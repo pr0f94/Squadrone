@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/squadrone_badge_transparent.png" alt="Squadrone" width="200" />
+  <img src="assets/squadrone_badge_transparent.png" alt="Squadrone" width="260" />
 </p>
 
 <h1 align="center">Squadrone</h1>
