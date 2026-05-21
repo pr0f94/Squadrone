@@ -1,0 +1,117 @@
+cost_ceiling_usd: 2.00
+max_hypotheses_to_verify: 10
+sandbox_timeout_seconds: 120
+verify_max_iterations: 7
+developer_calls_per_agent: 7
+
+models:
+  critic: claude-opus-4-6
+  developer: claude-opus-4-6                      # propose_setup (initial) + consult
+  developer_followup: claude-sonnet-4-6           # propose_setup_followup — structured diagnostic, cheaper tier
+  surveyor: claude-sonnet-4-6
+  poc_author: claude-sonnet-4-6
+  specialists: claude-sonnet-4-6
+  reporter: claude-haiku-4-5-20251001
+  dedup_fallback: claude-haiku-4-5-20251001
+  hypothesis_verifier: claude-haiku-4-5-20251001
+
+sandbox:
+  wordpress_image: wordpress:latest
+  db_image: mariadb:10.11
+  wp_admin_user: admin
+  wp_admin_pass: password
+  wp_admin_email: admin@test.local
+  wp_url: http://localhost:8080
+
+vuln_dbs:
+  wordfence:
+    base_url: https://www.wordfence.com/api/intelligence/v2
+    # no api key required for the production feed
+  wpscan:
+    base_url: https://wpscan.com/api/v3
+    # api_key loaded from env: WPSCAN_API_KEY
+
+stages:
+  - intake
+  - recon
+  - hypothesis
+  - triage
+  - verify
+  - dedup
+  - report
+
+# Stage 1 (intake) opt-in features — all default off, additive metadata.
+intake:
+  bundle_wp_core: false           # #1: cache WP core source at cache/wp-core/<ver>/
+  classify_files: false           # #2: bucket files admin/frontend/vendor/tests/lang
+  fetch_changelog: false          # #4: parse readme.txt Changelog into structured data
+  detect_closed: false            # #6: bail early if wp.org marks plugin closed
+  wp_core_version: latest         # used when bundle_wp_core=true
+
+# Stage 2 (recon) opt-in features — all default off.
+recon:
+  deterministic_analysis: false       # static hook/callback/callee metadata for grounding
+  validate_entry_points: false        # #1: per-entry-point LLM validation pass with file:line citations
+  trace_cross_file_callees: false     # #2: regex-based cross-file call-graph for handler bodies
+  scan_nonce_emissions: false         # #3: PHP+JS scan for wp_create_nonce / wp_localize_script sites
+  exclude_vendor_tests_lang: false    # #4: skip vendor/tests/lang buckets (needs intake.classify_files=true)
+  enrich_entry_points: false          # #5+#6: extract body_slice + confidence per entry point
+  negative_pattern_reference: false   # #7: append "what NOT to flag" reference to surveyor prompt
+  cache_enabled: false                # #8: cache recon.json keyed by (slug, version, recon-config)
+  max_entries_to_validate: 30         # cost-cap for #1 — top-N entries by confidence
+
+# Stage 3 (hypothesis specialists + verifier) opt-in features — all default off.
+hypothesis:
+  # Specialists
+  specialist_grep_read_tools: false       # S1: expose read_plugin_file tool to specialists
+  specialist_wp_idioms: false             # S2 + X2: append _wp_idioms.md to specialist prompts
+  require_branch_enumeration: false       # S3: require taint_path_branches in specialist output
+  require_exploit_classification: false   # S4: require exploit_classification block (direct/chained/gated)
+  require_bounty_fit_pretagging: false    # S5: require bounty_fit block (wordfence_tier, cvss, etc.)
+  self_critique_pass: false               # S7: specialist self-critique pass (flag uncited claims)
+  # Verifier
+  iterative_verifier: false               # V1: multi-pass verifier with read_plugin_file tool
+  verifier_max_iterations: 3              # iteration cap for V1
+  verifier_require_citation: false        # V3: drop reasons must cite file:line
+  verifier_wp_idioms: false               # V4 + X2: append _wp_idioms.md to verifier prompt
+  verifier_drop_categorisation: false     # V5: 5-state verdicts (keep_high / keep_conditional / drop_def / drop_insufficient / escalate)
+  verifier_cache_enabled: false           # V7: cache verifier decisions per (hypothesis, plugin_version)
+  # Cross-cutting
+  pre_verifier_dedup: false               # X1: merge near-duplicate hypotheses before verifier runs
+
+# Stage 4 (triage critic) opt-in features — all default off.
+triage:
+  inject_review_md: false        # T2: load plugins/<slug>/review.md into critic context
+  cluster_aware: false           # T3: pre-cluster hypotheses by (file, line, bug_class) and tell critic
+  allow_reframing: false         # T4: critic can output `request_reframing` decisions
+  drift_logging: false           # T5: append every decision to cache/triage_decisions.jsonl
+  cache_enabled: false           # T6: cache triage results per (hypotheses, plugin_version, toggles)
+  review_md_max_chars: 12000     # T2 size cap so review.md doesn't blow up the prompt
+
+# Stage 5 (verify) opt-in features — all default off.
+# W1 (proper HTML parser) is unconditional — already shipped in xss_check.py (no toggle).
+verify:
+  headless_browser_check: false        # W2: Playwright execution check (requires `pip install playwright && playwright install chromium`)
+  persistent_sandbox: false            # W3: one sandbox boot per scan w/ DB+uploads snapshot/restore between hypotheses
+  payload_variants: false              # W4: rotate through XSS payload variants on retries
+  state_introspection_on_failure: false # W5: dump DB/uploads/error.log when a hypothesis fails persistently
+  manual_review_handoff: false         # W6: emit manual-review queue + sandbox scaffold on persistent failure
+  negative_control: false              # W8: differential reflection check (benign payload should NOT also reflect)
+  collaborative_dev_poc_loop: false    # W9: PoC author can call developer mid-iteration via request_additional_setup tool
+  cache_enabled: false                 # W10: cache verify findings per (hypothesis, plugin_version, sandbox_image)
+  payload_variant_cap: 6               # cost-cap for W4 (max payload variants tried)
+  headless_browser_timeout_s: 15       # W2: per-page render budget
+
+# Stage 6 (dedup) opt-in features — all default off.
+dedup:
+  meaningful_scoring: false        # D1: per-match similarity scoring (replaces uniform 1.0)
+  submission_recommendation: false # D4: emit submit_as_novel / regression_of_X / skip_dupe / rebuttal
+  review_md_signal: false          # D5: parse plugins/<slug>/review.md for past-FP/confirmed signals
+
+# Stage 7 (report) opt-in features — all default off.
+report:
+  claim_validation_pass: false     # R1: post-report critic checks every load-bearing claim is cited
+  submission_readiness_gate: false # R2: emit *_NOT_READY.md when prerequisites missing
+  poc_bundling: false              # R4: write plugins/<slug>/submissions/<finding_id>/ bundle
+  screenshot_capture: false        # R5: take Playwright screenshot at verify success (needs Playwright)
+  submission_json: false           # R7: alongside report.md, emit machine-readable submission JSON

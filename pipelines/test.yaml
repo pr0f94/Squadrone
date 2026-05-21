@@ -1,0 +1,115 @@
+# Heavy-test pipeline — every approved toggle ON.
+# Used for end-to-end validation of the stage-1 → stage-7 implementations.
+# DO NOT use this in budget-sensitive scans — it's the most expensive config we ship.
+
+cost_ceiling_usd: 10.00
+max_hypotheses_to_verify: 10
+sandbox_timeout_seconds: 120
+verify_max_iterations: 7  # W7
+developer_calls_per_agent: 7  # S6
+
+models:
+  critic: claude-opus-4-6
+  developer: claude-opus-4-6
+  developer_followup: claude-sonnet-4-6
+  surveyor: claude-sonnet-4-6
+  poc_author: claude-sonnet-4-6
+  specialists: claude-sonnet-4-6
+  reporter: claude-haiku-4-5-20251001
+  dedup_fallback: claude-haiku-4-5-20251001
+  hypothesis_verifier: claude-haiku-4-5-20251001
+
+sandbox:
+  wordpress_image: wordpress:latest
+  db_image: mariadb:10.11
+  wp_admin_user: admin
+  wp_admin_pass: password
+  wp_admin_email: admin@test.local
+  wp_url: http://localhost:8080
+
+vuln_dbs:
+  wordfence:
+    base_url: https://www.wordfence.com/api/intelligence/v2
+  wpscan:
+    base_url: https://wpscan.com/api/v3
+
+stages:
+  - intake
+  - recon
+  - hypothesis
+  - triage
+  - verify
+  - dedup
+  - report
+
+# Stage 1 — all approved features ON except WP core bundling (skip the 70MB download for the test)
+intake:
+  bundle_wp_core: false           # skip for test (one-time but slow)
+  classify_files: true            # #2
+  fetch_changelog: true           # #4
+  detect_closed: true             # #6 (cheap safety)
+  wp_core_version: latest
+
+# Stage 2 — every approved feature ON
+recon:
+  deterministic_analysis: true
+  validate_entry_points: true     # #1 — Haiku per entry point, capped at 30
+  trace_cross_file_callees: true  # #2
+  scan_nonce_emissions: true      # #3
+  exclude_vendor_tests_lang: true # #4
+  enrich_entry_points: true       # #5+#6
+  negative_pattern_reference: true # #7
+  cache_enabled: true             # #8
+  max_entries_to_validate: 30
+
+# Stage 3 — every approved feature ON (skipping V2/V6 which weren't approved)
+hypothesis:
+  specialist_grep_read_tools: true       # S1
+  specialist_wp_idioms: true             # S2 + X2
+  require_branch_enumeration: true       # S3
+  require_exploit_classification: true   # S4
+  require_bounty_fit_pretagging: true    # S5
+  self_critique_pass: true               # S7
+  iterative_verifier: true               # V1
+  verifier_max_iterations: 3
+  verifier_require_citation: true        # V3
+  verifier_wp_idioms: true               # V4 + X2
+  verifier_drop_categorisation: true     # V5
+  verifier_cache_enabled: true           # V7
+  pre_verifier_dedup: true               # X1
+
+# Stage 4 — every approved feature ON
+triage:
+  inject_review_md: true          # T2 (no review.md exists for wp-job-openings yet, so this is a no-op safe-test)
+  cluster_aware: true             # T3
+  allow_reframing: true           # T4
+  drift_logging: true             # T5
+  cache_enabled: true             # T6
+  review_md_max_chars: 12000
+
+# Stage 5 — every approved feature ON
+verify:
+  headless_browser_check: true        # W2 (requires Playwright — installed earlier)
+  persistent_sandbox: true            # W3 — exercises mariadb-dump snapshot/restore
+  payload_variants: true              # W4
+  state_introspection_on_failure: true # W5
+  manual_review_handoff: true         # W6
+  negative_control: true              # W8
+  collaborative_dev_poc_loop: true    # W9
+  cache_enabled: true                 # W10
+  payload_variant_cap: 6
+  headless_browser_timeout_s: 15
+
+# Stage 6 — every approved feature ON
+dedup:
+  meaningful_scoring: true        # D1
+  submission_recommendation: true # D4
+  review_md_signal: true          # D5
+
+# Stage 7 — every approved feature ON
+report:
+  claim_validation_pass: true     # R1
+  submission_readiness_gate: true # R2
+  poc_bundling: true              # R4
+  screenshot_capture: true        # R5 (Playwright)
+  submission_json: true           # R7

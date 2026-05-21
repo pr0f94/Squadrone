@@ -1,0 +1,40 @@
+services:
+  db:
+    image: mariadb:10.11
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: wordpress
+      MYSQL_USER: wpuser
+      MYSQL_PASSWORD: wppass
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  wordpress:
+    image: wordpress:latest
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "{{ port }}:80"
+    environment:
+      WORDPRESS_DB_HOST: db
+      WORDPRESS_DB_USER: wpuser
+      WORDPRESS_DB_PASSWORD: wppass
+      WORDPRESS_DB_NAME: wordpress
+      WORDPRESS_DEBUG: "1"
+      WORDPRESS_CONFIG_EXTRA: |
+        define('SAVEQUERIES', true);
+      WP_URL: "{{ wp_url }}"
+      WP_TITLE: "{{ wp_title }}"
+      WP_ADMIN_USER: "{{ wp_admin_user }}"
+      WP_ADMIN_PASS: "{{ wp_admin_pass }}"
+      WP_ADMIN_EMAIL: "{{ wp_admin_email }}"
+    volumes:
+      - wp_data:/var/www/html
+      - ./wp-init.sh:/docker-entrypoint.d/99-wp-init.sh
+
+volumes:
+  wp_data:

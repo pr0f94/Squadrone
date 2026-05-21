@@ -1,0 +1,42 @@
+.env
+.env.*
+!.env.example
+
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Runtime scan artifacts and downloaded plugin corpora.
+plugins/
+cache/
+db/*.sqlite
+db/*.sqlite-*
+output.txt
+*.log
+
+# Generated benchmark and manual sandbox outputs.
+benchmarks/results/
+manual/sandboxes/
+
+# Local editor/agent state.
+.DS_Store
+.claude/
+.codex/
+.cursor/
+.windsurf/
+.aider*
+CLAUDE.md
+AGENTS.md
+CODEX.md
+GEMINI.md
+scripts/codex_repro.py
+pipelines/openai-research.yaml

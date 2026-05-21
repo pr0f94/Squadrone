@@ -1,0 +1,22 @@
+import requests
+
+TARGET   = "{{ target_url }}"
+ACTION   = "{{ ajax_action }}"
+USERNAME = "{{ test_username }}"
+PASSWORD = "{{ test_password }}"
+
+session = requests.Session()
+session.post(f"{TARGET}/wp-login.php", data={
+    "log": USERNAME, "pwd": PASSWORD,
+    "wp-submit": "Log In", "redirect_to": "/wp-admin/",
+})
+
+resp = session.post(f"{TARGET}/wp-admin/admin-ajax.php", data={
+    "action": ACTION,
+    {{ extra_params }}
+})
+
+if resp.status_code == 200 and "error" not in resp.text.lower():
+    print(f"[+] SUCCESS as {USERNAME}: {resp.text[:200]}")
+else:
+    print(f"[-] FAILURE status={resp.status_code}: {resp.text[:200]}")
