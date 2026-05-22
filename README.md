@@ -22,13 +22,26 @@ What you get:
 
 ## ⚡ Quickstart
 
+Install the prerequisites below first, and make sure Docker Desktop is running
+before starting a scan.
+
 ```sh
-git clone <this repo>
+git clone https://github.com/pr0f94/Squadrone.git squadrone
 cd squadrone
 python3.12 -m venv .venv
-.venv/bin/pip install -e ".[dev]"
+.venv/bin/python -m pip install -e ".[dev]"
 cp .env.example .env
+$EDITOR .env
+set -a; . ./.env; set +a
+.venv/bin/squadrone --help
 .venv/bin/squadrone scan hello-dolly
+```
+
+The default pipeline uses Anthropic models, so set `ANTHROPIC_API_KEY` in `.env`
+before running the scan. To use ChatGPT subscription OAuth instead, run:
+
+```sh
+.venv/bin/squadrone scan hello-dolly --config pipelines/openai.yaml
 ```
 
 Each scan writes artifacts under `plugins/<slug>/runs/<run_id>/`.
