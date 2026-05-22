@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 import pytest
 from pydantic import ValidationError
 
-from wpvulnhunt.schemas import (
+from squadrone.schemas import (
     BugClass,
     Confidence,
     DedupStatus,
@@ -154,7 +154,7 @@ def test_hypothesis_coerces_list_to_str():
 def test_strip_fences_handles_prose_and_embedded_json():
     """Runtime must extract JSON from various LLM response shapes."""
     import json as _json
-    from wpvulnhunt.agents.runtime import _strip_fences
+    from squadrone.agents.runtime import _strip_fences
     assert _json.loads(_strip_fences("```json\n[1,2]\n```")) == [1, 2]
     assert _json.loads(_strip_fences("Here you go:\n```json\n[1,2]\n```")) == [1, 2]
     assert _json.loads(_strip_fences("Based on analysis:\n[{\"a\":1}]\nThanks.")) == [{"a": 1}]

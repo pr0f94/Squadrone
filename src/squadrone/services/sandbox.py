@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 _PORT_MIN = 8100
 _PORT_MAX = 8200
-_PROJECT_PREFIX = "wpvh"
+_PROJECT_PREFIX = "squadrone"
 _DOCKER_DIR = Path(__file__).resolve().parents[3] / "docker"
 
 
@@ -173,12 +173,12 @@ class SandboxManager:
             "docker", "exec", self.container_name,
             "sh", "-c",
             "mkdir -p /var/www/html/wp-content/uploads && "
-            "tar czf /tmp/wpvh_uploads.tar.gz -C /var/www/html/wp-content uploads || true",
+            "tar czf /tmp/squadrone_uploads.tar.gz -C /var/www/html/wp-content uploads || true",
             check=False,
         )
         await _run(
             "docker", "cp",
-            f"{self.container_name}:/tmp/wpvh_uploads.tar.gz",
+            f"{self.container_name}:/tmp/squadrone_uploads.tar.gz",
             str(snap_dir / "uploads.tar.gz"),
             check=False,
         )
@@ -210,14 +210,14 @@ class SandboxManager:
         if uploads_tar.exists() and uploads_tar.stat().st_size > 0:
             await _run(
                 "docker", "cp", str(uploads_tar),
-                f"{self.container_name}:/tmp/wpvh_uploads.tar.gz",
+                f"{self.container_name}:/tmp/squadrone_uploads.tar.gz",
                 check=False,
             )
             await _run(
                 "docker", "exec", self.container_name,
                 "sh", "-c",
                 "rm -rf /var/www/html/wp-content/uploads && "
-                "tar xzf /tmp/wpvh_uploads.tar.gz -C /var/www/html/wp-content",
+                "tar xzf /tmp/squadrone_uploads.tar.gz -C /var/www/html/wp-content",
                 check=False,
             )
         logger.info("sandbox restore from %s — done", snap_dir)
@@ -307,14 +307,14 @@ class SandboxManager:
         """
         try:
             login_cmd = (
-                "curl -s -c /tmp/wpvh_cookies.txt "
+                "curl -s -c /tmp/squadrone_cookies.txt "
                 "-d 'log=admin&pwd=password&wp-submit=Log+In&testcookie=1' "
                 "-b 'wordpress_test_cookie=WP+Cookie+check' "
                 "http://localhost/wp-login.php -o /dev/null"
             )
             await _run("docker", "exec", self.container_name, "sh", "-c", login_cmd, check=False)
             visit_cmd = (
-                "curl -s -b /tmp/wpvh_cookies.txt "
+                "curl -s -b /tmp/squadrone_cookies.txt "
                 "http://localhost/wp-admin/ -o /dev/null -w '%{http_code}'"
             )
             _, status, _ = await _run("docker", "exec", self.container_name, "sh", "-c", visit_cmd, check=False)

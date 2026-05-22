@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from wpvulnhunt.schemas.hypothesis import BugClass, Confidence, Hypothesis
-from wpvulnhunt.stages.verify import _setup_command_plants_exploit_payload
+from squadrone.schemas.hypothesis import BugClass, Confidence, Hypothesis
+from squadrone.stages.verify import _setup_command_plants_exploit_payload
 
 
 def _hyp(cwe: BugClass) -> Hypothesis:

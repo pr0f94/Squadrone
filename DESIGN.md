@@ -131,7 +131,7 @@ stages:
 # documented by the pipeline config schema.
 ```
 
-A `chain` stage exists (`src/wpvulnhunt/stages/chain.py`) but runs only when `--chain` is passed on the CLI; it's not in the default stage list.
+A `chain` stage exists (`src/squadrone/stages/chain.py`) but runs only when `--chain` is passed on the CLI; it's not in the default stage list.
 
 ---
 
@@ -211,7 +211,7 @@ When an agent calls `consult_developer`, the agent runtime:
 ## Pydantic Schemas
 
 ```python
-# src/wpvulnhunt/schemas/
+# src/squadrone/schemas/
 
 from pydantic import BaseModel
 from enum import Enum
@@ -531,7 +531,7 @@ Tone: professional, factual, no hype. Length: 400-600 words.
 ## LLM Gateway + Cache
 
 ```python
-# src/wpvulnhunt/services/llm.py
+# src/squadrone/services/llm.py
 
 import hashlib, json
 import aiosqlite
@@ -614,7 +614,7 @@ The companion **`agents/transport/litellm_transport.py`** wraps `call_llm` in an
 ## Budget Tracker
 
 ```python
-# src/wpvulnhunt/services/budget.py
+# src/squadrone/services/budget.py
 
 COST_PER_1M = {
     "claude-opus-4-7":           {"input": 15.00, "output": 75.00},
@@ -653,7 +653,7 @@ class BudgetTracker:
 ## Verify Stage — Iteration Loop
 
 ```python
-# src/wpvulnhunt/stages/verify.py (outline)
+# src/squadrone/stages/verify.py (outline)
 
 async def verify_hypothesis(
     hypothesis: Hypothesis,
@@ -839,7 +839,7 @@ finding needs bespoke reproduction logic.
 ## WP-CLI Wrapper Interface
 
 ```python
-# src/wpvulnhunt/services/wp_cli.py
+# src/squadrone/services/wp_cli.py
 
 class WPCli:
     """Executes WP-CLI commands inside the running sandbox container."""
@@ -860,7 +860,7 @@ class WPCli:
 ## Vuln DB Integration
 
 ```python
-# src/wpvulnhunt/services/vuln_db.py
+# src/squadrone/services/vuln_db.py
 
 class VulnMatch(BaseModel):
     source: str                 # "wordfence" | "wpscan"
@@ -939,7 +939,7 @@ CREATE TABLE IF NOT EXISTS disclosures (
 
 ## PoC Templates
 
-Two kinds of artefacts live in `src/wpvulnhunt/poc_templates/`:
+Two kinds of artefacts live in `src/squadrone/poc_templates/`:
 
 - **Jinja2 skeletons (`*.py.j2`)** — bug-class starting points selected by `_select_template(bug_class)`. The PoC author treats them as a starting point and freely rewrites whole sections per hypothesis.
 - **Importable Python helpers** — provisioned next to the generated `iter_N.py` script by `stages/verify.py` so the PoC can `from <helper> import …` directly:
@@ -1047,7 +1047,7 @@ squadrone/
 │   └── test.yaml          # cheap config for the test suite
 ├── db/
 │   └── schema.sql
-├── src/wpvulnhunt/
+├── src/squadrone/
 │   ├── cli.py
 │   ├── orchestrator.py
 │   ├── stages/

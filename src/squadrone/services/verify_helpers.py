@@ -23,11 +23,11 @@ MANUAL_REVIEW_QUEUE = Path("cache/findings_for_manual_review.jsonl")
 # ---------- W2: Headless browser execution check (Playwright, optional dep) ---------
 
 # Sentinel injected into payloads — if it gets set on `window`, the script ran.
-BROWSER_SENTINEL_GLOBAL = "__wpvh_xss_fired"
+BROWSER_SENTINEL_GLOBAL = "__squadrone_xss_fired"
 
 
 def make_browser_payload_marker() -> str:
-    """Return a unique payload that, if executed, sets window.__wpvh_xss_fired."""
+    """Return a unique payload that, if executed, sets window.__squadrone_xss_fired."""
     nonce = hashlib.sha256(datetime.now(timezone.utc).isoformat().encode()).hexdigest()[:8]
     return f"<script>window.{BROWSER_SENTINEL_GLOBAL}_{nonce}=true;</script>"
 

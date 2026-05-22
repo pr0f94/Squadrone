@@ -1,4 +1,4 @@
-"""wpvulnhunt.schemas — re-exports of all artifact schemas."""
+"""squadrone.schemas — re-exports of all artifact schemas."""
 
 from .config import (
     ModelConfig,

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from wpvulnhunt.agents.developer import _parse_json_resilient, _autoclose_unbalanced
+from squadrone.agents.developer import _parse_json_resilient, _autoclose_unbalanced
 
 
 # ----- happy path ---------------------------------------------------------

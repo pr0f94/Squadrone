@@ -23,14 +23,14 @@ from ..services import verify_helpers
 
 logger = logging.getLogger(__name__)
 
-_XSS_CHECK_SRC = (_pkg_files("wpvulnhunt") / "poc_templates" / "xss_check.py").read_text()
-_WP_LOGIN_SRC = (_pkg_files("wpvulnhunt") / "poc_templates" / "wp_login.py").read_text()
+_XSS_CHECK_SRC = (_pkg_files("squadrone") / "poc_templates" / "xss_check.py").read_text()
+_WP_LOGIN_SRC = (_pkg_files("squadrone") / "poc_templates" / "wp_login.py").read_text()
 
 
 def _zip_plugin(plugin_path: str, slug: str) -> str:
     """Create a zip with the plugin folder at top level — wp plugin install expects this."""
     src = Path(plugin_path).resolve()
-    staging = Path(tempfile.mkdtemp(prefix=f"wpvh-zip-{slug}-"))
+    staging = Path(tempfile.mkdtemp(prefix=f"squadrone-zip-{slug}-"))
     target = staging / slug
     shutil.copytree(src, target)
     out = shutil.make_archive(str(staging / slug), "zip", root_dir=str(staging), base_dir=slug)

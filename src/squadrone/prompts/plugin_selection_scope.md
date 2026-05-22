@@ -1,6 +1,6 @@
 # Plugin Selection Scope
 
-**MUST be consulted whenever recommending or selecting a WordPress plugin to scan with wpvulnhunt.**
+**MUST be consulted whenever recommending or selecting a WordPress plugin to scan with squadrone.**
 
 This is distinct from `wordfence_scope.md`, which describes which *bug classes* Wordfence pays bounties for. This document describes which *plugins* are worth investing budget to scan.
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from wpvulnhunt.agents.transport.litellm_transport import _trim_history_for_budget
+from squadrone.agents.transport.litellm_transport import _trim_history_for_budget
 
 
 def _cycle(call_id: str, body: str) -> list[dict]:

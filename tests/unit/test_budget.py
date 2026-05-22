@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from wpvulnhunt.services.budget import BudgetExceededError, BudgetTracker
+from squadrone.services.budget import BudgetExceededError, BudgetTracker
 
 
 def _usage(prompt: int, completion: int):

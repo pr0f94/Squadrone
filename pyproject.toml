@@ -25,10 +25,10 @@ dependencies = [
 dev = ["pytest", "pytest-asyncio", "pytest-httpx", "ruff", "mypy"]
 
 [project.scripts]
-squadrone = "wpvulnhunt.cli:app"
+squadrone = "squadrone.cli:app"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-wpvulnhunt = ["prompts/*.md", "prompts/specialists/*.md", "poc_templates/*.j2", "poc_templates/*.py"]
+squadrone = ["prompts/*.md", "prompts/specialists/*.md", "poc_templates/*.j2", "poc_templates/*.py"]

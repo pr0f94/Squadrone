@@ -1,4 +1,4 @@
-"""wpvulnhunt.agents — agent runtime + all agent classes."""
+"""squadrone.agents — agent runtime + all agent classes."""
 
 from .critic import CriticAgent
 from .developer import DeveloperAgent

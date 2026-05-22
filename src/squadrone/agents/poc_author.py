@@ -44,7 +44,7 @@ def _select_template(bug_class: str) -> str:
 
 
 def _render_template(name: str, **vars) -> str:
-    raw = (files("wpvulnhunt.poc_templates") / name).read_text()
+    raw = (files("squadrone.poc_templates") / name).read_text()
     return Template(raw).render(**vars)
 
 

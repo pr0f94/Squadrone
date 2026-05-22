@@ -13,9 +13,9 @@ from typing import Optional
 
 from pydantic import BaseModel
 
-from wpvulnhunt.orchestrator import _resolve_run_dir, run_scan
-from wpvulnhunt.schemas.finding import DedupStatus, Finding, PoCStatus
-from wpvulnhunt.schemas.hypothesis import Confidence, Hypothesis
+from squadrone.orchestrator import _resolve_run_dir, run_scan
+from squadrone.schemas.finding import DedupStatus, Finding, PoCStatus
+from squadrone.schemas.hypothesis import Confidence, Hypothesis
 
 logger = logging.getLogger(__name__)
 

@@ -14,7 +14,7 @@ from dataclasses import dataclass
 
 
 def _load_wp_login_module():
-    src = Path(__file__).resolve().parents[2] / "src/wpvulnhunt/poc_templates/wp_login.py"
+    src = Path(__file__).resolve().parents[2] / "src/squadrone/poc_templates/wp_login.py"
     spec = importlib.util.spec_from_file_location("wp_login_test", src)
     mod = importlib.util.module_from_spec(spec)
     sys.modules["wp_login_test"] = mod

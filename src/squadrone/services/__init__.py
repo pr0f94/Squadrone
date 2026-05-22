@@ -1,4 +1,4 @@
-"""wpvulnhunt.services — shared async services."""
+"""squadrone.services — shared async services."""
 
 from .budget import BudgetExceededError, BudgetTracker
 from .llm import call_llm, init_cache

@@ -130,7 +130,7 @@ def _install_chatgpt_aggregator_patch() -> None:
     except ImportError:
         return  # LiteLLM build without chatgpt provider; nothing to patch.
 
-    if getattr(ChatGPTResponsesAPIConfig, "_wpvulnhunt_aggregator_patched", False):
+    if getattr(ChatGPTResponsesAPIConfig, "_squadrone_aggregator_patched", False):
         return  # already wrapped
 
     original = ChatGPTResponsesAPIConfig.transform_response_api_response
@@ -179,7 +179,7 @@ def _install_chatgpt_aggregator_patch() -> None:
         return result
 
     ChatGPTResponsesAPIConfig.transform_response_api_response = patched
-    ChatGPTResponsesAPIConfig._wpvulnhunt_aggregator_patched = True
+    ChatGPTResponsesAPIConfig._squadrone_aggregator_patched = True
     logger.info(
         "patched ChatGPTResponsesAPIConfig.transform_response_api_response "
         "to recover output items from response.output_item.done SSE events"

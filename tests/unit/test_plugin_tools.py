@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from pathlib import Path
 
-from wpvulnhunt.agents.plugin_tools import PluginToolHandlers
+from squadrone.agents.plugin_tools import PluginToolHandlers
 
 
 @pytest.fixture

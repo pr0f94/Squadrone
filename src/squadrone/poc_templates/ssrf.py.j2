@@ -31,8 +31,8 @@ threading.Thread(target=server.serve_forever, daemon=True).start()
 
 # host.docker.internal is reachable from a Docker container on Mac/Win.
 CALLBACK_URLS = [
-    f"http://host.docker.internal:{LISTEN_PORT}/wpvh_ssrf",
-    f"http://172.17.0.1:{LISTEN_PORT}/wpvh_ssrf",
+    f"http://host.docker.internal:{LISTEN_PORT}/squadrone_ssrf",
+    f"http://172.17.0.1:{LISTEN_PORT}/squadrone_ssrf",
     f"http://169.254.169.254/latest/meta-data/",  # cloud metadata, harmless if no provider
     f"file:///etc/hostname",
 ]

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from wpvulnhunt.services import recon_helpers
+from squadrone.services import recon_helpers
 
 
 def test_extract_static_callbacks_and_edges(tmp_path: Path):
