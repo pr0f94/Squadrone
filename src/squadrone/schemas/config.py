@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel
@@ -22,6 +23,37 @@ class ModelConfig(BaseModel):
     developer_followup: str = "claude-sonnet-4-6"
     # Used only when --chain flag is enabled. Defaults to the same tier as critic.
     chain_synthesizer: str = "claude-opus-4-6"
+
+
+ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "default"]
+Verbosity = Literal["low", "medium", "high"]
+
+
+class LLMConfig(BaseModel):
+    """Provider-level generation controls passed through to LiteLLM."""
+
+    reasoning_effort: ReasoningEffort | None = None
+    verbosity: Verbosity | None = None
+
+
+class ReasoningConfig(BaseModel):
+    """Optional per-role reasoning-effort overrides.
+
+    These override `llm.reasoning_effort` for matching roles only. Specialist
+    implementation names such as `auth`, `xss`, and `file_ops` map to the
+    `specialists` role.
+    """
+
+    critic: ReasoningEffort | None = None
+    developer: ReasoningEffort | None = None
+    developer_followup: ReasoningEffort | None = None
+    surveyor: ReasoningEffort | None = None
+    poc_author: ReasoningEffort | None = None
+    specialists: ReasoningEffort | None = None
+    reporter: ReasoningEffort | None = None
+    dedup_fallback: ReasoningEffort | None = None
+    hypothesis_verifier: ReasoningEffort | None = None
+    chain_synthesizer: ReasoningEffort | None = None
 
 
 class SandboxConfig(BaseModel):
@@ -139,6 +171,8 @@ class PipelineConfig(BaseModel):
     sandbox: SandboxConfig
     vuln_dbs: VulnDbConfig
     stages: list[str]
+    llm: LLMConfig = LLMConfig()
+    reasoning: ReasoningConfig = ReasoningConfig()
     intake: IntakeConfig = IntakeConfig()  # default-off, fully backward-compatible
     recon: ReconConfig = ReconConfig()     # default-off, fully backward-compatible
     hypothesis: HypothesisConfig = HypothesisConfig()  # default-off, fully backward-compatible
@@ -151,3 +185,11 @@ class PipelineConfig(BaseModel):
     def from_yaml(cls, path: str) -> "PipelineConfig":
         data = yaml.safe_load(Path(path).read_text())
         return cls.model_validate(data)
+
+    def llm_options_for_role(self, role: str) -> dict:
+        """Return LiteLLM keyword args for a configured role."""
+        opts = self.llm.model_dump(exclude_none=True)
+        role_effort = getattr(self.reasoning, role, None)
+        if role_effort is not None:
+            opts["reasoning_effort"] = role_effort
+        return opts

@@ -134,6 +134,18 @@ def test_pipeline_config_loads():
     assert "wordfence" in cfg.vuln_dbs.model_dump()
 
 
+def test_pipeline_llm_options_load():
+    cfg = PipelineConfig.from_yaml("pipelines/openai.yaml")
+    assert cfg.llm_options_for_role("critic") == {
+        "reasoning_effort": "high",
+        "verbosity": "high",
+    }
+    assert cfg.llm_options_for_role("surveyor") == {
+        "reasoning_effort": "high",
+        "verbosity": "high",
+    }
+
+
 def test_hypothesis_coerces_list_to_str():
     """LLMs sometimes emit list[str] for fields we declared as str. Coerce."""
     h = Hypothesis.model_validate({

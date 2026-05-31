@@ -32,6 +32,41 @@ def _ensure_parent(path: str) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
 
 
+def _coerce_response_api_usage(response: object) -> object:
+    """Normalize LiteLLM Responses API usage after model_construct paths.
+
+    LiteLLM's ChatGPT Responses adapter may fall back to
+    `ResponsesAPIResponse.model_construct(**payload)` when the streamed
+    `response.completed` payload contains fields that fail normal validation.
+    That bypasses Pydantic validators, leaving `usage` as a plain dict even
+    though the model field expects `ResponseAPIUsage`. A later `model_dump()`
+    then emits a noisy serializer warning.
+    """
+    usage = getattr(response, "usage", None)
+    if not isinstance(usage, dict):
+        return response
+
+    try:
+        from litellm.types.llms.openai import ResponseAPIUsage
+    except ImportError:
+        return response
+
+    try:
+        coerced = ResponseAPIUsage(**usage)
+    except Exception:
+        return response
+
+    try:
+        setattr(response, "usage", coerced)
+    except Exception:
+        try:
+            response.__dict__["usage"] = coerced  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+    return response
+
+
 async def init_cache(cache_db: str = DEFAULT_CACHE_DB) -> None:
     _ensure_parent(cache_db)
     async with aiosqlite.connect(cache_db) as db:
@@ -47,9 +82,9 @@ async def init_cache(cache_db: str = DEFAULT_CACHE_DB) -> None:
         await db.commit()
 
 
-def _cache_key(model: str, messages: list, tools: list | None) -> str:
+def _cache_key(model: str, messages: list, tools: list | None, llm_options: dict | None = None) -> str:
     payload = json.dumps(
-        {"model": model, "messages": messages, "tools": tools},
+        {"model": model, "messages": messages, "tools": tools, "llm_options": llm_options or {}},
         sort_keys=True,
         default=str,
     )
@@ -69,6 +104,7 @@ async def call_llm_oneshot(
     max_tokens: int = 4096,
     budget_tracker: Optional[BudgetTracker] = None,
     agent_name: str = "unknown",
+    llm_options: dict | None = None,
 ) -> str:
     """Single-turn LLM call (no tools, no agent loop).
 
@@ -79,6 +115,7 @@ async def call_llm_oneshot(
     resp = await call_llm(
         model=model, messages=messages, max_tokens=max_tokens,
         budget_tracker=budget_tracker, agent_name=agent_name,
+        llm_options=llm_options,
     )
     choice = (resp.get("choices") or [{}])[0]
     return ((choice.get("message") or {}).get("content") or "").strip()
@@ -160,7 +197,7 @@ def _install_chatgpt_aggregator_patch() -> None:
                     if item:
                         accumulated_items.append(item)
 
-        result = original(self, model, raw_response, logging_obj)
+        result = _coerce_response_api_usage(original(self, model, raw_response, logging_obj))
 
         if accumulated_items:
             existing = getattr(result, "output", None)
@@ -198,6 +235,7 @@ async def call_llm(
     budget_tracker: Optional[BudgetTracker] = None,
     cache_db: str = DEFAULT_CACHE_DB,
     agent_name: str = "unknown",
+    llm_options: dict | None = None,
 ) -> dict:
     """Direct LiteLLM completion with on-disk response cache.
 
@@ -206,7 +244,8 @@ async def call_llm(
     response's `output` field.
     """
     _ensure_parent(cache_db)
-    key = _cache_key(model, messages, tools)
+    options = dict(llm_options or {})
+    key = _cache_key(model, messages, tools, options)
 
     async with aiosqlite.connect(cache_db) as db:
         async with db.execute(
@@ -219,16 +258,19 @@ async def call_llm(
 
     logger.debug("llm cache MISS model=%s key=%s", model, key[:12])
 
-    response = await litellm.acompletion(
-        model=model,
-        messages=messages,
-        tools=tools,
-        max_tokens=max_tokens,
-    )
+    request_kwargs = {
+        "model": model,
+        "messages": messages,
+        "tools": tools,
+        "max_tokens": max_tokens,
+    }
+    request_kwargs.update(options)
+    response = await litellm.acompletion(**request_kwargs)
 
     if budget_tracker is not None:
         await budget_tracker.add(response.usage, model, agent=agent_name)
 
+    _coerce_response_api_usage(response)
     result = response.model_dump()
 
     async with aiosqlite.connect(cache_db) as db:

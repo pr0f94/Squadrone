@@ -187,6 +187,7 @@ def write_manual_scaffold(
     *,
     attempts: list | None = None,
     setup_results: list[dict] | None = None,
+    handoff_reason: str | None = None,
 ) -> None:
     """Write a minimal docker-compose + README scaffold the user can take over."""
     scaffold = hyp_dir / "manual_scaffold"
@@ -204,10 +205,19 @@ def write_manual_scaffold(
         status = "FAILED" if item.get("failed") else "OK"
         blocked = " REJECTED" if item.get("forbidden_payload_seed") else ""
         setup_lines.append(f"- {status}{blocked}: wp {' '.join(item.get('args', []))}")
+    if attempts:
+        pickup_note = (
+            f"See `iter_*.py` files alongside this scaffold. Each failed in some way; "
+            f"check stdout in trace.jsonl.\n\n"
+        )
+    else:
+        pickup_note = (
+            "No automated PoC iterations were recorded for this handoff.\n\n"
+        )
 
     (scaffold / "README.md").write_text(
         f"# Manual review handoff: {hyp.id}\n\n"
-        f"Auto-pipeline failed to confirm this hypothesis after the configured iteration cap.\n\n"
+        f"{handoff_reason or 'Auto-pipeline failed to confirm this hypothesis after the configured iteration cap.'}\n\n"
         f"- **Bug class:** {hyp.bug_class.value}\n"
         f"- **File:** {hyp.file}:{hyp.line}\n"
         f"- **Sink:** `{hyp.sink}`\n"
@@ -217,7 +227,7 @@ def write_manual_scaffold(
         f"{chr(10).join(setup_lines) if setup_lines else '- none recorded'}\n\n"
         f"## Failed PoC iterations\n"
         f"{chr(10).join(attempt_lines) if attempt_lines else '- none recorded'}\n\n"
-        f"See `iter_*.py` files alongside this scaffold. Each failed in some way; check stdout in trace.jsonl.\n\n"
+        f"{pickup_note}"
         f"## To pick up manually\n"
         f"1. Look at the standing `manual_reviews/<plugin>/sandbox/` if it exists, or follow that pattern\n"
         f"2. The auto-pipeline left findings under `runs/<id>/verifications/{hyp.id}/`\n"

@@ -154,6 +154,15 @@ squadrone scan contact-form-7 --budget 5.00
 # Use the OpenAI/ChatGPT pipeline
 squadrone scan contact-form-7 --budget 5.00 --config pipelines/openai.yaml
 
+# Skip sandbox verification and queue accepted hypotheses for manual review
+squadrone scan contact-form-7 --no-verify
+
+# Scan multiple plugins from a file, one slug per line
+squadrone scan-batch plugins.txt
+
+# Scan multiple plugins in parallel
+squadrone scan-batch plugins.txt --concurrency 3
+
 # Resume an existing run
 squadrone scan contact-form-7 --resume <run_id>
 
@@ -183,6 +192,8 @@ Output by default:
 - `plugins/<slug>/runs/<run_id>/findings.jsonl`
 - `plugins/<slug>/runs/<run_id>/trace.jsonl`
 - `plugins/<slug>/runs/<run_id>/report_<finding_id>_<program>.md`
+
+When `--no-verify` is used, triage-accepted hypotheses are written to the manual review queue instead of `findings.jsonl`, and no submission reports are generated.
 
 ## 🔍 Triage
 

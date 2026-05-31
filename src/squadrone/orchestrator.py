@@ -19,6 +19,7 @@ from .schemas.config import PipelineConfig
 from .schemas.finding import DedupStatus, Finding
 from .services.budget import BudgetExceededError, BudgetTracker
 from .services.llm import init_cache
+from .services import verify_helpers
 from .stages import chain as chain_stage
 from .stages import dedup as dedup_stage
 from .stages import hypothesis as hypothesis_stage
@@ -141,6 +142,7 @@ async def run_scan(
     on_event: Optional[EventCallback] = None,
     version: Optional[str] = None,
     no_triage: bool = False,
+    no_verify: bool = False,
     resume_run_id: Optional[str] = None,
     resume_from: Optional[str] = None,
     apply_scope_filter: bool = True,
@@ -196,12 +198,16 @@ async def run_scan(
         model=config.models.developer,
         followup_model=config.models.developer_followup,
         budget_tracker=budget,
+        llm_options=config.llm_options_for_role("developer"),
+        followup_llm_options=config.llm_options_for_role("developer_followup"),
     )
     runtime = AgentRuntime(
         run_dir=str(run_dir),
         developer=developer,
         developer_calls_per_agent=config.developer_calls_per_agent,
         budget_tracker=budget,
+        llm_options=config.llm.model_dump(exclude_none=True),
+        role_reasoning=config.reasoning.model_dump(exclude_none=True),
     )
 
     status = "running"
@@ -335,7 +341,39 @@ async def run_scan(
 
         # ---- verify ----
         budget.set_stage("verify")
-        if _should_load("verify") and findings_path.exists():
+        if no_verify:
+            findings_path.write_text("")
+            manual_queued = 0
+            for hyp in triaged.accepted:
+                hyp_dir = run_dir / "verifications" / hyp.id
+                hyp_dir.mkdir(parents=True, exist_ok=True)
+                verify_helpers.write_manual_scaffold(
+                    hyp,
+                    hyp_dir,
+                    intake.plugin_slug,
+                    "",
+                    handoff_reason=(
+                        "Verification was skipped by --no-verify. This hypothesis passed "
+                        "automated triage and needs manual validation before it is treated "
+                        "as a confirmed vulnerability."
+                    ),
+                )
+                verify_helpers.emit_to_manual_review_queue(
+                    hyp,
+                    run_dir,
+                    reason="verification skipped by --no-verify",
+                    verifier_notes={
+                        "triage_accepted": True,
+                        "verification_skipped": True,
+                    },
+                )
+                manual_queued += 1
+            await _emit(on_event, "verify", "skipped", {
+                "findings": 0,
+                "manual_queued": manual_queued,
+                "reason": "no_verify",
+            })
+        elif _should_load("verify") and findings_path.exists():
             findings = [
                 Finding.model_validate_json(line)
                 for line in findings_path.read_text().splitlines() if line.strip()
@@ -350,30 +388,31 @@ async def run_scan(
             )
             await _emit(on_event, "verify", "done", {"findings": len(findings), "spent": budget.spent})
 
-        # ---- dedup (cheap; always re-run on resume since output overwrites findings.jsonl) ----
-        budget.set_stage("dedup")
-        await _emit(on_event, "dedup", "start", {})
-        findings = await dedup_stage.run(
-            findings, plugin_slug, config, runs_root=_runs_root(plugin_slug), run_id=run_id,
-        )
-        novel_count = sum(1 for f in findings if f.dedup_status == DedupStatus.NOVEL)
-        await _emit(on_event, "dedup", "done", {
-            "novel": novel_count, "possibly_known": sum(1 for f in findings if f.dedup_status == DedupStatus.POSSIBLY_KNOWN),
-            "known_dupe": sum(1 for f in findings if f.dedup_status == DedupStatus.KNOWN_DUPE),
-        })
+        if not no_verify:
+            # ---- dedup (cheap; always re-run on resume since output overwrites findings.jsonl) ----
+            budget.set_stage("dedup")
+            await _emit(on_event, "dedup", "start", {})
+            findings = await dedup_stage.run(
+                findings, plugin_slug, config, runs_root=_runs_root(plugin_slug), run_id=run_id,
+            )
+            novel_count = sum(1 for f in findings if f.dedup_status == DedupStatus.NOVEL)
+            await _emit(on_event, "dedup", "done", {
+                "novel": novel_count, "possibly_known": sum(1 for f in findings if f.dedup_status == DedupStatus.POSSIBLY_KNOWN),
+                "known_dupe": sum(1 for f in findings if f.dedup_status == DedupStatus.KNOWN_DUPE),
+            })
 
-        await _persist_findings(run_id, plugin_slug, findings)
+            await _persist_findings(run_id, plugin_slug, findings)
 
-        # ---- report (per-finding skip: existing report files are preserved) ----
-        budget.set_stage("report")
-        await _emit(on_event, "report", "start", {})
-        report_paths = await report_stage.run(
-            findings, plugin_slug, config, budget, runtime,
-            runs_root=_runs_root(plugin_slug), run_id=run_id,
-            plugin_path=intake.source_path,
-            plugin_version=intake.plugin_version,
-        )
-        await _emit(on_event, "report", "done", {"reports": len(report_paths), "spent": budget.spent})
+            # ---- report (per-finding skip: existing report files are preserved) ----
+            budget.set_stage("report")
+            await _emit(on_event, "report", "start", {})
+            report_paths = await report_stage.run(
+                findings, plugin_slug, config, budget, runtime,
+                runs_root=_runs_root(plugin_slug), run_id=run_id,
+                plugin_path=intake.source_path,
+                plugin_version=intake.plugin_version,
+            )
+            await _emit(on_event, "report", "done", {"reports": len(report_paths), "spent": budget.spent})
 
         status = "complete"
 

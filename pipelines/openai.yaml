@@ -43,6 +43,22 @@ models:
   dedup_fallback: chatgpt/gpt-5.4        # Similarity matching
   hypothesis_verifier: chatgpt/gpt-5.4   # Per-hypothesis source-quote check (highest volume)
 
+llm:
+  reasoning_effort: high
+  verbosity: high
+
+reasoning:
+  critic: high
+  developer: high
+  chain_synthesizer: high
+  specialists: high
+  poc_author: high
+  hypothesis_verifier: high
+  developer_followup: high
+  surveyor: high
+  reporter: medium
+  dedup_fallback: medium
+
 sandbox:
   wordpress_image: wordpress:latest
   db_image: mariadb:10.11

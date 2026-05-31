@@ -38,6 +38,8 @@ class AgentRuntime:
         developer: Optional["DeveloperAgent"] = None,
         developer_calls_per_agent: int = 3,
         budget_tracker=None,
+        llm_options: dict | None = None,
+        role_reasoning: dict | None = None,
     ):
         self.run_dir = Path(run_dir)
         self.run_dir.mkdir(parents=True, exist_ok=True)
@@ -45,6 +47,30 @@ class AgentRuntime:
         self.developer = developer
         self.developer_calls_per_agent = developer_calls_per_agent
         self.budget_tracker = budget_tracker
+        self.llm_options = dict(llm_options or {})
+        self.role_reasoning = {
+            role: effort for role, effort in (role_reasoning or {}).items()
+            if effort is not None
+        }
+
+    @staticmethod
+    def _role_for_agent(agent_name: str) -> str:
+        base = agent_name.split(".", 1)[0]
+        if base in {"auth", "auth_flow", "cross_file_xss", "file_ops", "injection", "logic_flaw", "ssrf_deser", "xss"}:
+            return "specialists"
+        if base == "claim_validator":
+            return "reporter"
+        if base == "entry_point_validator":
+            return "hypothesis_verifier"
+        return base
+
+    def llm_options_for_agent(self, agent_name: str) -> dict:
+        opts = dict(self.llm_options)
+        role = self._role_for_agent(agent_name)
+        effort = self.role_reasoning.get(role)
+        if effort is not None:
+            opts["reasoning_effort"] = effort
+        return opts
 
     def _trace(self, agent_name: str, kind: str, payload: dict) -> None:
         record = {"ts": time.time(), "agent": agent_name, "kind": kind, **payload}

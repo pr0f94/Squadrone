@@ -240,7 +240,13 @@ class LiteLLMTransport:
                     "original_messages": len(call_msgs),
                 })
             cached_msgs = _apply_cache_control(trimmed_msgs, model)
-            runtime._trace(agent_name, "request", {"model": model, "messages": trimmed_msgs, "tools": tools})
+            llm_options = runtime.llm_options_for_agent(agent_name)
+            runtime._trace(agent_name, "request", {
+                "model": model,
+                "messages": trimmed_msgs,
+                "tools": tools,
+                "llm_options": llm_options,
+            })
             resp = await call_llm(
                 model=model,
                 messages=cached_msgs,
@@ -248,6 +254,7 @@ class LiteLLMTransport:
                 max_tokens=max_tokens,
                 budget_tracker=runtime.budget_tracker,
                 agent_name=agent_name,
+                llm_options=llm_options,
             )
             usage = resp.get("usage") if isinstance(resp, dict) else None
             _accumulate_usage(usage_acc, usage if isinstance(usage, dict) else None)
@@ -336,7 +343,12 @@ class LiteLLMTransport:
                     "where": "forced_finalisation",
                 })
             cached_msgs = _apply_cache_control(trimmed_msgs, model)
-            runtime._trace(agent_name, "forced_request", {"model": model, "messages": trimmed_msgs})
+            llm_options = runtime.llm_options_for_agent(agent_name)
+            runtime._trace(agent_name, "forced_request", {
+                "model": model,
+                "messages": trimmed_msgs,
+                "llm_options": llm_options,
+            })
             try:
                 resp = await call_llm(
                     model=model,
@@ -345,6 +357,7 @@ class LiteLLMTransport:
                     max_tokens=max_tokens,
                     budget_tracker=runtime.budget_tracker,
                     agent_name=agent_name,
+                    llm_options=llm_options,
                 )
             except Exception as e:
                 raise AgentOutputError(

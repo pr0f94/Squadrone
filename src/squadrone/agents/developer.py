@@ -137,15 +137,29 @@ def _parse_json_resilient(content: str) -> Optional[dict]:
 
 
 class DeveloperAgent:
-    def __init__(self, model: str, budget_tracker=None, followup_model: str | None = None):
+    def __init__(
+        self,
+        model: str,
+        budget_tracker=None,
+        followup_model: str | None = None,
+        llm_options: dict | None = None,
+        followup_llm_options: dict | None = None,
+    ):
         self.model = model
         # Followup is a structured diagnostic task; defaults to a cheaper tier than the
         # main developer model (which handles initial reasoning + ad-hoc consult).
         self.followup_model = followup_model or model
         self.budget_tracker = budget_tracker
+        self.llm_options = dict(llm_options or {})
+        self.followup_llm_options = dict(followup_llm_options or self.llm_options)
         self.system_prompt = load_prompt("developer")
         self.setup_prompt = load_prompt("developer_setup")
         self.setup_followup_prompt = load_prompt("developer_setup_followup")
+
+    def _llm_options_for_agent(self, agent_name: str) -> dict:
+        if agent_name.startswith("developer.propose_setup_followup"):
+            return self.followup_llm_options
+        return self.llm_options
 
     async def _call_setup_json(self, *, model: str, messages: list[dict], agent_name: str) -> dict | None:
         """Call a setup-oriented prompt and retry once if no JSON object is recoverable."""
@@ -155,6 +169,7 @@ class DeveloperAgent:
             budget_tracker=self.budget_tracker,
             max_tokens=4096,
             agent_name=agent_name,
+            llm_options=self._llm_options_for_agent(agent_name),
         )
         parsed = _parse_json_resilient(content)
         if parsed is not None:
@@ -184,6 +199,7 @@ class DeveloperAgent:
             budget_tracker=self.budget_tracker,
             max_tokens=4096,
             agent_name=f"{agent_name}.retry",
+            llm_options=self._llm_options_for_agent(agent_name),
         )
         parsed = _parse_json_resilient(retry_content)
         if parsed is None:
@@ -209,6 +225,7 @@ class DeveloperAgent:
             messages=messages,
             budget_tracker=self.budget_tracker,
             agent_name="developer.consult",
+            llm_options=self.llm_options,
         )
 
     async def propose_setup(

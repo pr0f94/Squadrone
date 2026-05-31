@@ -1163,7 +1163,8 @@ squadrone scan <plugin-slug> [--config pipelines/default.yaml] [--budget 2.00]
                               [--from <stage>]               # force re-run from a given stage (requires --resume)
 
 # Batch / harness / review / disclosure
-squadrone scan-batch plugins.txt                            # currently not implemented — shell-loop over `scan`
+squadrone scan-batch plugins.txt                            # scan one plugin at a time by default
+squadrone scan-batch plugins.txt --concurrency 3            # opt into parallel plugin scans
 squadrone benchmark benchmarks/corpus.json [--split test]
 squadrone review <run-id>
 squadrone runs list

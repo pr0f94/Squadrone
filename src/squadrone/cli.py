@@ -120,7 +120,7 @@ def _stage_done_summary(stage: str, info: dict[str, Any]) -> str:
         "hypothesis": ("count",),
         "chain": ("chains",),
         "triage": ("accepted", "rejected", "merged"),
-        "verify": ("findings",),
+        "verify": ("findings", "manual_queued"),
         "dedup": ("novel", "possibly_known", "known_dupe"),
         "report": ("reports",),
     }
@@ -168,110 +168,7 @@ def _print_artifacts(result: Any) -> None:
     console.print(table)
 
 
-def _run_dir(run_id: str) -> Path:
-    """Resolve a run_id to its directory under plugins/<slug>/runs/<run_id>.
-
-    Globs the filesystem for plugins/*/runs/<run_id>. Raises FileNotFoundError
-    if no match exists.
-    """
-    matches = list(Path("plugins").glob(f"*/runs/{run_id}"))
-    if matches:
-        return matches[0]
-    raise FileNotFoundError(f"plugins/*/runs/{run_id} not found")
-
-
-@app.command()
-def scan(
-    plugin_slug: str = typer.Argument(..., help="WordPress plugin slug"),
-    config: str = typer.Option("pipelines/default.yaml", "--config", help="Pipeline config YAML path"),
-    budget: float | None = typer.Option(None, "--budget", help="Override cost ceiling (USD)"),
-    version: str | None = typer.Option(None, "--version", help="Pin a specific plugin version (e.g. for re-scanning a historical release). Defaults to the latest version on wordpress.org."),
-    no_triage: bool = typer.Option(False, "--no-triage", help="Skip Critic; pipe hypotheses straight to verify"),
-    ignore_scope: bool = typer.Option(
-        False, "--ignore-scope",
-        help="Disable Wordfence/Patchstack scope filtering in triage; verify everything that's technically a bug (use for plugin-author disclosures or CVE-only pursuit)",
-    ),
-    resume: str | None = typer.Option(
-        None, "--resume",
-        help="Resume an existing run by ID — auto-detects the latest completed stage from disk artifacts and re-runs from the next stage onwards",
-    ),
-    resume_from: str | None = typer.Option(
-        None, "--from",
-        help="Force re-run from a specific stage (requires --resume). One of: intake, recon, hypothesis, chain, triage, verify, dedup, report. Later artifacts on disk are ignored and re-generated.",
-    ),
-    chain: bool = typer.Option(
-        False, "--chain/--no-chain",
-        help="Enable cross-specialist exploit-chain synthesis after the hypothesis stage. Adds chain annotations (chains_with / chain_impact / chain_severity_bump) to hypotheses. Off by default.",
-    ),
-    cross_file_taint: bool = typer.Option(
-        False, "--cross-file-taint/--no-cross-file-taint",
-        help="Enable the cross-file stored-XSS specialist. Receives the full plugin corpus (not a filtered subset) and looks for sanitize-on-write + read-raw-on-output patterns spanning multiple files. Off by default because it sends a larger payload per call.",
-    ),
-    diff_baseline: str | None = typer.Option(
-        None, "--diff",
-        help="Compute a PHP diff between the scan version and this baseline version (e.g. --diff 1.21.0). The diff summary is fed to specialists as a prior, raising attention on files touched by the change. Useful for n-day discovery against released fixes. Requires a real prior version available on wp.org.",
-    ),
-    verbose: bool = typer.Option(
-        False, "--verbose", "-v",
-        help="Show detailed INFO logs from stages, agents, sandbox setup, and LLM calls. Default output stays concise.",
-    ),
-) -> None:
-    """Scan a single plugin for vulnerabilities."""
-    _configure_logging(verbose=verbose)
-    from .orchestrator import run_scan
-
-    _print_scan_header(plugin_slug, config, budget, version, resume, verbose)
-
-    stage_started_at: dict[str, float] = {}
-    run_id_seen: str | None = resume
-
-    def on_event(stage: str, status: str, info: dict) -> None:
-        nonlocal run_id_seen
-        label = _stage_label(stage)
-        if status == "start":
-            stage_started_at[stage] = time.monotonic()
-            if info.get("run_id"):
-                run_id_seen = str(info["run_id"])
-            description = STAGE_DESCRIPTIONS.get(stage, "Running this pipeline stage.")
-            detail_parts = []
-            if info.get("run_id"):
-                detail_parts.append(f"run {info['run_id']}")
-            if info.get("version"):
-                detail_parts.append(f"version {info['version']}")
-            detail = f" [dim]({' · '.join(detail_parts)})[/]" if detail_parts else ""
-            console.print(f"\n[bold cyan]▶ {label}[/]{detail}")
-            console.print(f"[dim]{description}[/]")
-            if verbose and run_id_seen:
-                console.print(f"[dim]Artifacts: plugins/{plugin_slug}/runs/{run_id_seen}/[/]")
-        elif status == "done":
-            elapsed = time.monotonic() - stage_started_at.get(stage, time.monotonic())
-            summary = _stage_done_summary(stage, info)
-            suffix = f" · {summary}" if summary else ""
-            console.print(f"[green]✓ {label} complete[/] [dim]in {_fmt_elapsed(elapsed)}[/]{suffix}")
-        elif status == "skipped":
-            extras = _stage_done_summary(stage, info)
-            suffix = f" · {extras}" if extras else ""
-            console.print(f"[dim]↺ {label} loaded from existing artifacts{suffix}[/]")
-        elif status == "budget_exceeded":
-            console.print(f"[yellow]⚠ budget exceeded — {info.get('message','')}[/]")
-        elif status == "failed":
-            console.print(f"[red]✗ pipeline failed — {info.get('message','')}[/]")
-
-    result = asyncio.run(run_scan(
-        plugin_slug=plugin_slug,
-        config_path=config,
-        budget_override=budget,
-        on_event=on_event,
-        version=version,
-        no_triage=no_triage,
-        resume_run_id=resume,
-        resume_from=resume_from,
-        apply_scope_filter=not ignore_scope,
-        enable_chain=chain,
-        enable_cross_file_taint=cross_file_taint,
-        diff_baseline=diff_baseline,
-    ))
-
+def _print_scan_result(result: Any) -> None:
     table = Table(title=f"Scan summary — {result.plugin_slug}")
     table.add_column("field")
     table.add_column("value")
@@ -303,20 +200,284 @@ def scan(
                 )
         console.print(stage_table)
 
+
+async def _run_scan_cli(
+    *,
+    plugin_slug: str,
+    config: str,
+    budget: float | None,
+    version: str | None,
+    no_triage: bool,
+    no_verify: bool,
+    ignore_scope: bool,
+    resume: str | None,
+    resume_from: str | None,
+    chain: bool,
+    cross_file_taint: bool,
+    diff_baseline: str | None,
+    verbose: bool,
+    batch_prefix: str | None = None,
+) -> Any:
+    from .orchestrator import run_scan
+
+    _print_scan_header(plugin_slug, config, budget, version, resume, verbose)
+
+    stage_started_at: dict[str, float] = {}
+    run_id_seen: str | None = resume
+    prefix = f"[dim]{batch_prefix}[/] " if batch_prefix else ""
+
+    def on_event(stage: str, status: str, info: dict) -> None:
+        nonlocal run_id_seen
+        label = _stage_label(stage)
+        if status == "start":
+            stage_started_at[stage] = time.monotonic()
+            if info.get("run_id"):
+                run_id_seen = str(info["run_id"])
+            description = STAGE_DESCRIPTIONS.get(stage, "Running this pipeline stage.")
+            detail_parts = []
+            if info.get("run_id"):
+                detail_parts.append(f"run {info['run_id']}")
+            if info.get("version"):
+                detail_parts.append(f"version {info['version']}")
+            detail = f" [dim]({' · '.join(detail_parts)})[/]" if detail_parts else ""
+            console.print(f"\n{prefix}[bold cyan]▶ {label}[/]{detail}")
+            console.print(f"[dim]{description}[/]")
+            if verbose and run_id_seen:
+                console.print(f"[dim]Artifacts: plugins/{plugin_slug}/runs/{run_id_seen}/[/]")
+        elif status == "done":
+            elapsed = time.monotonic() - stage_started_at.get(stage, time.monotonic())
+            summary = _stage_done_summary(stage, info)
+            suffix = f" · {summary}" if summary else ""
+            console.print(f"{prefix}[green]✓ {label} complete[/] [dim]in {_fmt_elapsed(elapsed)}[/]{suffix}")
+        elif status == "skipped":
+            extras = _stage_done_summary(stage, info)
+            suffix = f" · {extras}" if extras else ""
+            if info.get("reason") == "no_verify":
+                console.print(f"{prefix}[yellow]↷ {label} skipped by --no-verify{suffix}[/]")
+            else:
+                console.print(f"{prefix}[dim]↺ {label} loaded from existing artifacts{suffix}[/]")
+        elif status == "budget_exceeded":
+            console.print(f"{prefix}[yellow]⚠ budget exceeded — {info.get('message','')}[/]")
+        elif status == "failed":
+            console.print(f"{prefix}[red]✗ pipeline failed — {info.get('message','')}[/]")
+
+    result = await run_scan(
+        plugin_slug=plugin_slug,
+        config_path=config,
+        budget_override=budget,
+        on_event=on_event,
+        version=version,
+        no_triage=no_triage,
+        no_verify=no_verify,
+        resume_run_id=resume,
+        resume_from=resume_from,
+        apply_scope_filter=not ignore_scope,
+        enable_chain=chain,
+        enable_cross_file_taint=cross_file_taint,
+        diff_baseline=diff_baseline,
+    )
+
+    _print_scan_result(result)
+    return result
+
+
+def _run_dir(run_id: str) -> Path:
+    """Resolve a run_id to its directory under plugins/<slug>/runs/<run_id>.
+
+    Globs the filesystem for plugins/*/runs/<run_id>. Raises FileNotFoundError
+    if no match exists.
+    """
+    matches = list(Path("plugins").glob(f"*/runs/{run_id}"))
+    if matches:
+        return matches[0]
+    raise FileNotFoundError(f"plugins/*/runs/{run_id} not found")
+
+
+@app.command()
+def scan(
+    plugin_slug: str = typer.Argument(..., help="WordPress plugin slug"),
+    config: str = typer.Option("pipelines/default.yaml", "--config", help="Pipeline config YAML path"),
+    budget: float | None = typer.Option(None, "--budget", help="Override cost ceiling (USD)"),
+    version: str | None = typer.Option(None, "--version", help="Pin a specific plugin version (e.g. for re-scanning a historical release). Defaults to the latest version on wordpress.org."),
+    no_triage: bool = typer.Option(False, "--no-triage", help="Skip Critic; pipe hypotheses straight to verify"),
+    no_verify: bool = typer.Option(
+        False,
+        "--no-verify",
+        help="Skip sandbox verification; queue triage-accepted hypotheses for manual review instead of creating findings",
+    ),
+    ignore_scope: bool = typer.Option(
+        False, "--ignore-scope",
+        help="Disable Wordfence/Patchstack scope filtering in triage; verify everything that's technically a bug (use for plugin-author disclosures or CVE-only pursuit)",
+    ),
+    resume: str | None = typer.Option(
+        None, "--resume",
+        help="Resume an existing run by ID — auto-detects the latest completed stage from disk artifacts and re-runs from the next stage onwards",
+    ),
+    resume_from: str | None = typer.Option(
+        None, "--from",
+        help="Force re-run from a specific stage (requires --resume). One of: intake, recon, hypothesis, chain, triage, verify, dedup, report. Later artifacts on disk are ignored and re-generated.",
+    ),
+    chain: bool = typer.Option(
+        False, "--chain/--no-chain",
+        help="Enable cross-specialist exploit-chain synthesis after the hypothesis stage. Adds chain annotations (chains_with / chain_impact / chain_severity_bump) to hypotheses. Off by default.",
+    ),
+    cross_file_taint: bool = typer.Option(
+        False, "--cross-file-taint/--no-cross-file-taint",
+        help="Enable the cross-file stored-XSS specialist. Receives the full plugin corpus (not a filtered subset) and looks for sanitize-on-write + read-raw-on-output patterns spanning multiple files. Off by default because it sends a larger payload per call.",
+    ),
+    diff_baseline: str | None = typer.Option(
+        None, "--diff",
+        help="Compute a PHP diff between the scan version and this baseline version (e.g. --diff 1.21.0). The diff summary is fed to specialists as a prior, raising attention on files touched by the change. Useful for n-day discovery against released fixes. Requires a real prior version available on wp.org.",
+    ),
+    verbose: bool = typer.Option(
+        False, "--verbose", "-v",
+        help="Show detailed INFO logs from stages, agents, sandbox setup, and LLM calls. Default output stays concise.",
+    ),
+) -> None:
+    """Scan a single plugin for vulnerabilities."""
+    _configure_logging(verbose=verbose)
+    result = asyncio.run(_run_scan_cli(
+        plugin_slug=plugin_slug,
+        config=config,
+        budget=budget,
+        version=version,
+        no_triage=no_triage,
+        no_verify=no_verify,
+        ignore_scope=ignore_scope,
+        resume=resume,
+        resume_from=resume_from,
+        chain=chain,
+        cross_file_taint=cross_file_taint,
+        diff_baseline=diff_baseline,
+        verbose=verbose,
+    ))
+
     if result.status != "complete":
         console.print(f"[yellow]Run ended with status [b]{result.status}[/b]; "
                       f"inspect plugins/{result.plugin_slug}/runs/{result.run_id}/ for details.[/]")
         raise typer.Exit(code=1)
 
 
+def _read_plugins_file(path: str) -> list[str]:
+    plugins_path = Path(path)
+    try:
+        lines = plugins_path.read_text().splitlines()
+    except FileNotFoundError as exc:
+        raise typer.BadParameter(f"plugins file not found: {path}") from exc
+
+    slugs: list[str] = []
+    for line in lines:
+        slug = line.strip()
+        if not slug or slug.startswith("#"):
+            continue
+        slugs.append(slug)
+    if not slugs:
+        raise typer.BadParameter(f"plugins file contains no plugin slugs: {path}")
+    return slugs
+
+
 @app.command("scan-batch")
 def scan_batch(
     plugins_file: str = typer.Argument(..., help="File containing plugin slugs (one per line)"),
-    concurrency: int = typer.Option(2, "--concurrency", help="Number of plugins to scan in parallel"),
+    concurrency: int = typer.Option(1, "--concurrency", min=1, help="Number of plugins to scan in parallel"),
+    config: str = typer.Option("pipelines/default.yaml", "--config", help="Pipeline config YAML path"),
+    budget: float | None = typer.Option(None, "--budget", help="Per-plugin cost ceiling override (USD)"),
+    version: str | None = typer.Option(None, "--version", help="Pin the same plugin version for every slug in the batch"),
+    no_triage: bool = typer.Option(False, "--no-triage", help="Skip Critic; pipe hypotheses straight to verify"),
+    no_verify: bool = typer.Option(
+        False,
+        "--no-verify",
+        help="Skip sandbox verification; queue triage-accepted hypotheses for manual review instead of creating findings",
+    ),
+    ignore_scope: bool = typer.Option(
+        False, "--ignore-scope",
+        help="Disable Wordfence/Patchstack scope filtering in triage; verify everything that's technically a bug",
+    ),
+    chain: bool = typer.Option(
+        False, "--chain/--no-chain",
+        help="Enable cross-specialist exploit-chain synthesis after the hypothesis stage. Off by default.",
+    ),
+    cross_file_taint: bool = typer.Option(
+        False, "--cross-file-taint/--no-cross-file-taint",
+        help="Enable the cross-file stored-XSS specialist. Off by default because it sends a larger payload per call.",
+    ),
+    diff_baseline: str | None = typer.Option(
+        None, "--diff",
+        help="Compute a PHP diff between the scan version and this baseline version for every plugin in the batch.",
+    ),
+    verbose: bool = typer.Option(
+        False, "--verbose", "-v",
+        help="Show detailed INFO logs from stages, agents, sandbox setup, and LLM calls. Default output stays concise.",
+    ),
 ) -> None:
-    """Scan multiple plugins. (Not yet implemented — use `scan` in a shell loop for now.)"""
-    console.print("[red]scan-batch is not yet implemented.[/] For now, run `squadrone scan <slug>` for each plugin individually.")
-    raise typer.Exit(code=2)
+    """Scan multiple plugins from a newline-delimited file."""
+    _configure_logging(verbose=verbose)
+    plugin_slugs = _read_plugins_file(plugins_file)
+    console.print(Panel(
+        "\n".join([
+            f"[b]Plugins[/b]      {len(plugin_slugs)}",
+            f"[b]Config[/b]       {config}",
+            f"[b]Budget[/b]       {f'${budget:.2f} per plugin' if budget is not None else 'from config'}",
+            f"[b]Concurrency[/b]  {concurrency}",
+            f"[b]Version[/b]      {version or 'latest'}",
+        ]),
+        title="Squadrone Batch Scan",
+        border_style="cyan",
+    ))
+
+    async def run_batch() -> list[tuple[str, str, str | None]]:
+        semaphore = asyncio.Semaphore(concurrency)
+        outcomes: list[tuple[str, str, str | None]] = []
+
+        async def run_one(index: int, slug: str) -> None:
+            async with semaphore:
+                prefix = f"[{index}/{len(plugin_slugs)} {slug}]"
+                try:
+                    result = await _run_scan_cli(
+                        plugin_slug=slug,
+                        config=config,
+                        budget=budget,
+                        version=version,
+                        no_triage=no_triage,
+                        no_verify=no_verify,
+                        ignore_scope=ignore_scope,
+                        resume=None,
+                        resume_from=None,
+                        chain=chain,
+                        cross_file_taint=cross_file_taint,
+                        diff_baseline=diff_baseline,
+                        verbose=verbose,
+                        batch_prefix=prefix,
+                    )
+                except Exception as exc:
+                    outcomes.append((slug, "failed", str(exc)))
+                    console.print(f"[red]{prefix} failed — {exc}[/]")
+                    return
+
+                outcomes.append((slug, result.status, result.run_id))
+                if result.status != "complete":
+                    console.print(
+                        f"[yellow]{prefix} ended with status [b]{result.status}[/b]; "
+                        f"inspect plugins/{result.plugin_slug}/runs/{result.run_id}/ for details.[/]"
+                    )
+
+        await asyncio.gather(*(run_one(index, slug) for index, slug in enumerate(plugin_slugs, start=1)))
+        return outcomes
+
+    outcomes = asyncio.run(run_batch())
+    summary = Table(title="Batch summary")
+    summary.add_column("plugin")
+    summary.add_column("status")
+    summary.add_column("run/error")
+    failed = False
+    for slug, status, detail in outcomes:
+        if status != "complete":
+            failed = True
+        summary.add_row(slug, status, detail or "")
+    console.print(summary)
+
+    if failed:
+        raise typer.Exit(code=1)
 
 
 @app.command()
