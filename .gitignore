@@ -26,6 +26,7 @@ output.txt
 # Generated benchmark and manual sandbox outputs.
 benchmarks/results/
 manual/sandboxes/
+manual/reports/
 
 # Local editor/agent state.
 .DS_Store
