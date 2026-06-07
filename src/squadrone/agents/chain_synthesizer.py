@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 from pydantic import BaseModel, RootModel
@@ -33,6 +34,60 @@ class _ChainList(RootModel[list[ChainEntry]]):
     pass
 
 
+@dataclass
+class ChainSynthesisResult:
+    chains: list[ChainEntry]
+    status: str
+    hypothesis_count: int
+    raw_chain_count: int = 0
+    accepted_chain_count: int = 0
+    dropped_self_or_single_count: int = 0
+    dropped_unknown_id_count: int = 0
+    error: str | None = None
+
+    def diagnostics(self) -> dict:
+        return {
+            "status": self.status,
+            "hypothesis_count": self.hypothesis_count,
+            "raw_chain_count": self.raw_chain_count,
+            "accepted_chain_count": self.accepted_chain_count,
+            "dropped_self_or_single_count": self.dropped_self_or_single_count,
+            "dropped_unknown_id_count": self.dropped_unknown_id_count,
+            "error": self.error,
+        }
+
+
+def _truncate(value: object, limit: int = 1200) -> object:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value if len(value) <= limit else value[: limit - 3] + "..."
+    return value
+
+
+def _compact_hypothesis(h: Hypothesis) -> dict:
+    return {
+        "id": h.id,
+        "specialist": h.specialist,
+        "bug_class": h.bug_class.value,
+        "entry_point": h.entry_point,
+        "file": h.file,
+        "line": h.line,
+        "sink": _truncate(h.sink),
+        "sink_code": _truncate(h.sink_code),
+        "taint_path": h.taint_path[:20],
+        "reasoning": _truncate(h.reasoning, 2000),
+        "preconditions": _truncate(h.preconditions),
+        "confidence": h.confidence.value,
+        "exploit_classification": h.exploit_classification,
+        "bounty_fit": h.bounty_fit,
+        "requires_verification": h.requires_verification,
+        "evidence_summary": h.evidence_summary,
+        "quality_gate": h.quality_gate,
+        "derived_severity": h.derived_severity,
+    }
+
+
 class ChainSynthesizer:
     NAME = "chain_synthesizer"
 
@@ -40,25 +95,16 @@ class ChainSynthesizer:
         self.runtime = runtime
         self.model = model
 
-    async def synthesize(self, hypotheses: list[Hypothesis]) -> list[ChainEntry]:
+    async def synthesize(self, hypotheses: list[Hypothesis]) -> ChainSynthesisResult:
         if len(hypotheses) < 2:
-            return []
+            return ChainSynthesisResult(
+                chains=[],
+                status="insufficient_hypotheses",
+                hypothesis_count=len(hypotheses),
+            )
 
         system = load_prompt("chain_synthesis")
-        compact = [
-            {
-                "id": h.id,
-                "specialist": h.specialist,
-                "bug_class": h.bug_class.value,
-                "entry_point": h.entry_point,
-                "file": h.file,
-                "line": h.line,
-                "sink": h.sink,
-                "preconditions": h.preconditions,
-                "confidence": h.confidence.value,
-            }
-            for h in hypotheses
-        ]
+        compact = [_compact_hypothesis(h) for h in hypotheses]
         user = (
             "Identify exploit chains in the following hypothesis list. "
             "Apply the rules strictly. Empty output is valid.\n\n"
@@ -77,18 +123,27 @@ class ChainSynthesizer:
             )
             chains: list[ChainEntry] = result.output.root
         except Exception as e:
-            logger.warning("chain_synthesizer crashed: %s — emitting no chains", e)
-            return []
+            logger.warning("chain_synthesizer crashed: %s — marking chain stage failed", e)
+            return ChainSynthesisResult(
+                chains=[],
+                status="failed",
+                hypothesis_count=len(hypotheses),
+                error=str(e),
+            )
 
         valid_ids = {h.id for h in hypotheses}
         clean: list[ChainEntry] = []
+        dropped_self_or_single = 0
+        dropped_unknown = 0
         for c in chains:
             unique_ids = list(dict.fromkeys(c.ids))
             if len(unique_ids) < 2:
+                dropped_self_or_single += 1
                 logger.info("chain_synthesizer: dropping chain with <2 unique ids: %s", c.ids)
                 continue
             unknown = [i for i in unique_ids if i not in valid_ids]
             if unknown:
+                dropped_unknown += 1
                 logger.info("chain_synthesizer: dropping chain referencing unknown ids %s", unknown)
                 continue
             clean.append(ChainEntry(
@@ -97,7 +152,15 @@ class ChainSynthesizer:
                 severity_bump=c.severity_bump,
                 bypass_mechanism=c.bypass_mechanism,
             ))
-        return clean
+        return ChainSynthesisResult(
+            chains=clean,
+            status="complete",
+            hypothesis_count=len(hypotheses),
+            raw_chain_count=len(chains),
+            accepted_chain_count=len(clean),
+            dropped_self_or_single_count=dropped_self_or_single,
+            dropped_unknown_id_count=dropped_unknown,
+        )
 
 
 def annotate_hypotheses(

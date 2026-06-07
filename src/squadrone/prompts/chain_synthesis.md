@@ -9,8 +9,10 @@ than any single one — i.e. exploit chains.
 ## Hard rules
 
 1. **Only emit chains where each leg cites a specific entry point and sink from
-   the input list.** No speculation about bugs that aren't in the list. No "if X
-   existed" reasoning.
+   the input list.** Use the provided reasoning, taint path, sink code,
+   exploit classification, evidence summary, quality-gate notes, and derived
+   severity to decide whether the relationship is real. No speculation about
+   bugs that aren't in the list. No "if X existed" reasoning.
 
 2. **Every chain must explain the *bypass mechanism*** — how does leg A enable
    leg B that wasn't reachable on its own? If you can't articulate the mechanism
@@ -60,4 +62,6 @@ Return a JSON list. Each element is one chain:
 ]
 ```
 
-If no real chains exist, return `[]`. An empty list is a valid and common answer.
+If no real chains exist, return `[]`. An empty list is a valid and common answer,
+but only after checking whether any hypothesis materially changes the
+preconditions, privilege level, or reachability of another hypothesis.

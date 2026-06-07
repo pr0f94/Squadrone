@@ -207,8 +207,8 @@ def write_manual_scaffold(
         setup_lines.append(f"- {status}{blocked}: wp {' '.join(item.get('args', []))}")
     if attempts:
         pickup_note = (
-            f"See `iter_*.py` files alongside this scaffold. Each failed in some way; "
-            f"check stdout in trace.jsonl.\n\n"
+            "See `iter_*.py` files alongside this scaffold. Each failed in some way; "
+            "check stdout in trace.jsonl.\n\n"
         )
     else:
         pickup_note = (

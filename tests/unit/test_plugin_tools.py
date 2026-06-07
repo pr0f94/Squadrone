@@ -122,7 +122,7 @@ def test_grep_max_results_cap(fake_plugin):
     h = PluginToolHandlers(plugin_root=fake_plugin)
     out = h.grep_plugin({"pattern": "line", "max_results": 3})
     # Should cap at 3 hits even though many lines match
-    body_lines = [l for l in out.splitlines() if l.startswith("long.php:")]
+    body_lines = [line for line in out.splitlines() if line.startswith("long.php:")]
     assert len(body_lines) == 3
 
 

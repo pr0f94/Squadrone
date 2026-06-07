@@ -167,6 +167,9 @@ squadrone scan contact-form-7 --no-strict-quality
 # Require a majority vote from three independent Critic passes
 squadrone scan contact-form-7 --triage-votes 3
 
+# Run exploit-chain synthesis between hypotheses before triage
+squadrone scan contact-form-7 --chain
+
 # Scan multiple plugins from a file, one slug per line
 squadrone scan-batch plugins.txt
 
@@ -199,6 +202,8 @@ Output by default:
 - `plugins/<slug>/runs/<run_id>/recon.json`
 - `plugins/<slug>/runs/<run_id>/hypotheses.jsonl`
 - `plugins/<slug>/runs/<run_id>/focus_areas.json`
+- `plugins/<slug>/runs/<run_id>/chains.json` when `--chain` is used
+- `plugins/<slug>/runs/<run_id>/chain_diagnostics.json` when `--chain` is used
 - `plugins/<slug>/runs/<run_id>/triaged.jsonl`
 - `plugins/<slug>/runs/<run_id>/quality_gate_triage.json`
 - `plugins/<slug>/runs/<run_id>/findings.jsonl`
@@ -218,6 +223,7 @@ Squadrone's default pipelines enable strict quality controls. These are determin
 - **Report grader** blocks confirmed findings from becoming polished reports if the evidence or impact does not meet the submission bar.
 - **Focused review fanout** writes `focus_areas.json` and feeds the attack-surface map into specialist review.
 - **Verifier voting** is available with `--triage-votes N`; use `3` or `5` when quality matters more than runtime.
+- **Exploit-chain synthesis** is available with `--chain`; it enriches hypotheses with `chains_with`, `chain_impact`, and `chain_severity_bump`, and writes `chain_diagnostics.json` so skipped, failed, and empty chain passes are distinguishable.
 
 Use `--no-strict-quality` for exploratory scans where you want more raw hypotheses.
 

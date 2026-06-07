@@ -131,7 +131,7 @@ stages:
 # documented by the pipeline config schema.
 ```
 
-A `chain` stage exists (`src/squadrone/stages/chain.py`) but runs only when `--chain` is passed on the CLI; it's not in the default stage list.
+A `chain` stage exists (`src/squadrone/stages/chain.py`) but runs only when `--chain` is passed on the CLI; it's not in the default stage list. When enabled, it writes `chains.json`, rewrites `hypotheses.jsonl` with chain annotations, and writes `chain_diagnostics.json` so a failed model call, insufficient hypotheses, and a valid empty chain result are distinguishable.
 
 ---
 

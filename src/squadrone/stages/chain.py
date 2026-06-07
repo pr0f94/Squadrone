@@ -33,26 +33,41 @@ async def run(
 ) -> HypothesesArtifact:
     if not hypotheses.hypotheses:
         logger.info("chain: no hypotheses to chain — skipping")
-        out_path = Path(runs_root) / run_id / "chains.json"
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text("[]")
+        out_dir = Path(runs_root) / run_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "chains.json").write_text("[]")
+        (out_dir / "chain_diagnostics.json").write_text(json.dumps({
+            "status": "insufficient_hypotheses",
+            "hypothesis_count": 0,
+            "raw_chain_count": 0,
+            "accepted_chain_count": 0,
+            "annotated_hypothesis_count": 0,
+            "dropped_self_or_single_count": 0,
+            "dropped_unknown_id_count": 0,
+            "error": None,
+        }, indent=2))
         return hypotheses
 
     synthesizer = ChainSynthesizer(runtime, model=config.models.chain_synthesizer)
-    chains = await synthesizer.synthesize(hypotheses.hypotheses)
+    result = await synthesizer.synthesize(hypotheses.hypotheses)
+    chains = result.chains
     logger.info("chain: synthesized %d chains from %d hypotheses",
                 len(chains), len(hypotheses.hypotheses))
 
-    chains_path = Path(runs_root) / run_id / "chains.json"
-    chains_path.parent.mkdir(parents=True, exist_ok=True)
+    out_dir = Path(runs_root) / run_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    chains_path = out_dir / "chains.json"
     chains_path.write_text(json.dumps([c.model_dump() for c in chains], indent=2))
 
     annotated = annotate_hypotheses(hypotheses.hypotheses, chains)
-    hyps_path = Path(runs_root) / run_id / "hypotheses.jsonl"
+    hyps_path = out_dir / "hypotheses.jsonl"
     with hyps_path.open("w") as f:
         for h in annotated:
             f.write(h.model_dump_json() + "\n")
 
     annotated_count = sum(1 for h in annotated if h.chains_with)
+    diagnostics = result.diagnostics()
+    diagnostics["annotated_hypothesis_count"] = annotated_count
+    (out_dir / "chain_diagnostics.json").write_text(json.dumps(diagnostics, indent=2))
     logger.info("chain: annotated %d hypotheses with chain info", annotated_count)
     return HypothesesArtifact(plugin_slug=hypotheses.plugin_slug, hypotheses=annotated)

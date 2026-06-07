@@ -15,7 +15,7 @@ import asyncio
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 COST_PER_1M: dict[str, dict[str, float]] = {
     "claude-opus-4-5": {"input": 15.00, "output": 75.00},

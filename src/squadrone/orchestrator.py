@@ -294,9 +294,17 @@ async def run_scan(
         budget.set_stage("chain")
         if enable_chain:
             chains_path = run_dir / "chains.json"
+            chain_diagnostics_path = run_dir / "chain_diagnostics.json"
             if _should_load("chain") and chains_path.exists():
                 # On resume, hyps_path already has annotations from the previous run.
-                await _emit(on_event, "chain", "skipped", {"chains_path": str(chains_path)})
+                info = {"chains_path": str(chains_path)}
+                if chain_diagnostics_path.exists():
+                    try:
+                        import json as _json_chain_diag
+                        info.update(_json_chain_diag.loads(chain_diagnostics_path.read_text()))
+                    except Exception:
+                        pass
+                await _emit(on_event, "chain", "skipped", info)
             else:
                 await _emit(on_event, "chain", "start", {})
                 hyps = await chain_stage.run(
@@ -308,8 +316,14 @@ async def run_scan(
                     chain_count = len(_json_chain.loads(chains_path.read_text()))
                 except Exception:
                     chain_count = 0
+                diagnostics = {}
+                if chain_diagnostics_path.exists():
+                    try:
+                        diagnostics = _json_chain.loads(chain_diagnostics_path.read_text())
+                    except Exception:
+                        diagnostics = {}
                 await _emit(on_event, "chain", "done", {
-                    "chains": chain_count, "spent": budget.spent,
+                    "chains": chain_count, "spent": budget.spent, **diagnostics,
                 })
 
         # ---- triage ----

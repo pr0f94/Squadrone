@@ -118,7 +118,7 @@ def _stage_done_summary(stage: str, info: dict[str, Any]) -> str:
         "intake": ("version", "files", "lines"),
         "recon": ("entry_points", "sinks"),
         "hypothesis": ("count",),
-        "chain": ("chains",),
+        "chain": ("status", "hypothesis_count", "chains", "annotated_hypothesis_count"),
         "triage": ("accepted", "rejected", "merged"),
         "verify": ("findings", "manual_queued"),
         "dedup": ("novel", "possibly_known", "known_dupe"),
