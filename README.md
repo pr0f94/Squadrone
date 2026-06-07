@@ -16,6 +16,7 @@ What you get:
 - **One-command plugin scans** from a WordPress.org plugin slug
 - **Specialist agent coverage** across auth, auth-flow, injection, file ops, SSRF/deserialization, XSS, and logic flaws
 - **Source-grounded triage** against exploitability and Wordfence/Patchstack scope rules
+- **Strict quality gates** that reject admin-only, self-only, config-dependent, and low-impact findings before they waste review time
 - **Sandbox verification** with an isolated WordPress install and iterative PoC attempts
 - **Known-vulnerability deduplication** against Wordfence Intelligence and WPScan when API keys are available
 - **Private report drafts** for novel findings, with no auto-submit path
@@ -63,12 +64,15 @@ The SQLite index is created automatically at `db/squadrone.sqlite` on first use.
 2. Maps attack surface: reachable entry points, nonce/capability checks, and risky sinks.
 3. Runs specialist LLM agents with on-demand `grep_plugin`, `glob_plugin`, and `read_plugin_file` tools instead of dumping the full plugin into context.
 4. Self-verifies hypotheses to drop fabricated sinks and missed-guard claims.
-5. Triages survivors against exploitability and bounty-scope rules.
-6. Builds a one-shot Docker WordPress sandbox for accepted hypotheses.
-7. Iteratively runs LLM-authored Python PoCs against the sandbox.
-8. Deduplicates confirmed findings against Wordfence Intelligence and WPScan when keys are configured.
-9. Writes private report drafts per finding and program.
-10. Records run metadata and findings in SQLite for later review.
+5. Builds a focus-area map for AJAX/REST, forms, files, auth, SQL, payment logic, and rendering paths.
+6. Triages survivors against exploitability and bounty-scope rules.
+7. Applies strict quality gates: evidence completeness, WordPress false-positive rules, and derived severity.
+8. Builds a one-shot Docker WordPress sandbox for accepted hypotheses.
+9. Iteratively runs LLM-authored Python PoCs against the sandbox.
+10. Deduplicates confirmed findings against Wordfence Intelligence and WPScan when keys are configured.
+11. Runs a report-quality gate before writing disclosure drafts.
+12. Writes private report drafts per finding and program.
+13. Records run metadata and findings in SQLite for later review.
 
 The system **never auto-submits** anything. It produces files. You decide what to disclose, where, and when.
 
@@ -157,6 +161,12 @@ squadrone scan contact-form-7 --budget 5.00 --config pipelines/openai.yaml
 # Skip sandbox verification and queue accepted hypotheses for manual review
 squadrone scan contact-form-7 --no-verify
 
+# Disable strict quality gates for exploratory research
+squadrone scan contact-form-7 --no-strict-quality
+
+# Require a majority vote from three independent Critic passes
+squadrone scan contact-form-7 --triage-votes 3
+
 # Scan multiple plugins from a file, one slug per line
 squadrone scan-batch plugins.txt
 
@@ -188,12 +198,28 @@ Output by default:
 - `plugins/<slug>/runs/<run_id>/intake.json`
 - `plugins/<slug>/runs/<run_id>/recon.json`
 - `plugins/<slug>/runs/<run_id>/hypotheses.jsonl`
+- `plugins/<slug>/runs/<run_id>/focus_areas.json`
 - `plugins/<slug>/runs/<run_id>/triaged.jsonl`
+- `plugins/<slug>/runs/<run_id>/quality_gate_triage.json`
 - `plugins/<slug>/runs/<run_id>/findings.jsonl`
 - `plugins/<slug>/runs/<run_id>/trace.jsonl`
 - `plugins/<slug>/runs/<run_id>/report_<finding_id>_<program>.md`
 
-When `--no-verify` is used, triage-accepted hypotheses are written to the manual review queue instead of `findings.jsonl`, and no submission reports are generated.
+When `--no-verify` is used, triage-accepted hypotheses are first graded by the quality gate, then written to the manual review queue instead of `findings.jsonl`; no submission reports are generated.
+
+## Quality gates
+
+Squadrone's default pipelines enable strict quality controls. These are deterministic checks inspired by verifier/grader harnesses:
+
+- **Finding grader before manual queue** rejects candidates without realistic submit-worthy impact.
+- **WordPress false-positive rules** reject admin-only, self-XSS, own-resource-only, config-dependent, cosmetic, open redirect, and low-impact CSRF cases.
+- **Evidence-first schema** annotates each survivor with attacker role, source, sink, affected file/function, guard discussion, impact statement, and bounty routing.
+- **Severity recomputation** derives an internal CVSS-style score and OWASP 2021 category instead of trusting model-written severity.
+- **Report grader** blocks confirmed findings from becoming polished reports if the evidence or impact does not meet the submission bar.
+- **Focused review fanout** writes `focus_areas.json` and feeds the attack-surface map into specialist review.
+- **Verifier voting** is available with `--triage-votes N`; use `3` or `5` when quality matters more than runtime.
+
+Use `--no-strict-quality` for exploratory scans where you want more raw hypotheses.
 
 ## 🔍 Triage
 

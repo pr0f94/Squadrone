@@ -122,6 +122,17 @@ triage:
   drift_logging: false
   cache_enabled: false
   review_md_max_chars: 12000
+  verifier_votes: 1
+
+quality:
+  enabled: true
+  require_evidence_schema: true
+  false_positive_rules: true
+  recompute_severity: true
+  finding_grader: true
+  report_grader: true
+  focus_area_fanout: true
+  reject_below_submit_bar: true
 
 verify:
   headless_browser_check: false

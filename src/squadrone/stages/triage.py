@@ -16,11 +16,63 @@ from ..services.console_format import (
     format_triage_reframe,
     format_triage_reject,
 )
+from ..services.quality_gate import apply_quality_gate
 from .hypothesis import _build_code_slices
 
 logger = logging.getLogger(__name__)
 
 _CONF_RANK = {Confidence.HIGH: 0, Confidence.MEDIUM: 1, Confidence.LOW: 2}
+
+
+def _combine_vote_artifacts(votes: list[TriagedArtifact], original: HypothesesArtifact) -> TriagedArtifact:
+    """Majority-vote multiple critic passes by hypothesis id.
+
+    A hypothesis is accepted if more than half of vote artifacts accepted it. The
+    first accepted object is retained so any bounty_programs from the critic carry
+    forward. Rejections keep the most common-ish first reason for auditability.
+    """
+    if len(votes) == 1:
+        return votes[0]
+    threshold = len(votes) // 2 + 1
+    by_id = {h.id: h for h in original.hypotheses}
+    accepted_counts: dict[str, int] = {h.id: 0 for h in original.hypotheses}
+    accepted_objects: dict[str, object] = {}
+    rejection_reasons: dict[str, list[str]] = {h.id: [] for h in original.hypotheses}
+    merged: list[dict] = []
+    reframes: list[dict] = []
+    for art in votes:
+        accepted_ids = {h.id for h in art.accepted}
+        for h in art.accepted:
+            accepted_counts[h.id] = accepted_counts.get(h.id, 0) + 1
+            accepted_objects.setdefault(h.id, h)
+        for h_id in by_id:
+            if h_id not in accepted_ids:
+                reason = next(
+                    (str(r.get("reason", "")) for r in art.rejected if r.get("hypothesis_id") == h_id),
+                    "not accepted by critic vote",
+                )
+                rejection_reasons.setdefault(h_id, []).append(reason)
+        merged.extend(art.merged)
+        reframes.extend(art.request_reframing)
+
+    accepted = []
+    rejected = []
+    for h_id, count in accepted_counts.items():
+        if count >= threshold:
+            accepted.append(accepted_objects.get(h_id, by_id[h_id]))
+        else:
+            reasons = rejection_reasons.get(h_id) or ["critic vote majority rejected"]
+            rejected.append({
+                "hypothesis_id": h_id,
+                "reason": f"triage_votes: accepted {count}/{len(votes)}; majority rejected — {reasons[0]}",
+            })
+    return TriagedArtifact(
+        plugin_slug=original.plugin_slug,
+        accepted=accepted,
+        rejected=rejected,
+        merged=merged,
+        request_reframing=reframes,
+    )
 
 
 async def run(
@@ -53,18 +105,24 @@ async def run(
     except Exception:
         pass
 
-    critic = CriticAgent(
-        runtime,
-        model=config.models.critic,
-        inject_review_md=triage_cfg.inject_review_md,
-        cluster_aware=triage_cfg.cluster_aware,
-        allow_reframing=triage_cfg.allow_reframing,
-        drift_logging=triage_cfg.drift_logging,
-        cache_enabled=triage_cfg.cache_enabled,
-        review_md_max_chars=triage_cfg.review_md_max_chars,
-        plugin_version=plugin_version_for_cache,
-    )
-    triaged = await critic.review(hypotheses, code_slices, apply_scope_filter=apply_scope_filter)
+    votes = max(1, triage_cfg.verifier_votes)
+    vote_artifacts: list[TriagedArtifact] = []
+    for vote_idx in range(votes):
+        critic = CriticAgent(
+            runtime,
+            model=config.models.critic,
+            inject_review_md=triage_cfg.inject_review_md,
+            cluster_aware=triage_cfg.cluster_aware,
+            allow_reframing=triage_cfg.allow_reframing,
+            drift_logging=triage_cfg.drift_logging,
+            cache_enabled=triage_cfg.cache_enabled and votes == 1,
+            review_md_max_chars=triage_cfg.review_md_max_chars,
+            plugin_version=plugin_version_for_cache,
+        )
+        if votes > 1:
+            logger.info("triage: critic vote %d/%d", vote_idx + 1, votes)
+        vote_artifacts.append(await critic.review(hypotheses, code_slices, apply_scope_filter=apply_scope_filter))
+    triaged = _combine_vote_artifacts(vote_artifacts, hypotheses)
     for h in triaged.accepted:
         logger.info(format_triage_accept(h))
     for rejection in triaged.rejected:
@@ -85,6 +143,18 @@ async def run(
         logger.info("triage: capping accepted from %d to %d", len(accepted_sorted), cap)
         accepted_sorted = accepted_sorted[:cap]
     triaged.accepted = accepted_sorted
+
+    if config.quality.enabled and config.quality.finding_grader:
+        before = len(triaged.accepted)
+        triaged = apply_quality_gate(
+            triaged,
+            require_evidence_schema=config.quality.require_evidence_schema,
+            false_positive_rules=config.quality.false_positive_rules,
+            recompute=config.quality.recompute_severity,
+            reject_below_submit_bar=config.quality.reject_below_submit_bar,
+            artifact_path=Path(runs_root) / run_id / "quality_gate_triage.json",
+        )
+        logger.info("triage: quality gate accepted %d/%d", len(triaged.accepted), before)
 
     out_path = Path(runs_root) / run_id / "triaged.jsonl"
     out_path.parent.mkdir(parents=True, exist_ok=True)

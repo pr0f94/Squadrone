@@ -76,6 +76,10 @@ class Hypothesis(JSONFileMixin):
     chains_with: list[str] = []                 # IDs of other hypotheses that combine with this one
     chain_impact: str | None = None             # human-readable combined impact (e.g. "Subscriber→RCE via auth-bypass + file-write")
     chain_severity_bump: str | None = None      # severity delta from chaining (e.g. "medium→critical")
+    # Populated by optional quality gates. These fields are additive metadata only.
+    evidence_summary: dict[str, Any] = {}        # source/sink/role/guard fields inferred for triage/reporting
+    quality_gate: dict[str, Any] = {}            # rule decisions, warnings, and submit-worthiness notes
+    derived_severity: dict[str, Any] = {}        # deterministic severity/CVSS approximation
 
 
 class HypothesesArtifact(JSONFileMixin):

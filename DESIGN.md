@@ -1118,6 +1118,7 @@ squadrone/
 │   │   ├── intake_helpers.py
 │   │   ├── recon_helpers.py
 │   │   ├── verify_helpers.py
+│   │   ├── quality_gate.py    # deterministic evidence/severity/false-positive gates
 │   │   ├── dedup_helpers.py
 │   │   └── report_helpers.py
 │   ├── poc_templates/
@@ -1156,6 +1157,8 @@ squadrone scan <plugin-slug> [--config pipelines/default.yaml] [--budget 2.00]
                               [--version 1.2.3]              # pin a specific plugin version
                               [--no-triage]                  # skip Critic; pipe hypotheses straight to verify
                               [--ignore-scope]               # disable Wordfence/Patchstack scope filtering in triage
+                              [--strict-quality|--no-strict-quality]
+                              [--triage-votes 3]             # majority vote across independent Critic passes
                               [--chain]                      # run cross-specialist exploit-chain synthesis
                               [--cross-file-taint]           # enable cross-file XSS specialist
                               [--diff 1.21.0]                # PHP diff vs a prior version (n-day hunting)

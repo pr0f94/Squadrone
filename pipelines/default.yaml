@@ -87,6 +87,19 @@ triage:
   drift_logging: false           # T5: append every decision to cache/triage_decisions.jsonl
   cache_enabled: false           # T6: cache triage results per (hypotheses, plugin_version, toggles)
   review_md_max_chars: 12000     # T2 size cap so review.md doesn't blow up the prompt
+  verifier_votes: 1              # Mythos-style N-vote Critic pass; use --triage-votes 3/5 for stricter runs
+
+# Strict quality controls. These are deterministic gates that reject common
+# WordPress false positives before manual review/report drafting.
+quality:
+  enabled: true
+  require_evidence_schema: true
+  false_positive_rules: true
+  recompute_severity: true
+  finding_grader: true
+  report_grader: true
+  focus_area_fanout: true
+  reject_below_submit_bar: true
 
 # Stage 5 (verify) opt-in features — all default off.
 # W1 (proper HTML parser) is unconditional — already shipped in xss_check.py (no toggle).

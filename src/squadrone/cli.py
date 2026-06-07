@@ -215,6 +215,8 @@ async def _run_scan_cli(
     chain: bool,
     cross_file_taint: bool,
     diff_baseline: str | None,
+    strict_quality: bool | None,
+    triage_votes: int | None,
     verbose: bool,
     batch_prefix: str | None = None,
 ) -> Any:
@@ -275,6 +277,8 @@ async def _run_scan_cli(
         enable_chain=chain,
         enable_cross_file_taint=cross_file_taint,
         diff_baseline=diff_baseline,
+        strict_quality=strict_quality,
+        triage_votes=triage_votes,
     )
 
     _print_scan_result(result)
@@ -329,6 +333,17 @@ def scan(
         None, "--diff",
         help="Compute a PHP diff between the scan version and this baseline version (e.g. --diff 1.21.0). The diff summary is fed to specialists as a prior, raising attention on files touched by the change. Useful for n-day discovery against released fixes. Requires a real prior version available on wp.org.",
     ),
+    strict_quality: bool | None = typer.Option(
+        None,
+        "--strict-quality/--no-strict-quality",
+        help="Override quality gates from config. Strict mode grades evidence, false-positive rules, derived severity, and report readiness.",
+    ),
+    triage_votes: int | None = typer.Option(
+        None,
+        "--triage-votes",
+        min=1,
+        help="Run N independent Critic triage votes and keep majority-accepted hypotheses. Overrides config.",
+    ),
     verbose: bool = typer.Option(
         False, "--verbose", "-v",
         help="Show detailed INFO logs from stages, agents, sandbox setup, and LLM calls. Default output stays concise.",
@@ -349,6 +364,8 @@ def scan(
         chain=chain,
         cross_file_taint=cross_file_taint,
         diff_baseline=diff_baseline,
+        strict_quality=strict_quality,
+        triage_votes=triage_votes,
         verbose=verbose,
     ))
 
@@ -405,6 +422,17 @@ def scan_batch(
         None, "--diff",
         help="Compute a PHP diff between the scan version and this baseline version for every plugin in the batch.",
     ),
+    strict_quality: bool | None = typer.Option(
+        None,
+        "--strict-quality/--no-strict-quality",
+        help="Override quality gates from config for every plugin.",
+    ),
+    triage_votes: int | None = typer.Option(
+        None,
+        "--triage-votes",
+        min=1,
+        help="Run N independent Critic triage votes per plugin. Overrides config.",
+    ),
     verbose: bool = typer.Option(
         False, "--verbose", "-v",
         help="Show detailed INFO logs from stages, agents, sandbox setup, and LLM calls. Default output stays concise.",
@@ -446,6 +474,8 @@ def scan_batch(
                         chain=chain,
                         cross_file_taint=cross_file_taint,
                         diff_baseline=diff_baseline,
+                        strict_quality=strict_quality,
+                        triage_votes=triage_votes,
                         verbose=verbose,
                         batch_prefix=prefix,
                     )

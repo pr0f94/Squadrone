@@ -12,6 +12,7 @@ from ..schemas.config import PipelineConfig
 from ..schemas.finding import DedupStatus, Finding
 from ..services import report_helpers
 from ..services.budget import BudgetTracker
+from ..services.quality_gate import grade_finding_for_report
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,40 @@ async def run(
         if f.dedup_status == DedupStatus.KNOWN_DUPE:
             logger.info("report: skipping %s (KNOWN_DUPE)", f.id)
             continue
+
+        if config.quality.enabled and config.quality.report_grader:
+            grade = grade_finding_for_report(
+                f,
+                require_evidence_schema=config.quality.require_evidence_schema,
+                false_positive_rules=config.quality.false_positive_rules,
+                recompute=config.quality.recompute_severity,
+            )
+            f.hypothesis.evidence_summary = grade.evidence
+            f.hypothesis.derived_severity = grade.severity
+            f.hypothesis.quality_gate = {
+                "accepted": grade.accepted,
+                "reason": grade.reason,
+                "warnings": grade.warnings,
+                "rules": grade.rules,
+            }
+            if f.cvss_estimate is None:
+                f.cvss_estimate = str(grade.severity.get("cvss_estimate"))
+            if not grade.accepted:
+                programs = list(f.hypothesis.bounty_programs) or ["wordfence"]
+                for program in programs:
+                    blocked_path = run_dir / f"report_{f.id}_{program}_QUALITY_BLOCKED.md"
+                    blocked_path.write_text(
+                        f"# QUALITY GATE BLOCKED: {f.id} ({program})\n\n"
+                        f"**Reason:** {grade.reason}\n\n"
+                        f"**Derived severity:** {grade.severity}\n\n"
+                        f"**Evidence summary:** {grade.evidence}\n\n"
+                        f"**Warnings:** {grade.warnings or 'none'}\n\n"
+                        "This confirmed finding was not converted into a submission draft because "
+                        "the quality gate did not find enough submit-worthy impact."
+                    )
+                    out_paths.append(str(blocked_path))
+                    logger.info("report: quality gate blocked %s (%s) — wrote %s", f.id, program, blocked_path)
+                continue
 
         # R2: submission readiness gate — emit *_NOT_READY.md instead of polished report
         # if upstream prerequisites aren't satisfied.

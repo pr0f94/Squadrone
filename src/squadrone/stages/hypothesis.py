@@ -24,6 +24,7 @@ from ..schemas.hypothesis import HypothesesArtifact, Hypothesis
 from ..schemas.recon import ReconArtifact
 from ..services.budget import BudgetTracker
 from ..services.console_format import format_verifier_decision
+from ..services.quality_gate import build_focus_area_summary, render_focus_area_prompt
 
 
 # X1: pre-verifier dedup. Group hypotheses by (file, line, bug_class) and keep the
@@ -160,6 +161,16 @@ async def run(
     code_slices = _build_code_slices(recon, Path(plugin_path))
     logger.info("hypothesis: %d code slices for %d entry points",
                 len(code_slices), len(recon.entry_points))
+    if config.quality.enabled and config.quality.focus_area_fanout:
+        focus = build_focus_area_summary(recon)
+        focus_path = Path(runs_root) / run_id / "focus_areas.json"
+        focus_path.parent.mkdir(parents=True, exist_ok=True)
+        import json as _json_focus
+        focus_path.write_text(_json_focus.dumps(focus, indent=2))
+        focus_prompt = render_focus_area_prompt(focus)
+        if focus_prompt:
+            diff_summary = "\n\n".join(part for part in (diff_summary, focus_prompt) if part)
+        logger.info("hypothesis: focus-area fanout mapped %d review areas -> %s", len(focus), focus_path)
 
     model = config.models.specialists
     hyp_cfg = config.hypothesis

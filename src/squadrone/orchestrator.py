@@ -20,6 +20,7 @@ from .schemas.finding import DedupStatus, Finding
 from .services.budget import BudgetExceededError, BudgetTracker
 from .services.llm import init_cache
 from .services import verify_helpers
+from .services.quality_gate import apply_quality_gate
 from .stages import chain as chain_stage
 from .stages import dedup as dedup_stage
 from .stages import hypothesis as hypothesis_stage
@@ -149,8 +150,14 @@ async def run_scan(
     enable_chain: bool = False,
     enable_cross_file_taint: bool = False,
     diff_baseline: Optional[str] = None,
+    strict_quality: Optional[bool] = None,
+    triage_votes: Optional[int] = None,
 ) -> ScanResult:
     config = PipelineConfig.from_yaml(config_path)
+    if strict_quality is not None:
+        config.quality.enabled = strict_quality
+    if triage_votes is not None:
+        config.triage.verifier_votes = triage_votes
     ceiling = budget_override if budget_override is not None else config.cost_ceiling_usd
 
     if resume_from is not None and resume_from not in STAGE_ORDER:
@@ -322,6 +329,15 @@ async def run_scan(
                 plugin_slug=hyps.plugin_slug,
                 accepted=accepted[:cap], rejected=[], merged=[],
             )
+            if config.quality.enabled and config.quality.finding_grader:
+                triaged = apply_quality_gate(
+                    triaged,
+                    require_evidence_schema=config.quality.require_evidence_schema,
+                    false_positive_rules=config.quality.false_positive_rules,
+                    recompute=config.quality.recompute_severity,
+                    reject_below_submit_bar=config.quality.reject_below_submit_bar,
+                    artifact_path=run_dir / "quality_gate_triage.json",
+                )
             triaged.to_json_file(str(run_dir / "triaged.json"))
             await _emit(on_event, "triage", "done", {
                 "accepted": len(triaged.accepted), "rejected": 0, "merged": 0,

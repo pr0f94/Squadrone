@@ -139,6 +139,19 @@ class TriageConfig(BaseModel):
     drift_logging: bool = False           # T5: append every decision to cache/triage_decisions.jsonl
     cache_enabled: bool = False           # T6: cache triage results per (hypotheses_hash, plugin_version, scope)
     review_md_max_chars: int = 12000      # T2 size cap so review.md doesn't blow up the prompt
+    verifier_votes: int = 1               # Mythos-style N-vote critic pass; 1 keeps legacy single-pass behavior
+
+
+class QualityConfig(BaseModel):
+    """Strict quality controls inspired by reference harness verifier/grader stages."""
+    enabled: bool = False                 # master switch for pre-manual/pre-report quality gates
+    require_evidence_schema: bool = True  # require core attacker/source/sink/impact fields before queue/report
+    false_positive_rules: bool = True     # deterministic WP false-positive rules
+    recompute_severity: bool = True       # derive severity from bug class, role, impact, and preconditions
+    finding_grader: bool = True           # grade triage-accepted hypotheses before manual queue/verify
+    report_grader: bool = True            # grade confirmed findings before generating reports
+    focus_area_fanout: bool = True        # write focus-area map and feed it to specialist context
+    reject_below_submit_bar: bool = True  # reject accepted hypotheses that lack realistic submit-worthy impact
 
 
 class HypothesisConfig(BaseModel):
@@ -177,6 +190,7 @@ class PipelineConfig(BaseModel):
     recon: ReconConfig = ReconConfig()     # default-off, fully backward-compatible
     hypothesis: HypothesisConfig = HypothesisConfig()  # default-off, fully backward-compatible
     triage: TriageConfig = TriageConfig()  # default-off, fully backward-compatible
+    quality: QualityConfig = QualityConfig()  # default-off, fully backward-compatible
     verify: VerifyConfig = VerifyConfig()  # default-off, fully backward-compatible
     dedup: DedupConfig = DedupConfig()     # default-off, fully backward-compatible
     report: ReportConfig = ReportConfig()  # default-off, fully backward-compatible
