@@ -17,6 +17,7 @@ from ..services.console_format import (
     format_triage_reframe,
     format_triage_reject,
 )
+from ..services.artifacts import atomic_write_jsonl
 from ..services.decision_ledger import append_decision
 from ..services.quality_gate import apply_quality_gate
 from .hypothesis import _build_code_slices
@@ -258,10 +259,7 @@ async def run(
         logger.info("triage: quality gate accepted %d/%d", len(triaged.accepted), before)
 
     out_path = Path(runs_root) / run_id / "triaged.jsonl"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with out_path.open("w") as f:
-        for h in triaged.accepted:
-            f.write(h.model_dump_json() + "\n")
+    atomic_write_jsonl(out_path, triaged.accepted)
     # Also write the full TriagedArtifact for posterity.
     triaged.to_json_file(str(out_path.with_suffix(".json")))
     logger.info("triage: accepted=%d rejected=%d merged=%d -> %s",

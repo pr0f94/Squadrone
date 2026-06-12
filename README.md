@@ -57,6 +57,8 @@ Report      reports 2
 ```
 
 The SQLite index is created automatically at `db/squadrone.sqlite` on first use.
+SQLite connections use WAL mode and a busy timeout so batch scans can share the
+run index and LLM cache without most transient lock failures.
 
 ## What it does
 
@@ -208,6 +210,8 @@ Output by default:
 - `plugins/<slug>/runs/<run_id>/quality_gate_triage.json`
 - `plugins/<slug>/runs/<run_id>/manual_review_queued.json` when triage or quality gates queue manual review
 - `plugins/<slug>/runs/<run_id>/findings.jsonl`
+- `plugins/<slug>/runs/<run_id>/findings_corrupt.jsonl` if malformed finding rows are quarantined during resume
+- `plugins/<slug>/runs/<run_id>/schema_invalid_<agent>.json` if an agent returns invalid structured output after repair
 - `plugins/<slug>/runs/<run_id>/decision_ledger.jsonl`
 - `plugins/<slug>/runs/<run_id>/trace.jsonl`
 - `plugins/<slug>/runs/<run_id>/report_<finding_id>_<program>.md`
@@ -215,6 +219,11 @@ Output by default:
 When `--no-verify` is used, triage-accepted hypotheses are first graded by the quality gate, then written to the manual review queue instead of `findings.jsonl`; no submission reports are generated.
 
 When triage voting or the quality gate cannot make a clean automatic decision, the hypothesis is preserved in the manual review queue. The per-run `decision_ledger.jsonl` records the exact stage, action, result, reason, and artifact path for each keep, reject, manual-review, verification, dedup, and report decision.
+
+Run artifacts that affect resume are written atomically where possible. If a
+crash leaves malformed rows in `findings.jsonl`, Squadrone preserves readable
+findings, writes the bad rows to `findings_corrupt.jsonl`, and records the
+recovery in `decision_ledger.jsonl`.
 
 ## Quality gates
 

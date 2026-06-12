@@ -26,6 +26,7 @@ from ..agents.specialists.xss import XSSSpecialist
 from ..schemas.config import PipelineConfig
 from ..schemas.hypothesis import HypothesesArtifact, Hypothesis
 from ..schemas.recon import ReconArtifact
+from ..services.artifacts import atomic_write_json, atomic_write_jsonl
 from ..services.budget import BudgetTracker
 from ..services.console_format import format_verifier_decision
 from ..services.decision_ledger import append_decision
@@ -210,8 +211,7 @@ async def run(
         focus = build_focus_area_summary(recon)
         focus_path = Path(runs_root) / run_id / "focus_areas.json"
         focus_path.parent.mkdir(parents=True, exist_ok=True)
-        import json as _json_focus
-        focus_path.write_text(_json_focus.dumps(focus, indent=2))
+        atomic_write_json(focus_path, focus)
         focus_prompt = render_focus_area_prompt(focus)
         if focus_prompt:
             diff_summary = "\n\n".join(part for part in (diff_summary, focus_prompt) if part)
@@ -261,9 +261,7 @@ async def run(
             continue
         # Persist this specialist's output BEFORE moving on, so a crash mid-loop
         # doesn't lose its work.
-        with spec_path.open("w") as f:
-            for h in res.hypotheses:
-                f.write(h.model_dump_json() + "\n")
+        atomic_write_jsonl(spec_path, res.hypotheses)
         merged.extend(res.hypotheses)
 
     # X1: pre-verifier dedup (config-toggled). Merges (file, line, bug_class) duplicates
@@ -387,34 +385,29 @@ async def run(
     if drop_reasons:
         verifier_path = run_dir / "hypothesis_verifier_drops.json"
         verifier_path.parent.mkdir(parents=True, exist_ok=True)
-        import json as _json
         # Store reason + category (when V5 enabled) for downstream analysis
         drops_dump = {
             hid: {"reason": reason, "category": drop_categories.get(hid, "drop")}
             for hid, reason in drop_reasons.items()
         }
-        verifier_path.write_text(_json.dumps(drops_dump, indent=2))
+        atomic_write_json(verifier_path, drops_dump)
         logger.info("hypothesis: verifier dropped %d/%d -> %s",
                     len(drop_reasons), len(merged), verifier_path)
     if manual_review_queue:
         manual_path = run_dir / "hypothesis_manual_review_queue.json"
         manual_path.parent.mkdir(parents=True, exist_ok=True)
-        import json as _json2
-        manual_path.write_text(_json2.dumps(manual_review_queue, indent=2))
+        atomic_write_json(manual_path, manual_review_queue)
         logger.info("hypothesis: %d hypotheses escalated to manual review queue -> %s",
                     len(manual_review_queue), manual_path)
     if keep_conditional:
         cond_path = Path(runs_root) / run_id / "hypothesis_kept_conditional.json"
         cond_path.parent.mkdir(parents=True, exist_ok=True)
-        import json as _json3
-        cond_path.write_text(_json3.dumps(keep_conditional, indent=2))
+        atomic_write_json(cond_path, keep_conditional)
 
     artifact = HypothesesArtifact(plugin_slug=recon.plugin_slug, hypotheses=kept)
     out_path = Path(runs_root) / run_id / "hypotheses.jsonl"
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    with out_path.open("w") as f:
-        for h in kept:
-            f.write(h.model_dump_json() + "\n")
+    atomic_write_jsonl(out_path, kept)
     logger.info("hypothesis: wrote %d hypotheses to %s (verifier kept %d/%d)",
                 len(kept), out_path, len(kept), len(merged))
     return artifact

@@ -12,7 +12,6 @@ Downstream stages see hypotheses with `chains_with`, `chain_impact`, and
 
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 
@@ -20,6 +19,7 @@ from ..agents.chain_synthesizer import ChainSynthesizer, annotate_hypotheses
 from ..agents.runtime import AgentRuntime
 from ..schemas.config import PipelineConfig
 from ..schemas.hypothesis import HypothesesArtifact
+from ..services.artifacts import atomic_write_json, atomic_write_jsonl
 
 logger = logging.getLogger(__name__)
 
@@ -34,9 +34,8 @@ async def run(
     if not hypotheses.hypotheses:
         logger.info("chain: no hypotheses to chain — skipping")
         out_dir = Path(runs_root) / run_id
-        out_dir.mkdir(parents=True, exist_ok=True)
-        (out_dir / "chains.json").write_text("[]")
-        (out_dir / "chain_diagnostics.json").write_text(json.dumps({
+        atomic_write_json(out_dir / "chains.json", [])
+        atomic_write_json(out_dir / "chain_diagnostics.json", {
             "status": "insufficient_hypotheses",
             "hypothesis_count": 0,
             "raw_chain_count": 0,
@@ -45,7 +44,7 @@ async def run(
             "dropped_self_or_single_count": 0,
             "dropped_unknown_id_count": 0,
             "error": None,
-        }, indent=2))
+        })
         return hypotheses
 
     synthesizer = ChainSynthesizer(runtime, model=config.models.chain_synthesizer)
@@ -55,19 +54,16 @@ async def run(
                 len(chains), len(hypotheses.hypotheses))
 
     out_dir = Path(runs_root) / run_id
-    out_dir.mkdir(parents=True, exist_ok=True)
     chains_path = out_dir / "chains.json"
-    chains_path.write_text(json.dumps([c.model_dump() for c in chains], indent=2))
+    atomic_write_json(chains_path, [c.model_dump() for c in chains])
 
     annotated = annotate_hypotheses(hypotheses.hypotheses, chains)
     hyps_path = out_dir / "hypotheses.jsonl"
-    with hyps_path.open("w") as f:
-        for h in annotated:
-            f.write(h.model_dump_json() + "\n")
+    atomic_write_jsonl(hyps_path, annotated)
 
     annotated_count = sum(1 for h in annotated if h.chains_with)
     diagnostics = result.diagnostics()
     diagnostics["annotated_hypothesis_count"] = annotated_count
-    (out_dir / "chain_diagnostics.json").write_text(json.dumps(diagnostics, indent=2))
+    atomic_write_json(out_dir / "chain_diagnostics.json", diagnostics)
     logger.info("chain: annotated %d hypotheses with chain info", annotated_count)
     return HypothesesArtifact(plugin_slug=hypotheses.plugin_slug, hypotheses=annotated)

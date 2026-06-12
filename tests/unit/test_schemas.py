@@ -163,6 +163,64 @@ def test_hypothesis_coerces_list_to_str():
     assert h.sink == "a; b"
 
 
+def test_hypothesis_coerces_scalar_taint_path_to_list():
+    h = Hypothesis.model_validate({
+        "id": "x", "specialist": "auth", "bug_class": "CWE-862",
+        "entry_point": "wp_ajax_x", "file": "x.php", "line": 1,
+        "sink": "state change",
+        "sink_code": "do_action();",
+        "taint_path": "request -> handler -> sink",
+        "reasoning": "Missing capability check.",
+        "confidence": "medium",
+        "preconditions": "unauthenticated attacker",
+        "affected_versions": "current",
+    })
+
+    assert h.taint_path == ["request", "handler", "sink"]
+
+
+def test_hypothesis_coerces_step_object_taint_path_to_list():
+    h = Hypothesis.model_validate({
+        "id": "auth-001", "specialist": "auth", "bug_class": "CWE-862",
+        "entry_point": "ApplePay VALIDATE",
+        "file": "modules/ppcp-applepay/src/Assets/ApplePayButton.php",
+        "line": 85,
+        "sink": "global Apple Pay payment settings update",
+        "sink_code": "set_applepay_validated();",
+        "taint_path": [
+            {"step": "wp_ajax_nopriv_ApplePay VALIDATE -> ApplePayButton::validate()"},
+            {"step": "ApplePayButton::validate() accepts POST data"},
+        ],
+        "reasoning": "Missing capability check before saving global settings.",
+        "confidence": "high",
+        "preconditions": "unauthenticated user with valid checkout nonce",
+        "affected_versions": "all currently shipped",
+    })
+
+    assert h.taint_path == [
+        "wp_ajax_nopriv_ApplePay VALIDATE -> ApplePayButton::validate()",
+        "ApplePayButton::validate() accepts POST data",
+    ]
+
+
+def test_hypothesis_coerces_confidence_case():
+    h = Hypothesis.model_validate({
+        "id": "authflow-001", "specialist": "auth_flow", "bug_class": "CWE-287",
+        "entry_point": "rest_permission_callback",
+        "file": "Auth.php",
+        "line": 32,
+        "sink": "token validation",
+        "sink_code": "return true;",
+        "taint_path": "request -> permission_callback",
+        "reasoning": "Forged token accepted.",
+        "confidence": "MEDIUM",
+        "preconditions": "unauthenticated attacker",
+        "affected_versions": "current",
+    })
+
+    assert h.confidence == Confidence.MEDIUM
+
+
 def test_strip_fences_handles_prose_and_embedded_json():
     """Runtime must extract JSON from various LLM response shapes."""
     import json as _json

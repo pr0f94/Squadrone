@@ -10,7 +10,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
-import aiosqlite
 from pydantic import BaseModel
 
 from .agents.developer import DeveloperAgent
@@ -18,11 +17,13 @@ from .agents.runtime import AgentRuntime
 from .schemas.config import PipelineConfig
 from .schemas.finding import DedupStatus, Finding
 from .schemas.hypothesis import Hypothesis
+from .services.artifacts import atomic_write_json, atomic_write_text, read_jsonl_models
 from .services.budget import BudgetExceededError, BudgetTracker
 from .services.decision_ledger import append_decision
 from .services.llm import init_cache
 from .services import verify_helpers
 from .services.quality_gate import apply_quality_gate
+from .services.sqlite import connect_sqlite
 from .stages import chain as chain_stage
 from .stages import dedup as dedup_stage
 from .stages import hypothesis as hypothesis_stage
@@ -142,20 +143,20 @@ def _emit_triage_manual_review_queue(
         queued += 1
         queued_ids.add(hyp.id)
     if queued:
-        marker_path.write_text(_json.dumps({"hypothesis_ids": sorted(queued_ids)}, indent=2))
+        atomic_write_json(marker_path, {"hypothesis_ids": sorted(queued_ids)})
     return queued
 
 
 async def _init_db() -> None:
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     schema = Path(SCHEMA_PATH).read_text()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_sqlite(DB_PATH) as db:
         await db.executescript(schema)
         await db.commit()
 
 
 async def _record_run_start(run_id: str, plugin_slug: str) -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_sqlite(DB_PATH) as db:
         await db.execute(
             "INSERT OR IGNORE INTO plugins(slug) VALUES (?)",
             (plugin_slug,),
@@ -169,7 +170,7 @@ async def _record_run_start(run_id: str, plugin_slug: str) -> None:
 
 
 async def _record_run_finish(run_id: str, status: str, cost: float, finding_count: int) -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_sqlite(DB_PATH) as db:
         # Cumulative cost across resumes: add this run's spend to the previous
         # value rather than overwriting (an empty cost row is 0, so first
         # finish reads 0 and stores `cost`; subsequent --resume finishes add).
@@ -183,13 +184,19 @@ async def _record_run_finish(run_id: str, status: str, cost: float, finding_coun
             "(SELECT plugin_slug FROM runs WHERE run_id=?)",
             (datetime.now(timezone.utc).isoformat(), finding_count, run_id),
         )
+        await db.execute(
+            "UPDATE plugins SET finding_count=("
+            "SELECT COUNT(*) FROM findings WHERE plugin_slug=plugins.slug"
+            ") WHERE slug=(SELECT plugin_slug FROM runs WHERE run_id=?)",
+            (run_id,),
+        )
         await db.commit()
 
 
 async def _persist_findings(run_id: str, plugin_slug: str, findings: list[Finding]) -> None:
     if not findings:
         return
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_sqlite(DB_PATH) as db:
         for f in findings:
             await db.execute(
                 "INSERT OR REPLACE INTO findings(finding_id, run_id, plugin_slug, bug_class, "
@@ -277,7 +284,7 @@ async def run_scan(
         await _record_run_start(run_id, plugin_slug)
     else:
         # Mark the existing run record as running again
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with connect_sqlite(DB_PATH) as db:
             await db.execute(
                 "UPDATE runs SET status='running', finished_at=NULL WHERE run_id=?", (run_id,),
             )
@@ -507,7 +514,7 @@ async def run_scan(
         # ---- verify ----
         budget.set_stage("verify")
         if no_verify:
-            findings_path.write_text("")
+            atomic_write_text(findings_path, "")
             manual_queued = 0
             for hyp in triaged.accepted:
                 hyp_dir = run_dir / "verifications" / hyp.id
@@ -548,10 +555,20 @@ async def run_scan(
                 "reason": "no_verify",
             })
         elif _should_load("verify") and findings_path.exists():
-            findings = [
-                Finding.model_validate_json(line)
-                for line in findings_path.read_text().splitlines() if line.strip()
-            ]
+            findings, corrupt_count = read_jsonl_models(
+                findings_path,
+                Finding,
+                corrupt_path=run_dir / "findings_corrupt.jsonl",
+            )
+            if corrupt_count:
+                append_decision(
+                    run_dir,
+                    stage="verify",
+                    action="recover",
+                    result="corrupt_findings_quarantined",
+                    reason=f"{corrupt_count} malformed findings.jsonl line(s)",
+                    artifact=run_dir / "findings_corrupt.jsonl",
+                )
             await _emit(on_event, "verify", "skipped", {"findings": len(findings)})
         else:
             await _emit(on_event, "verify", "start", {"to_verify": len(triaged.accepted)})
@@ -613,7 +630,7 @@ async def run_scan(
 
     except Exception as e:
         logger.exception("scan %s: failed — %s", run_id, e)
-        (run_dir / "error.log").write_text(traceback.format_exc())
+        atomic_write_text(run_dir / "error.log", traceback.format_exc())
         status = "failed"
         append_decision(
             run_dir,
@@ -631,7 +648,10 @@ async def run_scan(
             budget.write_cost_report(run_dir)
         except Exception as e:
             logger.warning("scan %s: failed to write cost report: %s", run_id, e)
-        await _record_run_finish(run_id, status, budget.spent, len(findings))
+        try:
+            await _record_run_finish(run_id, status, budget.spent, len(findings))
+        except Exception as e:
+            logger.warning("scan %s: failed to record run finish: %s", run_id, e)
 
     duration = time.time() - started
     return ScanResult(

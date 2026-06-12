@@ -8,6 +8,7 @@ from pathlib import Path
 from ..schemas.config import PipelineConfig
 from ..schemas.finding import DedupStatus, Finding
 from ..services import dedup_helpers
+from ..services.artifacts import atomic_write_jsonl
 from ..services.decision_ledger import append_decision
 from ..services.vuln_db import VulnDBClient, VulnMatch
 
@@ -161,8 +162,5 @@ async def run(
         )
 
     findings_path = Path(runs_root) / run_id / "findings.jsonl"
-    findings_path.parent.mkdir(parents=True, exist_ok=True)
-    with findings_path.open("w") as fp:
-        for x in findings:
-            fp.write(x.model_dump_json() + "\n")
+    atomic_write_jsonl(findings_path, findings)
     return findings

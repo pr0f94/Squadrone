@@ -39,6 +39,15 @@ def test_normalises_root_list_single_item_wrapper():
     assert _ItemList.model_validate(normalised).root[0].id == "logic-001"
 
 
+def test_does_not_unwrap_single_root_list_item():
+    payload = [{"id": "auth-001"}]
+
+    normalised = _normalise_schema_payload(payload, _ItemList)
+
+    assert normalised is payload
+    assert _ItemList.model_validate(normalised).root[0].id == "auth-001"
+
+
 def test_normalises_root_list_output_wrapper():
     payload = {"output": [{"id": "inj-001"}]}
 
@@ -88,6 +97,17 @@ def test_does_not_normalise_non_root_model():
     assert normalised is payload
 
 
+def test_salvages_valid_root_list_items_from_mixed_payload(tmp_path):
+    from squadrone.agents.transport.litellm_transport import _salvage_root_list_items
+
+    payload = [{"id": "ok-001"}, {"missing": "id"}]
+
+    salvaged, invalid = _salvage_root_list_items(payload, _ItemList)
+
+    assert salvaged == [{"id": "ok-001"}]
+    assert invalid[0]["index"] == 1
+
+
 @pytest.mark.asyncio
 async def test_root_list_schema_falls_back_to_empty_after_retry(monkeypatch, tmp_path):
     async def fake_call_llm(**kwargs):
@@ -122,3 +142,44 @@ async def test_root_list_schema_falls_back_to_empty_after_retry(monkeypatch, tmp
     )
 
     assert result.output.root == []
+    artifact = tmp_path / "schema_invalid_injection.json"
+    assert artifact.exists()
+    assert "No injection issues found" in artifact.read_text()
+
+
+@pytest.mark.asyncio
+async def test_root_list_schema_salvages_after_retry(monkeypatch, tmp_path):
+    responses = iter([
+        '{"summary": "bad wrapper"}',
+        '[{"id": "kept"}, {"missing": "id"}]',
+    ])
+
+    async def fake_call_llm(**kwargs):
+        return {
+            "choices": [{"message": {"content": next(responses)}}],
+            "usage": {},
+        }
+
+    monkeypatch.setattr(
+        "squadrone.agents.transport.litellm_transport.call_llm",
+        fake_call_llm,
+    )
+    runtime = AgentRuntime(run_dir=str(tmp_path))
+
+    result = await LiteLLMTransport().run_agent(
+        runtime=runtime,
+        agent_name="auth",
+        model="test-model",
+        messages=[{"role": "user", "content": "Return hypotheses"}],
+        tools=[],
+        max_iterations=1,
+        output_schema=_ItemList,
+        tool_handlers=None,
+        force_finalise_after=None,
+        max_tokens=100,
+    )
+
+    assert [item.id for item in result.output.root] == ["kept"]
+    artifact = tmp_path / "schema_invalid_auth.json"
+    assert artifact.exists()
+    assert "missing" in artifact.read_text()

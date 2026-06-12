@@ -14,15 +14,30 @@ import copy
 import hashlib
 import json
 import logging
+import ssl
 from pathlib import Path
 from typing import Optional
 
-import aiosqlite
 import litellm
-from litellm.exceptions import RateLimitError
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+from litellm.exceptions import (
+    APIConnectionError,
+    APIError,
+    InternalServerError,
+    RateLimitError,
+    ServiceUnavailableError,
+    Timeout,
+)
+from tenacity import (
+    before_sleep_log,
+    retry,
+    retry_if_exception,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from .budget import BudgetTracker
+from .sqlite import connect_sqlite
 
 DEFAULT_CACHE_DB = "cache/llm.sqlite"
 
@@ -30,6 +45,38 @@ logger = logging.getLogger(__name__)
 
 CHATGPT_55_MODEL = "chatgpt/gpt-5.5"
 CHATGPT_55_SOURCE_MODEL = "chatgpt/gpt-5.4"
+
+_RETRYABLE_LLM_EXCEPTIONS = (
+    APIConnectionError,
+    InternalServerError,
+    RateLimitError,
+    ServiceUnavailableError,
+    Timeout,
+)
+
+
+def _is_retryable_llm_error(exc: BaseException) -> bool:
+    if isinstance(exc, _RETRYABLE_LLM_EXCEPTIONS):
+        return True
+    if isinstance(exc, (ssl.SSLError, ConnectionError, TimeoutError)):
+        return True
+    # Some providers wrap transport failures in APIError/InternalServerError
+    # while preserving only the original message.
+    if isinstance(exc, APIError):
+        message = str(exc).lower()
+        return any(
+            marker in message
+            for marker in (
+                "ssl",
+                "tls",
+                "bad record mac",
+                "connection reset",
+                "connection aborted",
+                "temporarily unavailable",
+                "timeout",
+            )
+        )
+    return False
 
 
 def _ensure_parent(path: str) -> None:
@@ -112,7 +159,7 @@ def _install_chatgpt_55_model_patch() -> bool:
 
 async def init_cache(cache_db: str = DEFAULT_CACHE_DB) -> None:
     _ensure_parent(cache_db)
-    async with aiosqlite.connect(cache_db) as db:
+    async with connect_sqlite(cache_db) as db:
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS llm_cache (
@@ -271,6 +318,17 @@ _install_chatgpt_55_model_patch()
 _install_chatgpt_aggregator_patch()
 
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(min=2, max=30),
+    retry=retry_if_exception(_is_retryable_llm_error),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+    reraise=True,
+)
+async def _acompletion_with_retries(request_kwargs: dict) -> object:
+    return await litellm.acompletion(**request_kwargs)
+
+
 async def call_llm(
     model: str,
     messages: list[dict],
@@ -291,7 +349,7 @@ async def call_llm(
     options = dict(llm_options or {})
     key = _cache_key(model, messages, tools, options)
 
-    async with aiosqlite.connect(cache_db) as db:
+    async with connect_sqlite(cache_db) as db:
         async with db.execute(
             "SELECT response FROM llm_cache WHERE cache_key = ?", (key,)
         ) as cursor:
@@ -309,7 +367,7 @@ async def call_llm(
         "max_tokens": max_tokens,
     }
     request_kwargs.update(options)
-    response = await litellm.acompletion(**request_kwargs)
+    response = await _acompletion_with_retries(request_kwargs)
 
     if budget_tracker is not None:
         await budget_tracker.add(response.usage, model, agent=agent_name)
@@ -317,7 +375,7 @@ async def call_llm(
     _coerce_response_api_usage(response)
     result = response.model_dump()
 
-    async with aiosqlite.connect(cache_db) as db:
+    async with connect_sqlite(cache_db) as db:
         await db.execute(
             "INSERT OR IGNORE INTO llm_cache (cache_key, response) VALUES (?, ?)",
             (key, json.dumps(result)),

@@ -47,7 +47,34 @@ def _coerce_str(v: Any) -> Any:
     return v
 
 
+def _coerce_str_list(v: Any) -> Any:
+    """Accept common scalar/list drift in model-produced path fields."""
+    if isinstance(v, str):
+        if "->" in v:
+            return [part.strip() for part in v.split("->") if part.strip()]
+        return [v]
+    if isinstance(v, list):
+        coerced: list[str] = []
+        for item in v:
+            if isinstance(item, str):
+                coerced.append(item)
+            elif isinstance(item, dict) and isinstance(item.get("step"), str):
+                coerced.append(item["step"])
+            else:
+                coerced.append(str(item))
+        return coerced
+    return v
+
+
+def _coerce_lower_str(v: Any) -> Any:
+    if isinstance(v, str):
+        return v.lower()
+    return v
+
+
 _StrLike = Annotated[str, BeforeValidator(_coerce_str)]
+_StrListLike = Annotated[list[str], BeforeValidator(_coerce_str_list)]
+_ConfidenceLike = Annotated[Confidence, BeforeValidator(_coerce_lower_str)]
 
 
 class Hypothesis(JSONFileMixin):
@@ -59,9 +86,9 @@ class Hypothesis(JSONFileMixin):
     line: int
     sink: _StrLike
     sink_code: _StrLike = ""  # Verbatim source line(s) of the sink. Empty = legacy hypothesis.
-    taint_path: list[str]
+    taint_path: _StrListLike
     reasoning: _StrLike
-    confidence: Confidence
+    confidence: _ConfidenceLike
     preconditions: _StrLike
     affected_versions: _StrLike
     # Populated by the triage stage. Empty for hypotheses produced before scope filtering ran;

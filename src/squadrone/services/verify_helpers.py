@@ -13,6 +13,7 @@ from pathlib import Path
 
 from ..schemas.finding import Finding
 from ..schemas.hypothesis import Hypothesis
+from .artifacts import atomic_write_text
 
 logger = logging.getLogger(__name__)
 
@@ -159,6 +160,23 @@ def emit_to_manual_review_queue(
     Generates a sandbox scaffold under run_dir/verifications/<hyp_id>/manual_scaffold/
     that the user can `cd` into and iterate by hand.
     """
+    source = str((verifier_notes or {}).get("source") or "verify")
+    dedupe_key = f"{run_dir}:{hyp.id}:{source}"
+    existing_keys: set[str] = set()
+    if MANUAL_REVIEW_QUEUE.exists():
+        for line in MANUAL_REVIEW_QUEUE.read_text().splitlines():
+            if not line.strip():
+                continue
+            try:
+                prior = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            prior_source = str((prior.get("verifier_notes") or {}).get("source") or "verify")
+            existing_keys.add(f"{prior.get('run_dir')}:{prior.get('hypothesis_id')}:{prior_source}")
+    if dedupe_key in existing_keys:
+        logger.info("verify: hypothesis %s already exists in manual review queue (%s)", hyp.id, source)
+        return
+
     MANUAL_REVIEW_QUEUE.parent.mkdir(parents=True, exist_ok=True)
     entry = {
         "queued_at": datetime.now(timezone.utc).isoformat(),
@@ -215,7 +233,8 @@ def write_manual_scaffold(
             "No automated PoC iterations were recorded for this handoff.\n\n"
         )
 
-    (scaffold / "README.md").write_text(
+    atomic_write_text(
+        scaffold / "README.md",
         f"# Manual review handoff: {hyp.id}\n\n"
         f"{handoff_reason or 'Auto-pipeline failed to confirm this hypothesis after the configured iteration cap.'}\n\n"
         f"- **Bug class:** {hyp.bug_class.value}\n"
@@ -233,7 +252,7 @@ def write_manual_scaffold(
         f"2. The auto-pipeline left findings under `runs/<id>/verifications/{hyp.id}/`\n"
         f"3. If `state_dump/` exists (W5), inspect it for clues about why the PoC didn't fire\n"
     )
-    (scaffold / "context.json").write_text(json.dumps({
+    atomic_write_text(scaffold / "context.json", json.dumps({
         "plugin_slug": plugin_slug,
         "target_url": target_url,
         "hypothesis": hyp.model_dump(mode="json"),
@@ -270,7 +289,7 @@ def verify_cache_load(key: str) -> Finding | None:
 
 def verify_cache_save(key: str, finding: Finding) -> None:
     VERIFY_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    (VERIFY_CACHE_DIR / f"{key}.json").write_text(finding.model_dump_json(indent=2))
+    atomic_write_text(VERIFY_CACHE_DIR / f"{key}.json", finding.model_dump_json(indent=2))
 
 
 # ---------- W4: payload variants -----------------------------------------------------

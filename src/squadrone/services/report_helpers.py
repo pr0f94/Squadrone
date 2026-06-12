@@ -7,12 +7,12 @@ R7 — machine-readable submission JSON: pre-filled form-field payload per progr
 
 from __future__ import annotations
 
-import json
 import logging
 import shutil
 from pathlib import Path
 
 from ..schemas.finding import Finding
+from .artifacts import atomic_write_json, atomic_write_text
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +99,7 @@ def write_submission_bundle(
 
     # Report (one per program when called repeatedly)
     report_name = f"{program}_report.md" if program else "report.md"
-    (bundle / report_name).write_text(report_md)
+    atomic_write_text(bundle / report_name, report_md)
 
     # PoC script
     if finding.poc_script_path:
@@ -129,9 +129,7 @@ def write_submission_bundle(
     # Submission JSON
     if submission_json is not None:
         suffix = f"_{program}" if program else ""
-        (bundle / f"submission{suffix}.json").write_text(
-            json.dumps(submission_json, indent=2)
-        )
+        atomic_write_json(bundle / f"submission{suffix}.json", submission_json)
 
     logger.info("report: bundle written → %s", bundle)
     return bundle

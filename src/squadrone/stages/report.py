@@ -11,6 +11,7 @@ from ..agents.runtime import AgentRuntime
 from ..schemas.config import PipelineConfig
 from ..schemas.finding import DedupStatus, Finding
 from ..services import report_helpers
+from ..services.artifacts import atomic_write_json, atomic_write_text
 from ..services.budget import BudgetTracker
 from ..services.decision_ledger import append_decision
 from ..services.quality_gate import grade_finding_for_report
@@ -95,7 +96,8 @@ async def run(
                 programs = list(f.hypothesis.bounty_programs) or ["wordfence"]
                 for program in programs:
                     blocked_path = run_dir / f"report_{f.id}_{program}_QUALITY_BLOCKED.md"
-                    blocked_path.write_text(
+                    atomic_write_text(
+                        blocked_path,
                         f"# QUALITY GATE BLOCKED: {f.id} ({program})\n\n"
                         f"**Reason:** {grade.reason}\n\n"
                         f"**Derived severity:** {grade.severity}\n\n"
@@ -127,7 +129,7 @@ async def run(
                 programs = list(f.hypothesis.bounty_programs) or ["wordfence"]
                 for program in programs:
                     not_ready_path = run_dir / f"report_{f.id}_{program}_NOT_READY.md"
-                    not_ready_path.write_text(report_helpers.render_not_ready_md(f, checklist))
+                    atomic_write_text(not_ready_path, report_helpers.render_not_ready_md(f, checklist))
                     out_paths.append(str(not_ready_path))
                     logger.info("report: NOT READY for %s (%s) — wrote %s", f.id, program, not_ready_path)
                     append_decision(
@@ -184,7 +186,7 @@ async def run(
                         + "\n\n## Original report\n\n"
                         + md
                     )
-                    blocked_path.write_text(block_md)
+                    atomic_write_text(blocked_path, block_md)
                     out_paths.append(str(blocked_path))
                     logger.warning("report: %s (%s) — claim validation BLOCKED (%d blocking claims) — %s",
                                    f.id, program, len(blocking), blocked_path)
@@ -202,7 +204,7 @@ async def run(
                     continue
 
             out = run_dir / f"report_{f.id}_{program}.md"
-            out.write_text(md)
+            atomic_write_text(out, md)
             out_paths.append(str(out))
             logger.info("report: wrote %s (%d bytes, program=%s)", out, len(md), program)
             append_decision(
@@ -242,7 +244,6 @@ async def run(
             elif cfg.submission_json and submission_json is not None:
                 # JSON without bundling — drop it next to the report
                 json_path = run_dir / f"report_{f.id}_{program}.submission.json"
-                import json as _json
-                json_path.write_text(_json.dumps(submission_json, indent=2))
+                atomic_write_json(json_path, submission_json)
                 logger.info("report: submission JSON → %s", json_path)
     return out_paths

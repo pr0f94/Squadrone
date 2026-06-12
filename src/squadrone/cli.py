@@ -12,7 +12,6 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-import aiosqlite
 import typer
 from rich.console import Console
 from rich.logging import RichHandler
@@ -20,6 +19,9 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.syntax import Syntax
 from rich.table import Table
+
+from .services.artifacts import atomic_write_json
+from .services.sqlite import connect_sqlite
 
 
 def _configure_logging(verbose: bool = False) -> None:
@@ -640,7 +642,7 @@ def review(run_id: str = typer.Argument(..., help="Run ID to review")) -> None:
                 "decision": {"v": "valid", "i": "invalid", "m": "needs_more_investigation"}[choice],
                 "at": datetime.now(timezone.utc).isoformat(),
             }
-            review_path.write_text(json.dumps(decisions, indent=2))
+            atomic_write_json(review_path, decisions)
             console.print(f"[green]saved {decisions[f.id]['decision']}[/]")
             idx = min(idx + 1, len(findings) - 1)
         elif choice == "n":
@@ -679,7 +681,7 @@ def disclose(
         submitted_at = datetime.now(timezone.utc).isoformat()
 
     async def _run():
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with connect_sqlite(DB_PATH) as db:
             async with db.execute(
                 "SELECT bug_class, cwe, confidence, poc_status, dedup_status, plugin_slug, run_id "
                 "FROM findings WHERE finding_id=?", (finding_id,)
@@ -718,7 +720,7 @@ def runs_list() -> None:
     from .orchestrator import DB_PATH
 
     async def _query():
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with connect_sqlite(DB_PATH) as db:
             async with db.execute(
                 "SELECT run_id, plugin_slug, status, finding_count, cost_usd, started_at "
                 "FROM runs ORDER BY started_at DESC"
@@ -745,7 +747,7 @@ def findings_show(finding_id: str = typer.Argument(...)) -> None:
     from .schemas.finding import Finding
 
     async def _query():
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with connect_sqlite(DB_PATH) as db:
             async with db.execute(
                 "SELECT run_id, plugin_slug FROM findings WHERE finding_id=?", (finding_id,)
             ) as cur:

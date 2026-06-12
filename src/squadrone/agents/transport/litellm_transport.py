@@ -17,10 +17,12 @@ from __future__ import annotations
 import json
 import logging
 import re
+from pathlib import Path
 from typing import Optional, TYPE_CHECKING
 
 from pydantic import BaseModel, ValidationError
 
+from ...services.artifacts import atomic_write_json
 from ...services.llm import call_llm
 from .base import AgentOutputError, AgentResult
 
@@ -199,8 +201,65 @@ def _normalise_schema_payload(parsed: object, output_schema: type[BaseModel]) ->
     if isinstance(parsed, dict):
         return unwrap(parsed)
     if isinstance(parsed, list) and len(parsed) == 1:
-        return unwrap(parsed[0])
+        unwrapped = unwrap(parsed[0])
+        # Only unwrap obvious wrapper/empty-result objects. A single-item root
+        # list like [{"id": "...", ...}] is already the exact schema shape.
+        if unwrapped is not parsed[0]:
+            return unwrapped
     return parsed
+
+
+def _root_list_item_model(output_schema: type[BaseModel]) -> type[BaseModel] | None:
+    if not getattr(output_schema, "__pydantic_root_model__", False):
+        return None
+    ann = output_schema.model_fields.get("root").annotation
+    item_model = getattr(ann, "__args__", [None])[0] if ann is not None else None
+    if isinstance(item_model, type) and issubclass(item_model, BaseModel):
+        return item_model
+    return None
+
+
+def _salvage_root_list_items(parsed: object, output_schema: type[BaseModel]) -> tuple[object | None, list[dict]]:
+    """Keep valid items from a root-list payload when some siblings are malformed."""
+    normalised = _normalise_schema_payload(parsed, output_schema)
+    if not isinstance(normalised, list):
+        return None, []
+    item_model = _root_list_item_model(output_schema)
+    if item_model is None:
+        return None, []
+
+    valid: list[dict] = []
+    invalid: list[dict] = []
+    for idx, item in enumerate(normalised):
+        try:
+            valid.append(item_model.model_validate(item).model_dump(mode="json"))
+        except ValidationError as exc:
+            invalid.append({"index": idx, "error": str(exc), "item": item})
+    if not valid:
+        return None, invalid
+    return [valid_item for valid_item in valid], invalid
+
+
+def _write_schema_invalid_artifact(
+    runtime: "AgentRuntime",
+    agent_name: str,
+    *,
+    reason: str,
+    final_content: str,
+    invalid_items: list[dict] | None = None,
+) -> None:
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", agent_name)
+    path = Path(runtime.run_dir) / f"schema_invalid_{safe_name}.json"
+    payload = {
+        "agent": agent_name,
+        "reason": reason,
+        "final_content": final_content[:20000],
+        "invalid_items": invalid_items or [],
+    }
+    try:
+        atomic_write_json(path, payload)
+    except Exception as exc:
+        logger.warning("%s failed to write schema invalid artifact %s: %s", agent_name, path, exc)
 
 
 # Sliding-window trim defaults. 80KB is roughly 20K input tokens, leaving
@@ -476,6 +535,26 @@ class LiteLLMTransport:
                         iterations=iteration,
                     )
                 except ValidationError as e:
+                    salvaged, invalid_items = _salvage_root_list_items(parsed, output_schema)
+                    if salvaged is not None:
+                        runtime._trace(agent_name, "schema_salvaged_root_list", {
+                            "valid_items": len(salvaged),
+                            "invalid_items": len(invalid_items),
+                        })
+                        _write_schema_invalid_artifact(
+                            runtime,
+                            agent_name,
+                            reason=f"salvaged {len(salvaged)} valid item(s) after schema validation failed",
+                            final_content=final_content,
+                            invalid_items=invalid_items,
+                        )
+                        validated = output_schema.model_validate(salvaged)
+                        return AgentResult(
+                            output=validated,
+                            token_usage=usage_acc,
+                            developer_calls_made=dev_calls[0],
+                            iterations=iteration,
+                        )
                     err = f"Your JSON failed schema validation:\n{e}\nFix it and return ONLY the corrected JSON."
 
             if attempt == 2:
@@ -485,10 +564,18 @@ class LiteLLMTransport:
                     except ValidationError:
                         pass
                     else:
+                        _write_schema_invalid_artifact(
+                            runtime,
+                            agent_name,
+                            reason=err,
+                            final_content=final_content,
+                        )
                         runtime._trace(agent_name, "schema_fallback_empty_list", {"reason": err[:500]})
                         logger.warning(
-                            "%s returned invalid list JSON after retry; treating as empty result",
+                            "%s returned invalid list JSON after retry; treating as empty result "
+                            "(artifact: %s)",
                             agent_name,
+                            Path(runtime.run_dir) / f"schema_invalid_{re.sub(r'[^A-Za-z0-9_.-]+', '_', agent_name)}.json",
                         )
                         return AgentResult(
                             output=empty,

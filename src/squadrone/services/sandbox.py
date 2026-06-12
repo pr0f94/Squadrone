@@ -27,6 +27,7 @@ _PORT_MIN = 8100
 _PORT_MAX = 8200
 _PROJECT_PREFIX = "squadrone"
 _DOCKER_DIR = Path(__file__).resolve().parents[3] / "docker"
+_PORT_ALLOC_LOCK = asyncio.Lock()
 
 
 class SandboxRunResult(BaseModel):
@@ -96,30 +97,31 @@ class SandboxManager:
     async def boot(self) -> None:
         if self._booted:
             return
-        self.port = _alloc_port()
-        self.project = f"{_PROJECT_PREFIX}-{uuid.uuid4().hex[:8]}"
-        self.container_name = f"{self.project}-wordpress-1"
-        self.target_url = f"http://localhost:{self.port}"
-        self.workdir = Path(tempfile.mkdtemp(prefix=f"{self.project}-"))
+        async with _PORT_ALLOC_LOCK:
+            self.port = _alloc_port()
+            self.project = f"{_PROJECT_PREFIX}-{uuid.uuid4().hex[:8]}"
+            self.container_name = f"{self.project}-wordpress-1"
+            self.target_url = f"http://localhost:{self.port}"
+            self.workdir = Path(tempfile.mkdtemp(prefix=f"{self.project}-"))
 
-        template = Template((_DOCKER_DIR / "docker-compose.yml.j2").read_text())
-        rendered = template.render(
-            port=self.port,
-            wp_url=self.target_url,
-            wp_title="Squadrone Sandbox",
-            wp_admin_user=self.config.wp_admin_user,
-            wp_admin_pass=self.config.wp_admin_pass,
-            wp_admin_email=self.config.wp_admin_email,
-        )
-        (self.workdir / "docker-compose.yml").write_text(rendered)
-        shutil.copy(_DOCKER_DIR / "wp-init.sh", self.workdir / "wp-init.sh")
-        (self.workdir / "wp-init.sh").chmod(0o755)
+            template = Template((_DOCKER_DIR / "docker-compose.yml.j2").read_text())
+            rendered = template.render(
+                port=self.port,
+                wp_url=self.target_url,
+                wp_title="Squadrone Sandbox",
+                wp_admin_user=self.config.wp_admin_user,
+                wp_admin_pass=self.config.wp_admin_pass,
+                wp_admin_email=self.config.wp_admin_email,
+            )
+            (self.workdir / "docker-compose.yml").write_text(rendered)
+            shutil.copy(_DOCKER_DIR / "wp-init.sh", self.workdir / "wp-init.sh")
+            (self.workdir / "wp-init.sh").chmod(0o755)
 
-        logger.info("sandbox boot project=%s port=%d", self.project, self.port)
-        await _run(
-            "docker", "compose", "-p", self.project, "up", "-d",
-            cwd=str(self.workdir),
-        )
+            logger.info("sandbox boot project=%s port=%d", self.project, self.port)
+            await _run(
+                "docker", "compose", "-p", self.project, "up", "-d",
+                cwd=str(self.workdir),
+            )
 
         await self._wait_for_wordpress()
         self.wp_cli = WPCli(self.container_name)

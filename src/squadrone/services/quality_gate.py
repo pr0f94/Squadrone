@@ -7,7 +7,6 @@ LLM critic and live sandbox verification.
 
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +14,7 @@ from typing import Any
 
 from ..schemas.finding import Finding
 from ..schemas.hypothesis import BugClass, Hypothesis, TriagedArtifact
+from .artifacts import atomic_write_json
 
 
 TRUSTED_ROLE_RE = re.compile(
@@ -342,8 +342,7 @@ def apply_quality_gate(
     triaged.rejected = rejected
     triaged.manual_review = manual_review
     if artifact_path is not None:
-        artifact_path.parent.mkdir(parents=True, exist_ok=True)
-        artifact_path.write_text(json.dumps(decisions, indent=2))
+        atomic_write_json(artifact_path, decisions)
     return triaged
 
 

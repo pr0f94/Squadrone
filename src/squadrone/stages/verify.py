@@ -17,6 +17,7 @@ from ..agents.runtime import AgentRuntime
 from ..schemas.config import PipelineConfig
 from ..schemas.finding import DedupStatus, Finding, PoCAttempt, PoCStatus
 from ..schemas.hypothesis import Hypothesis, TriagedArtifact
+from ..services.artifacts import atomic_write_jsonl, atomic_write_text, read_jsonl_models
 from ..services.budget import BudgetTracker
 from ..services.decision_ledger import append_decision
 from ..services.sandbox import SandboxManager
@@ -28,14 +29,14 @@ _XSS_CHECK_SRC = (_pkg_files("squadrone") / "poc_templates" / "xss_check.py").re
 _WP_LOGIN_SRC = (_pkg_files("squadrone") / "poc_templates" / "wp_login.py").read_text()
 
 
-def _zip_plugin(plugin_path: str, slug: str) -> str:
+def _zip_plugin(plugin_path: str, slug: str) -> tuple[str, Path]:
     """Create a zip with the plugin folder at top level — wp plugin install expects this."""
     src = Path(plugin_path).resolve()
     staging = Path(tempfile.mkdtemp(prefix=f"squadrone-zip-{slug}-"))
     target = staging / slug
     shutil.copytree(src, target)
     out = shutil.make_archive(str(staging / slug), "zip", root_dir=str(staging), base_dir=slug)
-    return out
+    return out, staging
 
 
 def _next_finding_id() -> str:
@@ -271,11 +272,11 @@ async def _verify_one(
 
     poc_dir.mkdir(parents=True, exist_ok=True)
     # Drop the xss_check helper next to the PoC scripts so they can `from xss_check import ...`.
-    (poc_dir / "xss_check.py").write_text(_XSS_CHECK_SRC)
+    atomic_write_text(poc_dir / "xss_check.py", _XSS_CHECK_SRC)
     # Drop the wp_login helper too — robust GET-then-POST flow with the
     # `wordpress_test_cookie` handled. Eliminates "admin login failed" false
     # negatives caused by PoC scripts skipping the GET prime step.
-    (poc_dir / "wp_login.py").write_text(_WP_LOGIN_SRC)
+    atomic_write_text(poc_dir / "wp_login.py", _WP_LOGIN_SRC)
     attempts: list[PoCAttempt] = []
     last_evidence: dict = {}
 
@@ -459,7 +460,7 @@ async def _verify_one(
                 extra_context=extra_ctx or None,
             )
             script_path = poc_dir / f"iter_{iteration}.py"
-            script_path.write_text(script)
+            atomic_write_text(script_path, script)
 
             result = await sb.run_poc(str(script_path))
             attempt = PoCAttempt(
@@ -633,7 +634,7 @@ async def run(
     run_id: str = "",
     developer: DeveloperAgent | None = None,
 ) -> list[Finding]:
-    plugin_zip = _zip_plugin(plugin_path, triaged.plugin_slug)
+    plugin_zip, plugin_zip_staging = _zip_plugin(plugin_path, triaged.plugin_slug)
     logger.info("verify: zipped plugin to %s", plugin_zip)
 
     # Thread plugin_version through to _verify_one for W10 cache keying.
@@ -644,7 +645,7 @@ async def run(
         if intake_path.exists():
             plugin_version = IntakeArtifact.from_json_file(str(intake_path)).plugin_version
     except Exception:
-        pass
+        logger.warning("verify: failed to read intake metadata for cache key", exc_info=True)
 
     findings: list[Finding] = []
     run_dir = Path(runs_root) / run_id
@@ -658,14 +659,27 @@ async def run(
     # either iter_*.py (PoC iterations were written) or error.log (failure recorded).
     previously_confirmed: dict[str, Finding] = {}
     if findings_path.exists() and findings_path.stat().st_size > 0:
-        for line in findings_path.read_text().splitlines():
-            if not line.strip():
-                continue
-            try:
-                f = Finding.model_validate_json(line)
-                previously_confirmed[f.hypothesis.id] = f
-            except Exception:
-                pass  # malformed line — ignore, will be overwritten
+        parsed, corrupt_count = read_jsonl_models(
+            findings_path,
+            Finding,
+            corrupt_path=run_dir / "findings_corrupt.jsonl",
+        )
+        for f in parsed:
+            previously_confirmed[f.hypothesis.id] = f
+        if corrupt_count:
+            logger.warning(
+                "verify: quarantined %d malformed findings.jsonl line(s) to %s",
+                corrupt_count,
+                run_dir / "findings_corrupt.jsonl",
+            )
+            append_decision(
+                run_dir,
+                stage="verify",
+                action="recover",
+                result="corrupt_findings_quarantined",
+                reason=f"{corrupt_count} malformed findings.jsonl line(s)",
+                artifact=run_dir / "findings_corrupt.jsonl",
+            )
         if previously_confirmed:
             logger.info("verify: resuming with %d previously confirmed findings",
                         len(previously_confirmed))
@@ -673,9 +687,7 @@ async def run(
 
     # Open findings.jsonl in append mode after preserving prior content.
     # Re-write what we have so the file is the canonical source of truth.
-    with findings_path.open("w") as f:
-        for fnd in findings:
-            f.write(fnd.model_dump_json() + "\n")
+    atomic_write_jsonl(findings_path, findings)
 
     # W3: persistent-sandbox path — boot one sandbox at scan level, snapshot baseline,
     # restore between hypotheses. Cuts ~80% of sandbox cost for multi-hypothesis runs.
@@ -756,7 +768,8 @@ async def run(
                 import traceback
                 tb = traceback.format_exc()
                 logger.exception("verify: hypothesis %s raised: %s", hyp.id, e)
-                (hyp_dir / "error.log").write_text(
+                atomic_write_text(
+                    hyp_dir / "error.log",
                     f"=== Exception during verify for {hyp.id} ===\n"
                     f"hypothesis: {hyp.bug_class.value} {hyp.file}:{hyp.line}\n"
                     f"sink: {hyp.sink}\n\n"
@@ -775,7 +788,8 @@ async def run(
             # Detect silent failures — completed normally but no iter files were written.
             iter_files = sorted(hyp_dir.glob("iter_*.py"))
             if not iter_files and not (hyp_dir / "error.log").exists():
-                (hyp_dir / "error.log").write_text(
+                atomic_write_text(
+                    hyp_dir / "error.log",
                     f"=== Silent failure for {hyp.id} ===\n"
                     f"_verify_one returned without raising an exception, but no iter files\n"
                     f"were written. This usually means SandboxManager.__aenter__() raised an\n"
@@ -822,6 +836,7 @@ async def run(
                 shutil.rmtree(persistent_snapshot)
             except Exception:
                 pass
+        shutil.rmtree(plugin_zip_staging, ignore_errors=True)
 
     logger.info("verify: %d findings confirmed -> %s", len(findings), findings_path)
     return findings
