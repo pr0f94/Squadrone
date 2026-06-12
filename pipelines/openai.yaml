@@ -7,14 +7,17 @@
 # When the first chatgpt/* model call is made, LiteLLM prints a code and
 # https://auth.openai.com/codex/device URL; complete the flow once.
 #
-# Available models (LiteLLM 1.83.14 chatgpt provider registry):
-#   chatgpt/gpt-5.4, chatgpt/gpt-5.4,
+# Available models:
+#   chatgpt/gpt-5.5 via Squadrone's temporary LiteLLM compatibility patch,
+#   cloned from the known-working chatgpt/gpt-5.4 registry metadata.
+#   The upstream LiteLLM 1.83.14 chatgpt provider registry includes:
+#   chatgpt/gpt-5.4, chatgpt/gpt-5.4-pro,
 #   chatgpt/gpt-5.3-codex, chatgpt/gpt-5.3-codex-spark,
 #   chatgpt/gpt-5.3-instant, chatgpt/gpt-5.3-chat-latest,
 #   chatgpt/gpt-5.2, chatgpt/gpt-5.2-codex,
 #   chatgpt/gpt-5.1-codex-max, chatgpt/gpt-5.1-codex-mini
-# All route through the Responses API (mode=responses) with function calling
-# and structured output supported. No gpt-5.5 and no *-mini in this registry.
+# ChatGPT models route through the Responses API (mode=responses) with function
+# calling and structured output supported.
 #
 # Billing: usage counts against the ChatGPT subscription quota, not the API
 # dollar balance. The on-disk LiteLLM token-usage numbers may not map cleanly
@@ -28,20 +31,20 @@ developer_calls_per_agent: 7
 
 models:
   # Frontier tier
-  critic: chatgpt/gpt-5.4              # Wordfence/Patchstack scope + severity decisions
-  developer: chatgpt/gpt-5.4           # WordPress-internals expert + initial sandbox setup
-  chain_synthesizer: chatgpt/gpt-5.4   # Cross-specialist exploit-chain reasoning
+  critic: chatgpt/gpt-5.5              # Wordfence/Patchstack scope + severity decisions
+  developer: chatgpt/gpt-5.5           # WordPress-internals expert + initial sandbox setup
+  chain_synthesizer: chatgpt/gpt-5.5   # Cross-specialist exploit-chain reasoning
 
   # Balanced tier
-  specialists: chatgpt/gpt-5.4
-  surveyor: chatgpt/gpt-5.4
-  poc_author: chatgpt/gpt-5.4
+  specialists: chatgpt/gpt-5.5
+  surveyor: chatgpt/gpt-5.5
+  poc_author: chatgpt/gpt-5.5
 
   # Cost-efficient tier
-  developer_followup: chatgpt/gpt-5.4    # Structured diagnostic
-  reporter: chatgpt/gpt-5.4              # Per-finding markdown formatting
-  dedup_fallback: chatgpt/gpt-5.4        # Similarity matching
-  hypothesis_verifier: chatgpt/gpt-5.4   # Per-hypothesis source-quote check (highest volume)
+  developer_followup: chatgpt/gpt-5.5    # Structured diagnostic
+  reporter: chatgpt/gpt-5.5              # Per-finding markdown formatting
+  dedup_fallback: chatgpt/gpt-5.5        # Similarity matching
+  hypothesis_verifier: chatgpt/gpt-5.5   # Per-hypothesis source-quote check (highest volume)
 
 llm:
   reasoning_effort: high

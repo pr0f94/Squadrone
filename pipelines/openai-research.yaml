@@ -1,0 +1,142 @@
+# OpenAI research pipeline.
+#
+# This uses the ChatGPT-subscription model routing from pipelines/openai.yaml,
+# including Squadrone's temporary chatgpt/gpt-5.5 LiteLLM compatibility patch,
+# and enables quality toggles that improve grounding, scope decisions,
+# deduplication, and manual follow-up artifacts.
+#
+# Use with:
+#   squadrone scan <slug> --budget 10.00 --config pipelines/openai-research.yaml
+
+cost_ceiling_usd: 10.00
+max_hypotheses_to_verify: 10
+sandbox_timeout_seconds: 120
+verify_max_iterations: 7
+developer_calls_per_agent: 7
+
+models:
+  critic: chatgpt/gpt-5.5
+  developer: chatgpt/gpt-5.5
+  chain_synthesizer: chatgpt/gpt-5.5
+  specialists: chatgpt/gpt-5.5
+  surveyor: chatgpt/gpt-5.5
+  poc_author: chatgpt/gpt-5.5
+  developer_followup: chatgpt/gpt-5.5
+  reporter: chatgpt/gpt-5.5
+  dedup_fallback: chatgpt/gpt-5.5
+  hypothesis_verifier: chatgpt/gpt-5.5
+
+llm:
+  reasoning_effort: high
+  verbosity: high
+
+reasoning:
+  critic: high
+  developer: high
+  chain_synthesizer: high
+  specialists: high
+  poc_author: medium
+  hypothesis_verifier: high
+  developer_followup: high
+  surveyor: high
+  reporter: medium
+  dedup_fallback: medium
+
+sandbox:
+  wordpress_image: wordpress:latest
+  db_image: mariadb:10.11
+  wp_admin_user: admin
+  wp_admin_pass: password
+  wp_admin_email: admin@test.local
+  wp_url: http://localhost:8080
+
+vuln_dbs:
+  wordfence:
+    base_url: https://www.wordfence.com/api/intelligence/v2
+  wpscan:
+    base_url: https://wpscan.com/api/v3
+
+stages:
+  - intake
+  - recon
+  - hypothesis
+  - triage
+  - verify
+  - dedup
+  - report
+
+intake:
+  bundle_wp_core: false
+  classify_files: false
+  fetch_changelog: false
+  detect_closed: false
+  wp_core_version: latest
+
+recon:
+  deterministic_analysis: true
+  validate_entry_points: false
+  trace_cross_file_callees: false
+  scan_nonce_emissions: false
+  exclude_vendor_tests_lang: false
+  enrich_entry_points: false
+  negative_pattern_reference: false
+  cache_enabled: false
+  max_entries_to_validate: 30
+
+hypothesis:
+  specialist_grep_read_tools: false
+  specialist_wp_idioms: true
+  require_branch_enumeration: false
+  require_exploit_classification: false
+  require_bounty_fit_pretagging: false
+  self_critique_pass: false
+  iterative_verifier: true
+  verifier_max_iterations: 3
+  verifier_require_citation: true
+  verifier_wp_idioms: true
+  verifier_drop_categorisation: true
+  verifier_cache_enabled: false
+  pre_verifier_dedup: false
+
+triage:
+  inject_review_md: true
+  cluster_aware: true
+  allow_reframing: false
+  drift_logging: true
+  cache_enabled: true
+  review_md_max_chars: 12000
+  verifier_votes: 1
+
+quality:
+  enabled: true
+  require_evidence_schema: true
+  false_positive_rules: true
+  recompute_severity: true
+  finding_grader: true
+  report_grader: true
+  focus_area_fanout: true
+  reject_below_submit_bar: true
+
+verify:
+  headless_browser_check: false
+  persistent_sandbox: false
+  payload_variants: false
+  state_introspection_on_failure: true
+  manual_review_handoff: true
+  negative_control: true
+  collaborative_dev_poc_loop: false
+  cache_enabled: false
+  payload_variant_cap: 6
+  headless_browser_timeout_s: 15
+
+dedup:
+  meaningful_scoring: true
+  submission_recommendation: true
+  review_md_signal: true
+
+report:
+  claim_validation_pass: false
+  submission_readiness_gate: true
+  poc_bundling: true
+  screenshot_capture: false
+  submission_json: true

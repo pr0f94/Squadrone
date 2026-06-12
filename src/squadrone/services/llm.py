@@ -10,6 +10,7 @@ LiteLLM is the only LLM transport used by the application.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import logging
@@ -26,6 +27,9 @@ from .budget import BudgetTracker
 DEFAULT_CACHE_DB = "cache/llm.sqlite"
 
 logger = logging.getLogger(__name__)
+
+CHATGPT_55_MODEL = "chatgpt/gpt-5.5"
+CHATGPT_55_SOURCE_MODEL = "chatgpt/gpt-5.4"
 
 
 def _ensure_parent(path: str) -> None:
@@ -65,6 +69,45 @@ def _coerce_response_api_usage(response: object) -> object:
             pass
 
     return response
+
+
+def _install_chatgpt_55_model_patch() -> bool:
+    """Register chatgpt/gpt-5.5 in LiteLLM's in-memory model map.
+
+    LiteLLM's ChatGPT provider can route gpt-5.5 through the Codex backend, but
+    some released model registries do not list `chatgpt/gpt-5.5` yet. Clone the
+    known-working `chatgpt/gpt-5.4` metadata for the current Python process only.
+    This does not modify LiteLLM's package files on disk and becomes a no-op once
+    upstream LiteLLM ships native metadata for the target model.
+    """
+    model_cost = getattr(litellm, "model_cost", None)
+    if not isinstance(model_cost, dict):
+        return False
+
+    if CHATGPT_55_MODEL in model_cost:
+        return False
+
+    source = model_cost.get(CHATGPT_55_SOURCE_MODEL)
+    if not source:
+        return False
+
+    patched = copy.deepcopy(source)
+    patched["litellm_provider"] = "chatgpt"
+    patched["mode"] = "responses"
+    model_cost[CHATGPT_55_MODEL] = patched
+
+    chatgpt_models = getattr(litellm, "chatgpt_models", None)
+    if isinstance(chatgpt_models, set):
+        chatgpt_models.add(CHATGPT_55_MODEL)
+    elif isinstance(chatgpt_models, list) and CHATGPT_55_MODEL not in chatgpt_models:
+        chatgpt_models.append(CHATGPT_55_MODEL)
+
+    logger.info(
+        "registered %s in LiteLLM model map from %s metadata",
+        CHATGPT_55_MODEL,
+        CHATGPT_55_SOURCE_MODEL,
+    )
+    return True
 
 
 async def init_cache(cache_db: str = DEFAULT_CACHE_DB) -> None:
@@ -224,6 +267,7 @@ def _install_chatgpt_aggregator_patch() -> None:
 
 
 # Install at import time so any caller of call_llm() benefits.
+_install_chatgpt_55_model_patch()
 _install_chatgpt_aggregator_patch()
 
 
@@ -239,9 +283,9 @@ async def call_llm(
 ) -> dict:
     """Direct LiteLLM completion with on-disk response cache.
 
-    For `chatgpt/...` models, `_install_chatgpt_aggregator_patch()` (called
-    at module-import time) normalizes streamed output items into the final
-    response's `output` field.
+    For `chatgpt/...` models, module-import compatibility patches register
+    chatgpt/gpt-5.5 when missing from LiteLLM's registry and normalize streamed
+    output items into the final response's `output` field.
     """
     _ensure_parent(cache_db)
     options = dict(llm_options or {})
