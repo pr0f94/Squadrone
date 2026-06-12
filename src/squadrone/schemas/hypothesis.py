@@ -92,6 +92,9 @@ class TriagedArtifact(JSONFileMixin):
     accepted: list[Hypothesis]
     rejected: list[dict]
     merged: list[dict]
+    # Candidates that are source-grounded enough to preserve but not strong enough
+    # for automatic verification/reporting. These are emitted to the manual queue.
+    manual_review: list[dict] = []
     # T4: optional list of hypotheses where the critic suggests re-framing rather than accept/reject.
     # Each entry: {"hypothesis_id": str, "suggested_framing": str, "reason_original_rejected": str}
     request_reframing: list[dict] = []

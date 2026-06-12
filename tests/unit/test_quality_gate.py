@@ -71,6 +71,24 @@ def test_apply_quality_gate_moves_rejections():
     assert gated.rejected[0]["hypothesis_id"] == "h-4"
 
 
+def test_apply_quality_gate_routes_borderline_to_manual_review():
+    borderline = _hypothesis(
+        id="h-5",
+        bug_class=BugClass.WEAK_CRYPTO,
+        entry_point="custom_magic_link_handler",
+        reasoning="Weak crypto appears to protect a magic link token, but impact needs manual confirmation.",
+        preconditions="authenticated user",
+    )
+    artifact = TriagedArtifact(plugin_slug="demo", accepted=[borderline], rejected=[], merged=[])
+
+    gated = apply_quality_gate(artifact)
+
+    assert gated.accepted == []
+    assert gated.rejected == []
+    assert gated.manual_review[0]["hypothesis_id"] == "h-5"
+    assert gated.manual_review[0]["source"] == "quality_gate"
+
+
 def test_recompute_severity_maps_owasp():
     severity = recompute_severity(_hypothesis(bug_class=BugClass.SQLI))
     assert severity["owasp_2021"] == "A03:2021-Injection"

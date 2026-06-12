@@ -17,7 +17,9 @@ from .agents.developer import DeveloperAgent
 from .agents.runtime import AgentRuntime
 from .schemas.config import PipelineConfig
 from .schemas.finding import DedupStatus, Finding
+from .schemas.hypothesis import Hypothesis
 from .services.budget import BudgetExceededError, BudgetTracker
+from .services.decision_ledger import append_decision
 from .services.llm import init_cache
 from .services import verify_helpers
 from .services.quality_gate import apply_quality_gate
@@ -62,6 +64,86 @@ class ScanResult(BaseModel):
     duration_seconds: float
     report_paths: list[str]
     cache_hit_rate: float = 0.0  # 0.0–1.0; fraction of input tokens served from prompt cache
+
+
+def _hypothesis_from_manual_item(item: dict) -> Optional[Hypothesis]:
+    try:
+        hyp_data = item.get("hypothesis")
+        if not hyp_data:
+            return None
+        return Hypothesis.model_validate(hyp_data)
+    except Exception:
+        return None
+
+
+def _emit_triage_manual_review_queue(
+    triaged: TriagedArtifact,
+    run_dir: Path,
+    plugin_slug: str,
+) -> int:
+    import json as _json
+
+    marker_path = run_dir / "manual_review_queued.json"
+    queued_ids: set[str] = set()
+    if marker_path.exists():
+        try:
+            data = _json.loads(marker_path.read_text())
+            queued_ids = {str(x) for x in data.get("hypothesis_ids", [])}
+        except Exception:
+            queued_ids = set()
+
+    queued = 0
+    for item in triaged.manual_review:
+        item_id = str(item.get("hypothesis_id") or "")
+        if item_id and item_id in queued_ids:
+            continue
+        hyp = _hypothesis_from_manual_item(item)
+        if hyp is None:
+            append_decision(
+                run_dir,
+                stage="manual_queue",
+                action="error",
+                result="missing_hypothesis",
+                hypothesis_id=str(item.get("hypothesis_id") or ""),
+                reason="manual-review item did not contain a valid hypothesis payload",
+                artifact=run_dir / "triaged.json",
+            )
+            continue
+        hyp_dir = run_dir / "verifications" / hyp.id
+        hyp_dir.mkdir(parents=True, exist_ok=True)
+        reason = str(item.get("reason") or "triage/manual quality gate requested manual review")
+        verify_helpers.write_manual_scaffold(
+            hyp,
+            hyp_dir,
+            plugin_slug,
+            "",
+            handoff_reason=reason,
+        )
+        verify_helpers.emit_to_manual_review_queue(
+            hyp,
+            run_dir,
+            reason=reason,
+            verifier_notes={
+                "source": item.get("source") or "triage",
+                "manual_review": True,
+                "rules": item.get("rules") or [],
+                "warnings": item.get("warnings") or [],
+            },
+        )
+        append_decision(
+            run_dir,
+            stage="manual_queue",
+            action="enqueue",
+            result=str(item.get("source") or "triage"),
+            hypothesis_id=hyp.id,
+            reason=reason,
+            artifact=hyp_dir / "manual_scaffold",
+        )
+        queued += 1
+        queued_ids.add(hyp.id)
+    if queued:
+        marker_path.write_text(_json.dumps({"hypothesis_ids": sorted(queued_ids)}, indent=2))
+    return queued
 
 
 async def _init_db() -> None:
@@ -336,6 +418,7 @@ async def run_scan(
             })
         elif no_triage:
             from .schemas.hypothesis import Confidence as _Conf
+            import json as _json_quality
             _rank = {_Conf.HIGH: 0, _Conf.MEDIUM: 1, _Conf.LOW: 2}
             accepted = sorted(hyps.hypotheses, key=lambda h: _rank.get(h.confidence, 99))
             cap = config.max_hypotheses_to_verify
@@ -343,18 +426,62 @@ async def run_scan(
                 plugin_slug=hyps.plugin_slug,
                 accepted=accepted[:cap], rejected=[], merged=[],
             )
+            for hyp in triaged.accepted:
+                append_decision(
+                    run_dir,
+                    stage="triage",
+                    action="accept",
+                    result="accepted_no_triage",
+                    hypothesis_id=hyp.id,
+                    reason="triage skipped by --no-triage",
+                    artifact=run_dir / "triaged.json",
+                )
+            for hyp in accepted[cap:]:
+                append_decision(
+                    run_dir,
+                    stage="triage",
+                    action="drop",
+                    result="capped_before_verification",
+                    hypothesis_id=hyp.id,
+                    reason=f"max_hypotheses_to_verify cap {cap}",
+                    artifact=run_dir / "triaged.json",
+                )
             if config.quality.enabled and config.quality.finding_grader:
+                quality_path = run_dir / "quality_gate_triage.json"
                 triaged = apply_quality_gate(
                     triaged,
                     require_evidence_schema=config.quality.require_evidence_schema,
                     false_positive_rules=config.quality.false_positive_rules,
                     recompute=config.quality.recompute_severity,
                     reject_below_submit_bar=config.quality.reject_below_submit_bar,
-                    artifact_path=run_dir / "quality_gate_triage.json",
+                    borderline_to_manual_review=config.quality.borderline_to_manual_review,
+                    artifact_path=quality_path,
                 )
+                if quality_path.exists():
+                    try:
+                        for decision in _json_quality.loads(quality_path.read_text()):
+                            accepted_by_gate = bool(decision.get("accepted"))
+                            disposition = str(decision.get("disposition") or ("accepted" if accepted_by_gate else "rejected"))
+                            append_decision(
+                                run_dir,
+                                stage="quality_gate",
+                                action="manual_review" if disposition == "manual_review" else "accept" if accepted_by_gate else "reject",
+                                result=disposition,
+                                hypothesis_id=str(decision.get("hypothesis_id") or ""),
+                                reason=str(decision.get("reason") or ""),
+                                artifact=quality_path,
+                                details={
+                                    "rules": decision.get("rules") or [],
+                                    "warnings": decision.get("warnings") or [],
+                                    "severity": decision.get("severity") or {},
+                                },
+                            )
+                    except Exception as exc:
+                        logger.warning("scan %s: failed to mirror quality gate decisions into ledger: %s", run_id, exc)
             triaged.to_json_file(str(run_dir / "triaged.json"))
             await _emit(on_event, "triage", "done", {
                 "accepted": len(triaged.accepted), "rejected": 0, "merged": 0,
+                "manual_review": len(triaged.manual_review),
                 "spent": budget.spent, "skipped": "no_triage",
             })
         else:
@@ -366,7 +493,15 @@ async def run_scan(
             )
             await _emit(on_event, "triage", "done", {
                 "accepted": len(triaged.accepted), "rejected": len(triaged.rejected),
-                "merged": len(triaged.merged), "spent": budget.spent,
+                "merged": len(triaged.merged), "manual_review": len(triaged.manual_review),
+                "spent": budget.spent,
+            })
+
+        triage_manual_queued = _emit_triage_manual_review_queue(triaged, run_dir, intake.plugin_slug)
+        if triage_manual_queued:
+            await _emit(on_event, "manual_queue", "done", {
+                "manual_queued": triage_manual_queued,
+                "reason": "triage_or_quality_gate",
             })
 
         # ---- verify ----
@@ -396,6 +531,15 @@ async def run_scan(
                         "triage_accepted": True,
                         "verification_skipped": True,
                     },
+                )
+                append_decision(
+                    run_dir,
+                    stage="verify",
+                    action="manual_review",
+                    result="verification_skipped",
+                    hypothesis_id=hyp.id,
+                    reason="verification skipped by --no-verify",
+                    artifact=run_dir / "verifications" / hyp.id / "manual_scaffold",
                 )
                 manual_queued += 1
             await _emit(on_event, "verify", "skipped", {
@@ -445,17 +589,41 @@ async def run_scan(
             await _emit(on_event, "report", "done", {"reports": len(report_paths), "spent": budget.spent})
 
         status = "complete"
+        append_decision(
+            run_dir,
+            stage="_pipeline",
+            action="finish",
+            result=status,
+            details={"findings": len(findings), "cost_usd": budget.spent},
+        )
 
     except BudgetExceededError as e:
         logger.warning("scan %s: budget exceeded — %s", run_id, e)
         await _persist_findings(run_id, plugin_slug, findings)
         status = "budget_exceeded"
+        append_decision(
+            run_dir,
+            stage="_pipeline",
+            action="finish",
+            result=status,
+            reason=str(e),
+            details={"findings": len(findings), "cost_usd": budget.spent},
+        )
         await _emit(on_event, "_pipeline", "budget_exceeded", {"message": str(e)})
 
     except Exception as e:
         logger.exception("scan %s: failed — %s", run_id, e)
         (run_dir / "error.log").write_text(traceback.format_exc())
         status = "failed"
+        append_decision(
+            run_dir,
+            stage="_pipeline",
+            action="finish",
+            result=status,
+            reason=str(e),
+            artifact=run_dir / "error.log",
+            details={"findings": len(findings), "cost_usd": budget.spent},
+        )
         await _emit(on_event, "_pipeline", "failed", {"message": str(e)})
 
     finally:

@@ -12,6 +12,7 @@ from ..schemas.config import PipelineConfig
 from ..schemas.finding import DedupStatus, Finding
 from ..services import report_helpers
 from ..services.budget import BudgetTracker
+from ..services.decision_ledger import append_decision
 from ..services.quality_gate import grade_finding_for_report
 
 logger = logging.getLogger(__name__)
@@ -62,6 +63,15 @@ async def run(
     for f in findings:
         if f.dedup_status == DedupStatus.KNOWN_DUPE:
             logger.info("report: skipping %s (KNOWN_DUPE)", f.id)
+            append_decision(
+                run_dir,
+                stage="report",
+                action="skip",
+                result="known_duplicate",
+                hypothesis_id=f.hypothesis.id,
+                finding_id=f.id,
+                reason="dedup_status is known_dupe",
+            )
             continue
 
         if config.quality.enabled and config.quality.report_grader:
@@ -96,6 +106,17 @@ async def run(
                     )
                     out_paths.append(str(blocked_path))
                     logger.info("report: quality gate blocked %s (%s) — wrote %s", f.id, program, blocked_path)
+                    append_decision(
+                        run_dir,
+                        stage="report",
+                        action="block",
+                        result="quality_gate_blocked",
+                        hypothesis_id=f.hypothesis.id,
+                        finding_id=f.id,
+                        reason=grade.reason,
+                        artifact=blocked_path,
+                        details={"program": program, "rules": grade.rules, "warnings": grade.warnings},
+                    )
                 continue
 
         # R2: submission readiness gate — emit *_NOT_READY.md instead of polished report
@@ -109,6 +130,16 @@ async def run(
                     not_ready_path.write_text(report_helpers.render_not_ready_md(f, checklist))
                     out_paths.append(str(not_ready_path))
                     logger.info("report: NOT READY for %s (%s) — wrote %s", f.id, program, not_ready_path)
+                    append_decision(
+                        run_dir,
+                        stage="report",
+                        action="block",
+                        result="not_ready",
+                        hypothesis_id=f.hypothesis.id,
+                        finding_id=f.id,
+                        artifact=not_ready_path,
+                        details={"program": program, "checklist": checklist},
+                    )
                 continue
 
         code_slice = None
@@ -157,12 +188,33 @@ async def run(
                     out_paths.append(str(blocked_path))
                     logger.warning("report: %s (%s) — claim validation BLOCKED (%d blocking claims) — %s",
                                    f.id, program, len(blocking), blocked_path)
+                    append_decision(
+                        run_dir,
+                        stage="report",
+                        action="block",
+                        result="claim_validation_blocked",
+                        hypothesis_id=f.hypothesis.id,
+                        finding_id=f.id,
+                        reason=validation_summary,
+                        artifact=blocked_path,
+                        details={"program": program, "blocking_claims": len(blocking)},
+                    )
                     continue
 
             out = run_dir / f"report_{f.id}_{program}.md"
             out.write_text(md)
             out_paths.append(str(out))
             logger.info("report: wrote %s (%d bytes, program=%s)", out, len(md), program)
+            append_decision(
+                run_dir,
+                stage="report",
+                action="write",
+                result="report_written",
+                hypothesis_id=f.hypothesis.id,
+                finding_id=f.id,
+                artifact=out,
+                details={"program": program, "bytes": len(md)},
+            )
             if validation_summary:
                 logger.info("report: %s validator: %s", f.id, validation_summary)
 

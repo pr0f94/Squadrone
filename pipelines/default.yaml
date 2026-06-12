@@ -100,6 +100,7 @@ quality:
   report_grader: true
   focus_area_fanout: true
   reject_below_submit_bar: true
+  borderline_to_manual_review: true # keep borderline evidence/impact cases in manual queue instead of hard rejecting
 
 # Stage 5 (verify) opt-in features — all default off.
 # W1 (proper HTML parser) is unconditional — already shipped in xss_check.py (no toggle).

@@ -16,7 +16,7 @@ What you get:
 - **One-command plugin scans** from a WordPress.org plugin slug
 - **Specialist agent coverage** across auth, auth-flow, object authorization, state changes, payment logic, injection, file ops, SSRF/deserialization, stored-to-admin paths, XSS, and logic flaws
 - **Source-grounded triage** against exploitability and Wordfence/Patchstack scope rules
-- **Strict quality gates** that reject admin-only, self-only, config-dependent, and low-impact findings before they waste review time
+- **Balanced quality gates** that reject clear false positives while preserving borderline evidence or impact for manual review
 - **Sandbox verification** with an isolated WordPress install and iterative PoC attempts
 - **Known-vulnerability deduplication** against Wordfence Intelligence and WPScan when API keys are available
 - **Private report drafts** for novel findings, with no auto-submit path
@@ -51,7 +51,7 @@ Each scan writes artifacts under `plugins/<slug>/runs/<run_id>/`.
 Intake      version 1.7.2 · files 42 · lines 4,812
 Recon       entry points 8 · sinks 3
 Hypothesis  count 2
-Triage      accepted 1 · rejected 1 · merged 0
+Triage      accepted 1 · rejected 1 · merged 0 · manual review 0
 Verify      findings 1
 Report      reports 2
 ```
@@ -63,10 +63,10 @@ The SQLite index is created automatically at `db/squadrone.sqlite` on first use.
 1. Pulls plugin source from `plugins.svn.wordpress.org`.
 2. Maps attack surface: reachable entry points, nonce/capability checks, risky sinks, plugin type, sensitive objects, custom roles/capabilities, and high-risk workflows.
 3. Runs role-aware and workflow-aware specialist LLM agents with on-demand `grep_plugin`, `glob_plugin`, and `read_plugin_file` tools instead of dumping the full plugin into context.
-4. Self-verifies hypotheses to drop fabricated sinks and missed-guard claims.
+4. Self-verifies hypotheses to drop only definitely ungrounded claims such as fabricated sinks, impossible bug classes, or explicit missed guards.
 5. Builds a focus-area map for AJAX/REST, forms, files, auth, SQL, payment logic, and rendering paths.
-6. Triages survivors against exploitability and bounty-scope rules, including an adversarial rejection pass when multiple triage votes are used.
-7. Applies strict quality gates: evidence completeness, WordPress false-positive rules, and derived severity.
+6. Triages survivors against exploitability and bounty-scope rules, including an adversarial rejection pass when multiple triage votes are used; split votes are routed to manual review.
+7. Applies balanced quality gates: evidence completeness, WordPress false-positive rules, derived severity, and manual-review routing for borderline cases.
 8. Builds a one-shot Docker WordPress sandbox for accepted hypotheses.
 9. Iteratively runs LLM-authored Python PoCs against the sandbox.
 10. Deduplicates confirmed findings against Wordfence Intelligence and WPScan when keys are configured.
@@ -206,24 +206,28 @@ Output by default:
 - `plugins/<slug>/runs/<run_id>/chain_diagnostics.json` when `--chain` is used
 - `plugins/<slug>/runs/<run_id>/triaged.jsonl`
 - `plugins/<slug>/runs/<run_id>/quality_gate_triage.json`
+- `plugins/<slug>/runs/<run_id>/manual_review_queued.json` when triage or quality gates queue manual review
 - `plugins/<slug>/runs/<run_id>/findings.jsonl`
+- `plugins/<slug>/runs/<run_id>/decision_ledger.jsonl`
 - `plugins/<slug>/runs/<run_id>/trace.jsonl`
 - `plugins/<slug>/runs/<run_id>/report_<finding_id>_<program>.md`
 
 When `--no-verify` is used, triage-accepted hypotheses are first graded by the quality gate, then written to the manual review queue instead of `findings.jsonl`; no submission reports are generated.
 
+When triage voting or the quality gate cannot make a clean automatic decision, the hypothesis is preserved in the manual review queue. The per-run `decision_ledger.jsonl` records the exact stage, action, result, reason, and artifact path for each keep, reject, manual-review, verification, dedup, and report decision.
+
 ## Quality gates
 
 Squadrone's default pipelines enable strict quality controls. These are deterministic checks inspired by verifier/grader harnesses:
 
-- **Finding grader before manual queue** rejects candidates without realistic submit-worthy impact.
-- **WordPress false-positive rules** reject admin-only, self-XSS, own-resource-only, config-dependent, cosmetic, open redirect, and low-impact CSRF cases.
+- **Finding grader before verification** accepts strong candidates, hard-rejects clear false positives, and routes borderline evidence or impact to manual review.
+- **WordPress false-positive rules** reject admin-only, self-XSS, own-resource-only, cosmetic, open redirect, and low-impact CSRF cases; borderline submit-worthiness can be preserved for manual review.
 - **Evidence-first schema** annotates each survivor with attacker role, source, sink, affected file/function, guard discussion, impact statement, and bounty routing.
 - **Severity recomputation** derives an internal CVSS-style score and OWASP 2021 category instead of trusting model-written severity.
 - **Report grader** blocks confirmed findings from becoming polished reports if the evidence or impact does not meet the submission bar.
 - **Focused review fanout** writes `focus_areas.json` and feeds the attack-surface map into specialist review.
 - **V2 methodology** is the default: the surveyor maps plugin type, sensitive objects, roles, and workflows; specialists review object authorization, state changes, payment logic, and stored-to-admin paths alongside classic vulnerability classes.
-- **Verifier voting** is available with `--triage-votes N`; use `3` or `5` when quality matters more than runtime. In multi-vote mode, the final critic pass is adversarial and tries to reject weak findings before acceptance.
+- **Verifier voting** is available with `--triage-votes N`; use `3` or `5` when quality matters more than runtime. In multi-vote mode, majority-accepted findings continue, zero-accept findings reject, and split votes go to manual review.
 - **Exploit-chain synthesis** is available with `--chain`; it enriches hypotheses with `chains_with`, `chain_impact`, and `chain_severity_bump`, and writes `chain_diagnostics.json` so skipped, failed, and empty chain passes are distinguishable.
 
 Use `--no-strict-quality` for exploratory scans where you want more raw hypotheses.

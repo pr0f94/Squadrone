@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from ..services.console_format import (
     format_triage_reframe,
     format_triage_reject,
 )
+from ..services.decision_ledger import append_decision
 from ..services.quality_gate import apply_quality_gate
 from .hypothesis import _build_code_slices
 
@@ -57,9 +59,20 @@ def _combine_vote_artifacts(votes: list[TriagedArtifact], original: HypothesesAr
 
     accepted = []
     rejected = []
+    manual_review = []
     for h_id, count in accepted_counts.items():
         if count >= threshold:
             accepted.append(accepted_objects.get(h_id, by_id[h_id]))
+        elif count > 0:
+            reasons = rejection_reasons.get(h_id) or ["critic vote split below acceptance threshold"]
+            manual_review.append({
+                "hypothesis_id": h_id,
+                "reason": f"triage_votes: accepted {count}/{len(votes)}; split vote requires manual review — {reasons[0]}",
+                "source": "triage_votes",
+                "accepted_votes": count,
+                "total_votes": len(votes),
+                "hypothesis": by_id[h_id].model_dump(mode="json"),
+            })
         else:
             reasons = rejection_reasons.get(h_id) or ["critic vote majority rejected"]
             rejected.append({
@@ -71,6 +84,7 @@ def _combine_vote_artifacts(votes: list[TriagedArtifact], original: HypothesesAr
         accepted=accepted,
         rejected=rejected,
         merged=merged,
+        manual_review=manual_review,
         request_reframing=reframes,
     )
 
@@ -133,6 +147,12 @@ async def run(
         logger.info(format_triage_merge(merge))
     for reframe in triaged.request_reframing:
         logger.info(format_triage_reframe(reframe))
+    for item in triaged.manual_review:
+        logger.info(
+            "triage: manual review %s — %s",
+            item.get("hypothesis_id"),
+            item.get("reason"),
+        )
 
     scope_rejects = sum(1 for r in triaged.rejected if (r.get("reason") or "").startswith("out_of_scope:"))
     if scope_rejects:
@@ -143,19 +163,98 @@ async def run(
     accepted_sorted = sorted(triaged.accepted, key=lambda h: _CONF_RANK.get(h.confidence, 99))
     if len(accepted_sorted) > cap:
         logger.info("triage: capping accepted from %d to %d", len(accepted_sorted), cap)
+        run_dir = Path(runs_root) / run_id
+        for h in accepted_sorted[cap:]:
+            append_decision(
+                run_dir,
+                stage="triage",
+                action="drop",
+                result="capped_before_verification",
+                hypothesis_id=h.id,
+                reason=f"max_hypotheses_to_verify cap {cap}",
+                details={"votes": votes},
+            )
         accepted_sorted = accepted_sorted[:cap]
     triaged.accepted = accepted_sorted
 
+    run_dir = Path(runs_root) / run_id
+    for h in triaged.accepted:
+        append_decision(
+            run_dir,
+            stage="triage",
+            action="accept",
+            result="accepted",
+            hypothesis_id=h.id,
+            artifact=run_dir / "triaged.json",
+            details={"votes": votes},
+        )
+    for rejection in triaged.rejected:
+        append_decision(
+            run_dir,
+            stage="triage",
+            action="reject",
+            result="rejected",
+            hypothesis_id=str(rejection.get("hypothesis_id") or ""),
+            reason=str(rejection.get("reason") or ""),
+            artifact=run_dir / "triaged.json",
+            details={"votes": votes},
+        )
+    for item in triaged.manual_review:
+        append_decision(
+            run_dir,
+            stage="triage",
+            action="manual_review",
+            result=str(item.get("source") or "manual_review"),
+            hypothesis_id=str(item.get("hypothesis_id") or ""),
+            reason=str(item.get("reason") or ""),
+            artifact=run_dir / "triaged.json",
+            details={"votes": votes},
+        )
+    for merge in triaged.merged:
+        append_decision(
+            run_dir,
+            stage="triage",
+            action="merge",
+            result="merged",
+            hypothesis_id=str(merge.get("hypothesis_id") or merge.get("source_id") or ""),
+            reason=str(merge.get("reason") or ""),
+            artifact=run_dir / "triaged.json",
+            details={"merge": merge},
+        )
+
     if config.quality.enabled and config.quality.finding_grader:
         before = len(triaged.accepted)
+        quality_path = run_dir / "quality_gate_triage.json"
         triaged = apply_quality_gate(
             triaged,
             require_evidence_schema=config.quality.require_evidence_schema,
             false_positive_rules=config.quality.false_positive_rules,
             recompute=config.quality.recompute_severity,
             reject_below_submit_bar=config.quality.reject_below_submit_bar,
-            artifact_path=Path(runs_root) / run_id / "quality_gate_triage.json",
+            borderline_to_manual_review=config.quality.borderline_to_manual_review,
+            artifact_path=quality_path,
         )
+        if quality_path.exists():
+            try:
+                for decision in json.loads(quality_path.read_text()):
+                    accepted = bool(decision.get("accepted"))
+                    disposition = str(decision.get("disposition") or ("accepted" if accepted else "rejected"))
+                    append_decision(
+                        run_dir,
+                        stage="quality_gate",
+                        action="manual_review" if disposition == "manual_review" else "accept" if accepted else "reject",
+                        result=disposition,
+                        hypothesis_id=str(decision.get("hypothesis_id") or ""),
+                        reason=str(decision.get("reason") or ""),
+                        artifact=quality_path,
+                        details={
+                            "rules": decision.get("rules") or [],
+                            "warnings": decision.get("warnings") or [],
+                            "severity": decision.get("severity") or {},
+                        },
+                    )
+            except Exception as exc:
+                logger.warning("triage: failed to mirror quality gate decisions into ledger: %s", exc)
         logger.info("triage: quality gate accepted %d/%d", len(triaged.accepted), before)
 
     out_path = Path(runs_root) / run_id / "triaged.jsonl"

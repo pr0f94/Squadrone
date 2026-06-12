@@ -136,6 +136,7 @@ quality:
   report_grader: true
   focus_area_fanout: true
   reject_below_submit_bar: true
+  borderline_to_manual_review: true
 
 verify:
   headless_browser_check: false

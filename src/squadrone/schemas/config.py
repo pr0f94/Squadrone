@@ -152,6 +152,7 @@ class QualityConfig(BaseModel):
     report_grader: bool = True            # grade confirmed findings before generating reports
     focus_area_fanout: bool = True        # write focus-area map and feed it to specialist context
     reject_below_submit_bar: bool = True  # reject accepted hypotheses that lack realistic submit-worthy impact
+    borderline_to_manual_review: bool = True # route borderline impact/evidence cases to manual queue instead of hard reject
 
 
 class HypothesisConfig(BaseModel):

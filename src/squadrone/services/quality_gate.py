@@ -73,6 +73,13 @@ class Grade:
     rules: list[str]
 
 
+MANUAL_REVIEW_RULES = {
+    "missing_code_location_or_sink",
+    "configuration_dependent",
+    "below_submit_bar",
+}
+
+
 def _text(h: Hypothesis) -> str:
     return " ".join(
         str(x or "")
@@ -274,11 +281,13 @@ def apply_quality_gate(
     false_positive_rules: bool = True,
     recompute: bool = True,
     reject_below_submit_bar: bool = True,
+    borderline_to_manual_review: bool = True,
     artifact_path: Path | None = None,
 ) -> TriagedArtifact:
     accepted: list[Hypothesis] = []
     decisions: list[dict[str, Any]] = []
     rejected = list(triaged.rejected)
+    manual_review = list(triaged.manual_review)
     for h in triaged.accepted:
         grade = grade_hypothesis(
             h,
@@ -288,9 +297,21 @@ def apply_quality_gate(
             reject_below_submit_bar=reject_below_submit_bar,
         )
         annotate_hypothesis(h, grade)
+        manual_review_candidate = (
+            borderline_to_manual_review
+            and not grade.accepted
+            and bool(grade.rules)
+            and set(grade.rules).issubset(MANUAL_REVIEW_RULES)
+        )
+        disposition = (
+            "accepted" if grade.accepted
+            else "manual_review" if manual_review_candidate
+            else "rejected"
+        )
         decisions.append({
             "hypothesis_id": h.id,
             "accepted": grade.accepted,
+            "disposition": disposition,
             "reason": grade.reason,
             "evidence": grade.evidence,
             "severity": grade.severity,
@@ -299,6 +320,17 @@ def apply_quality_gate(
         })
         if grade.accepted:
             accepted.append(h)
+        elif manual_review_candidate:
+            manual_review.append({
+                "hypothesis_id": h.id,
+                "reason": grade.reason,
+                "source": "quality_gate",
+                "rules": grade.rules,
+                "warnings": grade.warnings,
+                "evidence": grade.evidence,
+                "derived_severity": grade.severity,
+                "hypothesis": h.model_dump(mode="json"),
+            })
         else:
             rejected.append({
                 "hypothesis_id": h.id,
@@ -308,6 +340,7 @@ def apply_quality_gate(
             })
     triaged.accepted = accepted
     triaged.rejected = rejected
+    triaged.manual_review = manual_review
     if artifact_path is not None:
         artifact_path.parent.mkdir(parents=True, exist_ok=True)
         artifact_path.write_text(json.dumps(decisions, indent=2))

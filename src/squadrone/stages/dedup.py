@@ -8,6 +8,7 @@ from pathlib import Path
 from ..schemas.config import PipelineConfig
 from ..schemas.finding import DedupStatus, Finding
 from ..services import dedup_helpers
+from ..services.decision_ledger import append_decision
 from ..services.vuln_db import VulnDBClient, VulnMatch
 
 logger = logging.getLogger(__name__)
@@ -144,6 +145,20 @@ async def run(
             logger.info("dedup: %s — recommendation: %s", f.id, rec)
 
         logger.info("dedup: %s -> %s (matches=%d)", f.id, status.value, len(matches))
+        append_decision(
+            Path(runs_root) / run_id,
+            stage="dedup",
+            action="classify",
+            result=status.value,
+            hypothesis_id=f.hypothesis.id,
+            finding_id=f.id,
+            artifact=Path(runs_root) / run_id / "findings.jsonl",
+            details={
+                "matches": len(matches),
+                "submission_recommendation": f.submission_recommendation,
+                "submission_recommendation_reason": f.submission_recommendation_reason,
+            },
+        )
 
     findings_path = Path(runs_root) / run_id / "findings.jsonl"
     findings_path.parent.mkdir(parents=True, exist_ok=True)

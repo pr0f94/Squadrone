@@ -28,6 +28,7 @@ from ..schemas.hypothesis import HypothesesArtifact, Hypothesis
 from ..schemas.recon import ReconArtifact
 from ..services.budget import BudgetTracker
 from ..services.console_format import format_verifier_decision
+from ..services.decision_ledger import append_decision
 from ..services.quality_gate import build_focus_area_summary, render_focus_area_prompt
 
 
@@ -313,32 +314,78 @@ async def run(
     drop_categories: dict[str, str] = {}      # V5: track category per drop for reporting
     manual_review_queue: list[dict] = []       # V5: hypotheses needing human review
     keep_conditional: dict[str, str] = {}      # V5: track conditional keeps + their condition
+    run_dir = Path(runs_root) / run_id
 
     for h, v in zip(merged, verdicts):
         if isinstance(v, BaseException):
             logger.warning("verifier crashed for %s: %s — keeping by default", h.id, v)
             kept.append(h)
+            append_decision(
+                run_dir,
+                stage="hypothesis_verifier",
+                action="keep",
+                result="kept_by_default",
+                hypothesis_id=h.id,
+                reason=str(v),
+            )
             continue
         if v.verdict in KEEP_VERDICTS:
             kept.append(h)
             if v.verdict == "keep_conditional":
                 keep_conditional[h.id] = v.reason
+            append_decision(
+                run_dir,
+                stage="hypothesis_verifier",
+                action="keep",
+                result=v.verdict,
+                hypothesis_id=h.id,
+                reason=v.reason,
+                details={"citation": v.citation} if v.citation else None,
+            )
         elif v.verdict in DROP_VERDICTS:
             drop_reasons[h.id] = v.reason
             drop_categories[h.id] = v.verdict
             logger.info(format_verifier_decision(h, v.verdict, v.reason, citation=v.citation))
+            append_decision(
+                run_dir,
+                stage="hypothesis_verifier",
+                action="drop",
+                result=v.verdict,
+                hypothesis_id=h.id,
+                reason=v.reason,
+                artifact=run_dir / "hypothesis_verifier_drops.json",
+                details={"citation": v.citation} if v.citation else None,
+            )
         elif v.verdict in ESCALATE_VERDICTS:
             manual_review_queue.append({
                 "id": h.id, "reason": v.reason, "citation": v.citation,
                 "hypothesis": h.model_dump(mode="json"),
             })
             logger.info(format_verifier_decision(h, v.verdict, v.reason, citation=v.citation))
+            append_decision(
+                run_dir,
+                stage="hypothesis_verifier",
+                action="manual_review",
+                result=v.verdict,
+                hypothesis_id=h.id,
+                reason=v.reason,
+                artifact=run_dir / "hypothesis_manual_review_queue.json",
+                details={"citation": v.citation} if v.citation else None,
+            )
         else:
             logger.warning("verifier returned unknown verdict %r for %s — keeping by default", v.verdict, h.id)
             kept.append(h)
+            append_decision(
+                run_dir,
+                stage="hypothesis_verifier",
+                action="keep",
+                result="unknown_verdict_kept_by_default",
+                hypothesis_id=h.id,
+                reason=f"unknown verdict: {v.verdict}",
+            )
 
     if drop_reasons:
-        verifier_path = Path(runs_root) / run_id / "hypothesis_verifier_drops.json"
+        verifier_path = run_dir / "hypothesis_verifier_drops.json"
         verifier_path.parent.mkdir(parents=True, exist_ok=True)
         import json as _json
         # Store reason + category (when V5 enabled) for downstream analysis
@@ -350,7 +397,7 @@ async def run(
         logger.info("hypothesis: verifier dropped %d/%d -> %s",
                     len(drop_reasons), len(merged), verifier_path)
     if manual_review_queue:
-        manual_path = Path(runs_root) / run_id / "hypothesis_manual_review_queue.json"
+        manual_path = run_dir / "hypothesis_manual_review_queue.json"
         manual_path.parent.mkdir(parents=True, exist_ok=True)
         import json as _json2
         manual_path.write_text(_json2.dumps(manual_review_queue, indent=2))

@@ -18,6 +18,7 @@ from ..schemas.config import PipelineConfig
 from ..schemas.finding import DedupStatus, Finding, PoCAttempt, PoCStatus
 from ..schemas.hypothesis import Hypothesis, TriagedArtifact
 from ..services.budget import BudgetTracker
+from ..services.decision_ledger import append_decision
 from ..services.sandbox import SandboxManager
 from ..services import verify_helpers
 
@@ -646,6 +647,7 @@ async def run(
         pass
 
     findings: list[Finding] = []
+    run_dir = Path(runs_root) / run_id
     verifications_dir = Path(runs_root) / run_id / "verifications"
     findings_path = Path(runs_root) / run_id / "findings.jsonl"
     findings_path.parent.mkdir(parents=True, exist_ok=True)
@@ -706,6 +708,14 @@ async def run(
         for hyp in triaged.accepted:
             if hyp.id in previously_confirmed:
                 logger.info("verify: %s — skipping (already confirmed in prior run)", hyp.id)
+                append_decision(
+                    run_dir,
+                    stage="verify",
+                    action="skip",
+                    result="previously_confirmed",
+                    hypothesis_id=hyp.id,
+                    artifact=findings_path,
+                )
                 continue
             hyp_dir = verifications_dir / hyp.id
             # Already-attempted check: if the dir has iter files or an error log, we
@@ -715,6 +725,14 @@ async def run(
             ):
                 logger.info("verify: %s — skipping (already attempted, no confirm). "
                             "Delete %s to retry.", hyp.id, hyp_dir)
+                append_decision(
+                    run_dir,
+                    stage="verify",
+                    action="skip",
+                    result="previously_attempted_not_confirmed",
+                    hypothesis_id=hyp.id,
+                    artifact=hyp_dir,
+                )
                 continue
             logger.info("verify: %s (%s)", hyp.id, hyp.bug_class.value)
             hyp_dir.mkdir(parents=True, exist_ok=True)
@@ -744,6 +762,15 @@ async def run(
                     f"sink: {hyp.sink}\n\n"
                     f"{tb}"
                 )
+                append_decision(
+                    run_dir,
+                    stage="verify",
+                    action="error",
+                    result="exception",
+                    hypothesis_id=hyp.id,
+                    reason=str(e),
+                    artifact=hyp_dir / "error.log",
+                )
                 continue
             # Detect silent failures — completed normally but no iter files were written.
             iter_files = sorted(hyp_dir.glob("iter_*.py"))
@@ -760,10 +787,28 @@ async def run(
                 )
                 logger.warning("verify: hypothesis %s — no iter files written and no exception raised", hyp.id)
             if finding is None:
+                append_decision(
+                    run_dir,
+                    stage="verify",
+                    action="reject",
+                    result="not_confirmed",
+                    hypothesis_id=hyp.id,
+                    artifact=hyp_dir,
+                )
                 continue
             findings.append(finding)
             with findings_path.open("a") as f:
                 f.write(finding.model_dump_json() + "\n")
+            append_decision(
+                run_dir,
+                stage="verify",
+                action="confirm",
+                result=finding.poc_status.value,
+                hypothesis_id=hyp.id,
+                finding_id=finding.id,
+                artifact=findings_path,
+                details={"poc_script_path": finding.poc_script_path},
+            )
     finally:
         # W3: tear down persistent sandbox at end of scan
         if persistent_sb is not None:

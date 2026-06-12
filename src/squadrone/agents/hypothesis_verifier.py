@@ -264,7 +264,9 @@ class HypothesisVerifier:
                 "(e.g. nonce reachability); explain the condition in `reason`\n"
                 "- `keep_insufficient_evidence` — source slice/tooling was insufficient; "
                 "defer to triage/verification instead of dropping\n"
-                "- `drop_definitely_not_a_bug` — explicit upstream guard cited at file:line\n"
+                "- `drop_definitely_not_a_bug` — only when the sink is hallucinated, the "
+                "bug class is impossible from the cited source, or an explicit upstream "
+                "guard is cited at file:line\n"
                 "- `escalate_to_manual_review` — your confidence is below threshold; route to human"
             )
         return "".join(parts)
