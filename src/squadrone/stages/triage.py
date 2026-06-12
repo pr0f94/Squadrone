@@ -108,6 +108,7 @@ async def run(
     votes = max(1, triage_cfg.verifier_votes)
     vote_artifacts: list[TriagedArtifact] = []
     for vote_idx in range(votes):
+        review_mode = "adversarial" if votes > 1 and vote_idx == votes - 1 else "standard"
         critic = CriticAgent(
             runtime,
             model=config.models.critic,
@@ -118,9 +119,10 @@ async def run(
             cache_enabled=triage_cfg.cache_enabled and votes == 1,
             review_md_max_chars=triage_cfg.review_md_max_chars,
             plugin_version=plugin_version_for_cache,
+            review_mode=review_mode,
         )
         if votes > 1:
-            logger.info("triage: critic vote %d/%d", vote_idx + 1, votes)
+            logger.info("triage: critic vote %d/%d (%s)", vote_idx + 1, votes, review_mode)
         vote_artifacts.append(await critic.review(hypotheses, code_slices, apply_scope_filter=apply_scope_filter))
     triaged = _combine_vote_artifacts(vote_artifacts, hypotheses)
     for h in triaged.accepted:

@@ -16,7 +16,7 @@ from .hypothesis import (
     TriagedArtifact,
 )
 from .intake import IntakeArtifact
-from .recon import EntryPoint, ReconArtifact, Sink, StaticCallEdge, StaticCallback
+from .recon import EntryPoint, ReconArtifact, SecurityProfile, Sink, StaticCallEdge, StaticCallback
 
 __all__ = [
     "BugClass",
@@ -33,6 +33,7 @@ __all__ = [
     "PoCStatus",
     "ReconArtifact",
     "SandboxConfig",
+    "SecurityProfile",
     "Sink",
     "StaticCallEdge",
     "StaticCallback",

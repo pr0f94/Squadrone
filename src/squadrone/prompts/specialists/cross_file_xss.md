@@ -27,6 +27,11 @@ What you must do:
 4. Confirm the write site is reachable by a user level below the read site's
    audience (e.g. Subscriber writes a profile field, Admin views it in admin
    page — stored XSS in admin context, severity high).
+5. Identify the exact output context at the read site: HTML body, HTML
+   attribute, URL, JavaScript string, JSON-in-script, or CSS. Escaping must be
+   correct for that context.
+6. State whether moderation/approval or a premium/default-disabled feature is
+   required before the privileged viewer sees the stored value.
 
 What NOT to emit:
 
@@ -39,6 +44,9 @@ What NOT to emit:
   attribute, not URL).
 - Speculative chains where you cannot point to a specific storage key shared
   by both sites.
+- Admin-only write and admin-only read paths with no lower-privileged storage
+  step.
+- HTML-only injection without JavaScript execution potential.
 
 You will receive a JSON object with `plugin_slug`, `recon`, and `code_slices`
 containing the FULL corpus (not pre-filtered). For each suspected bug emit a

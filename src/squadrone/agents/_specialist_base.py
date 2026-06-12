@@ -112,6 +112,43 @@ Examples that demand verification:
 """
 
 
+_V2_METHODOLOGY = """
+
+## Squadrone V2 methodology: role-aware workflow review
+
+Do not behave like a sink-only scanner. For every candidate, prove a concrete
+security story:
+
+1. **Attacker role**: unauthenticated, subscriber, contributor, author, customer,
+   vendor, editor, shop manager, administrator, or custom role.
+2. **Object/workflow**: identify the object or workflow being affected
+   (submission, order, booking, file, user, option, template, payment, etc.).
+3. **Security rule**: state the rule that should have blocked the attacker
+   (ownership, capability, payment, approval, nonce plus authorization, token
+   binding, default configuration).
+4. **Source-to-sink proof**: show that attacker-controlled data reaches the
+   sink with the required guard missing or bypassed.
+5. **Impact**: explain what the attacker gets that they should not get.
+
+Use `recon.security_profile` when present. It summarizes plugin type, sensitive
+objects, custom roles/capabilities, state-changing workflows, payment/webhook
+routes, import/export routes, and stored-input-to-privileged-view paths. Treat it
+as a focus map, not proof: still cite exact code for every hypothesis.
+
+Reject weak shapes before emitting:
+- admin-only behavior with no privilege boundary
+- public analytics/view-count manipulation
+- logout or notice-dismissal CSRF
+- fixed/public asset reads such as constrained `style.css`
+- configuration-dependent findings requiring unsafe admin setup
+- self-XSS or own-object-only behavior
+- premium/default-disabled paths without current unmodified evidence
+
+Prefer fewer, stronger hypotheses. A useful empty list is better than a noisy
+set of maybe-bugs.
+"""
+
+
 _TOOL_LOOP_EXPLORATION_INSTRUCTIONS = """
 
 ## Source-exploration tools
@@ -174,7 +211,7 @@ async def run_specialist(
     priority_files: Optional[list[str]] = None,
 ) -> HypothesesArtifact:
     cfg = hypothesis_cfg or HypothesisConfig()  # all-False defaults
-    parts = [load_prompt(prompt_path), "\n\n", load_prompt("specialists/_shared_rules")]
+    parts = [load_prompt(prompt_path), "\n\n", load_prompt("specialists/_shared_rules"), _V2_METHODOLOGY]
     if cfg.specialist_wp_idioms:
         parts.append("\n\n# Reference: WordPress idioms\n\n")
         parts.append(load_prompt("_wp_idioms"))

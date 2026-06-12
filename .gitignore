@@ -16,6 +16,7 @@ __pycache__/
 htmlcov/
 
 # Runtime scan artifacts and downloaded plugin corpora.
+plugins.txt
 plugins/
 cache/
 db/*.sqlite

@@ -38,7 +38,7 @@ COSMETIC_RE = re.compile(
     re.IGNORECASE,
 )
 IMPACT_RE = re.compile(
-    r"\b(admin account|privilege escalation|account takeover|rce|remote code|file delete|arbitrary file|stored xss|delete|modify other|sensitive|payment|subscription|order|webhook|ssrf|sql injection|data exfil)\b",
+    r"\b(admin account|privilege escalation|account takeover|rce|remote code|file delete|arbitrary file|stored xss|delete|modify other|sensitive|payment|subscription|order|webhook|ssrf|sql injection|data exfil|booking|invoice|submission|approval|protected content|downloadable|paid status|cross-user|another user's)\b",
     re.IGNORECASE,
 )
 SOURCE_RE = re.compile(r"\$_(?:GET|POST|REQUEST|COOKIE|FILES|SERVER)|REST|AJAX|shortcode|form|upload", re.IGNORECASE)

@@ -24,6 +24,18 @@ Rules:
 - Use the provided template for the bug class as your starting point
 - Target: the TARGET_URL provided in the user message
 - Credentials: **use the USER_ACCOUNTS table provided in the user message** — these are the exact accounts the sandbox actually provisioned. Do not invent credentials. Pick the lowest-privilege account that satisfies your hypothesis preconditions (e.g. a missing-authz claim should be tested with `subscriber_user`, not `admin`, to prove low-priv reachability).
+- Start with the smallest raw HTTP proof of the base bug. Do not build exploit
+  chains, reverse shells, or complex browser automation until the base
+  vulnerability is proven.
+- For object-authorization bugs, create or identify two users/objects when the
+  sandbox state allows it, then prove user A can access or change user B's
+  object. Include a negative control where the same request should fail.
+- For state-change bugs, prove the state changed through the real entry point
+  and print the before/after state.
+- For payment/workflow bugs, prove the protected paid/approved/downloadable
+  outcome without a legitimate server-verified payment or owner relationship.
+- For stored-to-admin/XSS bugs, first submit through the low-privileged write
+  path, then trigger the natural privileged render path.
 - Never hit external URLs
 - Script must print clear SUCCESS or FAILURE with evidence
 - Never prove a vulnerability by directly seeding the malicious payload into the database, options table, post meta, user meta, filesystem, or other sink storage. You may use setup-created benign state, but the PoC itself must deliver the attacker-controlled value through a real plugin/WordPress entry point reachable by the claimed attacker role.

@@ -129,6 +129,80 @@ def _accumulate_usage(acc: dict, usage: Optional[dict]) -> None:
             acc[k] = acc.get(k, 0) + int(usage[k])
 
 
+_ROOT_LIST_KEYS = (
+    "hypotheses",
+    "findings",
+    "vulnerabilities",
+    "issues",
+    "candidates",
+    "results",
+    "result",
+    "output",
+    "data",
+    "items",
+    "chains",
+    "entries",
+)
+
+_EMPTY_RESULT_KEYS = {
+    "summary",
+    "reason",
+    "rationale",
+    "message",
+    "notes",
+    "analysis",
+    "status",
+}
+
+_EMPTY_RESULT_MARKERS = (
+    "no confirmed",
+    "no valid",
+    "no vulnerabilities",
+    "no vulnerability",
+    "no issues",
+    "no issue",
+    "no findings",
+    "no finding",
+    "nothing found",
+    "empty",
+)
+
+
+def _normalise_schema_payload(parsed: object, output_schema: type[BaseModel]) -> object:
+    """Accept common LLM wrapper shapes before strict Pydantic validation.
+
+    RootModel[list[T]] schemas are intentionally terse in prompts, but models
+    sometimes wrap the list as {"hypotheses": [...]} or even
+    [{"hypotheses": [...]}] after a repair turn. Normalise only those obvious
+    list-wrapper shapes; leave all other payloads untouched so validation still
+    catches real schema drift.
+    """
+    if not getattr(output_schema, "__pydantic_root_model__", False):
+        return parsed
+
+    def unwrap(value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        for key in _ROOT_LIST_KEYS:
+            candidate = value.get(key)
+            if isinstance(candidate, list):
+                return candidate
+        list_values = [candidate for candidate in value.values() if isinstance(candidate, list)]
+        if len(list_values) == 1:
+            return list_values[0]
+        if value and set(value).issubset(_EMPTY_RESULT_KEYS):
+            text = " ".join(str(item).lower() for item in value.values())
+            if any(marker in text for marker in _EMPTY_RESULT_MARKERS):
+                return []
+        return value
+
+    if isinstance(parsed, dict):
+        return unwrap(parsed)
+    if isinstance(parsed, list) and len(parsed) == 1:
+        return unwrap(parsed[0])
+    return parsed
+
+
 # Sliding-window trim defaults. 80KB is roughly 20K input tokens, leaving
 # headroom for the model's reply while keeping tool-loop conversations bounded.
 _TRIM_THRESHOLD_BYTES = 80_000
@@ -393,7 +467,8 @@ class LiteLLMTransport:
                 err = f"Your response was not valid JSON: {e}. Output ONLY the JSON now, no prose, no fences."
             else:
                 try:
-                    validated = output_schema.model_validate(parsed)
+                    normalised = _normalise_schema_payload(parsed, output_schema)
+                    validated = output_schema.model_validate(normalised)
                     return AgentResult(
                         output=validated,
                         token_usage=usage_acc,
@@ -404,6 +479,23 @@ class LiteLLMTransport:
                     err = f"Your JSON failed schema validation:\n{e}\nFix it and return ONLY the corrected JSON."
 
             if attempt == 2:
+                if getattr(output_schema, "__pydantic_root_model__", False):
+                    try:
+                        empty = output_schema.model_validate([])
+                    except ValidationError:
+                        pass
+                    else:
+                        runtime._trace(agent_name, "schema_fallback_empty_list", {"reason": err[:500]})
+                        logger.warning(
+                            "%s returned invalid list JSON after retry; treating as empty result",
+                            agent_name,
+                        )
+                        return AgentResult(
+                            output=empty,
+                            token_usage=usage_acc,
+                            developer_calls_made=dev_calls[0],
+                            iterations=iteration,
+                        )
                 raise AgentOutputError(f"{agent_name}: schema validation failed after retry — {err}")
 
             msgs.append({"role": "assistant", "content": final_content})

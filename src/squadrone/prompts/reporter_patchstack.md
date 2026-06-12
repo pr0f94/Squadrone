@@ -22,7 +22,11 @@ Use the provided PLUGIN_VERSION verbatim in the `Affected version(s)` field and 
 If any of the following are true, the finding is out of scope for Patchstack and you should refuse to write the report — instead output a single line `OUT_OF_PATCHSTACK_SCOPE: <reason>` and stop:
 
 - Estimated CVSS v3.1 base score is below 6.5
+- Finding was not tested against the latest stable version
+- Finding requires modified plugin/theme source, a locally bypassed feature gate, or guessed premium behavior
+- Premium component finding without the original, unmodified archive available for validation
 - Attack Complexity: High (requires winning a race, password knowledge, or another non-trivial precondition)
+- XSS that is not site-wide stored XSS or reflected XSS with JavaScript execution
 - Contributor-or-higher stored XSS
 - Open redirect; CSS injection; HTML-only injection without JS execution
 - 2FA bypass; brute-force/rate-limit issues
@@ -120,7 +124,7 @@ A brief honesty check, four to seven bullets:
 - **Reflection check:** does the PoC evidence demonstrate exploitation, or only string reflection / encoded payload?
 - **Dedup:** Is the dedup status NOVEL? If POSSIBLY_KNOWN, name the prior CVE and explain whether this is the same code path or a residual variant.
 - **Pre-requisite:** Is the chosen pre-requisite role the lowest that works? Confirm it's Unauthenticated, Subscriber, or Customer (anything else is out of scope).
-- **Caveats Patchstack will push back on:** AC:H reliance, default-disabled feature, identifier-guessing requirement, expected functionality, missing CIA impact, multi-step preconditions.
+- **Caveats Patchstack will push back on:** AC:H reliance, default-disabled or premium-gated feature, modified source, missing original premium archive, identifier-guessing requirement, expected functionality, missing CIA impact, multi-step preconditions.
 
 # Tone and formatting rules
 

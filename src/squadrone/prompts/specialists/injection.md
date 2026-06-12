@@ -6,6 +6,9 @@ SQL injection — every $wpdb call:
 - Correct $wpdb->prepare() with %s/%d → SAFE
 - User input inside the format string of prepare() → SQLi despite prepare()
 - sprintf/str_replace query building → evaluate carefully
+- Dynamic SQL identifiers are a separate risk: `ORDER BY`, `GROUP BY`, table
+  names, column names, taxonomy names, and meta keys are not protected by `%s`
+  value placeholders unless they are allowlisted or safely escaped as identifiers.
 
 Command injection — shell_exec, exec, system, passthru, popen, proc_open:
 - Any non-literal argument → evaluate escapeshellarg/cmd usage
@@ -19,6 +22,12 @@ target derives from request data without an allowlist. Even when `wp_redirect`
 calls `wp_validate_redirect()` the validator can be bypassed if `$_GET['host']`
 is appended to a trusted host (e.g. `https://trusted.tld.attacker.com`). Emit
 as CWE-601.
+
+Output-context checks for XSS-like injection are owned by XSS specialists, but
+when reviewing injection-adjacent rendering, classify the context explicitly:
+HTML body, HTML attribute, JavaScript string, JSON-in-script, URL, CSS, shortcode
+or rendered block. Escaping must match the context; global `wp_kses` is not a
+substitute for safe JavaScript or URL construction.
 
 You will receive a JSON object with `plugin_slug`, `recon`, and `code_slices`. For each suspected bug emit a Hypothesis with the fields:
 

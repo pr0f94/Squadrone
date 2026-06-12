@@ -75,6 +75,19 @@ Look for the following bug shapes:
    - "Update goal" / "Update raised amount" endpoints reachable to non-admin.
    - Refund flow that doesn't decrement the campaign total.
 
+9. APPROVAL / STATUS / TOKEN WORKFLOWS — any plugin domain where the attacker
+   gets a protected state without satisfying the rule:
+   - pending submission becomes approved without moderator authority.
+   - invitation, email-verification, or magic-link token is reusable across
+     users/actions or does not expire.
+   - booking/event/submission can be previewed, published, cancelled, or exported
+     by the wrong user.
+   - webhook or callback trusts a client-supplied success flag.
+
+Frame every finding as: "attacker gets X without satisfying Y." If you cannot
+name X and Y concretely, do not emit. Use `security_profile` from recon when
+present to focus on the plugin's real object model and workflows.
+
 Confidence HIGH: the unsafe primitive is clearly used in the financial /
 authorisation-relevant path, with concrete request-data flow.
 Confidence MEDIUM: the primitive is used but the reachability story needs

@@ -52,7 +52,10 @@ Suggested workflow:
    `has_capability_check`, and `capability`.
 4. Do NOT read every file — only the ones containing entry points or sinks you
    flagged. Aim for thoroughness on the attack surface, not exhaustive reading.
-5. When you have enough information, stop calling tools and output ONLY the
+5. Build `security_profile` from plugin type, object names, custom roles,
+   state-changing workflows, file/import/export/payment/webhook routes, and
+   low-privileged stored input that privileged users may later view.
+6. When you have enough information, stop calling tools and output ONLY the
    ReconArtifact JSON. No prose, no markdown fences.
 """
 

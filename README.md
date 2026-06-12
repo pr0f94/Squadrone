@@ -14,7 +14,7 @@ Most vulnerability scanners stop at patterns. Squadrone runs a full research pip
 What you get:
 
 - **One-command plugin scans** from a WordPress.org plugin slug
-- **Specialist agent coverage** across auth, auth-flow, injection, file ops, SSRF/deserialization, XSS, and logic flaws
+- **Specialist agent coverage** across auth, auth-flow, object authorization, state changes, payment logic, injection, file ops, SSRF/deserialization, stored-to-admin paths, XSS, and logic flaws
 - **Source-grounded triage** against exploitability and Wordfence/Patchstack scope rules
 - **Strict quality gates** that reject admin-only, self-only, config-dependent, and low-impact findings before they waste review time
 - **Sandbox verification** with an isolated WordPress install and iterative PoC attempts
@@ -61,11 +61,11 @@ The SQLite index is created automatically at `db/squadrone.sqlite` on first use.
 ## What it does
 
 1. Pulls plugin source from `plugins.svn.wordpress.org`.
-2. Maps attack surface: reachable entry points, nonce/capability checks, and risky sinks.
-3. Runs specialist LLM agents with on-demand `grep_plugin`, `glob_plugin`, and `read_plugin_file` tools instead of dumping the full plugin into context.
+2. Maps attack surface: reachable entry points, nonce/capability checks, risky sinks, plugin type, sensitive objects, custom roles/capabilities, and high-risk workflows.
+3. Runs role-aware and workflow-aware specialist LLM agents with on-demand `grep_plugin`, `glob_plugin`, and `read_plugin_file` tools instead of dumping the full plugin into context.
 4. Self-verifies hypotheses to drop fabricated sinks and missed-guard claims.
 5. Builds a focus-area map for AJAX/REST, forms, files, auth, SQL, payment logic, and rendering paths.
-6. Triages survivors against exploitability and bounty-scope rules.
+6. Triages survivors against exploitability and bounty-scope rules, including an adversarial rejection pass when multiple triage votes are used.
 7. Applies strict quality gates: evidence completeness, WordPress false-positive rules, and derived severity.
 8. Builds a one-shot Docker WordPress sandbox for accepted hypotheses.
 9. Iteratively runs LLM-authored Python PoCs against the sandbox.
@@ -222,7 +222,8 @@ Squadrone's default pipelines enable strict quality controls. These are determin
 - **Severity recomputation** derives an internal CVSS-style score and OWASP 2021 category instead of trusting model-written severity.
 - **Report grader** blocks confirmed findings from becoming polished reports if the evidence or impact does not meet the submission bar.
 - **Focused review fanout** writes `focus_areas.json` and feeds the attack-surface map into specialist review.
-- **Verifier voting** is available with `--triage-votes N`; use `3` or `5` when quality matters more than runtime.
+- **V2 methodology** is the default: the surveyor maps plugin type, sensitive objects, roles, and workflows; specialists review object authorization, state changes, payment logic, and stored-to-admin paths alongside classic vulnerability classes.
+- **Verifier voting** is available with `--triage-votes N`; use `3` or `5` when quality matters more than runtime. In multi-vote mode, the final critic pass is adversarial and tries to reject weak findings before acceptance.
 - **Exploit-chain synthesis** is available with `--chain`; it enriches hypotheses with `chains_with`, `chain_impact`, and `chain_severity_bump`, and writes `chain_diagnostics.json` so skipped, failed, and empty chain passes are distinguishable.
 
 Use `--no-strict-quality` for exploratory scans where you want more raw hypotheses.

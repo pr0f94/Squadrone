@@ -2,18 +2,39 @@
 
 **Companion to `wordfence_scope.md`.** Patchstack is the second bounty program we submit to. Use this when triaging whether a finding is bountyable through Patchstack vs Wordfence vs both.
 
-A finding must satisfy ALL the in-scope criteria AND avoid every out-of-scope rejection reason below.
+A finding must satisfy at least one accepted route below AND avoid every out-of-scope rejection reason. Source of truth: Patchstack report pages and Bug Bounty guidelines, current as of the June 1, 2026 scope update.
 
 ---
 
 ## In scope
 
-- WordPress core, plugins, and themes that are publicly distributed through WordPress.org, Envato, GitHub, or a similarly recognised repository.
+- WordPress core, plugins, and themes that are publicly distributed through WordPress.org, Envato, GitHub, or a similarly recognized repository.
 - Vulnerabilities with a clear, measurable security impact and a **CVSS v3.1 base score of 6.5 or higher**.
 - Components with at least **1,000 active installs**, OR **100+ active installs with CVSS 8.5+** AND exploitable as **Unauthenticated, Subscriber, or Customer**.
 - Component must have had a release within the last 3 years and the report must target the latest version.
 - For premium components, attach the original, unmodified archive so Patchstack can validate.
 - Custom roles must have capabilities equivalent to Subscriber or Customer. Roles that exceed those capabilities are out of scope.
+
+As of the June 1, 2026 update, a submission must meet at least one of these routes:
+
+1. **Zero-day full-site compromise route:** latest stable version, default settings, working exploit, and full site compromise as Unauthenticated, Subscriber, or Customer.
+2. **Accepted vulnerability type route:** one accepted class below, with the listed conditions met.
+3. **Patchstack mVDP route:** target is included in Patchstack mVDP scope and demonstrates measurable security impact. Contributor role remains accepted for mVDP submissions, although it may not receive XP.
+
+### Accepted vulnerability types and conditions
+
+- **SQL injection**
+- **Arbitrary file upload, deletion, or download** — must provide full control over both path and extension.
+- **Remote / arbitrary code execution**
+- **PHP object injection**
+- **Arbitrary settings change** — must involve WordPress options or settings with significant site impact.
+- **Privilege escalation** — must lead to Contributor access or higher.
+- **Local file inclusion or remote file inclusion** — must provide full control over both path and extension.
+- **Broken access control** — must expose significant or sensitive objects, such as API keys/secrets with demonstrated impact, password hashes, backup files, or SQL dumps.
+- **IDOR** — must lead to significant security impact. PII leakage alone, or interactions limited to attachments, tickets, events, orders, or appointments, are rejected.
+- **CSRF** — must result in one of the accepted write-related actions above.
+- **XSS** — accepted only as site-wide stored XSS or reflected XSS with JavaScript execution. Contributor-level stored XSS and HTML-only injection are out of scope.
+- **DoS** — must crash or deface the entire site, work on any environment, and not depend on excessive user input volume or expected functionality.
 
 ---
 
@@ -24,6 +45,7 @@ A finding must satisfy ALL the in-scope criteria AND avoid every out-of-scope re
 - Vulnerabilities where the plugin's own Permissions UI lets administrators grant a capability to a lower-priv role (Author/Editor/Contributor/Subscriber), exposing the issue to that role.
 - Expected functionality is not a vulnerability — e.g. a contact form that allows uploads does not qualify as DoS just because someone could submit large quantities of entries.
 - Authenticated shortcode issues without sensitive data disclosure.
+- Default-disabled or premium-gated features are not submission-ready unless tested on the actual unmodified component where that feature is legitimately enabled. Do not submit a PoC that requires editing the plugin, bypassing a feature gate, or changing source code.
 
 ### Scoring & identifier requirements
 - Any report involving **Attack Complexity: High (AC:H)**.
@@ -38,6 +60,8 @@ A finding must satisfy ALL the in-scope criteria AND avoid every out-of-scope re
 - Incomplete, inaccurate, or unverifiable information, or invalid vulnerability claims.
 - Unrealistic pre-requisites or exploitation scenarios.
 - Closed, inaccessible, or non-publicly-distributed components, or reports based on non-standard user roles.
+- Reports that were clearly not tested against the actual plugin or theme are rejected and can trigger a temporary ban.
+- Reports containing incorrect AI-generated assumptions are rejected and can trigger a temporary ban.
 - CSV injection, CAPTCHA bypasses, and IP spoofing.
 
 ### Information disclosure
@@ -47,6 +71,7 @@ A finding must satisfy ALL the in-scope criteria AND avoid every out-of-scope re
 - API key leakage that does not result in significant impact.
 
 ### XSS, HTML & CSS injection
+- XSS is accepted only when the PoC demonstrates JavaScript execution and the impact is site-wide stored XSS or reflected XSS.
 - Contributor-level (or higher) stored XSS.
 - HTML-only injection without JavaScript execution — e.g. injection into emails or rendered output where script execution is not possible.
 - CSS injection.
@@ -82,6 +107,9 @@ A finding must satisfy ALL the in-scope criteria AND avoid every out-of-scope re
 
 - **Install-count floor is far lower than Wordfence Standard tier (1,000 vs 50,000 for "all other" classes).** A finding rejected by Wordfence due to install count may still qualify for Patchstack.
 - **CVSS gate is strict (≥6.5).** Low-impact bugs that Wordfence accepts as "Special Note / Resourceful tier credit" will be rejected outright by Patchstack. Compute CVSS first; if <6.5, don't bother submitting.
-- **Plugins that direct security reports to Patchstack VDP are now in-scope candidates** for our scanning — they were previously rejected at the plugin-selection stage. The disclosure channel is the right destination, not a disqualifier.
+- **Latest stable and actual component are mandatory.** Do not submit findings validated only on old versions, modified source, or guessed premium behavior. Premium reports need the original unmodified archive.
+- **Default settings matter.** A bug that requires an admin to enable an unsafe option, grant extra permissions, or modify plugin code is usually out of scope unless it still meets an accepted route and has clear, significant impact.
+- **Plugins that direct security reports to Patchstack VDP are in-scope candidates** for our scanning — the disclosure channel is the right destination, not a disqualifier.
 - **For dual-eligible findings (≥6.5 CVSS, ≥50k installs, no Patchstack VDP redirect)**: prefer Wordfence (typically higher payouts), but Patchstack is the fallback if Wordfence rejects on scope/dedup grounds.
-- **Subscriber+ stored XSS** is in-scope here (Patchstack only excludes Contributor+); Wordfence is similar but use higher CVSS thresholds for Patchstack to avoid the 6.5 floor.
+- **Subscriber+ stored XSS is not automatically accepted.** It must still be site-wide stored XSS with JavaScript execution and CVSS >= 6.5. Contributor+ stored XSS is explicitly out of scope.
+- **Premium-gated or default-disabled paths need real validation.** If a payload can be stored or a sink exists in source, but the affected execution path is disabled in the tested component, do not submit based on a local patch that removes the gate. Keep it as "needs latest unmodified component validation" unless the exploit works unchanged in the current component under legitimate settings.

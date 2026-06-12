@@ -92,6 +92,14 @@ Look for the following bug shapes:
    a plugin that signs its own download-protection URLs with `md5($secret . $id)`
    is in scope. The auth_flow specialist owns these CWEs across the codebase.
 
+For all account/session/token findings, explicitly check:
+- token binding: user, action, object, role, and destination
+- expiry and one-time-use behavior
+- replay after password change, logout, account approval, or 2FA setup
+- whether email ownership is proven before the token grants account access
+- whether role assignment can be influenced by request data
+- whether bypass applies in default configuration
+
 Confidence HIGH: the unsafe primitive is clearly used in the security path,
 with a concrete reachability story.
 Confidence MEDIUM: the unsafe primitive is used but reachability needs more

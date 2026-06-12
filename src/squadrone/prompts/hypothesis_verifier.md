@@ -23,7 +23,7 @@ Make a single keep/drop decision based on these checks, in order:
    - CWE-502 (Object injection): the line must call `unserialize()` / `maybe_unserialize()` on data the attacker influences. If `allowed_classes => false` is in the same call AND the PHP version requirement is supported PHP (7.0+), downgrade severity but keep — note in `reason`.
    - CWE-611 (XXE): the line must call XML parsing with entity loading enabled.
    - CWE-601 (Open redirect): the line must redirect to attacker-controlled input with `wp_redirect`, `header('Location: ...')`, or equivalent, without `wp_safe_redirect` or a strict same-site allowlist.
-   - CWE-639 (IDOR): the slice must show object/user/resource lookup by request-controlled identifier where authorization is absent or weaker than ownership/capability requirements.
+   - CWE-639 (IDOR): the slice must show object/user/resource lookup by request-controlled identifier where authorization is absent or weaker than ownership/capability requirements. A broad login or nonce check is not object authorization; look for object-specific checks such as `current_user_can('edit_post', $id)`, owner/user/customer comparisons, or tenant/form/order binding.
    - CWE-915 (Mass assignment): the slice must pass attacker-controlled arrays/objects into user/meta/option/model update code without allowlisting the accepted fields.
    - CWE-287 (Authentication bypass): the slice must show authentication state being granted or accepted (`wp_set_current_user`, `wp_set_auth_cookie`, `wp_signon`, custom token acceptance, JWT/session validation) with cited weak or missing preconditions.
    - CWE-640 (Weak password recovery): the slice must show reset/recovery token generation, validation, delivery, or account recovery logic with a concrete weakness such as predictable token, missing expiry, insecure delivery, enumeration, or unlimited guessing.
@@ -31,14 +31,24 @@ Make a single keep/drop decision based on these checks, in order:
    - CWE-307 (Missing rate limit): the slice must show a login/OTP/reset/token-check endpoint or loop where repeated guessing is security-relevant and no throttle/lockout/rate-limit is visible.
    - CWE-327 (Weak cryptography): the slice must show a weak cryptographic primitive (`md5`, `sha1`, static IV/key, ECB mode, custom XOR/encryption, direct secret comparison) used for a security purpose such as login tokens, magic links, reset tokens, signatures, API keys, sessions, 2FA/OTP, download-protection links, or webhook validation. Do not drop only because it is a crypto CWE; drop only if the cited primitive is not security-sensitive or the hypothesis cannot cite the security purpose.
    - CWE-338 (Weak PRNG): the slice must show predictable randomness (`rand`, `mt_rand`, `uniqid`, `microtime`, timestamp concatenation, weak custom random function) used to generate a security-sensitive value such as a login token, reset token, API key, session id, OTP, CSRF token, or magic link. Random cache keys, nonces for UI-only behavior, or filenames without security impact are not enough.
-   - CWE-840 (Business logic flaw): the slice must show a concrete state transition or authorization/payment/workflow rule that can be violated, not merely unusual control flow.
+   - CWE-840 (Business logic flaw): the slice must show a concrete state transition or authorization/payment/workflow rule that can be violated, not merely unusual control flow. Valid examples include unpaid->paid, pending->approved, cross-form/order/payment reference reuse, webhook spoofing, protected download/content access, or approval/token binding bypass.
    - If the hypothesis uses a CWE listed above, treat it as supported. If the evidence is incomplete, use `keep_insufficient_evidence` or `escalate_to_manual_review`, not `drop_definitely_not_a_bug` solely because the CWE is outside the older SQLi/XSS/authz/CSRF/file/SSRF/deser/XXE set.
 
 3. **Upstream-guard check.** Scan the SOURCE_SLICE for `current_user_can`, `wp_verify_nonce`, `check_ajax_referer`, `is_user_logged_in()`, or a `permission_callback` that gates the cited line. If one is present and the hypothesis claims it is absent, drop.
 
 4. **Attacker-control discipline.** If the hypothesis preconditions require admin misconfiguration, another plugin overriding a filter, EOL PHP version, or otherwise place the gate under the victim's control, drop. (The triage stage applies the Wordfence scope filter too — but cheap to filter here first.)
 
-If ALL four checks pass, keep.
+5. **V2 workflow sanity check.** For object authorization, state-change,
+payment-logic, or stored-to-admin hypotheses, keep only when the cited slice
+supports a real attacker benefit:
+   - user A can access/modify user B's sensitive object;
+   - a low-privileged role can perform a higher-privileged state change;
+   - paid/protected status is granted without server-side payment/ownership proof;
+   - low-privileged stored input is naturally rendered to a privileged viewer.
+If the slice shows only normal public data, own-object behavior, admin-only
+configuration, or no meaningful security impact, drop.
+
+If ALL checks pass, keep.
 
 Output a single JSON object with these exact fields:
 

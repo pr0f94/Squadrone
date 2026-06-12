@@ -1,4 +1,4 @@
-"""Hypothesis stage — runs all 5 specialists sequentially, each with a filtered code-slice subset."""
+"""Hypothesis stage — runs specialists sequentially with filtered code-slice subsets."""
 
 from __future__ import annotations
 
@@ -17,7 +17,11 @@ from ..agents.specialists.cross_file_xss import CrossFileXssSpecialist
 from ..agents.specialists.file_ops import FileOpsSpecialist
 from ..agents.specialists.injection import InjectionSpecialist
 from ..agents.specialists.logic_flaw import LogicFlawSpecialist
+from ..agents.specialists.object_authz import ObjectAuthzSpecialist
+from ..agents.specialists.payment_logic import PaymentLogicSpecialist
 from ..agents.specialists.ssrf_deser import SSRFDeserSpecialist
+from ..agents.specialists.state_change import StateChangeSpecialist
+from ..agents.specialists.stored_to_admin import StoredToAdminSpecialist
 from ..agents.specialists.xss import XSSSpecialist
 from ..schemas.config import PipelineConfig
 from ..schemas.hypothesis import HypothesesArtifact, Hypothesis
@@ -86,6 +90,24 @@ _SPECIALIST_PATTERNS: dict[str, list[re.Pattern[str]]] = {
         re.compile(r"\b(md5|sha1)\s*\(|\bmt_rand\s*\(|\brand\s*\(|\buniqid\s*\("),
         re.compile(r"\bhash_equals\s*\(|password_(hash|verify)|openssl_(encrypt|decrypt)"),
     ],
+    "object_authz": [
+        re.compile(r"\b(id|post_id|user_id|entry_id|submission_id|form_id|order_id|booking_id|event_id|invoice_id|file_id)\b", re.IGNORECASE),
+        re.compile(r"get_post|get_user|wc_get_order|get_user_meta|get_post_meta|update_post_meta|delete_post_meta", re.IGNORECASE),
+        re.compile(r"current_user_can|permission_callback|author|owner|user_id|customer_id", re.IGNORECASE),
+        re.compile(r"\$wpdb->(get_var|get_row|get_results|query|update|delete)", re.IGNORECASE),
+    ],
+    "state_change": [
+        re.compile(r"\b(update|delete|insert|create|save|approve|reject|publish|trash|restore|status|enable|disable)\b", re.IGNORECASE),
+        re.compile(r"update_option|delete_option|update_user_meta|update_post_meta|wp_update_user|wp_insert_user|wp_update_post|wp_insert_post|wp_delete_post", re.IGNORECASE),
+        re.compile(r"current_user_can|wp_verify_nonce|check_ajax_referer|permission_callback", re.IGNORECASE),
+        re.compile(r"add_action\(['\"]wp_ajax|register_rest_route|admin_post", re.IGNORECASE),
+    ],
+    "payment_logic": [
+        re.compile(r"woocommerce|wc_get_(order|cart|product)|WC\(\)|WC_Order|WC_Cart", re.IGNORECASE),
+        re.compile(r"easy[_-]digital[_-]downloads|edd_(get_|add_|update_)|EDD_Payment", re.IGNORECASE),
+        re.compile(r"\b(payment|paid|pay|checkout|order|invoice|refund|subscription|coupon|discount|downloadable|webhook|gateway|stripe|paypal)\b", re.IGNORECASE),
+        re.compile(r"update_status|payment_complete|set_status|verify_signature|hash_hmac", re.IGNORECASE),
+    ],
     "logic_flaw": [
         re.compile(r"woocommerce|wc_get_(order|cart|product)|WC\(\)|WC_Order|WC_Cart", re.IGNORECASE),
         re.compile(r"easy[_-]digital[_-]downloads|edd_(get_|add_|update_)|EDD_Payment", re.IGNORECASE),
@@ -94,6 +116,12 @@ _SPECIALIST_PATTERNS: dict[str, list[re.Pattern[str]]] = {
         re.compile(r"\b(quiz|certificate|grade|lesson|enrollment|course)\b", re.IGNORECASE),
         re.compile(r"\b(donation|campaign|fundrais|pledge|goal_amount)\b", re.IGNORECASE),
         re.compile(r"payment_(complete|status|method)|gateway_callback|webhook"),
+    ],
+    "stored_to_admin": [
+        re.compile(r"update_(post|user|comment)_meta|update_option|\$wpdb->(insert|update)|wp_insert_(post|comment|user)", re.IGNORECASE),
+        re.compile(r"get_(post|user|comment)_meta|get_option|\$wpdb->(get_var|get_row|get_results)", re.IGNORECASE),
+        re.compile(r"\becho\b|\bprint\b|\bprintf\b|wp_send_json|admin_menu|admin_page|list_table", re.IGNORECASE),
+        re.compile(r"esc_html|esc_attr|esc_url|esc_js|wp_kses|sanitize_text_field|sanitize_textarea_field", re.IGNORECASE),
     ],
 }
 
@@ -118,6 +146,22 @@ def _filter_slices_for_specialist(
 logger = logging.getLogger(__name__)
 
 MAX_LINES_PER_SLICE = 500
+
+
+def _build_specialists(runtime: AgentRuntime, model: str) -> list[Any]:
+    return [
+        AuthSpecialist(runtime, model=model),
+        InjectionSpecialist(runtime, model=model),
+        FileOpsSpecialist(runtime, model=model),
+        SSRFDeserSpecialist(runtime, model=model),
+        XSSSpecialist(runtime, model=model),
+        AuthFlowSpecialist(runtime, model=model),
+        LogicFlawSpecialist(runtime, model=model),
+        ObjectAuthzSpecialist(runtime, model=model),
+        StateChangeSpecialist(runtime, model=model),
+        PaymentLogicSpecialist(runtime, model=model),
+        StoredToAdminSpecialist(runtime, model=model),
+    ]
 
 
 def _build_code_slices(recon: ReconArtifact, plugin_path: Path) -> dict[str, str]:
@@ -174,15 +218,7 @@ async def run(
 
     model = config.models.specialists
     hyp_cfg = config.hypothesis
-    specialists: list[Any] = [
-        AuthSpecialist(runtime, model=model),
-        InjectionSpecialist(runtime, model=model),
-        FileOpsSpecialist(runtime, model=model),
-        SSRFDeserSpecialist(runtime, model=model),
-        XSSSpecialist(runtime, model=model),
-        AuthFlowSpecialist(runtime, model=model),
-        LogicFlawSpecialist(runtime, model=model),
-    ]
+    specialists = _build_specialists(runtime, model)
     if enable_cross_file_taint:
         specialists.append(CrossFileXssSpecialist(runtime, model=model))
 

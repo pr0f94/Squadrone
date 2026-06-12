@@ -29,8 +29,10 @@ If `WORDFENCE_SCOPE` and `PATCHSTACK_SCOPE` blocks are present in the user messa
 
 ### Patchstack check (use only PATCHSTACK_SCOPE)
 - Estimate CVSS v3.1 base score from the hypothesis. **Patchstack rejects anything below CVSS 6.5.** If your best estimate is <6.5, reject for Patchstack.
+- Reject for Patchstack if the hypothesis was validated only on an old version, modified source, or a premium-gated/default-disabled path without evidence from the current unmodified component.
 - Patchstack rejects any AC:H (Attack Complexity: High) finding — if exploitation requires winning a race, password knowledge, or another non-trivial precondition, reject for Patchstack.
 - Patchstack-specific out-of-scope items that differ from Wordfence:
+  - XSS that is not site-wide stored XSS or reflected XSS with JavaScript execution.
   - Contributor-or-higher stored XSS (Wordfence may accept; Patchstack rejects).
   - Account creation/registration with role below Contributor.
   - Open redirect (always out — same as Wordfence).

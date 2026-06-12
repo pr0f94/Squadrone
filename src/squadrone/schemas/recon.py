@@ -57,6 +57,29 @@ class StaticCallEdge(JSONFileMixin):
     confidence: str = "medium"
 
 
+class SecurityProfile(JSONFileMixin):
+    """V2 plugin-level security map produced by the surveyor.
+
+    All fields are optional/additive from the pipeline's perspective. The
+    specialist stage consumes this as grounding context when present, but older
+    recon artifacts remain valid because ReconArtifact.security_profile defaults
+    to None.
+    """
+
+    plugin_type: str | None = None
+    sensitive_objects: list[str] = []
+    custom_roles: list[str] = []
+    custom_capabilities: list[str] = []
+    high_risk_workflows: list[str] = []
+    state_changing_workflows: list[str] = []
+    file_workflows: list[str] = []
+    payment_workflows: list[str] = []
+    stored_input_to_privileged_view: list[str] = []
+    webhook_routes: list[str] = []
+    import_export_routes: list[str] = []
+    notes: str | None = None
+
+
 class ReconArtifact(JSONFileMixin):
     plugin_slug: str
     entry_points: list[EntryPoint]
@@ -69,3 +92,4 @@ class ReconArtifact(JSONFileMixin):
     excluded_buckets: Optional[list[str]] = None                  # #4: which intake.file_classification buckets we skipped
     static_callbacks: Optional[list[StaticCallback]] = None       # deterministic hook/route/shortcode registrations
     static_call_edges: Optional[list[StaticCallEdge]] = None      # best-effort callback -> helper call edges
+    security_profile: Optional[SecurityProfile] = None            # V2: plugin type/object/workflow map

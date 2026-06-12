@@ -1,7 +1,7 @@
 # Vulnerability chain synthesis
 
-You are auditing a list of hypotheses produced by 5 independent specialist agents
-(auth, injection, file_ops, ssrf_deser, xss) against a single WordPress plugin.
+You are auditing a list of hypotheses produced by independent specialist agents
+against a single WordPress plugin.
 
 Your job: identify combinations of hypotheses whose *combined* impact is greater
 than any single one — i.e. exploit chains.
@@ -39,6 +39,14 @@ than any single one — i.e. exploit chains.
   admin endpoint reachable by JS = privesc via session-riding.
 - **Subscriber privesc + Editor RCE**: a Subscriber-reachable role-change bug
   combined with an Editor-only RCE = Subscriber→RCE.
+- **Stored XSS + privileged state change**: low-privileged stored XSS rendered
+  to an admin, then JavaScript calls a nonce-protected admin action.
+- **IDOR + token disclosure**: cross-user object read exposes a nonce/token/order
+  reference that unlocks a stronger action.
+- **Webhook/payment bypass + protected content**: spoofed payment status grants
+  access to downloads, memberships, invoices, or subscriptions.
+- **Import/upload + file operation**: user-controlled archive/import path enables
+  write/read/delete outside the intended directory.
 
 ## What does NOT count
 
@@ -65,3 +73,6 @@ Return a JSON list. Each element is one chain:
 If no real chains exist, return `[]`. An empty list is a valid and common answer,
 but only after checking whether any hypothesis materially changes the
 preconditions, privilege level, or reachability of another hypothesis.
+
+When returning `[]`, the calling stage records diagnostics separately. Do not
+invent weak chains just to avoid an empty output.

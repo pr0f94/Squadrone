@@ -26,6 +26,20 @@ For every entry point evaluate:
    dangerous when the underlying function accepts `role`, `user_pass`,
    `meta_input`, or capability fields. Emit as CWE-915.
 
+6. ROLE BOUNDARY — identify the lowest role that can reach the handler. Do not
+   collapse "logged in" into "authorized"; subscriber/customer/contributor
+   reachability is usually the interesting boundary.
+
+7. OBJECT-AWARE CAPABILITIES — prefer object-specific capability checks such as
+   `current_user_can('edit_post', $post_id)` over broad checks such as
+   `edit_posts`. A broad check may still be vulnerable if the request controls
+   an object belonging to another user.
+
+Use `security_profile` from recon when present to prioritize custom roles,
+custom capabilities, and sensitive objects. If another specialist owns a more
+specific shape, still emit the auth finding when the authorization boundary is
+clearly missing.
+
 Confidence HIGH: check is clearly absent / mass assignment is obvious.
 Confidence MEDIUM: check may exist upstream / allowlist may be elsewhere.
 Confidence LOW: unusual preconditions required.

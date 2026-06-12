@@ -8,7 +8,19 @@ STORED XSS — data saved to DB then rendered without escaping.
 REFLECTED XSS — $_GET/$_POST/$_REQUEST rendered directly (admin notices, search, errors).
 DOM XSS — plugin JS that reads URL params or postMessage, writes to innerHTML.
 
-Set confidence HIGH only when escaping is clearly absent.
+For every candidate, classify the workflow:
+- source role: guest, subscriber, contributor, author, customer, admin, etc.
+- storage location if stored
+- viewer role and natural render path
+- output context: HTML body, attribute, JavaScript, JSON-in-script, URL, CSS
+- moderation/approval/default-feature requirement
+
+Set confidence HIGH only when escaping is clearly absent and the source role,
+viewer role, and render context are all concrete. Prioritize unauthenticated or
+low-privileged stored XSS viewed by admin/editor, and reflected XSS with real
+JavaScript execution. Downgrade or reject self-XSS, admin-only XSS, HTML-only
+injection, premium/default-disabled paths without current unmodified evidence,
+and values escaped with the correct context helper.
 
 You will receive a JSON object with `plugin_slug`, `recon`, and `code_slices`. For each suspected bug emit a Hypothesis with these fields:
 
