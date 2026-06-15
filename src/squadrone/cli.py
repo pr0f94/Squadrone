@@ -122,15 +122,17 @@ def _stage_done_summary(stage: str, info: dict[str, Any]) -> str:
         "recon": ("entry_points", "sinks"),
         "hypothesis": ("count",),
         "chain": ("status", "hypothesis_count", "chains", "annotated_hypothesis_count"),
-        "triage": ("accepted", "rejected", "merged", "manual_review"),
-        "manual_queue": ("manual_queued", "reason"),
-        "verify": ("findings", "manual_queued"),
+        "triage": ("accepted", "rejected", "merged", "manual_review_candidates"),
+        "manual_queue": ("candidates", "manual_queued", "already_queued", "unavailable", "reason"),
+        "verify": ("findings", "manual_queued", "already_queued"),
         "dedup": ("novel", "possibly_known", "known_dupe"),
         "report": ("reports",),
     }
     parts: list[str] = []
     for key in keys_by_stage.get(stage, tuple(k for k in info if k != "spent")):
         if key not in info:
+            continue
+        if key in {"already_queued", "unavailable"} and info[key] == 0:
             continue
         label = key.replace("_", " ")
         value = _fmt_int(info[key])

@@ -81,7 +81,7 @@ def _emit_triage_manual_review_queue(
     triaged: TriagedArtifact,
     run_dir: Path,
     plugin_slug: str,
-) -> int:
+) -> dict[str, int]:
     import json as _json
 
     marker_path = run_dir / "manual_review_queued.json"
@@ -94,9 +94,12 @@ def _emit_triage_manual_review_queue(
             queued_ids = set()
 
     queued = 0
+    already_queued = 0
+    unavailable = 0
     for item in triaged.manual_review:
         item_id = str(item.get("hypothesis_id") or "")
         if item_id and item_id in queued_ids:
+            already_queued += 1
             continue
         hyp = _hypothesis_from_manual_item(item)
         if hyp is None:
@@ -109,6 +112,7 @@ def _emit_triage_manual_review_queue(
                 reason="manual-review item did not contain a valid hypothesis payload",
                 artifact=run_dir / "triaged.json",
             )
+            unavailable += 1
             continue
         hyp_dir = run_dir / "verifications" / hyp.id
         hyp_dir.mkdir(parents=True, exist_ok=True)
@@ -120,7 +124,7 @@ def _emit_triage_manual_review_queue(
             "",
             handoff_reason=reason,
         )
-        verify_helpers.emit_to_manual_review_queue(
+        was_queued = verify_helpers.emit_to_manual_review_queue(
             hyp,
             run_dir,
             reason=reason,
@@ -131,6 +135,10 @@ def _emit_triage_manual_review_queue(
                 "warnings": item.get("warnings") or [],
             },
         )
+        if not was_queued:
+            already_queued += 1
+            queued_ids.add(hyp.id)
+            continue
         append_decision(
             run_dir,
             stage="manual_queue",
@@ -144,7 +152,12 @@ def _emit_triage_manual_review_queue(
         queued_ids.add(hyp.id)
     if queued:
         atomic_write_json(marker_path, {"hypothesis_ids": sorted(queued_ids)})
-    return queued
+    return {
+        "manual_queued": queued,
+        "already_queued": already_queued,
+        "unavailable": unavailable,
+        "candidates": len(triaged.manual_review),
+    }
 
 
 async def _init_db() -> None:
@@ -488,7 +501,7 @@ async def run_scan(
             triaged.to_json_file(str(run_dir / "triaged.json"))
             await _emit(on_event, "triage", "done", {
                 "accepted": len(triaged.accepted), "rejected": 0, "merged": 0,
-                "manual_review": len(triaged.manual_review),
+                "manual_review_candidates": len(triaged.manual_review),
                 "spent": budget.spent, "skipped": "no_triage",
             })
         else:
@@ -500,14 +513,14 @@ async def run_scan(
             )
             await _emit(on_event, "triage", "done", {
                 "accepted": len(triaged.accepted), "rejected": len(triaged.rejected),
-                "merged": len(triaged.merged), "manual_review": len(triaged.manual_review),
+                "merged": len(triaged.merged), "manual_review_candidates": len(triaged.manual_review),
                 "spent": budget.spent,
             })
 
-        triage_manual_queued = _emit_triage_manual_review_queue(triaged, run_dir, intake.plugin_slug)
-        if triage_manual_queued:
+        triage_manual_queue = _emit_triage_manual_review_queue(triaged, run_dir, intake.plugin_slug)
+        if triage_manual_queue["candidates"]:
             await _emit(on_event, "manual_queue", "done", {
-                "manual_queued": triage_manual_queued,
+                **triage_manual_queue,
                 "reason": "triage_or_quality_gate",
             })
 
@@ -516,6 +529,7 @@ async def run_scan(
         if no_verify:
             atomic_write_text(findings_path, "")
             manual_queued = 0
+            already_queued = 0
             for hyp in triaged.accepted:
                 hyp_dir = run_dir / "verifications" / hyp.id
                 hyp_dir.mkdir(parents=True, exist_ok=True)
@@ -530,7 +544,7 @@ async def run_scan(
                         "as a confirmed vulnerability."
                     ),
                 )
-                verify_helpers.emit_to_manual_review_queue(
+                was_queued = verify_helpers.emit_to_manual_review_queue(
                     hyp,
                     run_dir,
                     reason="verification skipped by --no-verify",
@@ -539,6 +553,10 @@ async def run_scan(
                         "verification_skipped": True,
                     },
                 )
+                if was_queued:
+                    manual_queued += 1
+                else:
+                    already_queued += 1
                 append_decision(
                     run_dir,
                     stage="verify",
@@ -548,10 +566,10 @@ async def run_scan(
                     reason="verification skipped by --no-verify",
                     artifact=run_dir / "verifications" / hyp.id / "manual_scaffold",
                 )
-                manual_queued += 1
             await _emit(on_event, "verify", "skipped", {
                 "findings": 0,
                 "manual_queued": manual_queued,
+                "already_queued": already_queued,
                 "reason": "no_verify",
             })
         elif _should_load("verify") and findings_path.exists():

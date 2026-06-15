@@ -154,11 +154,12 @@ def emit_to_manual_review_queue(
     attempts: list | None = None,
     setup_results: list[dict] | None = None,
     verifier_notes: dict | None = None,
-) -> None:
+) -> bool:
     """Append a structured entry to the global manual-review queue.
 
     Generates a sandbox scaffold under run_dir/verifications/<hyp_id>/manual_scaffold/
-    that the user can `cd` into and iterate by hand.
+    that the user can `cd` into and iterate by hand. Returns True only when a
+    new queue row is appended.
     """
     source = str((verifier_notes or {}).get("source") or "verify")
     dedupe_key = f"{run_dir}:{hyp.id}:{source}"
@@ -175,7 +176,7 @@ def emit_to_manual_review_queue(
             existing_keys.add(f"{prior.get('run_dir')}:{prior.get('hypothesis_id')}:{prior_source}")
     if dedupe_key in existing_keys:
         logger.info("verify: hypothesis %s already exists in manual review queue (%s)", hyp.id, source)
-        return
+        return False
 
     MANUAL_REVIEW_QUEUE.parent.mkdir(parents=True, exist_ok=True)
     entry = {
@@ -195,6 +196,7 @@ def emit_to_manual_review_queue(
     with MANUAL_REVIEW_QUEUE.open("a") as f:
         f.write(json.dumps(entry) + "\n")
     logger.info("verify: hypothesis %s emitted to manual review queue", hyp.id)
+    return True
 
 
 def write_manual_scaffold(

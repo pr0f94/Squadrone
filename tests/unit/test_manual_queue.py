@@ -27,24 +27,27 @@ def test_manual_review_queue_dedupes_by_run_hypothesis_and_source(tmp_path, monk
     hyp = _hypothesis()
     run_dir = tmp_path / "runs" / "abc123"
 
-    verify_helpers.emit_to_manual_review_queue(
+    first = verify_helpers.emit_to_manual_review_queue(
         hyp,
         run_dir,
         reason="needs manual review",
         verifier_notes={"source": "quality_gate"},
     )
-    verify_helpers.emit_to_manual_review_queue(
+    second = verify_helpers.emit_to_manual_review_queue(
         hyp,
         run_dir,
         reason="needs manual review again",
         verifier_notes={"source": "quality_gate"},
     )
-    verify_helpers.emit_to_manual_review_queue(
+    third = verify_helpers.emit_to_manual_review_queue(
         hyp,
         run_dir,
         reason="different source",
         verifier_notes={"source": "verify"},
     )
 
+    assert first is True
+    assert second is False
+    assert third is True
     lines = queue_path.read_text().splitlines()
     assert len(lines) == 2
