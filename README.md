@@ -62,7 +62,7 @@ run index and LLM cache without most transient lock failures.
 
 ## What it does
 
-1. Pulls plugin source from `plugins.svn.wordpress.org`.
+1. Pulls plugin source from `plugins.svn.wordpress.org`, falling back to the WordPress.org plugin ZIP if `svn` is not installed.
 2. Maps attack surface: reachable entry points, nonce/capability checks, risky sinks, plugin type, sensitive objects, custom roles/capabilities, and high-risk workflows.
 3. Runs role-aware and workflow-aware specialist LLM agents with on-demand `grep_plugin`, `glob_plugin`, and `read_plugin_file` tools instead of dumping the full plugin into context.
 4. Self-verifies hypotheses to drop only definitely ungrounded claims such as fabricated sinks, impossible bug classes, or explicit missed guards.
@@ -102,7 +102,7 @@ The intended workflow is conservative: use static tools and human review alongsi
 - Python 3.12+
 - Docker Desktop running before verification
 - `ripgrep`
-- `subversion`
+- `subversion` optional, but recommended for WordPress.org source checkout; Squadrone falls back to plugin ZIP downloads when `svn` is unavailable
 - LLM access through LiteLLM-compatible providers
 
 On macOS:
@@ -110,6 +110,9 @@ On macOS:
 ```sh
 brew install ripgrep subversion
 ```
+
+If you do not install `subversion`, scans can still run through the ZIP
+fallback, but historical source layouts may be less precise for some plugins.
 
 ## 🛠️ Install
 
@@ -157,11 +160,20 @@ squadrone scan hello-dolly
 # Scan with a higher budget
 squadrone scan contact-form-7 --budget 5.00
 
+# Scan a specific historical plugin release
+squadrone scan contact-form-7 --version 5.3.1
+
 # Use the OpenAI/ChatGPT pipeline
 squadrone scan contact-form-7 --budget 5.00 --config pipelines/openai.yaml
 
+# Show detailed stage, agent, sandbox, and LLM logs
+squadrone scan contact-form-7 --verbose
+
 # Skip sandbox verification and queue accepted hypotheses for manual review
 squadrone scan contact-form-7 --no-verify
+
+# Disable bounty-scope filtering when you only care whether a bug is technically valid
+squadrone scan contact-form-7 --ignore-scope
 
 # Disable strict quality gates for exploratory research
 squadrone scan contact-form-7 --no-strict-quality
@@ -172,11 +184,20 @@ squadrone scan contact-form-7 --triage-votes 3
 # Run exploit-chain synthesis between hypotheses before triage
 squadrone scan contact-form-7 --chain
 
+# Enable the larger cross-file stored-XSS specialist
+squadrone scan contact-form-7 --cross-file-taint
+
+# Compare the scanned version against a prior WordPress.org release
+squadrone scan contact-form-7 --version 5.3.2 --diff 5.3.1
+
 # Scan multiple plugins from a file, one slug per line
 squadrone scan-batch plugins.txt
 
 # Scan multiple plugins in parallel
 squadrone scan-batch plugins.txt --concurrency 3
+
+# Batch flags mirror the scan quality/scope controls
+squadrone scan-batch plugins.txt --concurrency 3 --triage-votes 3 --no-verify
 
 # Resume an existing run
 squadrone scan contact-form-7 --resume <run_id>
