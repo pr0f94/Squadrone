@@ -8,7 +8,7 @@ version = "0.1.0"
 requires-python = ">=3.12"
 description = "Squadrone multi-agent WordPress plugin vulnerability research tool"
 dependencies = [
-    "litellm>=1.40.0",
+    "litellm>=1.89.1",
     "httpx>=0.27.0",
     "requests>=2.32.0",
     "aiosqlite>=0.20.0",
