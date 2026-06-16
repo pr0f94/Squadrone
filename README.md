@@ -199,6 +199,10 @@ squadrone scan-batch plugins.txt --concurrency 3
 # Batch flags mirror the scan quality/scope controls
 squadrone scan-batch plugins.txt --concurrency 3 --triage-votes 3 --no-verify
 
+# Run a higher-budget ChatGPT research batch with verbose logs, no sandbox verification,
+# exploit-chain synthesis, cross-file taint review, and three independent triage votes
+squadrone scan-batch plugins.txt --budget 100 --config pipelines/openai-research.yaml --verbose --no-verify --chain --cross-file-taint --triage-votes 3
+
 # Resume an existing run
 squadrone scan contact-form-7 --resume <run_id>
 
