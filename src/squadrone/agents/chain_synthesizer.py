@@ -80,8 +80,6 @@ def _compact_hypothesis(h: Hypothesis) -> dict:
         "preconditions": _truncate(h.preconditions),
         "confidence": h.confidence.value,
         "exploit_classification": h.exploit_classification,
-        "bounty_fit": h.bounty_fit,
-        "requires_verification": h.requires_verification,
         "evidence_summary": h.evidence_summary,
         "quality_gate": h.quality_gate,
         "derived_severity": h.derived_severity,

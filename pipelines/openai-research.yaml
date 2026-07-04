@@ -56,15 +56,6 @@ vuln_dbs:
   wpscan:
     base_url: https://wpscan.com/api/v3
 
-stages:
-  - intake
-  - recon
-  - hypothesis
-  - triage
-  - verify
-  - dedup
-  - report
-
 intake:
   bundle_wp_core: false
   classify_files: false
@@ -80,7 +71,6 @@ recon:
   exclude_vendor_tests_lang: false
   enrich_entry_points: false
   negative_pattern_reference: false
-  cache_enabled: false
   max_entries_to_validate: 30
 
 hypothesis:
@@ -88,22 +78,16 @@ hypothesis:
   specialist_wp_idioms: true
   require_branch_enumeration: false
   require_exploit_classification: false
-  require_bounty_fit_pretagging: false
-  self_critique_pass: false
   iterative_verifier: true
   verifier_max_iterations: 3
   verifier_require_citation: true
   verifier_wp_idioms: true
   verifier_drop_categorisation: true
-  verifier_cache_enabled: false
   pre_verifier_dedup: false
 
 triage:
   inject_review_md: true
   cluster_aware: true
-  allow_reframing: false
-  drift_logging: true
-  cache_enabled: true
   review_md_max_chars: 12000
   verifier_votes: 1
 
@@ -125,18 +109,14 @@ verify:
   manual_review_handoff: true
   negative_control: true
   collaborative_dev_poc_loop: false
-  cache_enabled: false
   payload_variant_cap: 6
   headless_browser_timeout_s: 15
 
 dedup:
   meaningful_scoring: true
   submission_recommendation: true
-  review_md_signal: true
 
 report:
   claim_validation_pass: false
   submission_readiness_gate: true
-  poc_bundling: true
   screenshot_capture: false
-  submission_json: true

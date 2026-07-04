@@ -81,16 +81,3 @@ def format_triage_merge(merge: dict[str, Any]) -> str:
         _wrap(str(reason)),
     ])
 
-
-def format_triage_reframe(reframe: dict[str, Any]) -> str:
-    hypothesis_id = reframe.get("hypothesis_id") or reframe.get("id") or "unknown"
-    suggested = reframe.get("suggested_framing") or "-"
-    reason = reframe.get("reason_original_rejected") or "-"
-    return "\n".join([
-        "",
-        f"[bold yellow]TRIAGE REFRAME[/] [bold]{hypothesis_id}[/]",
-        "[yellow]Suggested framing[/]",
-        _wrap(str(suggested)),
-        "[yellow]Original issue[/]",
-        _wrap(str(reason)),
-    ])

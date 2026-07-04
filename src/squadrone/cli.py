@@ -60,10 +60,19 @@ def _configure_logging(verbose: bool = False) -> None:
 app = typer.Typer(help="Squadrone — multi-agent WordPress plugin vulnerability research tool")
 runs_app = typer.Typer(help="Manage scan runs")
 findings_app = typer.Typer(help="Inspect findings")
+manual_app = typer.Typer(help="Inspect and manage the manual review queue")
 app.add_typer(runs_app, name="runs")
 app.add_typer(findings_app, name="findings")
+app.add_typer(manual_app, name="manual")
 
 console = Console()
+MANUAL_QUEUE_PATH = Path("cache/findings_for_manual_review.jsonl")
+
+
+class ScanMode(str, Enum):
+    quick = "quick"
+    default = "default"
+    research = "research"
 
 
 STAGE_LABELS = {
@@ -149,13 +158,15 @@ def _print_scan_header(
     version: str | None,
     resume: str | None,
     verbose: bool,
+    mode: ScanMode,
 ) -> None:
     lines = [
         f"[b]Plugin[/b]        {plugin_slug}",
+        f"[b]Scan mode[/b]     {mode.value}",
         f"[b]Config[/b]        {config}",
         f"[b]Budget[/b]        {f'${budget:.2f}' if budget is not None else 'from config'}",
         f"[b]Version[/b]       {version or 'latest'}",
-        f"[b]Mode[/b]          {'resume ' + resume if resume else 'new scan'}",
+        f"[b]Run[/b]           {'resume ' + resume if resume else 'new scan'}",
         f"[b]Verbosity[/b]     {'verbose logs enabled' if verbose else 'concise progress'}",
     ]
     console.print(Panel("\n".join(lines), title="Squadrone Scan", border_style="cyan"))
@@ -210,6 +221,7 @@ def _print_scan_result(result: Any) -> None:
 async def _run_scan_cli(
     *,
     plugin_slug: str,
+    mode: ScanMode,
     config: str,
     budget: float | None,
     version: str | None,
@@ -218,8 +230,8 @@ async def _run_scan_cli(
     ignore_scope: bool,
     resume: str | None,
     resume_from: str | None,
-    chain: bool,
-    cross_file_taint: bool,
+    chain: bool | None,
+    cross_file_taint: bool | None,
     diff_baseline: str | None,
     strict_quality: bool | None,
     triage_votes: int | None,
@@ -228,7 +240,22 @@ async def _run_scan_cli(
 ) -> Any:
     from .orchestrator import run_scan
 
-    _print_scan_header(plugin_slug, config, budget, version, resume, verbose)
+    if mode is ScanMode.quick:
+        no_verify = True
+        chain = False if chain is None else chain
+        cross_file_taint = False if cross_file_taint is None else cross_file_taint
+        strict_quality = True if strict_quality is None else strict_quality
+        triage_votes = 1 if triage_votes is None else triage_votes
+    elif mode is ScanMode.research:
+        chain = True if chain is None else chain
+        cross_file_taint = True if cross_file_taint is None else cross_file_taint
+        strict_quality = True if strict_quality is None else strict_quality
+        triage_votes = 3 if triage_votes is None else triage_votes
+    else:
+        chain = False if chain is None else chain
+        cross_file_taint = False if cross_file_taint is None else cross_file_taint
+
+    _print_scan_header(plugin_slug, config, budget, version, resume, verbose, mode)
 
     stage_started_at: dict[str, float] = {}
     run_id_seen: str | None = resume
@@ -303,21 +330,185 @@ def _run_dir(run_id: str) -> Path:
     raise FileNotFoundError(f"plugins/*/runs/{run_id} not found")
 
 
+def _load_manual_queue() -> list[dict[str, Any]]:
+    if not MANUAL_QUEUE_PATH.exists():
+        return []
+
+    entries: list[dict[str, Any]] = []
+    for line_no, line in enumerate(MANUAL_QUEUE_PATH.read_text().splitlines(), start=1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise typer.BadParameter(f"manual queue has invalid JSON on line {line_no}: {exc}") from exc
+        entry["_line_no"] = line_no
+        entries.append(entry)
+    return entries
+
+
+def _manual_plugin_slug(entry: dict[str, Any]) -> str:
+    if entry.get("plugin_slug"):
+        return str(entry["plugin_slug"])
+    run_dir = str(entry.get("run_dir", ""))
+    parts = Path(run_dir).parts
+    if len(parts) >= 2 and parts[0] == "plugins":
+        return parts[1]
+    return "-"
+
+
+def _manual_hypothesis_id(entry: dict[str, Any]) -> str:
+    return str(entry.get("hypothesis_id") or entry.get("hypothesis", {}).get("id") or "-")
+
+
+def _manual_role(entry: dict[str, Any]) -> str:
+    notes = entry.get("verifier_notes")
+    if isinstance(notes, dict):
+        role = notes.get("attacker_role")
+        if role:
+            return str(role)
+    hyp = entry.get("hypothesis")
+    if isinstance(hyp, dict):
+        evidence = hyp.get("evidence_summary")
+        if isinstance(evidence, dict) and evidence.get("attacker_role"):
+            return str(evidence["attacker_role"])
+    return "-"
+
+
+def _manual_impact(entry: dict[str, Any]) -> str:
+    hyp = entry.get("hypothesis")
+    if isinstance(hyp, dict):
+        impact = hyp.get("impact") or hyp.get("reasoning")
+        if impact:
+            text = " ".join(str(impact).split())
+            return text[:120] + ("..." if len(text) > 120 else "")
+    return "-"
+
+
+def _manual_bug_class(entry: dict[str, Any]) -> str:
+    bug_class = entry.get("bug_class")
+    if bug_class:
+        return str(bug_class)
+    hyp = entry.get("hypothesis")
+    if isinstance(hyp, dict) and hyp.get("bug_class"):
+        return str(hyp["bug_class"])
+    return "-"
+
+
+def _write_manual_queue(entries: list[dict[str, Any]]) -> None:
+    if not entries:
+        if MANUAL_QUEUE_PATH.exists():
+            MANUAL_QUEUE_PATH.unlink()
+        return
+    MANUAL_QUEUE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    clean_entries = []
+    for entry in entries:
+        cleaned = dict(entry)
+        cleaned.pop("_line_no", None)
+        clean_entries.append(cleaned)
+    MANUAL_QUEUE_PATH.write_text("\n".join(json.dumps(e, sort_keys=True) for e in clean_entries) + "\n")
+
+
+@manual_app.command("list")
+def manual_list() -> None:
+    """List findings waiting for manual review."""
+    _configure_logging()
+    entries = _load_manual_queue()
+    table = Table(title=f"Manual review queue — {len(entries)} queued")
+    table.add_column("#", justify="right")
+    table.add_column("plugin")
+    table.add_column("hypothesis")
+    table.add_column("class")
+    table.add_column("role")
+    table.add_column("reason")
+    table.add_column("impact")
+
+    for idx, entry in enumerate(entries, start=1):
+        table.add_row(
+            str(idx),
+            _manual_plugin_slug(entry),
+            _manual_hypothesis_id(entry),
+            _manual_bug_class(entry),
+            _manual_role(entry),
+            str(entry.get("reason") or "-"),
+            _manual_impact(entry),
+        )
+
+    console.print(table)
+    if entries:
+        console.print(f"[dim]Queue file: {MANUAL_QUEUE_PATH}[/]")
+
+
+@manual_app.command("remove")
+def manual_remove(
+    selector: str = typer.Argument(
+        ...,
+        help="Queue row number, hypothesis id, or plugin:hypothesis id",
+    ),
+) -> None:
+    """Remove one manual-review queue entry."""
+    _configure_logging()
+    entries = _load_manual_queue()
+    if not entries:
+        console.print("[yellow]Manual review queue is empty.[/]")
+        return
+
+    def matches(idx: int, entry: dict[str, Any]) -> bool:
+        hyp_id = _manual_hypothesis_id(entry)
+        plugin = _manual_plugin_slug(entry)
+        return selector == str(idx) or selector == hyp_id or selector == f"{plugin}:{hyp_id}"
+
+    remaining = [entry for idx, entry in enumerate(entries, start=1) if not matches(idx, entry)]
+    removed = len(entries) - len(remaining)
+    if removed == 0:
+        console.print(f"[red]No manual queue entry matched {selector!r}.[/]")
+        raise typer.Exit(code=1)
+
+    _write_manual_queue(remaining)
+    console.print(f"[green]Removed {removed} manual queue entr{'y' if removed == 1 else 'ies'}.[/]")
+    console.print(f"[dim]{len(remaining)} remaining.[/]")
+
+
+@manual_app.command("clear")
+def manual_clear() -> None:
+    """Remove every active manual-review queue entry."""
+    _configure_logging()
+    count = len(_load_manual_queue())
+    _write_manual_queue([])
+    console.print(f"[green]Cleared manual review queue.[/] [dim]removed {count} entr{'y' if count == 1 else 'ies'}[/]")
+
+
 @app.command()
 def scan(
     plugin_slug: str = typer.Argument(..., help="WordPress plugin slug"),
+    mode: ScanMode = typer.Option(
+        ScanMode.default,
+        "--mode",
+        "-m",
+        help=(
+            "Scan preset: quick is static/manual-review only, default verifies likely findings, "
+            "research enables deeper review and stricter triage."
+        ),
+        case_sensitive=False,
+    ),
     config: str = typer.Option("pipelines/default.yaml", "--config", help="Pipeline config YAML path"),
     budget: float | None = typer.Option(None, "--budget", help="Override cost ceiling (USD)"),
     version: str | None = typer.Option(None, "--version", help="Pin a specific plugin version (e.g. for re-scanning a historical release). Defaults to the latest version on wordpress.org."),
-    no_triage: bool = typer.Option(False, "--no-triage", help="Skip Critic; pipe hypotheses straight to verify"),
+    no_triage: bool = typer.Option(
+        False,
+        "--no-triage",
+        help="Advanced: skip Critic; pipe hypotheses straight to verify.",
+        rich_help_panel="Advanced",
+    ),
     no_verify: bool = typer.Option(
         False,
         "--no-verify",
-        help="Skip sandbox verification; queue triage-accepted hypotheses for manual review instead of creating findings",
+        help="Skip sandbox verification; queue triage-accepted hypotheses for manual review instead of creating findings.",
     ),
     ignore_scope: bool = typer.Option(
         False, "--ignore-scope",
-        help="Disable Wordfence/Patchstack scope filtering in triage; verify everything that's technically a bug (use for plugin-author disclosures or CVE-only pursuit)",
+        help="Disable Wordfence/Patchstack scope filtering in triage; verify everything technically valid.",
     ),
     resume: str | None = typer.Option(
         None, "--resume",
@@ -325,30 +516,35 @@ def scan(
     ),
     resume_from: str | None = typer.Option(
         None, "--from",
-        help="Force re-run from a specific stage (requires --resume). One of: intake, recon, hypothesis, chain, triage, verify, dedup, report. Later artifacts on disk are ignored and re-generated.",
+        help="Force re-run from a specific stage (requires --resume). One of: intake, recon, hypothesis, chain, triage, verify, dedup, report.",
     ),
-    chain: bool = typer.Option(
-        False, "--chain/--no-chain",
-        help="Enable cross-specialist exploit-chain synthesis after the hypothesis stage. Adds chain annotations (chains_with / chain_impact / chain_severity_bump) to hypotheses. Off by default.",
+    chain: bool | None = typer.Option(
+        None, "--chain/--no-chain",
+        help="Advanced: override exploit-chain synthesis for this run.",
+        rich_help_panel="Advanced",
     ),
-    cross_file_taint: bool = typer.Option(
-        False, "--cross-file-taint/--no-cross-file-taint",
-        help="Enable the cross-file stored-XSS specialist. Receives the full plugin corpus (not a filtered subset) and looks for sanitize-on-write + read-raw-on-output patterns spanning multiple files. Off by default because it sends a larger payload per call.",
+    cross_file_taint: bool | None = typer.Option(
+        None, "--cross-file-taint/--no-cross-file-taint",
+        help="Advanced: override the larger cross-file stored-XSS specialist.",
+        rich_help_panel="Advanced",
     ),
     diff_baseline: str | None = typer.Option(
         None, "--diff",
-        help="Compute a PHP diff between the scan version and this baseline version (e.g. --diff 1.21.0). The diff summary is fed to specialists as a prior, raising attention on files touched by the change. Useful for n-day discovery against released fixes. Requires a real prior version available on wp.org.",
+        help="Advanced: compare the scanned version against this prior WordPress.org release.",
+        rich_help_panel="Advanced",
     ),
     strict_quality: bool | None = typer.Option(
         None,
         "--strict-quality/--no-strict-quality",
-        help="Override quality gates from config. Strict mode grades evidence, false-positive rules, derived severity, and report readiness.",
+        help="Advanced: override quality gates from the selected mode/config.",
+        rich_help_panel="Advanced",
     ),
     triage_votes: int | None = typer.Option(
         None,
         "--triage-votes",
         min=1,
-        help="Run N independent Critic triage votes and keep majority-accepted hypotheses. Overrides config.",
+        help="Advanced: run N independent Critic triage votes. Overrides mode/config.",
+        rich_help_panel="Advanced",
     ),
     verbose: bool = typer.Option(
         False, "--verbose", "-v",
@@ -359,6 +555,7 @@ def scan(
     _configure_logging(verbose=verbose)
     result = asyncio.run(_run_scan_cli(
         plugin_slug=plugin_slug,
+        mode=mode,
         config=config,
         budget=budget,
         version=version,
@@ -402,11 +599,26 @@ def _read_plugins_file(path: str) -> list[str]:
 @app.command("scan-batch")
 def scan_batch(
     plugins_file: str = typer.Argument(..., help="File containing plugin slugs (one per line)"),
+    mode: ScanMode = typer.Option(
+        ScanMode.default,
+        "--mode",
+        "-m",
+        help=(
+            "Scan preset: quick is static/manual-review only, default verifies likely findings, "
+            "research enables deeper review and stricter triage."
+        ),
+        case_sensitive=False,
+    ),
     concurrency: int = typer.Option(1, "--concurrency", min=1, help="Number of plugins to scan in parallel"),
     config: str = typer.Option("pipelines/default.yaml", "--config", help="Pipeline config YAML path"),
     budget: float | None = typer.Option(None, "--budget", help="Per-plugin cost ceiling override (USD)"),
     version: str | None = typer.Option(None, "--version", help="Pin the same plugin version for every slug in the batch"),
-    no_triage: bool = typer.Option(False, "--no-triage", help="Skip Critic; pipe hypotheses straight to verify"),
+    no_triage: bool = typer.Option(
+        False,
+        "--no-triage",
+        help="Advanced: skip Critic; pipe hypotheses straight to verify.",
+        rich_help_panel="Advanced",
+    ),
     no_verify: bool = typer.Option(
         False,
         "--no-verify",
@@ -416,28 +628,33 @@ def scan_batch(
         False, "--ignore-scope",
         help="Disable Wordfence/Patchstack scope filtering in triage; verify everything that's technically a bug",
     ),
-    chain: bool = typer.Option(
-        False, "--chain/--no-chain",
-        help="Enable cross-specialist exploit-chain synthesis after the hypothesis stage. Off by default.",
+    chain: bool | None = typer.Option(
+        None, "--chain/--no-chain",
+        help="Advanced: override exploit-chain synthesis for this batch.",
+        rich_help_panel="Advanced",
     ),
-    cross_file_taint: bool = typer.Option(
-        False, "--cross-file-taint/--no-cross-file-taint",
-        help="Enable the cross-file stored-XSS specialist. Off by default because it sends a larger payload per call.",
+    cross_file_taint: bool | None = typer.Option(
+        None, "--cross-file-taint/--no-cross-file-taint",
+        help="Advanced: override the larger cross-file stored-XSS specialist.",
+        rich_help_panel="Advanced",
     ),
     diff_baseline: str | None = typer.Option(
         None, "--diff",
-        help="Compute a PHP diff between the scan version and this baseline version for every plugin in the batch.",
+        help="Advanced: compare the scanned version against this prior WordPress.org release.",
+        rich_help_panel="Advanced",
     ),
     strict_quality: bool | None = typer.Option(
         None,
         "--strict-quality/--no-strict-quality",
-        help="Override quality gates from config for every plugin.",
+        help="Advanced: override quality gates from the selected mode/config.",
+        rich_help_panel="Advanced",
     ),
     triage_votes: int | None = typer.Option(
         None,
         "--triage-votes",
         min=1,
-        help="Run N independent Critic triage votes per plugin. Overrides config.",
+        help="Advanced: run N independent Critic triage votes per plugin. Overrides mode/config.",
+        rich_help_panel="Advanced",
     ),
     verbose: bool = typer.Option(
         False, "--verbose", "-v",
@@ -450,6 +667,7 @@ def scan_batch(
     console.print(Panel(
         "\n".join([
             f"[b]Plugins[/b]      {len(plugin_slugs)}",
+            f"[b]Scan mode[/b]    {mode.value}",
             f"[b]Config[/b]       {config}",
             f"[b]Budget[/b]       {f'${budget:.2f} per plugin' if budget is not None else 'from config'}",
             f"[b]Concurrency[/b]  {concurrency}",
@@ -469,6 +687,7 @@ def scan_batch(
                 try:
                     result = await _run_scan_cli(
                         plugin_slug=slug,
+                        mode=mode,
                         config=config,
                         budget=budget,
                         version=version,
@@ -516,7 +735,7 @@ def scan_batch(
         raise typer.Exit(code=1)
 
 
-@app.command()
+@app.command(rich_help_panel="Advanced")
 def benchmark(
     corpus: str = typer.Argument(..., help="Path to benchmark corpus JSON"),
     split: str = typer.Option("train", "--split", help="Corpus split to evaluate (e.g. train, test, holdout)"),
@@ -578,7 +797,7 @@ def benchmark(
     console.print(detail)
 
 
-@app.command()
+@app.command(rich_help_panel="Advanced")
 def review(run_id: str = typer.Argument(..., help="Run ID to review")) -> None:
     """Interactively review findings from a completed run."""
     from .schemas.finding import Finding
@@ -663,7 +882,7 @@ class DiscloseTarget(str, Enum):
     direct = "direct"
 
 
-@app.command()
+@app.command(rich_help_panel="Advanced")
 def disclose(
     finding_id: str = typer.Argument(...),
     to: DiscloseTarget = typer.Option(..., "--to", help="Submission target", case_sensitive=False),

@@ -108,18 +108,6 @@ async def run(
     plugin_path = Path(intake.source_path)
     cfg = config.recon
 
-    # #8: cache check (BEFORE any work)
-    cfg_dict = cfg.model_dump()
-    ckey = recon_helpers.cache_key(intake.plugin_slug, intake.plugin_version, cfg_dict) if cfg.cache_enabled else None
-    if ckey:
-        cached = recon_helpers.load_cached_recon(ckey)
-        if cached:
-            logger.info("recon: cache hit %s — reusing", ckey)
-            artifact = ReconArtifact.model_validate(cached)
-            out_path = Path(runs_root) / intake.run_id / "recon.json"
-            artifact.to_json_file(str(out_path))
-            return artifact
-
     # #4: vendor/tests/lang exclusion (depends on intake.file_classification)
     excluded_paths: set[str] = set()
     excluded_buckets: list[str] = []
@@ -235,10 +223,6 @@ async def run(
 
     out_path = Path(runs_root) / intake.run_id / "recon.json"
     artifact.to_json_file(str(out_path))
-    if ckey:
-        recon_helpers.save_cached_recon(ckey, artifact.model_dump(mode="json"))
-        logger.info("recon: cached at %s", recon_helpers.cache_path(ckey))
-
     logger.info("recon: wrote %s (entry_points=%d sinks=%d)",
                 out_path, len(artifact.entry_points), len(artifact.sinks))
     return artifact

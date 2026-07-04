@@ -78,7 +78,6 @@ class _Output:
         self.accepted = accepted or []
         self.rejected = []
         self.merged = []
-        self.request_reframing = []
 
 
 class _Result:

@@ -275,16 +275,7 @@ async def run(
 
     # Self-verification pass: cheap source-quote + guard check per hypothesis.
     # Drops hallucinated sinks and missed-guard claims before they reach triage/verify.
-    # All V1/V3/V4/V5/V7 toggles flow through the verifier constructor.
-    plugin_version_for_cache = ""
-    try:
-        from ..schemas.intake import IntakeArtifact
-        intake_path = Path(runs_root) / run_id / "intake.json"
-        if intake_path.exists():
-            plugin_version_for_cache = IntakeArtifact.from_json_file(str(intake_path)).plugin_version
-    except Exception:
-        pass
-
+    # All verifier toggles flow through the verifier constructor.
     verifier = HypothesisVerifier(
         runtime,
         model=config.models.hypothesis_verifier,
@@ -293,8 +284,6 @@ async def run(
         drop_categorisation_enabled=hyp_cfg.verifier_drop_categorisation,
         iterative_enabled=hyp_cfg.iterative_verifier,
         max_iterations=hyp_cfg.verifier_max_iterations,
-        cache_enabled=hyp_cfg.verifier_cache_enabled,
-        plugin_version=plugin_version_for_cache,
     )
     verdicts = await asyncio.gather(
         *[verifier.verify(h, plugin_path) for h in merged],

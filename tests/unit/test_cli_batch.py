@@ -74,3 +74,91 @@ def test_scan_batch_honors_concurrency_option(tmp_path, monkeypatch):
 
     assert result.exit_code == 0
     assert max_active == 2
+
+
+def test_scan_mode_research_sets_deeper_defaults(tmp_path, monkeypatch):
+    plugins_file = tmp_path / "plugins.txt"
+    plugins_file.write_text("alpha\n")
+    seen: dict = {}
+
+    async def fake_run_scan_cli(**kwargs):
+        seen.update(kwargs)
+        return _scan_result(kwargs["plugin_slug"])
+
+    monkeypatch.setattr(cli, "_run_scan_cli", fake_run_scan_cli)
+
+    result = runner.invoke(cli.app, ["scan-batch", str(plugins_file), "--mode", "research"])
+
+    assert result.exit_code == 0
+    assert seen["mode"] == cli.ScanMode.research
+
+
+def test_run_scan_cli_applies_research_mode_defaults(monkeypatch):
+    seen: dict = {}
+
+    async def fake_run_scan(**kwargs):
+        seen.update(kwargs)
+        return _scan_result(kwargs["plugin_slug"])
+
+    monkeypatch.setattr("squadrone.orchestrator.run_scan", fake_run_scan)
+    monkeypatch.setattr(cli, "_print_scan_result", lambda _result: None)
+
+    asyncio.run(cli._run_scan_cli(
+        plugin_slug="alpha",
+        mode=cli.ScanMode.research,
+        config="pipelines/default.yaml",
+        budget=None,
+        version=None,
+        no_triage=False,
+        no_verify=False,
+        ignore_scope=False,
+        resume=None,
+        resume_from=None,
+        chain=None,
+        cross_file_taint=None,
+        diff_baseline=None,
+        strict_quality=None,
+        triage_votes=None,
+        verbose=False,
+    ))
+
+    assert seen["enable_chain"] is True
+    assert seen["enable_cross_file_taint"] is True
+    assert seen["strict_quality"] is True
+    assert seen["triage_votes"] == 3
+
+
+def test_run_scan_cli_applies_quick_mode_defaults(monkeypatch):
+    seen: dict = {}
+
+    async def fake_run_scan(**kwargs):
+        seen.update(kwargs)
+        return _scan_result(kwargs["plugin_slug"])
+
+    monkeypatch.setattr("squadrone.orchestrator.run_scan", fake_run_scan)
+    monkeypatch.setattr(cli, "_print_scan_result", lambda _result: None)
+
+    asyncio.run(cli._run_scan_cli(
+        plugin_slug="alpha",
+        mode=cli.ScanMode.quick,
+        config="pipelines/default.yaml",
+        budget=None,
+        version=None,
+        no_triage=False,
+        no_verify=False,
+        ignore_scope=False,
+        resume=None,
+        resume_from=None,
+        chain=None,
+        cross_file_taint=None,
+        diff_baseline=None,
+        strict_quality=None,
+        triage_votes=None,
+        verbose=False,
+    ))
+
+    assert seen["no_verify"] is True
+    assert seen["enable_chain"] is False
+    assert seen["enable_cross_file_taint"] is False
+    assert seen["strict_quality"] is True
+    assert seen["triage_votes"] == 1

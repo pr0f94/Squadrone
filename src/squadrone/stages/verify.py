@@ -251,24 +251,10 @@ async def _verify_one(
     runtime: AgentRuntime,
     poc_dir: Path,
     developer: DeveloperAgent | None = None,
-    plugin_version: str = "",
     # W3: when provided, skip sandbox boot/teardown — caller manages lifecycle
     persistent_sb: SandboxManager | None = None,
 ) -> Finding | None:
     verify_cfg = config.verify
-
-    # W10: cache check (BEFORE we boot anything)
-    cache_key: str | None = None
-    if verify_cfg.cache_enabled:
-        cache_key = verify_helpers.verify_cache_key(
-            hyp, plugin_version,
-            sandbox_image=config.sandbox.wordpress_image,
-            verify_config=verify_cfg.model_dump(),
-        )
-        cached = verify_helpers.verify_cache_load(cache_key)
-        if cached is not None:
-            logger.info("verify: %s cache hit %s — reusing", hyp.id, cache_key)
-            return cached
 
     poc_dir.mkdir(parents=True, exist_ok=True)
     # Drop the xss_check helper next to the PoC scripts so they can `from xss_check import ...`.
@@ -494,9 +480,7 @@ async def _verify_one(
                 confirm = await sb.run_poc(str(script_path))
                 attempt.result = PoCStatus.SUCCESS if confirm.success else PoCStatus.PARTIAL
                 attempts.append(attempt)
-                # R5: capture a screenshot of the sandbox state (gracefully no-ops if Playwright missing)
-                # Coordinated with R4 — the screenshot lands at verifications/<id>/screenshots/, which
-                # the report-stage bundler picks up automatically.
+                # R5: capture a screenshot of the sandbox state (gracefully no-ops if Playwright missing).
                 if config.report.screenshot_capture:
                     screenshot_dir = poc_dir / "screenshots"
                     await verify_helpers.screenshot_url(
@@ -618,9 +602,6 @@ async def _verify_one(
         dedup_matches=[],
     )
 
-    # W10: cache the confirmed finding
-    if cache_key:
-        verify_helpers.verify_cache_save(cache_key, finding)
     return finding
 
 
@@ -636,16 +617,6 @@ async def run(
 ) -> list[Finding]:
     plugin_zip, plugin_zip_staging = _zip_plugin(plugin_path, triaged.plugin_slug)
     logger.info("verify: zipped plugin to %s", plugin_zip)
-
-    # Thread plugin_version through to _verify_one for W10 cache keying.
-    plugin_version = ""
-    try:
-        from ..schemas.intake import IntakeArtifact
-        intake_path = Path(runs_root) / run_id / "intake.json"
-        if intake_path.exists():
-            plugin_version = IntakeArtifact.from_json_file(str(intake_path)).plugin_version
-    except Exception:
-        logger.warning("verify: failed to read intake metadata for cache key", exc_info=True)
 
     findings: list[Finding] = []
     run_dir = Path(runs_root) / run_id
@@ -761,7 +732,6 @@ async def run(
                     config, runtime,
                     poc_dir=hyp_dir,
                     developer=developer,
-                    plugin_version=plugin_version,
                     persistent_sb=persistent_sb,
                 )
             except Exception as e:

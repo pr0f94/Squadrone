@@ -11,7 +11,7 @@ from ..agents.runtime import AgentRuntime
 from ..schemas.config import PipelineConfig
 from ..schemas.finding import DedupStatus, Finding
 from ..services import report_helpers
-from ..services.artifacts import atomic_write_json, atomic_write_text
+from ..services.artifacts import atomic_write_text
 from ..services.budget import BudgetTracker
 from ..services.decision_ledger import append_decision
 from ..services.quality_gate import grade_finding_for_report
@@ -220,30 +220,4 @@ async def run(
             if validation_summary:
                 logger.info("report: %s validator: %s", f.id, validation_summary)
 
-            # R7: machine-readable submission JSON
-            submission_json = None
-            if cfg.submission_json:
-                submission_json = report_helpers.build_submission_json(
-                    f, plugin_slug, plugin_version, program,
-                )
-
-            # R4: bundle the report + PoC + screenshots + JSON into plugins/<slug>/submissions/<id>/
-            if cfg.poc_bundling:
-                # Discover screenshot dir from R5 (verifications/<id>/screenshots/)
-                screenshot_dir = run_dir / "verifications" / f.id / "screenshots"
-                report_helpers.write_submission_bundle(
-                    finding=f,
-                    plugin_slug=plugin_slug,
-                    plugins_root=Path("plugins"),
-                    report_md=md,
-                    program=program,
-                    submission_json=submission_json,
-                    payload_files=None,
-                    screenshot_dir=screenshot_dir if screenshot_dir.exists() else None,
-                )
-            elif cfg.submission_json and submission_json is not None:
-                # JSON without bundling — drop it next to the report
-                json_path = run_dir / f"report_{f.id}_{program}.submission.json"
-                atomic_write_json(json_path, submission_json)
-                logger.info("report: submission JSON → %s", json_path)
     return out_paths

@@ -147,7 +147,7 @@ Set whichever keys match your pipeline and dedup needs:
 
 If a vuln-DB key is missing, dedup logs a warning and skips that source. The scan does not fail solely because a dedup key is absent.
 
-Pipeline YAML files in `pipelines/` control models, budget ceiling, sandbox shape, hypothesis limits, and developer-consult caps.
+Pipeline YAML files in `pipelines/` control models, budget ceiling, sandbox shape, hypothesis limits, and developer-consult caps. Most users should choose a scan mode first and only edit YAML when changing model routing or sandbox defaults.
 
 `pipelines/openai.yaml` uses LiteLLM's `chatgpt/` provider for ChatGPT subscription access. On first use, LiteLLM starts an OAuth device-code flow; complete the browser login prompt and Squadrone will use the authenticated ChatGPT session. This path does not require `OPENAI_API_KEY`.
 
@@ -156,6 +156,12 @@ Pipeline YAML files in `pipelines/` control models, budget ceiling, sandbox shap
 ```sh
 # Scan one plugin with the default pipeline
 squadrone scan hello-dolly
+
+# Cheap static pass; accepted candidates are queued for manual validation
+squadrone scan hello-dolly --mode quick
+
+# Deeper bounty-oriented pass; enables chain review, cross-file review, and 3 triage votes
+squadrone scan hello-dolly --mode research --budget 10.00
 
 # Scan with a higher budget
 squadrone scan contact-form-7 --budget 5.00
@@ -175,33 +181,14 @@ squadrone scan contact-form-7 --no-verify
 # Disable bounty-scope filtering when you only care whether a bug is technically valid
 squadrone scan contact-form-7 --ignore-scope
 
-# Disable strict quality gates for exploratory research
-squadrone scan contact-form-7 --no-strict-quality
-
-# Require a majority vote from three independent Critic passes
-squadrone scan contact-form-7 --triage-votes 3
-
-# Run exploit-chain synthesis between hypotheses before triage
-squadrone scan contact-form-7 --chain
-
-# Enable the larger cross-file stored-XSS specialist
-squadrone scan contact-form-7 --cross-file-taint
-
-# Compare the scanned version against a prior WordPress.org release
-squadrone scan contact-form-7 --version 5.3.2 --diff 5.3.1
-
 # Scan multiple plugins from a file, one slug per line
 squadrone scan-batch plugins.txt
 
 # Scan multiple plugins in parallel
 squadrone scan-batch plugins.txt --concurrency 3
 
-# Batch flags mirror the scan quality/scope controls
-squadrone scan-batch plugins.txt --concurrency 3 --triage-votes 3 --no-verify
-
-# Run a higher-budget ChatGPT research batch with verbose logs, no sandbox verification,
-# exploit-chain synthesis, cross-file taint review, and three independent triage votes
-squadrone scan-batch plugins.txt --budget 100 --config pipelines/openai-research.yaml --verbose --no-verify --chain --cross-file-taint --triage-votes 3
+# Run a higher-budget research batch
+squadrone scan-batch plugins.txt --mode research --budget 100 --config pipelines/openai-research.yaml --verbose
 
 # Resume an existing run
 squadrone scan contact-form-7 --resume <run_id>
@@ -213,15 +200,21 @@ squadrone scan contact-form-7 --resume <run_id> --from verify
 squadrone runs list
 squadrone findings show <finding-id>
 
-# Interactively review findings
-squadrone review <run-id>
-
-# Record a disclosure you submitted manually
-squadrone disclose <finding-id> --to wordfence --notes "Sent via Wordfence portal"
-
-# Run the benchmark harness
-squadrone benchmark benchmarks/corpus.json --split train --budget 5.00
+# Inspect and manage manual review candidates
+squadrone manual list
+squadrone manual remove <row-or-hypothesis-id>
+squadrone manual clear
 ```
+
+Scan modes:
+
+| Mode | Use when | Behavior |
+|---|---|---|
+| `default` | Normal vulnerability discovery | Runs the standard pipeline with quality gates and sandbox verification. |
+| `quick` | Cheap first-pass screening | Keeps quality gates on, skips sandbox verification, and queues accepted candidates for manual validation. |
+| `research` | Higher-effort bounty research | Enables exploit-chain synthesis, cross-file stored-XSS review, and three triage votes. |
+
+Advanced flags such as `--chain`, `--cross-file-taint`, `--triage-votes`, `--diff`, and `--no-strict-quality` still exist for targeted experiments, but they are overrides. Prefer `--mode quick`, `--mode default`, or `--mode research` for normal use.
 
 Output by default:
 
@@ -260,11 +253,11 @@ Squadrone's default pipelines enable strict quality controls. These are determin
 - **Severity recomputation** derives an internal CVSS-style score and OWASP 2021 category instead of trusting model-written severity.
 - **Report grader** blocks confirmed findings from becoming polished reports if the evidence or impact does not meet the submission bar.
 - **Focused review fanout** writes `focus_areas.json` and feeds the attack-surface map into specialist review.
-- **V2 methodology** is the default: the surveyor maps plugin type, sensitive objects, roles, and workflows; specialists review object authorization, state changes, payment logic, and stored-to-admin paths alongside classic vulnerability classes.
-- **Verifier voting** is available with `--triage-votes N`; use `3` or `5` when quality matters more than runtime. In multi-vote mode, majority-accepted findings continue, zero-accept findings reject, and split votes go to manual review.
-- **Exploit-chain synthesis** is available with `--chain`; it enriches hypotheses with `chains_with`, `chain_impact`, and `chain_severity_bump`, and writes `chain_diagnostics.json` so skipped, failed, and empty chain passes are distinguishable.
+- **Core methodology** maps plugin type, sensitive objects, roles, and workflows; specialists review object authorization, state changes, payment logic, and stored-to-admin paths alongside classic vulnerability classes.
+- **Verifier voting** is enabled by `--mode research` or the advanced `--triage-votes N` override. In multi-vote mode, majority-accepted findings continue, zero-accept findings reject, and split votes go to manual review.
+- **Exploit-chain synthesis** is enabled by `--mode research` or the advanced `--chain` override. It enriches hypotheses with `chains_with`, `chain_impact`, and `chain_severity_bump`, and writes `chain_diagnostics.json` so skipped, failed, and empty chain passes are distinguishable.
 
-Use `--no-strict-quality` for exploratory scans where you want more raw hypotheses.
+Use advanced `--no-strict-quality` only for targeted debugging where you intentionally want more raw hypotheses.
 
 ## 🔍 Triage
 
@@ -275,8 +268,8 @@ squadrone runs list
 # Show one finding
 squadrone findings show <finding-id>
 
-# Review a completed run interactively
-squadrone review <run-id>
+# List manual-review candidates
+squadrone manual list
 ```
 
 A confirmed finding typically has:
@@ -294,6 +287,19 @@ A confirmed finding typically has:
 ```
 
 Treat generated reports as drafts. Confirm the bug manually, reproduce the PoC, check source-side sanitization and authorization carefully, then disclose privately through the appropriate channel.
+
+Advanced bookkeeping and evaluation commands:
+
+```sh
+# Interactively review confirmed findings from a completed run
+squadrone review <run-id>
+
+# Record a disclosure you submitted manually
+squadrone disclose <finding-id> --to wordfence --notes "Sent via Wordfence portal"
+
+# Run the benchmark harness
+squadrone benchmark benchmarks/corpus.json --split train --budget 5.00
+```
 
 ## 🧪 Tests
 

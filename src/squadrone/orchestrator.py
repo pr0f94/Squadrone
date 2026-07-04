@@ -16,7 +16,7 @@ from .agents.developer import DeveloperAgent
 from .agents.runtime import AgentRuntime
 from .schemas.config import PipelineConfig
 from .schemas.finding import DedupStatus, Finding
-from .schemas.hypothesis import Hypothesis
+from .schemas.hypothesis import Hypothesis, TriagedArtifact
 from .services.artifacts import atomic_write_json, atomic_write_text, read_jsonl_models
 from .services.budget import BudgetExceededError, BudgetTracker
 from .services.decision_ledger import append_decision

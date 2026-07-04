@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 import re
 from pathlib import Path
@@ -18,8 +16,6 @@ if TYPE_CHECKING:
     from .runtime import AgentRuntime
 
 logger = logging.getLogger(__name__)
-
-CACHE_DIR = Path("cache/verifier")
 
 # V5: 5-state categorisation. Legacy binary "keep"/"drop" still accepted from older clients.
 VerdictType = Literal[
@@ -186,34 +182,6 @@ def _read_source_slice_with_handler_followup(
     return primary + "".join(appended_sections)
 
 
-def _verifier_cache_key(hyp: Hypothesis, plugin_version: str, prompt_version: str) -> str:
-    """Stable cache key for V7 verifier caching."""
-    payload = json.dumps(
-        {
-            "hyp": hyp.model_dump(mode="json"),
-            "plugin_version": plugin_version,
-            "prompt_version": prompt_version,
-        },
-        sort_keys=True,
-    )
-    return hashlib.sha256(payload.encode()).hexdigest()[:16]
-
-
-def _verifier_cache_load(key: str) -> VerifierVerdict | None:
-    p = CACHE_DIR / f"{key}.json"
-    if not p.exists():
-        return None
-    try:
-        return VerifierVerdict.model_validate_json(p.read_text())
-    except (OSError, ValueError):
-        return None
-
-
-def _verifier_cache_save(key: str, verdict: VerifierVerdict) -> None:
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    (CACHE_DIR / f"{key}.json").write_text(verdict.model_dump_json(indent=2))
-
-
 class HypothesisVerifier:
     NAME = "hypothesis_verifier"
     PROMPT = "hypothesis_verifier"
@@ -228,8 +196,6 @@ class HypothesisVerifier:
         drop_categorisation_enabled: bool = False,  # V5
         iterative_enabled: bool = False,            # V1
         max_iterations: int = 3,                    # V1
-        cache_enabled: bool = False,                # V7
-        plugin_version: str = "",                   # for cache key
     ):
         self.runtime = runtime
         self.model = model
@@ -238,8 +204,6 @@ class HypothesisVerifier:
         self.drop_categorisation_enabled = drop_categorisation_enabled
         self.iterative_enabled = iterative_enabled
         self.max_iterations = max_iterations
-        self.cache_enabled = cache_enabled
-        self.plugin_version = plugin_version
 
     def _build_system_prompt(self) -> str:
         parts = [load_prompt(self.PROMPT)]
@@ -271,20 +235,7 @@ class HypothesisVerifier:
             )
         return "".join(parts)
 
-    def _prompt_version(self) -> str:
-        flags = (self.wp_idioms_enabled, self.require_citation,
-                 self.drop_categorisation_enabled, self.iterative_enabled)
-        return "cwe-plausibility-v2:" + ":".join("1" if f else "0" for f in flags)
-
     async def verify(self, hyp: Hypothesis, plugin_path: str) -> VerifierVerdict:
-        # V7: cache check
-        cache_key: str | None = None
-        if self.cache_enabled:
-            cache_key = _verifier_cache_key(hyp, self.plugin_version, self._prompt_version())
-            cached = _verifier_cache_load(cache_key)
-            if cached is not None:
-                return cached
-
         plugin_root = Path(plugin_path)
         slice_text = _read_source_slice_with_handler_followup(
             plugin_root, hyp.file, hyp.line, hyp.sink_code or ""
@@ -295,8 +246,6 @@ class HypothesisVerifier:
                 verdict="keep_insufficient_evidence" if self.drop_categorisation_enabled else "keep",
                 reason="source file not found on disk; deferring to triage",
             )
-            if cache_key:
-                _verifier_cache_save(cache_key, verdict)
             return verdict
 
         system = self._build_system_prompt()
@@ -332,6 +281,4 @@ class HypothesisVerifier:
             logger.warning("verifier: %s — keeping hypothesis %s by default", e, hyp.id)
             verdict = VerifierVerdict(verdict="keep", reason=f"verifier error: {e}")
 
-        if cache_key:
-            _verifier_cache_save(cache_key, verdict)
         return verdict

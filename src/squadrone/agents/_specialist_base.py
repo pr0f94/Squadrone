@@ -72,46 +72,6 @@ The triage stage will likely reject chained hypotheses unless the secondary prim
 is also discoverable in this same plugin.
 """
 
-_S5_BOUNTY_FIT = """
-
-## S5: Bounty-fit pre-tagging
-
-In `bounty_fit`, output your tentative scope assessment:
-```json
-{
-  "wordfence_tier": "high_threat" | "stored_xss_sqli" | "all_other" | "not_applicable",
-  "wordfence_install_floor_satisfied": true | false | "unknown",
-  "patchstack_cvss_estimate": <float, e.g. 6.5>,
-  "patchstack_floor_satisfied": true | false | "unknown",
-  "realistic_payout_likelihood": "high" | "medium" | "low" | "none"
-}
-```
-
-If you don't know the install count, set `wordfence_install_floor_satisfied: "unknown"` —
-triage will resolve. Use `realistic_payout_likelihood: "none"` for hypotheses that
-fall under Wordfence rule 124 (missing-authz without consequential CIA impact) or
-WPScan-equivalent enumeration findings.
-"""
-
-_S7_SELF_CRITIQUE = """
-
-## S7: Self-critique before emitting
-
-For EACH hypothesis you would emit, ask: "is every load-bearing claim in `reasoning`
-either (a) directly visible in `code_slices`, or (b) something I read with
-`read_plugin_file` and can quote at file:line?". If a claim rests on training-data
-recall about a WP function's behaviour, set `requires_verification: true` and note
-the unverified claim in `reasoning`.
-
-Examples that demand verification:
-- "esc_url() does not encode single quotes" → check WP core, do not recall
-- "any logged-in user can compute the nonce via wp_create_nonce" → factually wrong
-  (nonces are user-bound); set requires_verification=true if you find yourself
-  about to emit such a claim
-- "wp_ajax_X is gated to admin by WordPress" → factually wrong; same handling
-"""
-
-
 _V2_METHODOLOGY = """
 
 ## Squadrone V2 methodology: role-aware workflow review
@@ -219,10 +179,6 @@ async def run_specialist(
         parts.append(_S3_BRANCH_ENUMERATION)
     if cfg.require_exploit_classification:
         parts.append(_S4_EXPLOIT_CLASSIFICATION)
-    if cfg.require_bounty_fit_pretagging:
-        parts.append(_S5_BOUNTY_FIT)
-    if cfg.self_critique_pass:
-        parts.append(_S7_SELF_CRITIQUE)
 
     tool_loop_mode = plugin_path is not None
     if tool_loop_mode:

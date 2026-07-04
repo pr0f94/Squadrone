@@ -94,11 +94,9 @@ class Hypothesis(JSONFileMixin):
     # Populated by the triage stage. Empty for hypotheses produced before scope filtering ran;
     # may contain "wordfence", "patchstack", or both. Routing/report stages should respect this.
     bounty_programs: list[str] = []
-    # Stage 3 opt-in additions (S3, S4, S5, S7). All None / empty when toggles off.
+    # Stage 3 opt-in additions. Empty when toggles are off.
     taint_path_branches: list[list[str]] = []   # S3: alternate taint branches from same entry to sink
     exploit_classification: dict | None = None  # S4: {type, secondary_primitive_required?, config_required?, realistic_in_default_install?}
-    bounty_fit: dict | None = None              # S5: {wordfence_tier, wordfence_install_floor_satisfied, patchstack_cvss_estimate, patchstack_floor_satisfied, realistic_payout_likelihood}
-    requires_verification: bool = False         # S7: specialist self-flagged "claim I can't fully cite"
     # Populated by the optional chain stage (--chain). Empty when the stage didn't run.
     chains_with: list[str] = []                 # IDs of other hypotheses that combine with this one
     chain_impact: str | None = None             # human-readable combined impact (e.g. "Subscriber→RCE via auth-bypass + file-write")
@@ -122,6 +120,3 @@ class TriagedArtifact(JSONFileMixin):
     # Candidates that are source-grounded enough to preserve but not strong enough
     # for automatic verification/reporting. These are emitted to the manual queue.
     manual_review: list[dict] = []
-    # T4: optional list of hypotheses where the critic suggests re-framing rather than accept/reject.
-    # Each entry: {"hypothesis_id": str, "suggested_framing": str, "reason_original_rejected": str}
-    request_reframing: list[dict] = []

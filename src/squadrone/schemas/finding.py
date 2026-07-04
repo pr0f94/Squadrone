@@ -46,6 +46,6 @@ class Finding(JSONFileMixin):
     suggested_fix: Optional[str] = None
     # Stage 6 D4 (submission_recommendation toggle): structured next-action.
     # One of: submit_as_novel | submit_as_regression_of_<CVE> | skip_exact_dupe_of_<CVE> |
-    #          submit_with_dedup_rebuttal | local_review_says_fp | None (toggle off / no decision)
+    #          submit_with_dedup_rebuttal | None (toggle off / no decision)
     submission_recommendation: Optional[str] = None
     submission_recommendation_reason: Optional[str] = None

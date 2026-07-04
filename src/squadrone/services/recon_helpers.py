@@ -4,21 +4,16 @@
 #3 nonce_emission_sites  — JS + PHP scan for wp_localize_script / wp_create_nonce sites
 #5 extract_body_slice    — function body slice for an entry-point file:line
 #6 score_confidence      — heuristic confidence per entry point
-#8 cache_key / load / save — recon.json cache keyed by (slug, version, config)
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 import re
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
-
-CACHE_DIR = Path("cache/recon")
 
 
 # ---------- #5: extract function body slice -------------------------------------------
@@ -404,37 +399,3 @@ def score_confidence(
         return "high"
 
     return "medium"
-
-
-# ---------- #8: recon caching ---------------------------------------------------------
-
-def cache_key(plugin_slug: str, plugin_version: str, recon_config: dict[str, Any]) -> str:
-    """Stable cache key for a (slug, version, config) tuple.
-
-    Different recon-config toggle combinations get different cache entries — so enabling
-    a new feature won't serve stale cached output that lacks that feature's metadata.
-    """
-    payload = json.dumps(
-        {"slug": plugin_slug, "version": plugin_version, "cfg": recon_config},
-        sort_keys=True,
-    )
-    return hashlib.sha256(payload.encode()).hexdigest()[:16]
-
-
-def cache_path(key: str) -> Path:
-    return CACHE_DIR / f"{key}.json"
-
-
-def load_cached_recon(key: str) -> dict | None:
-    p = cache_path(key)
-    if not p.exists():
-        return None
-    try:
-        return json.loads(p.read_text())
-    except (OSError, ValueError):
-        return None
-
-
-def save_cached_recon(key: str, recon_dict: dict) -> None:
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    cache_path(key).write_text(json.dumps(recon_dict, indent=2))

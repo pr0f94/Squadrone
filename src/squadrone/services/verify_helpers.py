@@ -1,6 +1,4 @@
-"""Stage-5 verify helpers: headless browser check (W2), state introspection (W5),
-manual-review handoff (W6), verify caching (W10).
-"""
+"""Stage-5 verify helpers: browser checks, state introspection, and manual handoff."""
 
 from __future__ import annotations
 
@@ -11,13 +9,11 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
-from ..schemas.finding import Finding
 from ..schemas.hypothesis import Hypothesis
 from .artifacts import atomic_write_text
 
 logger = logging.getLogger(__name__)
 
-VERIFY_CACHE_DIR = Path("cache/verify")
 MANUAL_REVIEW_QUEUE = Path("cache/findings_for_manual_review.jsonl")
 
 
@@ -264,34 +260,6 @@ def write_manual_scaffold(
         ],
         "setup_results": setup_results or [],
     }, indent=2))
-
-
-# ---------- W10: verify caching ------------------------------------------------------
-
-def verify_cache_key(hyp: Hypothesis, plugin_version: str, sandbox_image: str,
-                     verify_config: dict) -> str:
-    payload = json.dumps({
-        "hyp": hyp.model_dump(mode="json"),
-        "version": plugin_version,
-        "sandbox_image": sandbox_image,
-        "cfg": verify_config,
-    }, sort_keys=True)
-    return hashlib.sha256(payload.encode()).hexdigest()[:16]
-
-
-def verify_cache_load(key: str) -> Finding | None:
-    p = VERIFY_CACHE_DIR / f"{key}.json"
-    if not p.exists():
-        return None
-    try:
-        return Finding.model_validate_json(p.read_text())
-    except (OSError, ValueError):
-        return None
-
-
-def verify_cache_save(key: str, finding: Finding) -> None:
-    VERIFY_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    atomic_write_text(VERIFY_CACHE_DIR / f"{key}.json", finding.model_dump_json(indent=2))
 
 
 # ---------- W4: payload variants -----------------------------------------------------

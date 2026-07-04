@@ -94,16 +94,6 @@ async def run(
     known = await db.lookup_all(plugin_slug)
     logger.info("dedup: %d known vulns from DBs", len(known))
 
-    # D5: parse plugins/<slug>/review.md once for all findings
-    review_signals = (
-        dedup_helpers.parse_review_md_signals(plugin_slug)
-        if cfg.review_md_signal else {}
-    )
-    if review_signals:
-        logger.info("dedup: D5 review.md loaded — fp_keywords=%d confirmed_keywords=%d",
-                    len(review_signals.get("fp_keywords", set())),
-                    len(review_signals.get("confirmed_keywords", set())))
-
     # Determine scanned plugin version (for D1 version-range alignment)
     scanned_version = ""
     try:
@@ -122,24 +112,11 @@ async def run(
         f.dedup_status = status
         f.dedup_matches = matches
 
-        # D5: per-finding local review signal
-        local_signal: str | None = None
-        if cfg.review_md_signal and review_signals:
-            local_signal = dedup_helpers.local_review_signal_for_finding(
-                review_signals,
-                finding_sink=f.hypothesis.sink or "",
-                finding_file=f.hypothesis.file or "",
-                finding_handler=f.hypothesis.entry_point or "",
-            )
-            if local_signal:
-                logger.info("dedup: %s — D5 local signal: %s", f.id, local_signal)
-
-        # D4: submission recommendation (combines D1 score + D5 signal)
+        # D4: submission recommendation
         if cfg.submission_recommendation:
             rec, reason = dedup_helpers.derive_submission_recommendation(
                 finding_dedup_status=status.value,
                 scored_matches=matches,
-                review_signal=local_signal,
             )
             f.submission_recommendation = rec
             f.submission_recommendation_reason = reason

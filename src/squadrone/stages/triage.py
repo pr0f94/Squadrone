@@ -14,7 +14,6 @@ from ..services.budget import BudgetTracker
 from ..services.console_format import (
     format_triage_accept,
     format_triage_merge,
-    format_triage_reframe,
     format_triage_reject,
 )
 from ..services.artifacts import atomic_write_jsonl
@@ -42,7 +41,6 @@ def _combine_vote_artifacts(votes: list[TriagedArtifact], original: HypothesesAr
     accepted_objects: dict[str, object] = {}
     rejection_reasons: dict[str, list[str]] = {h.id: [] for h in original.hypotheses}
     merged: list[dict] = []
-    reframes: list[dict] = []
     for art in votes:
         accepted_ids = {h.id for h in art.accepted}
         for h in art.accepted:
@@ -56,7 +54,6 @@ def _combine_vote_artifacts(votes: list[TriagedArtifact], original: HypothesesAr
                 )
                 rejection_reasons.setdefault(h_id, []).append(reason)
         merged.extend(art.merged)
-        reframes.extend(art.request_reframing)
 
     accepted = []
     rejected = []
@@ -86,7 +83,6 @@ def _combine_vote_artifacts(votes: list[TriagedArtifact], original: HypothesesAr
         rejected=rejected,
         merged=merged,
         manual_review=manual_review,
-        request_reframing=reframes,
     )
 
 
@@ -111,14 +107,6 @@ async def run(
     # Stage-4 toggles flow through the critic constructor. All default off so existing
     # callers see identical behaviour.
     triage_cfg = config.triage
-    plugin_version_for_cache = ""
-    try:
-        from ..schemas.intake import IntakeArtifact
-        intake_path = Path(runs_root) / run_id / "intake.json"
-        if intake_path.exists():
-            plugin_version_for_cache = IntakeArtifact.from_json_file(str(intake_path)).plugin_version
-    except Exception:
-        pass
 
     votes = max(1, triage_cfg.verifier_votes)
     vote_artifacts: list[TriagedArtifact] = []
@@ -129,11 +117,7 @@ async def run(
             model=config.models.critic,
             inject_review_md=triage_cfg.inject_review_md,
             cluster_aware=triage_cfg.cluster_aware,
-            allow_reframing=triage_cfg.allow_reframing,
-            drift_logging=triage_cfg.drift_logging,
-            cache_enabled=triage_cfg.cache_enabled and votes == 1,
             review_md_max_chars=triage_cfg.review_md_max_chars,
-            plugin_version=plugin_version_for_cache,
             review_mode=review_mode,
         )
         if votes > 1:
@@ -146,8 +130,6 @@ async def run(
         logger.info(format_triage_reject(rejection))
     for merge in triaged.merged:
         logger.info(format_triage_merge(merge))
-    for reframe in triaged.request_reframing:
-        logger.info(format_triage_reframe(reframe))
     for item in triaged.manual_review:
         logger.info(
             "triage: manual review %s — %s",
