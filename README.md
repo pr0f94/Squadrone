@@ -64,17 +64,18 @@ run index and LLM cache without most transient lock failures.
 
 1. Pulls plugin source from `plugins.svn.wordpress.org`, falling back to the WordPress.org plugin ZIP if `svn` is not installed.
 2. Maps attack surface: reachable entry points, nonce/capability checks, risky sinks, plugin type, sensitive objects, custom roles/capabilities, and high-risk workflows.
-3. Runs role-aware and workflow-aware specialist LLM agents with on-demand `grep_plugin`, `glob_plugin`, and `read_plugin_file` tools instead of dumping the full plugin into context.
-4. Self-verifies hypotheses to drop only definitely ungrounded claims such as fabricated sinks, impossible bug classes, or explicit missed guards.
-5. Builds a focus-area map for AJAX/REST, forms, files, auth, SQL, payment logic, and rendering paths.
-6. Triages survivors against exploitability and bounty-scope rules, including an adversarial rejection pass when multiple triage votes are used; split votes are routed to manual review.
-7. Applies balanced quality gates: evidence completeness, WordPress false-positive rules, derived severity, and manual-review routing for borderline cases.
-8. Builds a one-shot Docker WordPress sandbox for accepted hypotheses.
-9. Iteratively runs LLM-authored Python PoCs against the sandbox.
-10. Deduplicates confirmed findings against Wordfence Intelligence and WPScan when keys are configured.
-11. Runs a report-quality gate before writing disclosure drafts.
-12. Writes private report drafts per finding and program.
-13. Records run metadata and findings in SQLite for later review.
+3. Generates deterministic WordPress leads for common CVE shapes such as missing capability checks, IDOR-style reads, state changes, SQLi, SSRF, and file operations.
+4. Runs role-aware and workflow-aware specialist LLM agents with on-demand `grep_plugin`, `glob_plugin`, and `read_plugin_file` tools instead of dumping the full plugin into context.
+5. Self-verifies hypotheses to drop only definitely ungrounded claims such as fabricated sinks, impossible bug classes, or explicit missed guards.
+6. Builds a focus-area map for AJAX/REST, forms, files, auth, SQL, payment logic, and rendering paths.
+7. Triages survivors against exploitability and bounty-scope rules, preserving plausible pre-verification leads for sandbox testing while rejecting clear false positives.
+8. Applies pre-verification quality gates that keep testable leads but still reject obvious non-security behavior.
+9. Builds a one-shot Docker WordPress sandbox for accepted hypotheses.
+10. Iteratively runs template-guided and LLM-refined Python PoCs against the sandbox.
+11. Applies strict post-verification CIA impact and reportability gates before disclosure drafts are produced.
+12. Deduplicates confirmed findings against Wordfence Intelligence and WPScan when keys are configured.
+13. Writes private report drafts per finding and program.
+14. Records run metadata and findings in SQLite for later review.
 
 The system **never auto-submits** anything. It produces files. You decide what to disclose, where, and when.
 
@@ -92,10 +93,10 @@ You should not pick only one approach. Static scanning is fast and broad; agenti
 | Sandbox PoC verification | ✓ | ✗ |
 | Report draft generation | ✓ | ✗ |
 | Known-vuln deduplication | ✓ | partial |
-| Cheap broad pre-filtering | partial | ✓ |
+| Cheap broad pre-filtering | ✓ | ✓ |
 | Deterministic repeated output | partial | ✓ |
 
-The intended workflow is conservative: use static tools and human review alongside Squadrone, then manually validate anything you plan to report.
+The intended workflow is test-first but impact-strict: Squadrone should test plausible WordPress bug shapes automatically, then keep only findings with concrete confidentiality, integrity, or availability impact.
 
 ## Prerequisites
 
@@ -147,7 +148,7 @@ Set whichever keys match your pipeline and dedup needs:
 
 If a vuln-DB key is missing, dedup logs a warning and skips that source. The scan does not fail solely because a dedup key is absent.
 
-Pipeline YAML files in `pipelines/` control models, budget ceiling, sandbox shape, hypothesis limits, and developer-consult caps. Most users should choose a scan mode first and only edit YAML when changing model routing or sandbox defaults.
+Pipeline YAML files in `pipelines/` control models, budget ceiling, sandbox shape, hypothesis limits, and developer-consult caps. Most users should only edit YAML when changing model routing or sandbox defaults.
 
 `pipelines/openai.yaml` uses LiteLLM's `chatgpt/` provider for ChatGPT subscription access. On first use, LiteLLM starts an OAuth device-code flow; complete the browser login prompt and Squadrone will use the authenticated ChatGPT session. This path does not require `OPENAI_API_KEY`.
 
@@ -156,12 +157,6 @@ Pipeline YAML files in `pipelines/` control models, budget ceiling, sandbox shap
 ```sh
 # Scan one plugin with the default pipeline
 squadrone scan hello-dolly
-
-# Cheap static pass; accepted candidates are queued for manual validation
-squadrone scan hello-dolly --mode quick
-
-# Deeper bounty-oriented pass; enables chain review, cross-file review, and 3 triage votes
-squadrone scan hello-dolly --mode research --budget 10.00
 
 # Scan with a higher budget
 squadrone scan contact-form-7 --budget 5.00
@@ -175,12 +170,6 @@ squadrone scan contact-form-7 --budget 5.00 --config pipelines/openai.yaml
 # Show detailed stage, agent, sandbox, and LLM logs
 squadrone scan contact-form-7 --verbose
 
-# Skip sandbox verification and queue accepted hypotheses for manual review
-squadrone scan contact-form-7 --no-verify
-
-# Disable bounty-scope filtering when you only care whether a bug is technically valid
-squadrone scan contact-form-7 --ignore-scope
-
 # Scan multiple plugins from a file, one slug per line
 squadrone scan-batch plugins.txt
 
@@ -188,7 +177,7 @@ squadrone scan-batch plugins.txt
 squadrone scan-batch plugins.txt --concurrency 3
 
 # Run a higher-budget research batch
-squadrone scan-batch plugins.txt --mode research --budget 100 --config pipelines/openai-research.yaml --verbose
+squadrone scan-batch plugins.txt --budget 100 --config pipelines/openai-research.yaml --verbose
 
 # Resume an existing run
 squadrone scan contact-form-7 --resume <run_id>
@@ -206,24 +195,13 @@ squadrone manual remove <row-or-hypothesis-id>
 squadrone manual clear
 ```
 
-Scan modes:
-
-| Mode | Use when | Behavior |
-|---|---|---|
-| `default` | Normal vulnerability discovery | Runs the standard pipeline with quality gates and sandbox verification. |
-| `quick` | Cheap first-pass screening | Keeps quality gates on, skips sandbox verification, and queues accepted candidates for manual validation. |
-| `research` | Higher-effort bounty research | Enables exploit-chain synthesis, cross-file stored-XSS review, and three triage votes. |
-
-Advanced flags such as `--chain`, `--cross-file-taint`, `--triage-votes`, `--diff`, and `--no-strict-quality` still exist for targeted experiments, but they are overrides. Prefer `--mode quick`, `--mode default`, or `--mode research` for normal use.
-
 Output by default:
 
 - `plugins/<slug>/runs/<run_id>/intake.json`
 - `plugins/<slug>/runs/<run_id>/recon.json`
 - `plugins/<slug>/runs/<run_id>/hypotheses.jsonl`
+- `plugins/<slug>/runs/<run_id>/deterministic_wp_leads.jsonl` when static WP leads are generated
 - `plugins/<slug>/runs/<run_id>/focus_areas.json`
-- `plugins/<slug>/runs/<run_id>/chains.json` when `--chain` is used
-- `plugins/<slug>/runs/<run_id>/chain_diagnostics.json` when `--chain` is used
 - `plugins/<slug>/runs/<run_id>/triaged.jsonl`
 - `plugins/<slug>/runs/<run_id>/quality_gate_triage.json`
 - `plugins/<slug>/runs/<run_id>/manual_review_queued.json` when triage or quality gates queue manual review
@@ -234,9 +212,7 @@ Output by default:
 - `plugins/<slug>/runs/<run_id>/trace.jsonl`
 - `plugins/<slug>/runs/<run_id>/report_<finding_id>_<program>.md`
 
-When `--no-verify` is used, triage-accepted hypotheses are first graded by the quality gate, then written to the manual review queue instead of `findings.jsonl`; no submission reports are generated.
-
-When triage voting or the quality gate cannot make a clean automatic decision, the hypothesis is preserved in the manual review queue. The per-run `decision_ledger.jsonl` records the exact stage, action, result, reason, and artifact path for each keep, reject, manual-review, verification, dedup, and report decision.
+When the quality gate cannot make a clean automatic decision, the hypothesis is preserved in the manual review queue. The per-run `decision_ledger.jsonl` records the exact stage, action, result, reason, and artifact path for each keep, reject, manual-review, verification, dedup, and report decision.
 
 Run artifacts that affect resume are written atomically where possible. If a
 crash leaves malformed rows in `findings.jsonl`, Squadrone preserves readable
@@ -247,17 +223,14 @@ recovery in `decision_ledger.jsonl`.
 
 Squadrone's default pipelines enable strict quality controls. These are deterministic checks inspired by verifier/grader harnesses:
 
-- **Finding grader before verification** accepts strong candidates, hard-rejects clear false positives, and routes borderline evidence or impact to manual review.
+- **Deterministic WordPress leads** generate common CVE-shaped candidates from recon before LLM review.
+- **Pre-verification grader** keeps plausible testable leads while hard-rejecting clear false positives.
 - **WordPress false-positive rules** reject admin-only, self-XSS, own-resource-only, cosmetic, open redirect, and low-impact CSRF cases; borderline submit-worthiness can be preserved for manual review.
 - **Evidence-first schema** annotates each survivor with attacker role, source, sink, affected file/function, guard discussion, impact statement, and bounty routing.
 - **Severity recomputation** derives an internal CVSS-style score and OWASP 2021 category instead of trusting model-written severity.
-- **Report grader** blocks confirmed findings from becoming polished reports if the evidence or impact does not meet the submission bar.
-- **Focused review fanout** writes `focus_areas.json` and feeds the attack-surface map into specialist review.
+- **Post-verification report grader** blocks confirmed behavior from becoming a polished report if the evidence or CIA impact does not meet the submission bar.
+- **Focused review fanout** writes `focus_areas.json` so reviewers can see which attack surfaces were detected.
 - **Core methodology** maps plugin type, sensitive objects, roles, and workflows; specialists review object authorization, state changes, payment logic, and stored-to-admin paths alongside classic vulnerability classes.
-- **Verifier voting** is enabled by `--mode research` or the advanced `--triage-votes N` override. In multi-vote mode, majority-accepted findings continue, zero-accept findings reject, and split votes go to manual review.
-- **Exploit-chain synthesis** is enabled by `--mode research` or the advanced `--chain` override. It enriches hypotheses with `chains_with`, `chain_impact`, and `chain_severity_bump`, and writes `chain_diagnostics.json` so skipped, failed, and empty chain passes are distinguishable.
-
-Use advanced `--no-strict-quality` only for targeted debugging where you intentionally want more raw hypotheses.
 
 ## 🔍 Triage
 

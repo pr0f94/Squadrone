@@ -17,22 +17,20 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# V5: 5-state categorisation. Legacy binary "keep"/"drop" still accepted from older clients.
 VerdictType = Literal[
-    "keep",                         # legacy
-    "drop",                         # legacy
-    "keep_high_confidence",         # V5: bug shape real, evidence cited
-    "keep_conditional",             # V5: real shape, depends on cited external factor (e.g. nonce reachability)
-    "keep_insufficient_evidence",   # V5: verifier could not inspect enough source; defer downstream
-    "drop_definitely_not_a_bug",    # V5: explicit upstream guard cited
-    "escalate_to_manual_review",    # V5: verifier confidence too low, route to human queue
+    "keep",
+    "keep_high_confidence",
+    "keep_conditional",
+    "keep_insufficient_evidence",
+    "drop",
+    "drop_definitely_not_a_bug",
+    "escalate_to_manual_review",
 ]
 
 
 class VerifierVerdict(BaseModel):
     verdict: VerdictType
     reason: str
-    # V3: optional citation field for "drop reasons must cite file:line"
     citation: Optional[str] = None
 
 
@@ -191,19 +189,13 @@ class HypothesisVerifier:
         runtime: "AgentRuntime",
         model: str,
         *,
-        wp_idioms_enabled: bool = False,            # V4 + X2
-        require_citation: bool = False,             # V3
-        drop_categorisation_enabled: bool = False,  # V5
-        iterative_enabled: bool = False,            # V1
-        max_iterations: int = 3,                    # V1
+        wp_idioms_enabled: bool = False,
+        require_citation: bool = False,
     ):
         self.runtime = runtime
         self.model = model
         self.wp_idioms_enabled = wp_idioms_enabled
         self.require_citation = require_citation
-        self.drop_categorisation_enabled = drop_categorisation_enabled
-        self.iterative_enabled = iterative_enabled
-        self.max_iterations = max_iterations
 
     def _build_system_prompt(self) -> str:
         parts = [load_prompt(self.PROMPT)]
@@ -219,20 +211,6 @@ class HypothesisVerifier:
                 "Conservative drops with 'I can't see X' framing are reliable; confident "
                 "drops with concrete-but-uncited claims about WP internals are the failure mode."
             )
-        if self.drop_categorisation_enabled:
-            parts.append(
-                "\n\n# V5: Five-state verdict\n\n"
-                "Use one of these verdicts (NOT the legacy `keep`/`drop`):\n"
-                "- `keep_high_confidence` — bug shape real, evidence cited\n"
-                "- `keep_conditional` — bug shape real, depends on a cited external factor "
-                "(e.g. nonce reachability); explain the condition in `reason`\n"
-                "- `keep_insufficient_evidence` — source slice/tooling was insufficient; "
-                "defer to triage/verification instead of dropping\n"
-                "- `drop_definitely_not_a_bug` — only when the sink is hallucinated, the "
-                "bug class is impossible from the cited source, or an explicit upstream "
-                "guard is cited at file:line\n"
-                "- `escalate_to_manual_review` — your confidence is below threshold; route to human"
-            )
         return "".join(parts)
 
     async def verify(self, hyp: Hypothesis, plugin_path: str) -> VerifierVerdict:
@@ -243,7 +221,7 @@ class HypothesisVerifier:
         if slice_text is None:
             # Can't read the file — keep by default; let triage/verify handle it.
             verdict = VerifierVerdict(
-                verdict="keep_insufficient_evidence" if self.drop_categorisation_enabled else "keep",
+                verdict="keep_insufficient_evidence",
                 reason="source file not found on disk; deferring to triage",
             )
             return verdict
@@ -254,13 +232,6 @@ class HypothesisVerifier:
             f"SOURCE_SLICE ({hyp.file} around line {hyp.line}):\n```\n{slice_text}\n```"
         )
 
-        # V1: iterative tool-enabled verifier — let it call read_plugin_file across N rounds
-        # before deciding. Reuses the existing tool infra.
-        tools = None
-        if self.iterative_enabled:
-            from .tools import READ_PLUGIN_FILE_TOOL
-            tools = [READ_PLUGIN_FILE_TOOL]
-
         run_kwargs: dict = {
             "agent_name": self.NAME,
             "model": self.model,
@@ -270,9 +241,6 @@ class HypothesisVerifier:
             ],
             "output_schema": VerifierVerdict,
         }
-        if self.iterative_enabled:
-            run_kwargs["tools"] = tools
-            run_kwargs["max_iterations"] = self.max_iterations + 1  # +1 for the final no-tool decision
 
         try:
             result = await self.runtime.run(**run_kwargs)

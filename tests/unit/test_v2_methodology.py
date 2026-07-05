@@ -14,9 +14,7 @@ from squadrone.schemas import (
     Sink,
     TriagedArtifact,
 )
-from squadrone.schemas.config import PipelineConfig
 from squadrone.stages import hypothesis as hypothesis_stage
-from squadrone.stages import triage as triage_stage
 
 
 def _hypothesis(hypothesis_id: str = "h-1") -> Hypothesis:
@@ -141,39 +139,3 @@ async def test_critic_prompt_always_includes_adversarial_review():
     system = runtime.calls[0]["messages"][0]["content"]
     assert "Squadrone V2 adversarial review" in system
     assert "strongest Patchstack or Wordfence rejection reason" in system
-
-
-@pytest.mark.asyncio
-async def test_multi_vote_final_critic_is_adversarial(monkeypatch, tmp_path):
-    seen_modes: list[str] = []
-
-    class FakeCritic:
-        def __init__(self, *args, review_mode="standard", **kwargs):
-            seen_modes.append(review_mode)
-
-        async def review(self, hypotheses, code_slices, apply_scope_filter=True):
-            return TriagedArtifact(
-                plugin_slug=hypotheses.plugin_slug,
-                accepted=[],
-                rejected=[{"hypothesis_id": "h-1", "reason": "reject"}],
-                merged=[],
-            )
-
-    cfg = PipelineConfig.from_yaml("pipelines/default.yaml")
-    cfg.triage.verifier_votes = 3
-    monkeypatch.setattr(triage_stage, "CriticAgent", FakeCritic)
-    monkeypatch.setattr(triage_stage, "_build_code_slices", lambda recon, plugin_path: {})
-
-    await triage_stage.run(
-        HypothesesArtifact(plugin_slug="demo", hypotheses=[_hypothesis()]),
-        plugin_path=str(tmp_path),
-        config=cfg,
-        budget=None,
-        runtime=_Runtime(),
-        recon=_recon(),
-        runs_root=str(tmp_path),
-        run_id="run1",
-        apply_scope_filter=False,
-    )
-
-    assert seen_modes == ["standard", "standard", "adversarial"]

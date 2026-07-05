@@ -142,7 +142,6 @@ _ROOT_LIST_KEYS = (
     "output",
     "data",
     "items",
-    "chains",
     "entries",
 )
 

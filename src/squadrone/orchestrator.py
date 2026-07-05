@@ -22,9 +22,7 @@ from .services.budget import BudgetExceededError, BudgetTracker
 from .services.decision_ledger import append_decision
 from .services.llm import init_cache
 from .services import verify_helpers
-from .services.quality_gate import apply_quality_gate
 from .services.sqlite import connect_sqlite
-from .stages import chain as chain_stage
 from .stages import dedup as dedup_stage
 from .stages import hypothesis as hypothesis_stage
 from .stages import intake as intake_stage
@@ -235,7 +233,7 @@ async def _emit(cb: Optional[EventCallback], stage: str, status: str, info: dict
         await res
 
 
-STAGE_ORDER = ["intake", "recon", "hypothesis", "chain", "triage", "verify", "dedup", "report"]
+STAGE_ORDER = ["intake", "recon", "hypothesis", "triage", "verify", "dedup", "report"]
 
 
 async def run_scan(
@@ -244,22 +242,10 @@ async def run_scan(
     budget_override: Optional[float] = None,
     on_event: Optional[EventCallback] = None,
     version: Optional[str] = None,
-    no_triage: bool = False,
-    no_verify: bool = False,
     resume_run_id: Optional[str] = None,
     resume_from: Optional[str] = None,
-    apply_scope_filter: bool = True,
-    enable_chain: bool = False,
-    enable_cross_file_taint: bool = False,
-    diff_baseline: Optional[str] = None,
-    strict_quality: Optional[bool] = None,
-    triage_votes: Optional[int] = None,
 ) -> ScanResult:
     config = PipelineConfig.from_yaml(config_path)
-    if strict_quality is not None:
-        config.quality.enabled = strict_quality
-    if triage_votes is not None:
-        config.triage.verifier_votes = triage_votes
     ceiling = budget_override if budget_override is not None else config.cost_ceiling_usd
 
     if resume_from is not None and resume_from not in STAGE_ORDER:
@@ -348,7 +334,6 @@ async def run_scan(
                 plugin_slug, run_id, config,
                 runs_root=_runs_root(plugin_slug),
                 version=version,
-                diff_baseline=diff_baseline,
             )
             await _emit(on_event, "intake", "done", {
                 "version": intake.plugin_version, "files": intake.file_count, "lines": intake.total_lines,
@@ -383,50 +368,10 @@ async def run_scan(
             hyps = await hypothesis_stage.run(
                 recon, intake.source_path, config, budget, runtime,
                 runs_root=_runs_root(plugin_slug), run_id=run_id,
-                enable_cross_file_taint=enable_cross_file_taint,
-                diff_summary=intake.diff_summary,
             )
             await _emit(on_event, "hypothesis", "done", {
                 "count": len(hyps.hypotheses), "spent": budget.spent,
             })
-
-        # ---- chain (optional, --chain flag) ----
-        # Skipped entirely when enable_chain=False so default flow is byte-identical.
-        # When enabled, may rewrite hyps_path with chain annotations + write chains.json.
-        budget.set_stage("chain")
-        if enable_chain:
-            chains_path = run_dir / "chains.json"
-            chain_diagnostics_path = run_dir / "chain_diagnostics.json"
-            if _should_load("chain") and chains_path.exists():
-                # On resume, hyps_path already has annotations from the previous run.
-                info = {"chains_path": str(chains_path)}
-                if chain_diagnostics_path.exists():
-                    try:
-                        import json as _json_chain_diag
-                        info.update(_json_chain_diag.loads(chain_diagnostics_path.read_text()))
-                    except Exception:
-                        pass
-                await _emit(on_event, "chain", "skipped", info)
-            else:
-                await _emit(on_event, "chain", "start", {})
-                hyps = await chain_stage.run(
-                    hyps, config, runtime,
-                    runs_root=_runs_root(plugin_slug), run_id=run_id,
-                )
-                import json as _json_chain
-                try:
-                    chain_count = len(_json_chain.loads(chains_path.read_text()))
-                except Exception:
-                    chain_count = 0
-                diagnostics = {}
-                if chain_diagnostics_path.exists():
-                    try:
-                        diagnostics = _json_chain.loads(chain_diagnostics_path.read_text())
-                    except Exception:
-                        diagnostics = {}
-                await _emit(on_event, "chain", "done", {
-                    "chains": chain_count, "spent": budget.spent, **diagnostics,
-                })
 
         # ---- triage ----
         budget.set_stage("triage")
@@ -436,80 +381,11 @@ async def run_scan(
                 "accepted": len(triaged.accepted), "rejected": len(triaged.rejected),
                 "merged": len(triaged.merged),
             })
-        elif no_triage:
-            from .schemas.hypothesis import Confidence as _Conf
-            import json as _json_quality
-            _rank = {_Conf.HIGH: 0, _Conf.MEDIUM: 1, _Conf.LOW: 2}
-            accepted = sorted(hyps.hypotheses, key=lambda h: _rank.get(h.confidence, 99))
-            cap = config.max_hypotheses_to_verify
-            triaged = TriagedArtifact(
-                plugin_slug=hyps.plugin_slug,
-                accepted=accepted[:cap], rejected=[], merged=[],
-            )
-            for hyp in triaged.accepted:
-                append_decision(
-                    run_dir,
-                    stage="triage",
-                    action="accept",
-                    result="accepted_no_triage",
-                    hypothesis_id=hyp.id,
-                    reason="triage skipped by --no-triage",
-                    artifact=run_dir / "triaged.json",
-                )
-            for hyp in accepted[cap:]:
-                append_decision(
-                    run_dir,
-                    stage="triage",
-                    action="drop",
-                    result="capped_before_verification",
-                    hypothesis_id=hyp.id,
-                    reason=f"max_hypotheses_to_verify cap {cap}",
-                    artifact=run_dir / "triaged.json",
-                )
-            if config.quality.enabled and config.quality.finding_grader:
-                quality_path = run_dir / "quality_gate_triage.json"
-                triaged = apply_quality_gate(
-                    triaged,
-                    require_evidence_schema=config.quality.require_evidence_schema,
-                    false_positive_rules=config.quality.false_positive_rules,
-                    recompute=config.quality.recompute_severity,
-                    reject_below_submit_bar=config.quality.reject_below_submit_bar,
-                    borderline_to_manual_review=config.quality.borderline_to_manual_review,
-                    artifact_path=quality_path,
-                )
-                if quality_path.exists():
-                    try:
-                        for decision in _json_quality.loads(quality_path.read_text()):
-                            accepted_by_gate = bool(decision.get("accepted"))
-                            disposition = str(decision.get("disposition") or ("accepted" if accepted_by_gate else "rejected"))
-                            append_decision(
-                                run_dir,
-                                stage="quality_gate",
-                                action="manual_review" if disposition == "manual_review" else "accept" if accepted_by_gate else "reject",
-                                result=disposition,
-                                hypothesis_id=str(decision.get("hypothesis_id") or ""),
-                                reason=str(decision.get("reason") or ""),
-                                artifact=quality_path,
-                                details={
-                                    "rules": decision.get("rules") or [],
-                                    "warnings": decision.get("warnings") or [],
-                                    "severity": decision.get("severity") or {},
-                                },
-                            )
-                    except Exception as exc:
-                        logger.warning("scan %s: failed to mirror quality gate decisions into ledger: %s", run_id, exc)
-            triaged.to_json_file(str(run_dir / "triaged.json"))
-            await _emit(on_event, "triage", "done", {
-                "accepted": len(triaged.accepted), "rejected": 0, "merged": 0,
-                "manual_review_candidates": len(triaged.manual_review),
-                "spent": budget.spent, "skipped": "no_triage",
-            })
         else:
             await _emit(on_event, "triage", "start", {})
             triaged = await triage_stage.run(
                 hyps, intake.source_path, config, budget, runtime,
                 recon=recon, runs_root=_runs_root(plugin_slug), run_id=run_id,
-                apply_scope_filter=apply_scope_filter,
             )
             await _emit(on_event, "triage", "done", {
                 "accepted": len(triaged.accepted), "rejected": len(triaged.rejected),
@@ -526,53 +402,7 @@ async def run_scan(
 
         # ---- verify ----
         budget.set_stage("verify")
-        if no_verify:
-            atomic_write_text(findings_path, "")
-            manual_queued = 0
-            already_queued = 0
-            for hyp in triaged.accepted:
-                hyp_dir = run_dir / "verifications" / hyp.id
-                hyp_dir.mkdir(parents=True, exist_ok=True)
-                verify_helpers.write_manual_scaffold(
-                    hyp,
-                    hyp_dir,
-                    intake.plugin_slug,
-                    "",
-                    handoff_reason=(
-                        "Verification was skipped by --no-verify. This hypothesis passed "
-                        "automated triage and needs manual validation before it is treated "
-                        "as a confirmed vulnerability."
-                    ),
-                )
-                was_queued = verify_helpers.emit_to_manual_review_queue(
-                    hyp,
-                    run_dir,
-                    reason="verification skipped by --no-verify",
-                    verifier_notes={
-                        "triage_accepted": True,
-                        "verification_skipped": True,
-                    },
-                )
-                if was_queued:
-                    manual_queued += 1
-                else:
-                    already_queued += 1
-                append_decision(
-                    run_dir,
-                    stage="verify",
-                    action="manual_review",
-                    result="verification_skipped",
-                    hypothesis_id=hyp.id,
-                    reason="verification skipped by --no-verify",
-                    artifact=run_dir / "verifications" / hyp.id / "manual_scaffold",
-                )
-            await _emit(on_event, "verify", "skipped", {
-                "findings": 0,
-                "manual_queued": manual_queued,
-                "already_queued": already_queued,
-                "reason": "no_verify",
-            })
-        elif _should_load("verify") and findings_path.exists():
+        if _should_load("verify") and findings_path.exists():
             findings, corrupt_count = read_jsonl_models(
                 findings_path,
                 Finding,
@@ -597,31 +427,30 @@ async def run_scan(
             )
             await _emit(on_event, "verify", "done", {"findings": len(findings), "spent": budget.spent})
 
-        if not no_verify:
-            # ---- dedup (cheap; always re-run on resume since output overwrites findings.jsonl) ----
-            budget.set_stage("dedup")
-            await _emit(on_event, "dedup", "start", {})
-            findings = await dedup_stage.run(
-                findings, plugin_slug, config, runs_root=_runs_root(plugin_slug), run_id=run_id,
-            )
-            novel_count = sum(1 for f in findings if f.dedup_status == DedupStatus.NOVEL)
-            await _emit(on_event, "dedup", "done", {
-                "novel": novel_count, "possibly_known": sum(1 for f in findings if f.dedup_status == DedupStatus.POSSIBLY_KNOWN),
-                "known_dupe": sum(1 for f in findings if f.dedup_status == DedupStatus.KNOWN_DUPE),
-            })
+        # ---- dedup (cheap; always re-run on resume since output overwrites findings.jsonl) ----
+        budget.set_stage("dedup")
+        await _emit(on_event, "dedup", "start", {})
+        findings = await dedup_stage.run(
+            findings, plugin_slug, config, runs_root=_runs_root(plugin_slug), run_id=run_id,
+        )
+        novel_count = sum(1 for f in findings if f.dedup_status == DedupStatus.NOVEL)
+        await _emit(on_event, "dedup", "done", {
+            "novel": novel_count, "possibly_known": sum(1 for f in findings if f.dedup_status == DedupStatus.POSSIBLY_KNOWN),
+            "known_dupe": sum(1 for f in findings if f.dedup_status == DedupStatus.KNOWN_DUPE),
+        })
 
-            await _persist_findings(run_id, plugin_slug, findings)
+        await _persist_findings(run_id, plugin_slug, findings)
 
-            # ---- report (per-finding skip: existing report files are preserved) ----
-            budget.set_stage("report")
-            await _emit(on_event, "report", "start", {})
-            report_paths = await report_stage.run(
-                findings, plugin_slug, config, budget, runtime,
-                runs_root=_runs_root(plugin_slug), run_id=run_id,
-                plugin_path=intake.source_path,
-                plugin_version=intake.plugin_version,
-            )
-            await _emit(on_event, "report", "done", {"reports": len(report_paths), "spent": budget.spent})
+        # ---- report (per-finding skip: existing report files are preserved) ----
+        budget.set_stage("report")
+        await _emit(on_event, "report", "start", {})
+        report_paths = await report_stage.run(
+            findings, plugin_slug, config, budget, runtime,
+            runs_root=_runs_root(plugin_slug), run_id=run_id,
+            plugin_path=intake.source_path,
+            plugin_version=intake.plugin_version,
+        )
+        await _emit(on_event, "report", "done", {"reports": len(report_paths), "spent": budget.spent})
 
         status = "complete"
         append_decision(

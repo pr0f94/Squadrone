@@ -56,10 +56,8 @@ class AgentRuntime:
     @staticmethod
     def _role_for_agent(agent_name: str) -> str:
         base = agent_name.split(".", 1)[0]
-        if base in {"auth", "auth_flow", "cross_file_xss", "file_ops", "injection", "logic_flaw", "ssrf_deser", "xss"}:
+        if base in {"auth", "auth_flow", "file_ops", "injection", "logic_flaw", "ssrf_deser", "xss"}:
             return "specialists"
-        if base == "claim_validator":
-            return "reporter"
         if base == "entry_point_validator":
             return "hypothesis_verifier"
         return base

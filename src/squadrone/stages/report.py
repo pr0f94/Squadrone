@@ -5,12 +5,10 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from ..agents.claim_validator import ClaimValidator
 from ..agents.reporter import ReporterAgent
 from ..agents.runtime import AgentRuntime
 from ..schemas.config import PipelineConfig
 from ..schemas.finding import DedupStatus, Finding
-from ..services import report_helpers
 from ..services.artifacts import atomic_write_text
 from ..services.budget import BudgetTracker
 from ..services.decision_ledger import append_decision
@@ -53,9 +51,7 @@ async def run(
     plugin_path: str | None = None,
     plugin_version: str | None = None,
 ) -> list[str]:
-    cfg = config.report
     reporter = ReporterAgent(runtime, model=config.models.reporter)
-    claim_validator = ClaimValidator(runtime, model=config.models.reporter) if cfg.claim_validation_pass else None
     out_paths: list[str] = []
     run_dir = Path(runs_root) / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -121,35 +117,12 @@ async def run(
                     )
                 continue
 
-        # R2: submission readiness gate — emit *_NOT_READY.md instead of polished report
-        # if upstream prerequisites aren't satisfied.
-        if cfg.submission_readiness_gate:
-            is_ready, checklist = report_helpers.check_submission_readiness(f)
-            if not is_ready:
-                programs = list(f.hypothesis.bounty_programs) or ["wordfence"]
-                for program in programs:
-                    not_ready_path = run_dir / f"report_{f.id}_{program}_NOT_READY.md"
-                    atomic_write_text(not_ready_path, report_helpers.render_not_ready_md(f, checklist))
-                    out_paths.append(str(not_ready_path))
-                    logger.info("report: NOT READY for %s (%s) — wrote %s", f.id, program, not_ready_path)
-                    append_decision(
-                        run_dir,
-                        stage="report",
-                        action="block",
-                        result="not_ready",
-                        hypothesis_id=f.hypothesis.id,
-                        finding_id=f.id,
-                        artifact=not_ready_path,
-                        details={"program": program, "checklist": checklist},
-                    )
-                continue
-
         code_slice = None
         if plugin_root is not None:
             code_slice = _read_code_slice(plugin_root, f.hypothesis.file, f.hypothesis.line)
 
-        # Generate one report per qualifying program. Default to wordfence for legacy
-        # findings produced before scope-tagging was wired in (empty bounty_programs).
+        # Generate one report per qualifying program. Default to Wordfence if
+        # routing metadata is unexpectedly absent.
         programs = list(f.hypothesis.bounty_programs) or ["wordfence"]
         for program in programs:
             md = await reporter.write(
@@ -159,49 +132,6 @@ async def run(
                 code_slice=code_slice,
                 program=program,
             )
-
-            # R1: claim-validation pass before writing
-            validation_summary = None
-            if claim_validator is not None:
-                evidence_summary = (
-                    f"Hypothesis: {f.hypothesis.model_dump_json(indent=2)[:3000]}\n\n"
-                    f"PoC evidence: {str(f.evidence)[:2000]}\n\n"
-                    f"Dedup matches (top 3): "
-                    f"{(f.dedup_matches[:3] if f.dedup_matches else 'none')}"
-                )
-                validation = await claim_validator.validate(md, evidence_summary)
-                validation_summary = validation.summary
-                blocking = [c for c in validation.unsupported_claims if c.severity == "blocking"]
-                if blocking:
-                    blocked_path = run_dir / f"report_{f.id}_{program}_CLAIM_VALIDATION_BLOCKED.md"
-                    block_md = (
-                        f"# CLAIM VALIDATION BLOCKED: {f.id} ({program})\n\n"
-                        f"R1 found {len(blocking)} blocking unsupported claim(s) in the generated report.\n\n"
-                        f"## Summary\n{validation_summary or '(none)'}\n\n"
-                        f"## Blocking claims\n\n"
-                        + "\n\n".join(
-                            f"### Severity: {c.severity}\n> {c.quote}\n\n**Issue:** {c.issue}"
-                            for c in blocking
-                        )
-                        + "\n\n## Original report\n\n"
-                        + md
-                    )
-                    atomic_write_text(blocked_path, block_md)
-                    out_paths.append(str(blocked_path))
-                    logger.warning("report: %s (%s) — claim validation BLOCKED (%d blocking claims) — %s",
-                                   f.id, program, len(blocking), blocked_path)
-                    append_decision(
-                        run_dir,
-                        stage="report",
-                        action="block",
-                        result="claim_validation_blocked",
-                        hypothesis_id=f.hypothesis.id,
-                        finding_id=f.id,
-                        reason=validation_summary,
-                        artifact=blocked_path,
-                        details={"program": program, "blocking_claims": len(blocking)},
-                    )
-                    continue
 
             out = run_dir / f"report_{f.id}_{program}.md"
             atomic_write_text(out, md)
@@ -217,7 +147,4 @@ async def run(
                 artifact=out,
                 details={"program": program, "bytes": len(md)},
             )
-            if validation_summary:
-                logger.info("report: %s validator: %s", f.id, validation_summary)
-
     return out_paths

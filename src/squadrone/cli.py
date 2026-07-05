@@ -69,17 +69,10 @@ console = Console()
 MANUAL_QUEUE_PATH = Path("cache/findings_for_manual_review.jsonl")
 
 
-class ScanMode(str, Enum):
-    quick = "quick"
-    default = "default"
-    research = "research"
-
-
 STAGE_LABELS = {
     "intake": "Intake",
     "recon": "Recon",
     "hypothesis": "Hypothesis",
-    "chain": "Chain synthesis",
     "triage": "Triage",
     "manual_queue": "Manual queue",
     "verify": "Verification",
@@ -91,7 +84,6 @@ STAGE_DESCRIPTIONS = {
     "intake": "Downloading the plugin from WordPress.org SVN and recording source metadata.",
     "recon": "Mapping reachable entry points, nonce/capability checks, and risky sinks.",
     "hypothesis": "Running specialist agents to look for source-grounded vulnerability candidates.",
-    "chain": "Checking whether accepted hypotheses combine into stronger exploit chains.",
     "triage": "Filtering candidates against exploitability and bounty-scope rules.",
     "verify": "Building a WordPress sandbox and attempting PoC reproduction for accepted candidates.",
     "dedup": "Comparing confirmed findings against known vulnerability databases.",
@@ -130,7 +122,6 @@ def _stage_done_summary(stage: str, info: dict[str, Any]) -> str:
         "intake": ("version", "files", "lines"),
         "recon": ("entry_points", "sinks"),
         "hypothesis": ("count",),
-        "chain": ("status", "hypothesis_count", "chains", "annotated_hypothesis_count"),
         "triage": ("accepted", "rejected", "merged", "manual_review_candidates"),
         "manual_queue": ("candidates", "manual_queued", "already_queued", "unavailable", "reason"),
         "verify": ("findings", "manual_queued", "already_queued"),
@@ -158,11 +149,9 @@ def _print_scan_header(
     version: str | None,
     resume: str | None,
     verbose: bool,
-    mode: ScanMode,
 ) -> None:
     lines = [
         f"[b]Plugin[/b]        {plugin_slug}",
-        f"[b]Scan mode[/b]     {mode.value}",
         f"[b]Config[/b]        {config}",
         f"[b]Budget[/b]        {f'${budget:.2f}' if budget is not None else 'from config'}",
         f"[b]Version[/b]       {version or 'latest'}",
@@ -221,41 +210,17 @@ def _print_scan_result(result: Any) -> None:
 async def _run_scan_cli(
     *,
     plugin_slug: str,
-    mode: ScanMode,
     config: str,
     budget: float | None,
     version: str | None,
-    no_triage: bool,
-    no_verify: bool,
-    ignore_scope: bool,
     resume: str | None,
     resume_from: str | None,
-    chain: bool | None,
-    cross_file_taint: bool | None,
-    diff_baseline: str | None,
-    strict_quality: bool | None,
-    triage_votes: int | None,
     verbose: bool,
     batch_prefix: str | None = None,
 ) -> Any:
     from .orchestrator import run_scan
 
-    if mode is ScanMode.quick:
-        no_verify = True
-        chain = False if chain is None else chain
-        cross_file_taint = False if cross_file_taint is None else cross_file_taint
-        strict_quality = True if strict_quality is None else strict_quality
-        triage_votes = 1 if triage_votes is None else triage_votes
-    elif mode is ScanMode.research:
-        chain = True if chain is None else chain
-        cross_file_taint = True if cross_file_taint is None else cross_file_taint
-        strict_quality = True if strict_quality is None else strict_quality
-        triage_votes = 3 if triage_votes is None else triage_votes
-    else:
-        chain = False if chain is None else chain
-        cross_file_taint = False if cross_file_taint is None else cross_file_taint
-
-    _print_scan_header(plugin_slug, config, budget, version, resume, verbose, mode)
+    _print_scan_header(plugin_slug, config, budget, version, resume, verbose)
 
     stage_started_at: dict[str, float] = {}
     run_id_seen: str | None = resume
@@ -287,10 +252,7 @@ async def _run_scan_cli(
         elif status == "skipped":
             extras = _stage_done_summary(stage, info)
             suffix = f" · {extras}" if extras else ""
-            if info.get("reason") == "no_verify":
-                console.print(f"{prefix}[yellow]↷ {label} skipped by --no-verify{suffix}[/]")
-            else:
-                console.print(f"{prefix}[dim]↺ {label} loaded from existing artifacts{suffix}[/]")
+            console.print(f"{prefix}[dim]↺ {label} loaded from existing artifacts{suffix}[/]")
         elif status == "budget_exceeded":
             console.print(f"{prefix}[yellow]⚠ budget exceeded — {info.get('message','')}[/]")
         elif status == "failed":
@@ -302,16 +264,8 @@ async def _run_scan_cli(
         budget_override=budget,
         on_event=on_event,
         version=version,
-        no_triage=no_triage,
-        no_verify=no_verify,
         resume_run_id=resume,
         resume_from=resume_from,
-        apply_scope_filter=not ignore_scope,
-        enable_chain=chain,
-        enable_cross_file_taint=cross_file_taint,
-        diff_baseline=diff_baseline,
-        strict_quality=strict_quality,
-        triage_votes=triage_votes,
     )
 
     _print_scan_result(result)
@@ -482,69 +436,16 @@ def manual_clear() -> None:
 @app.command()
 def scan(
     plugin_slug: str = typer.Argument(..., help="WordPress plugin slug"),
-    mode: ScanMode = typer.Option(
-        ScanMode.default,
-        "--mode",
-        "-m",
-        help=(
-            "Scan preset: quick is static/manual-review only, default verifies likely findings, "
-            "research enables deeper review and stricter triage."
-        ),
-        case_sensitive=False,
-    ),
     config: str = typer.Option("pipelines/default.yaml", "--config", help="Pipeline config YAML path"),
     budget: float | None = typer.Option(None, "--budget", help="Override cost ceiling (USD)"),
     version: str | None = typer.Option(None, "--version", help="Pin a specific plugin version (e.g. for re-scanning a historical release). Defaults to the latest version on wordpress.org."),
-    no_triage: bool = typer.Option(
-        False,
-        "--no-triage",
-        help="Advanced: skip Critic; pipe hypotheses straight to verify.",
-        rich_help_panel="Advanced",
-    ),
-    no_verify: bool = typer.Option(
-        False,
-        "--no-verify",
-        help="Skip sandbox verification; queue triage-accepted hypotheses for manual review instead of creating findings.",
-    ),
-    ignore_scope: bool = typer.Option(
-        False, "--ignore-scope",
-        help="Disable Wordfence/Patchstack scope filtering in triage; verify everything technically valid.",
-    ),
     resume: str | None = typer.Option(
         None, "--resume",
         help="Resume an existing run by ID — auto-detects the latest completed stage from disk artifacts and re-runs from the next stage onwards",
     ),
     resume_from: str | None = typer.Option(
         None, "--from",
-        help="Force re-run from a specific stage (requires --resume). One of: intake, recon, hypothesis, chain, triage, verify, dedup, report.",
-    ),
-    chain: bool | None = typer.Option(
-        None, "--chain/--no-chain",
-        help="Advanced: override exploit-chain synthesis for this run.",
-        rich_help_panel="Advanced",
-    ),
-    cross_file_taint: bool | None = typer.Option(
-        None, "--cross-file-taint/--no-cross-file-taint",
-        help="Advanced: override the larger cross-file stored-XSS specialist.",
-        rich_help_panel="Advanced",
-    ),
-    diff_baseline: str | None = typer.Option(
-        None, "--diff",
-        help="Advanced: compare the scanned version against this prior WordPress.org release.",
-        rich_help_panel="Advanced",
-    ),
-    strict_quality: bool | None = typer.Option(
-        None,
-        "--strict-quality/--no-strict-quality",
-        help="Advanced: override quality gates from the selected mode/config.",
-        rich_help_panel="Advanced",
-    ),
-    triage_votes: int | None = typer.Option(
-        None,
-        "--triage-votes",
-        min=1,
-        help="Advanced: run N independent Critic triage votes. Overrides mode/config.",
-        rich_help_panel="Advanced",
+        help="Force re-run from a specific stage (requires --resume). One of: intake, recon, hypothesis, triage, verify, dedup, report.",
     ),
     verbose: bool = typer.Option(
         False, "--verbose", "-v",
@@ -555,20 +456,11 @@ def scan(
     _configure_logging(verbose=verbose)
     result = asyncio.run(_run_scan_cli(
         plugin_slug=plugin_slug,
-        mode=mode,
         config=config,
         budget=budget,
         version=version,
-        no_triage=no_triage,
-        no_verify=no_verify,
-        ignore_scope=ignore_scope,
         resume=resume,
         resume_from=resume_from,
-        chain=chain,
-        cross_file_taint=cross_file_taint,
-        diff_baseline=diff_baseline,
-        strict_quality=strict_quality,
-        triage_votes=triage_votes,
         verbose=verbose,
     ))
 
@@ -599,63 +491,10 @@ def _read_plugins_file(path: str) -> list[str]:
 @app.command("scan-batch")
 def scan_batch(
     plugins_file: str = typer.Argument(..., help="File containing plugin slugs (one per line)"),
-    mode: ScanMode = typer.Option(
-        ScanMode.default,
-        "--mode",
-        "-m",
-        help=(
-            "Scan preset: quick is static/manual-review only, default verifies likely findings, "
-            "research enables deeper review and stricter triage."
-        ),
-        case_sensitive=False,
-    ),
     concurrency: int = typer.Option(1, "--concurrency", min=1, help="Number of plugins to scan in parallel"),
     config: str = typer.Option("pipelines/default.yaml", "--config", help="Pipeline config YAML path"),
     budget: float | None = typer.Option(None, "--budget", help="Per-plugin cost ceiling override (USD)"),
     version: str | None = typer.Option(None, "--version", help="Pin the same plugin version for every slug in the batch"),
-    no_triage: bool = typer.Option(
-        False,
-        "--no-triage",
-        help="Advanced: skip Critic; pipe hypotheses straight to verify.",
-        rich_help_panel="Advanced",
-    ),
-    no_verify: bool = typer.Option(
-        False,
-        "--no-verify",
-        help="Skip sandbox verification; queue triage-accepted hypotheses for manual review instead of creating findings",
-    ),
-    ignore_scope: bool = typer.Option(
-        False, "--ignore-scope",
-        help="Disable Wordfence/Patchstack scope filtering in triage; verify everything that's technically a bug",
-    ),
-    chain: bool | None = typer.Option(
-        None, "--chain/--no-chain",
-        help="Advanced: override exploit-chain synthesis for this batch.",
-        rich_help_panel="Advanced",
-    ),
-    cross_file_taint: bool | None = typer.Option(
-        None, "--cross-file-taint/--no-cross-file-taint",
-        help="Advanced: override the larger cross-file stored-XSS specialist.",
-        rich_help_panel="Advanced",
-    ),
-    diff_baseline: str | None = typer.Option(
-        None, "--diff",
-        help="Advanced: compare the scanned version against this prior WordPress.org release.",
-        rich_help_panel="Advanced",
-    ),
-    strict_quality: bool | None = typer.Option(
-        None,
-        "--strict-quality/--no-strict-quality",
-        help="Advanced: override quality gates from the selected mode/config.",
-        rich_help_panel="Advanced",
-    ),
-    triage_votes: int | None = typer.Option(
-        None,
-        "--triage-votes",
-        min=1,
-        help="Advanced: run N independent Critic triage votes per plugin. Overrides mode/config.",
-        rich_help_panel="Advanced",
-    ),
     verbose: bool = typer.Option(
         False, "--verbose", "-v",
         help="Show detailed INFO logs from stages, agents, sandbox setup, and LLM calls. Default output stays concise.",
@@ -667,7 +506,6 @@ def scan_batch(
     console.print(Panel(
         "\n".join([
             f"[b]Plugins[/b]      {len(plugin_slugs)}",
-            f"[b]Scan mode[/b]    {mode.value}",
             f"[b]Config[/b]       {config}",
             f"[b]Budget[/b]       {f'${budget:.2f} per plugin' if budget is not None else 'from config'}",
             f"[b]Concurrency[/b]  {concurrency}",
@@ -687,20 +525,11 @@ def scan_batch(
                 try:
                     result = await _run_scan_cli(
                         plugin_slug=slug,
-                        mode=mode,
                         config=config,
                         budget=budget,
                         version=version,
-                        no_triage=no_triage,
-                        no_verify=no_verify,
-                        ignore_scope=ignore_scope,
                         resume=None,
                         resume_from=None,
-                        chain=chain,
-                        cross_file_taint=cross_file_taint,
-                        diff_baseline=diff_baseline,
-                        strict_quality=strict_quality,
-                        triage_votes=triage_votes,
                         verbose=verbose,
                         batch_prefix=prefix,
                     )
@@ -741,11 +570,6 @@ def benchmark(
     split: str = typer.Option("train", "--split", help="Corpus split to evaluate (e.g. train, test, holdout)"),
     config: str = typer.Option("pipelines/default.yaml", "--config", help="Pipeline config YAML path"),
     budget: float | None = typer.Option(None, "--budget", help="Per-scan budget override (USD)"),
-    no_triage: bool = typer.Option(False, "--no-triage", help="Skip Critic per scan"),
-    ignore_scope: bool = typer.Option(
-        False, "--ignore-scope",
-        help="Disable Wordfence/Patchstack scope filtering in triage; verify everything that's technically a bug",
-    ),
 ) -> None:
     """Run the benchmark harness over a corpus."""
     _configure_logging()
@@ -755,8 +579,7 @@ def benchmark(
 
     result = asyncio.run(run_benchmark(
         corpus_path=corpus, split=split, config_path=config,
-        budget_override=budget, no_triage=no_triage,
-        apply_scope_filter=not ignore_scope,
+        budget_override=budget,
     ))
 
     table = Table(title=f"Benchmark — {corpus} (split={split})")

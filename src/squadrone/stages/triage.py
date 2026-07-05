@@ -26,66 +26,6 @@ logger = logging.getLogger(__name__)
 _CONF_RANK = {Confidence.HIGH: 0, Confidence.MEDIUM: 1, Confidence.LOW: 2}
 
 
-def _combine_vote_artifacts(votes: list[TriagedArtifact], original: HypothesesArtifact) -> TriagedArtifact:
-    """Majority-vote multiple critic passes by hypothesis id.
-
-    A hypothesis is accepted if more than half of vote artifacts accepted it. The
-    first accepted object is retained so any bounty_programs from the critic carry
-    forward. Rejections keep the most common-ish first reason for auditability.
-    """
-    if len(votes) == 1:
-        return votes[0]
-    threshold = len(votes) // 2 + 1
-    by_id = {h.id: h for h in original.hypotheses}
-    accepted_counts: dict[str, int] = {h.id: 0 for h in original.hypotheses}
-    accepted_objects: dict[str, object] = {}
-    rejection_reasons: dict[str, list[str]] = {h.id: [] for h in original.hypotheses}
-    merged: list[dict] = []
-    for art in votes:
-        accepted_ids = {h.id for h in art.accepted}
-        for h in art.accepted:
-            accepted_counts[h.id] = accepted_counts.get(h.id, 0) + 1
-            accepted_objects.setdefault(h.id, h)
-        for h_id in by_id:
-            if h_id not in accepted_ids:
-                reason = next(
-                    (str(r.get("reason", "")) for r in art.rejected if r.get("hypothesis_id") == h_id),
-                    "not accepted by critic vote",
-                )
-                rejection_reasons.setdefault(h_id, []).append(reason)
-        merged.extend(art.merged)
-
-    accepted = []
-    rejected = []
-    manual_review = []
-    for h_id, count in accepted_counts.items():
-        if count >= threshold:
-            accepted.append(accepted_objects.get(h_id, by_id[h_id]))
-        elif count > 0:
-            reasons = rejection_reasons.get(h_id) or ["critic vote split below acceptance threshold"]
-            manual_review.append({
-                "hypothesis_id": h_id,
-                "reason": f"triage_votes: accepted {count}/{len(votes)}; split vote requires manual review — {reasons[0]}",
-                "source": "triage_votes",
-                "accepted_votes": count,
-                "total_votes": len(votes),
-                "hypothesis": by_id[h_id].model_dump(mode="json"),
-            })
-        else:
-            reasons = rejection_reasons.get(h_id) or ["critic vote majority rejected"]
-            rejected.append({
-                "hypothesis_id": h_id,
-                "reason": f"triage_votes: accepted {count}/{len(votes)}; majority rejected — {reasons[0]}",
-            })
-    return TriagedArtifact(
-        plugin_slug=original.plugin_slug,
-        accepted=accepted,
-        rejected=rejected,
-        merged=merged,
-        manual_review=manual_review,
-    )
-
-
 async def run(
     hypotheses: HypothesesArtifact,
     plugin_path: str,
@@ -104,26 +44,8 @@ async def run(
 
     code_slices = _build_code_slices(recon, Path(plugin_path))
 
-    # Stage-4 toggles flow through the critic constructor. All default off so existing
-    # callers see identical behaviour.
-    triage_cfg = config.triage
-
-    votes = max(1, triage_cfg.verifier_votes)
-    vote_artifacts: list[TriagedArtifact] = []
-    for vote_idx in range(votes):
-        review_mode = "adversarial" if votes > 1 and vote_idx == votes - 1 else "standard"
-        critic = CriticAgent(
-            runtime,
-            model=config.models.critic,
-            inject_review_md=triage_cfg.inject_review_md,
-            cluster_aware=triage_cfg.cluster_aware,
-            review_md_max_chars=triage_cfg.review_md_max_chars,
-            review_mode=review_mode,
-        )
-        if votes > 1:
-            logger.info("triage: critic vote %d/%d (%s)", vote_idx + 1, votes, review_mode)
-        vote_artifacts.append(await critic.review(hypotheses, code_slices, apply_scope_filter=apply_scope_filter))
-    triaged = _combine_vote_artifacts(vote_artifacts, hypotheses)
+    critic = CriticAgent(runtime, model=config.models.critic)
+    triaged = await critic.review(hypotheses, code_slices, apply_scope_filter=apply_scope_filter)
     for h in triaged.accepted:
         logger.info(format_triage_accept(h))
     for rejection in triaged.rejected:
@@ -155,7 +77,6 @@ async def run(
                 result="capped_before_verification",
                 hypothesis_id=h.id,
                 reason=f"max_hypotheses_to_verify cap {cap}",
-                details={"votes": votes},
             )
         accepted_sorted = accepted_sorted[:cap]
     triaged.accepted = accepted_sorted
@@ -169,7 +90,6 @@ async def run(
             result="accepted",
             hypothesis_id=h.id,
             artifact=run_dir / "triaged.json",
-            details={"votes": votes},
         )
     for rejection in triaged.rejected:
         append_decision(
@@ -180,7 +100,6 @@ async def run(
             hypothesis_id=str(rejection.get("hypothesis_id") or ""),
             reason=str(rejection.get("reason") or ""),
             artifact=run_dir / "triaged.json",
-            details={"votes": votes},
         )
     for item in triaged.manual_review:
         append_decision(
@@ -191,7 +110,6 @@ async def run(
             hypothesis_id=str(item.get("hypothesis_id") or ""),
             reason=str(item.get("reason") or ""),
             artifact=run_dir / "triaged.json",
-            details={"votes": votes},
         )
     for merge in triaged.merged:
         append_decision(
@@ -215,6 +133,7 @@ async def run(
             recompute=config.quality.recompute_severity,
             reject_below_submit_bar=config.quality.reject_below_submit_bar,
             borderline_to_manual_review=config.quality.borderline_to_manual_review,
+            pre_verification=True,
             artifact_path=quality_path,
         )
         if quality_path.exists():

@@ -30,10 +30,15 @@ logger = logging.getLogger(__name__)
 _BUG_CLASS_TEMPLATE: dict[str, str] = {
     BugClass.SQLI.value: "sqli_timebased.py.j2",
     BugClass.MISSING_CAP_CHECK.value: "auth_bypass.py.j2",
-    BugClass.MISSING_NONCE.value: "auth_bypass.py.j2",
+    BugClass.MISSING_NONCE.value: "state_change.py.j2",
     BugClass.PATH_TRAVERSAL.value: "path_traversal.py.j2",
     BugClass.ARBITRARY_FILE_WRITE.value: "file_upload.py.j2",
     BugClass.SSRF.value: "ssrf.py.j2",
+    BugClass.IDOR.value: "idor.py.j2",
+    BugClass.MASS_ASSIGNMENT.value: "state_change.py.j2",
+    BugClass.LOGIC_FLAW.value: "state_change.py.j2",
+    BugClass.XSS_STORED.value: "stored_xss.py.j2",
+    BugClass.XSS_REFLECTED.value: "stored_xss.py.j2",
 }
 
 _FENCE_BLOCK_RE = re.compile(r"```(?:python)?\s*\n(.*?)\n```", re.DOTALL)

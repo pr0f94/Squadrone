@@ -1,5 +1,4 @@
-# Heavy-test pipeline — every approved toggle ON.
-# Used for end-to-end validation of the stage-1 → stage-7 implementations.
+# Heavy-test pipeline for end-to-end validation of the fixed scan path.
 # DO NOT use this in budget-sensitive scans — it's the most expensive config we ship.
 
 cost_ceiling_usd: 10.00
@@ -52,25 +51,11 @@ recon:
   negative_pattern_reference: true
   max_entries_to_validate: 30
 
-# Stage 3 — remaining approved features ON
 hypothesis:
-  specialist_grep_read_tools: true
   specialist_wp_idioms: true
-  require_branch_enumeration: true
-  require_exploit_classification: true
-  iterative_verifier: true
-  verifier_max_iterations: 3
   verifier_require_citation: true
   verifier_wp_idioms: true
-  verifier_drop_categorisation: true
   pre_verifier_dedup: true
-
-# Stage 4 — remaining approved features ON
-triage:
-  inject_review_md: true
-  cluster_aware: true
-  review_md_max_chars: 12000
-  verifier_votes: 1
 
 # Strict quality controls — every quality feature ON
 quality:
@@ -84,25 +69,13 @@ quality:
   reject_below_submit_bar: true
   borderline_to_manual_review: true
 
-# Stage 5 — remaining approved features ON
 verify:
   headless_browser_check: true        # requires Playwright
   persistent_sandbox: true            # exercises mariadb-dump snapshot/restore
-  payload_variants: true
   state_introspection_on_failure: true
-  manual_review_handoff: true
   negative_control: true
   collaborative_dev_poc_loop: true
-  payload_variant_cap: 6
   headless_browser_timeout_s: 15
 
-# Stage 6 — every approved feature ON
-dedup:
-  meaningful_scoring: true
-  submission_recommendation: true
-
-# Stage 7 — every approved feature ON
 report:
-  claim_validation_pass: true
-  submission_readiness_gate: true
   screenshot_capture: true

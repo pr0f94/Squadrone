@@ -21,8 +21,6 @@ class ModelConfig(BaseModel):
     # propose_setup_followup is a structured diagnostic task — Sonnet handles it fine
     # at ~30% the cost of Opus. Falls back to `developer` if not set.
     developer_followup: str = "claude-sonnet-4-6"
-    # Used only when --chain flag is enabled. Defaults to the same tier as critic.
-    chain_synthesizer: str = "claude-opus-4-6"
 
 
 ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "default"]
@@ -53,7 +51,6 @@ class ReasoningConfig(BaseModel):
     reporter: ReasoningEffort | None = None
     dedup_fallback: ReasoningEffort | None = None
     hypothesis_verifier: ReasoningEffort | None = None
-    chain_synthesizer: ReasoningEffort | None = None
 
 
 class SandboxConfig(BaseModel):
@@ -96,41 +93,27 @@ class ReconConfig(BaseModel):
 
 
 class ReportConfig(BaseModel):
-    """Stage 7 (report) opt-in features. All default off."""
-    claim_validation_pass: bool = False    # post-report critic that checks every claim cites source
-    submission_readiness_gate: bool = False # emit *_NOT_READY.md when prerequisites are missing
+    """Stage 7 (report) fixed report defaults."""
     screenshot_capture: bool = False       # screenshot during verify when browser checks are enabled
 
 
 class DedupConfig(BaseModel):
-    """Stage 6 (dedup) opt-in features. All default off."""
-    meaningful_scoring: bool = False        # per-match similarity scoring beyond bug-class match
-    submission_recommendation: bool = False # emit submit_as_novel / regression_of / skip_dupe / rebuttal
+    """Stage 6 (dedup) fixed dedup defaults."""
+    pass
 
 
 class VerifyConfig(BaseModel):
-    """Stage 5 (verify) opt-in features. All default off.
+    """Stage 5 (verify) options.
 
     Proper HTML parser context detection is implemented unconditionally inside
     xss_check.py; there is no toggle because it is a pure bug fix.
     """
     headless_browser_check: bool = False        # Playwright execution check
     persistent_sandbox: bool = False            # one sandbox boot per scan, snapshot/restore between PoCs
-    payload_variants: bool = False              # test multiple payload variants per hypothesis
     state_introspection_on_failure: bool = False # dump DB/uploads/error.log on persistent fail
-    manual_review_handoff: bool = False         # emit manual-review queue + sandbox scaffold on fail
     negative_control: bool = False              # differential reflection check with a benign marker
     collaborative_dev_poc_loop: bool = False    # PoC author can call developer mid-iteration
-    payload_variant_cap: int = 6                # payload variant cost cap
     headless_browser_timeout_s: int = 15        # per-page render budget
-
-
-class TriageConfig(BaseModel):
-    """Stage 4 (triage critic) opt-in features. All default off."""
-    inject_review_md: bool = False        # load plugins/<slug>/review.md into critic context
-    cluster_aware: bool = False           # pre-cluster hypotheses by file, line, and bug class
-    review_md_max_chars: int = 12000      # size cap so review.md does not blow up the prompt
-    verifier_votes: int = 1               # number of independent critic votes
 
 
 class QualityConfig(BaseModel):
@@ -147,20 +130,14 @@ class QualityConfig(BaseModel):
 
 
 class HypothesisConfig(BaseModel):
-    """Stage 3 (hypothesis specialists + verifier) opt-in features. All default off."""
+    """Stage 3 (hypothesis specialists + verifier) options."""
     # Specialists
-    specialist_grep_read_tools: bool = False   # expose read_plugin_file + grep tools to specialists
     specialist_wp_idioms: bool = False         # append WordPress idiom guidance to specialist prompts
-    require_branch_enumeration: bool = False   # require taint_path_branches in output
-    require_exploit_classification: bool = False  # require exploit_classification block
     # Verifier
-    iterative_verifier: bool = False           # multi-pass verifier with grep/read tools
-    verifier_max_iterations: int = 3           # iteration cap
     verifier_require_citation: bool = False    # drop reasons must cite file:line
     verifier_wp_idioms: bool = False           # append WordPress idiom guidance to verifier prompt
-    verifier_drop_categorisation: bool = False # five-state verdicts instead of binary keep/drop
     # Cross-cutting
-    pre_verifier_dedup: bool = False           # merge near-duplicate hypotheses before verifier runs
+    pre_verifier_dedup: bool = True            # merge near-duplicate hypotheses before verifier runs
 
 
 class PipelineConfig(BaseModel):
@@ -177,7 +154,6 @@ class PipelineConfig(BaseModel):
     intake: IntakeConfig = IntakeConfig()  # default-off, fully backward-compatible
     recon: ReconConfig = ReconConfig()     # default-off, fully backward-compatible
     hypothesis: HypothesisConfig = HypothesisConfig()  # default-off, fully backward-compatible
-    triage: TriageConfig = TriageConfig()  # default-off, fully backward-compatible
     quality: QualityConfig = QualityConfig()  # default-off, fully backward-compatible
     verify: VerifyConfig = VerifyConfig()  # default-off, fully backward-compatible
     dedup: DedupConfig = DedupConfig()     # default-off, fully backward-compatible

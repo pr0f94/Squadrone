@@ -13,7 +13,6 @@ from ..agents.hypothesis_verifier import HypothesisVerifier
 from ..agents.runtime import AgentRuntime
 from ..agents.specialists.auth import AuthSpecialist
 from ..agents.specialists.auth_flow import AuthFlowSpecialist
-from ..agents.specialists.cross_file_xss import CrossFileXssSpecialist
 from ..agents.specialists.file_ops import FileOpsSpecialist
 from ..agents.specialists.injection import InjectionSpecialist
 from ..agents.specialists.logic_flaw import LogicFlawSpecialist
@@ -30,7 +29,8 @@ from ..services.artifacts import atomic_write_json, atomic_write_jsonl
 from ..services.budget import BudgetTracker
 from ..services.console_format import format_verifier_decision
 from ..services.decision_ledger import append_decision
-from ..services.quality_gate import build_focus_area_summary, render_focus_area_prompt
+from ..services.quality_gate import build_focus_area_summary
+from ..services.wp_leads import generate_wp_leads
 
 
 # X1: pre-verifier dedup. Group hypotheses by (file, line, bug_class) and keep the
@@ -201,27 +201,25 @@ async def run(
     runtime: AgentRuntime,
     runs_root: str = "runs",
     run_id: str = "",
-    enable_cross_file_taint: bool = False,
-    diff_summary: str | None = None,
 ) -> HypothesesArtifact:
     code_slices = _build_code_slices(recon, Path(plugin_path))
     logger.info("hypothesis: %d code slices for %d entry points",
                 len(code_slices), len(recon.entry_points))
+    deterministic_leads = generate_wp_leads(recon, plugin_path)
+    if deterministic_leads:
+        leads_path = Path(runs_root) / run_id / "deterministic_wp_leads.jsonl"
+        atomic_write_jsonl(leads_path, deterministic_leads)
+        logger.info("hypothesis: deterministic WP leads generated %d -> %s", len(deterministic_leads), leads_path)
     if config.quality.enabled and config.quality.focus_area_fanout:
         focus = build_focus_area_summary(recon)
         focus_path = Path(runs_root) / run_id / "focus_areas.json"
         focus_path.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_json(focus_path, focus)
-        focus_prompt = render_focus_area_prompt(focus)
-        if focus_prompt:
-            diff_summary = "\n\n".join(part for part in (diff_summary, focus_prompt) if part)
         logger.info("hypothesis: focus-area fanout mapped %d review areas -> %s", len(focus), focus_path)
 
     model = config.models.specialists
     hyp_cfg = config.hypothesis
     specialists = _build_specialists(runtime, model)
-    if enable_cross_file_taint:
-        specialists.append(CrossFileXssSpecialist(runtime, model=model))
 
     # Run specialists sequentially, each with a slice corpus filtered to its bug class.
     # Sequential avoids the rate-limit bursts we hit with asyncio.gather; per-specialist
@@ -233,7 +231,7 @@ async def run(
     from ..schemas.hypothesis import Hypothesis as _Hyp
     spec_dir = Path(runs_root) / run_id
     spec_dir.mkdir(parents=True, exist_ok=True)
-    merged = []
+    merged = list(deterministic_leads)
     for spec in specialists:
         spec_path = spec_dir / f"hypotheses_{spec.NAME}.jsonl"
         if spec_path.exists():
@@ -244,16 +242,13 @@ async def run(
             logger.info("specialist %s: loaded %d cached hypotheses (skipping)", spec.NAME, len(cached))
             merged.extend(cached)
             continue
-        if spec.NAME == "cross_file_xss":
-            spec_slices = code_slices
-        else:
-            spec_slices = _filter_slices_for_specialist(code_slices, spec.NAME)
+        spec_slices = _filter_slices_for_specialist(code_slices, spec.NAME)
         priority_files = sorted(spec_slices)
         logger.info("specialist %s: prioritizing %d/%d files",
                     spec.NAME, len(spec_slices), len(code_slices))
         try:
             res = await spec.analyze(
-                recon, spec_slices, hypothesis_cfg=hyp_cfg, diff_summary=diff_summary,
+                recon, spec_slices, hypothesis_cfg=hyp_cfg,
                 plugin_path=plugin_path, priority_files=priority_files,
             )
         except BaseException as e:
@@ -281,9 +276,6 @@ async def run(
         model=config.models.hypothesis_verifier,
         wp_idioms_enabled=hyp_cfg.verifier_wp_idioms,
         require_citation=hyp_cfg.verifier_require_citation,
-        drop_categorisation_enabled=hyp_cfg.verifier_drop_categorisation,
-        iterative_enabled=hyp_cfg.iterative_verifier,
-        max_iterations=hyp_cfg.verifier_max_iterations,
     )
     verdicts = await asyncio.gather(
         *[verifier.verify(h, plugin_path) for h in merged],

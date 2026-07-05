@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import filecmp
 import logging
-import shutil
-import tempfile
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -60,63 +57,12 @@ def _maybe_unpack_zip_tag(plugin_dir: Path, slug: str) -> None:
         logger.info("intake: hoisted contents from %s/", inner.name)
 
 
-def _compute_diff_summary(current_dir: Path, baseline_dir: Path) -> str:
-    """Return a compact PHP-only diff summary between two plugin source trees.
-
-    Format: a newline-separated list of `STATUS path` entries where STATUS is
-    one of A (added), D (deleted), M (modified). Non-PHP files are ignored
-    because specialists only reason about PHP source. Intended for the
-    specialist `diff_summary` field, not a full unified diff.
-    """
-    def php_files(root: Path) -> dict[str, Path]:
-        out: dict[str, Path] = {}
-        for p in root.rglob("*.php"):
-            if p.is_file():
-                out[str(p.relative_to(root))] = p
-        return out
-
-    cur = php_files(current_dir)
-    base = php_files(baseline_dir)
-    lines: list[str] = []
-    for rel in sorted(set(cur) | set(base)):
-        if rel in cur and rel not in base:
-            lines.append(f"A {rel}")
-        elif rel in base and rel not in cur:
-            lines.append(f"D {rel}")
-        else:
-            try:
-                if not filecmp.cmp(cur[rel], base[rel], shallow=False):
-                    lines.append(f"M {rel}")
-            except OSError:
-                lines.append(f"M {rel}")
-    return "\n".join(lines)
-
-
-async def _fetch_diff_summary(
-    svn: SVNClient, plugin_slug: str, current_dir: Path, baseline_version: str,
-) -> str | None:
-    """Export `baseline_version` to a tempdir, diff against `current_dir`, return summary."""
-    with tempfile.TemporaryDirectory(prefix=f"{plugin_slug}-{baseline_version}-") as td:
-        baseline_dir = Path(td) / "baseline"
-        try:
-            await svn.export(plugin_slug, baseline_version, str(baseline_dir))
-        except Exception as e:
-            logger.warning("intake: diff baseline export failed (%s@%s): %s",
-                           plugin_slug, baseline_version, e)
-            return None
-        try:
-            return _compute_diff_summary(current_dir, baseline_dir)
-        finally:
-            shutil.rmtree(baseline_dir, ignore_errors=True)
-
-
 async def run(
     plugin_slug: str,
     run_id: str,
     config: PipelineConfig,
     runs_root: str = "runs",
     version: str | None = None,
-    diff_baseline: str | None = None,
 ) -> IntakeArtifact:
     intake_cfg = config.intake
 
@@ -173,17 +119,6 @@ async def run(
         else:
             logger.info("intake: changelog parse returned no entries")
 
-    diff_summary: str | None = None
-    if diff_baseline:
-        if diff_baseline == version:
-            logger.warning("intake: --diff baseline %s == scan version, skipping diff", diff_baseline)
-        else:
-            logger.info("intake: computing PHP diff vs baseline %s", diff_baseline)
-            diff_summary = await _fetch_diff_summary(svn, plugin_slug, plugin_dir, diff_baseline)
-            if diff_summary:
-                line_count = diff_summary.count("\n") + 1
-                logger.info("intake: diff vs %s — %d changed files", diff_baseline, line_count)
-
     artifact = IntakeArtifact(
         run_id=run_id,
         plugin_slug=plugin_slug,
@@ -197,8 +132,6 @@ async def run(
         file_classification=file_classification,
         recent_changelog=recent_changelog,
         is_plugin_closed=is_closed,
-        diff_baseline_version=diff_baseline if diff_summary else None,
-        diff_summary=diff_summary,
     )
     artifact.to_json_file(str(run_dir / "intake.json"))
     logger.info("intake: wrote %s (files=%d lines=%d)", run_dir / "intake.json", file_count, total_lines)

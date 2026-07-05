@@ -15,27 +15,6 @@ from ..services.vuln_db import VulnDBClient, VulnMatch
 logger = logging.getLogger(__name__)
 
 
-def _classify_legacy(finding: Finding, known: list[VulnMatch]) -> tuple[DedupStatus, list[dict]]:
-    """Original (pre-stage-6) classifier — uniform 1.0 scoring with title-substring strong-signal."""
-    cwe = finding.hypothesis.bug_class.value
-    matches: list[VulnMatch] = []
-    strong = False
-    sink = (finding.hypothesis.sink or "").lower()
-    handler = (finding.hypothesis.entry_point or "").lower()
-    for k in known:
-        if not k.bug_class or k.bug_class != cwe:
-            continue
-        matches.append(k)
-        title_l = (k.title or "").lower()
-        if (sink and sink in title_l) or (handler and handler in title_l):
-            strong = True
-
-    if not matches:
-        return DedupStatus.NOVEL, []
-    match_dicts = [m.model_dump() for m in matches]
-    return (DedupStatus.KNOWN_DUPE if strong else DedupStatus.POSSIBLY_KNOWN, match_dicts)
-
-
 def _classify_scored(
     finding: Finding,
     known: list[VulnMatch],
@@ -88,8 +67,6 @@ async def run(
         logger.info("dedup: no findings to classify")
         return findings
 
-    cfg = config.dedup
-
     db = VulnDBClient()
     known = await db.lookup_all(plugin_slug)
     logger.info("dedup: %d known vulns from DBs", len(known))
@@ -105,22 +82,17 @@ async def run(
         pass
 
     for f in findings:
-        if cfg.meaningful_scoring:
-            status, matches = _classify_scored(f, known, scanned_version)
-        else:
-            status, matches = _classify_legacy(f, known)
+        status, matches = _classify_scored(f, known, scanned_version)
         f.dedup_status = status
         f.dedup_matches = matches
 
-        # D4: submission recommendation
-        if cfg.submission_recommendation:
-            rec, reason = dedup_helpers.derive_submission_recommendation(
-                finding_dedup_status=status.value,
-                scored_matches=matches,
-            )
-            f.submission_recommendation = rec
-            f.submission_recommendation_reason = reason
-            logger.info("dedup: %s — recommendation: %s", f.id, rec)
+        rec, reason = dedup_helpers.derive_submission_recommendation(
+            finding_dedup_status=status.value,
+            scored_matches=matches,
+        )
+        f.submission_recommendation = rec
+        f.submission_recommendation_reason = reason
+        logger.info("dedup: %s — recommendation: %s", f.id, rec)
 
         logger.info("dedup: %s -> %s (matches=%d)", f.id, status.value, len(matches))
         append_decision(

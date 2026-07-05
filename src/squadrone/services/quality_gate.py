@@ -38,11 +38,22 @@ COSMETIC_RE = re.compile(
     re.IGNORECASE,
 )
 IMPACT_RE = re.compile(
-    r"\b(admin account|privilege escalation|account takeover|rce|remote code|file delete|arbitrary file|stored xss|delete|modify other|sensitive|payment|subscription|order|webhook|ssrf|sql injection|data exfil|booking|invoice|submission|approval|protected content|downloadable|paid status|cross-user|another user's)\b",
+    r"\b(admin account|privilege escalation|account takeover|rce|remote code|file delete|arbitrary file|stored xss|delete|modify other|sensitive|payment|subscription|order|webhook|ssrf|sql injection|data exfil|booking|invoice|submission|approval|protected content|downloadable|paid status|cross-user|another user's|magic link|reset token|api key|secret|token)\b",
     re.IGNORECASE,
 )
 SOURCE_RE = re.compile(r"\$_(?:GET|POST|REQUEST|COOKIE|FILES|SERVER)|REST|AJAX|shortcode|form|upload", re.IGNORECASE)
-GUARD_RE = re.compile(r"current_user_can|wp_verify_nonce|check_ajax_referer|check_admin_referer|permission_callback", re.IGNORECASE)
+GUARD_RE = re.compile(
+    r"current_user_can|user_can|wp_verify_nonce|check_ajax_referer|check_admin_referer|permission_callback|ownership|owner|capability|nonce|allowlist|sanitize|escape|validator|token",
+    re.IGNORECASE,
+)
+BOUNDARY_RE = re.compile(
+    r"\b(another user's|user b|other user|cross-user|higher[- ]priv|privilege|private|protected|sensitive|ownership|capability|authorization|payment|approval|paid|token|magic link|reset token|webhook|admin browser|privileged)\b",
+    re.IGNORECASE,
+)
+PROOF_GAP_RE = re.compile(
+    r"\b(unknown|unclear|unproven|not proven|needs manual|needs confirmation|needs validation|maybe|possibly|could be|appears to)\b",
+    re.IGNORECASE,
+)
 
 
 HIGH_IMPACT_CLASSES = {
@@ -90,7 +101,6 @@ def _text(h: Hypothesis) -> str:
             h.reasoning,
             h.preconditions,
             " ".join(h.taint_path),
-            h.chain_impact or "",
         )
     )
 
@@ -124,16 +134,39 @@ def infer_evidence(h: Hypothesis) -> dict[str, Any]:
     role = infer_attacker_role(h)
     taint = [str(x) for x in h.taint_path]
     text = _text(h)
+    supplied = dict(h.evidence_summary or {})
+    source = supplied.get("source") or (taint[0] if taint else "")
+    control = supplied.get("control") or supplied.get("guard") or ""
+    reachable_path = supplied.get("reachable_path") or supplied.get("path") or " -> ".join(taint)
+    boundary = supplied.get("boundary") or supplied.get("security_boundary") or ""
+    impact = supplied.get("impact") or supplied.get("impact_statement") or ""
+    counterevidence = supplied.get("counterevidence") or supplied.get("counter_evidence") or ""
+    proof_gaps = supplied.get("proof_gaps") or supplied.get("proof_gap") or ""
+    boundary_text = " ".join(str(x or "") for x in (boundary, text, impact))
+    impact_text = " ".join(str(x or "") for x in (impact, text))
+    proof_gap_text = " ".join(str(x or "") for x in (
+        proof_gaps if isinstance(proof_gaps, str) else " ".join(map(str, proof_gaps)) if isinstance(proof_gaps, list) else proof_gaps,
+        text,
+    ))
     return {
         "attacker_role": role,
         "entry_point": h.entry_point,
-        "source": taint[0] if taint else "",
+        "source": source,
+        "control": control,
         "sink": h.sink,
+        "reachable_path": reachable_path,
+        "boundary": boundary,
+        "counterevidence": counterevidence,
+        "proof_gaps": proof_gaps,
+        "impact": impact,
         "file": h.file,
         "line": h.line,
-        "has_source_indicator": bool(SOURCE_RE.search(text) or taint),
-        "has_guard_discussion": bool(GUARD_RE.search(text)),
-        "has_impact_statement": bool(IMPACT_RE.search(text) or h.chain_impact),
+        "has_source_indicator": bool(source or SOURCE_RE.search(text) or taint),
+        "has_guard_discussion": bool(control or GUARD_RE.search(text)),
+        "has_reachable_path": bool(reachable_path or taint),
+        "has_security_boundary": bool(boundary or BOUNDARY_RE.search(boundary_text)),
+        "has_impact_statement": bool(impact or IMPACT_RE.search(impact_text)),
+        "has_broad_proof_gap": bool(PROOF_GAP_RE.search(str(proof_gap_text))),
         "bounty_programs": list(h.bounty_programs),
     }
 
@@ -165,9 +198,6 @@ def recompute_severity(h: Hypothesis, evidence: dict[str, Any] | None = None) ->
         base -= 2.0
     if COSMETIC_RE.search(text):
         base -= 2.0
-    if h.chain_impact:
-        base += 0.5
-
     score = max(0.0, min(10.0, round(base, 1)))
     if score >= 9.0:
         rating = "critical"
@@ -219,6 +249,7 @@ def grade_hypothesis(
     false_positive_rules: bool = True,
     recompute: bool = True,
     reject_below_submit_bar: bool = True,
+    pre_verification: bool = False,
 ) -> Grade:
     evidence = infer_evidence(h)
     severity = recompute_severity(h, evidence) if recompute else dict(h.derived_severity or {})
@@ -233,8 +264,20 @@ def grade_hypothesis(
             rules.append("missing_code_location_or_sink")
         if not evidence["has_source_indicator"]:
             warnings.append("source_parameter_not_explicit")
+        if not evidence["has_reachable_path"]:
+            warnings.append("reachable_path_not_explicit")
+        if not evidence["has_security_boundary"]:
+            if pre_verification:
+                warnings.append("missing_security_boundary_preverify")
+            else:
+                rules.append("missing_security_boundary")
         if not evidence["has_impact_statement"]:
-            warnings.append("impact_not_explicit")
+            if pre_verification:
+                warnings.append("missing_concrete_impact_preverify")
+            else:
+                rules.append("missing_concrete_impact")
+        if evidence["has_broad_proof_gap"]:
+            warnings.append("broad_or_vague_proof_gap")
 
     role = evidence["attacker_role"]
     if false_positive_rules:
@@ -253,7 +296,10 @@ def grade_hypothesis(
             rules.append("csrf_without_meaningful_impact")
     score = severity.get("cvss_estimate")
     if reject_below_submit_bar and isinstance(score, int | float) and score < 6.5:
-        rules.append("below_submit_bar")
+        if pre_verification and h.bug_class not in {BugClass.OPEN_REDIRECT, BugClass.MISSING_NONCE}:
+            warnings.append("below_submit_bar_preverify")
+        else:
+            rules.append("below_submit_bar")
 
     accepted = not rules
     reason = "passes quality gate"
@@ -282,6 +328,7 @@ def apply_quality_gate(
     recompute: bool = True,
     reject_below_submit_bar: bool = True,
     borderline_to_manual_review: bool = True,
+    pre_verification: bool = False,
     artifact_path: Path | None = None,
 ) -> TriagedArtifact:
     accepted: list[Hypothesis] = []
@@ -295,6 +342,7 @@ def apply_quality_gate(
             false_positive_rules=false_positive_rules,
             recompute=recompute,
             reject_below_submit_bar=reject_below_submit_bar,
+            pre_verification=pre_verification,
         )
         annotate_hypothesis(h, grade)
         manual_review_candidate = (
@@ -359,6 +407,7 @@ def grade_finding_for_report(
         false_positive_rules=false_positive_rules,
         recompute=recompute,
         reject_below_submit_bar=True,
+        pre_verification=False,
     )
     if finding.poc_status.value not in {"success", "partial"}:
         grade.accepted = False
@@ -402,14 +451,3 @@ def build_focus_area_summary(recon: Any) -> dict[str, list[str]]:
         if re.search(r"echo|print|render|template|html|json|xss", hay, re.IGNORECASE):
             focus["output_rendering_xss"].append(label)
     return {k: sorted(set(v)) for k, v in focus.items() if v}
-
-
-def render_focus_area_prompt(focus: dict[str, list[str]]) -> str:
-    if not focus:
-        return ""
-    lines = ["Focus-area map from recon. Use this to avoid generic review and inspect the relevant routes/sinks:"]
-    for area, items in sorted(focus.items()):
-        lines.append(f"- {area}:")
-        for item in items[:20]:
-            lines.append(f"  - {item}")
-    return "\n".join(lines)

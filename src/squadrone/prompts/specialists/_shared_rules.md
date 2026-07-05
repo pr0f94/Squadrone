@@ -30,18 +30,25 @@ For each hypothesis, before adding it to your output array:
 2. Confirm the function/expression you cited as the sink actually appears there.
 3. Confirm the upstream guard you claim is absent (no nonce, no capability check) really is absent — search the same code slice for `current_user_can`, `wp_verify_nonce`, `check_ajax_referer`, `permission_callback`. If present, either drop the hypothesis or downgrade confidence and explain why the guard is bypassable.
 4. Confirm the precondition is attacker-reachable per the discipline above.
+5. Confirm the claim crosses a real security boundary and has a concrete C/I/A impact.
 
 If any check fails, do not emit. The verifier's bar is "the literal `sink_code` appears at the cited line and there is no obvious upstream guard the specialist missed" — meet that bar yourself before emitting.
 
-## Diff hint (optional)
+## Evidence summary proof tuple
 
-If the input contains a `diff_summary` field, it lists files and changes
-between the version being scanned and an earlier version. Treat this as a
-prior, not a constraint: bugs that the developer touched recently are more
-likely to be incompletely fixed or freshly introduced. Pay extra attention
-to the files and line ranges named there. Do not skip files outside the
-diff — full coverage is still required — but raise confidence by one tier
-on hypotheses that land inside diff-marked regions, and explain in
-`reasoning` why the change looks relevant.
+Every emitted Hypothesis must include an `evidence_summary` object with these
+keys:
 
-If `diff_summary` is absent, ignore this section.
+- `attacker_role`: lowest realistic role
+- `source`: attacker-controlled request/value/event
+- `control`: nearest missing, wrong, or bypassed security control
+- `sink`: dangerous operation or security outcome
+- `reachable_path`: concrete route/callback/helper path
+- `boundary`: why this crosses a WordPress/plugin security boundary
+- `impact`: what the attacker can read, change, execute, or deny
+- `counterevidence`: nearby facts that could defeat the claim
+- `proof_gaps`: narrow remaining facts for sandbox/manual validation
+
+If `boundary`, `impact`, or `reachable_path` would be vague, do not emit the
+hypothesis. Manual review is for nearly proven candidates with one narrow
+runtime question, not for broad uncertainty.

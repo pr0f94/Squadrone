@@ -17,10 +17,9 @@ class EntryPoint(JSONFileMixin):
     has_nonce_check: bool
     has_capability_check: bool
     capability: Optional[str] = None
-    # Stage 2 opt-in metadata (all None when toggles are off — backward compatible)
-    body_slice: Optional[str] = None              # #5: function body lifted into recon.json
-    confidence: Optional[str] = None              # #6: "high" | "medium" | "low"
-    # #1: per-entry-point validation pass output — overrides pattern-derived flags when present
+    body_slice: Optional[str] = None              # Function body lifted into recon.json.
+    confidence: Optional[str] = None              # "high" | "medium" | "low"
+    # Per-entry-point validation output overrides pattern-derived flags when present.
     validated_auth_gating: Optional[str] = None   # "logged_in_only" | "capability:<X>" |
                                                   # "nonce_only:<action>" | "none" | "mixed"
     validated_nonce_action: Optional[str] = None  # action name if nonce-gated

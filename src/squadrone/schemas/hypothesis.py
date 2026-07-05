@@ -85,7 +85,7 @@ class Hypothesis(JSONFileMixin):
     file: str
     line: int
     sink: _StrLike
-    sink_code: _StrLike = ""  # Verbatim source line(s) of the sink. Empty = legacy hypothesis.
+    sink_code: _StrLike = ""  # Verbatim source line(s) of the sink when available.
     taint_path: _StrListLike
     reasoning: _StrLike
     confidence: _ConfidenceLike
@@ -94,15 +94,8 @@ class Hypothesis(JSONFileMixin):
     # Populated by the triage stage. Empty for hypotheses produced before scope filtering ran;
     # may contain "wordfence", "patchstack", or both. Routing/report stages should respect this.
     bounty_programs: list[str] = []
-    # Stage 3 opt-in additions. Empty when toggles are off.
-    taint_path_branches: list[list[str]] = []   # S3: alternate taint branches from same entry to sink
-    exploit_classification: dict | None = None  # S4: {type, secondary_primitive_required?, config_required?, realistic_in_default_install?}
-    # Populated by the optional chain stage (--chain). Empty when the stage didn't run.
-    chains_with: list[str] = []                 # IDs of other hypotheses that combine with this one
-    chain_impact: str | None = None             # human-readable combined impact (e.g. "Subscriber→RCE via auth-bypass + file-write")
-    chain_severity_bump: str | None = None      # severity delta from chaining (e.g. "medium→critical")
     # Populated by optional quality gates. These fields are additive metadata only.
-    evidence_summary: dict[str, Any] = {}        # source/sink/role/guard fields inferred for triage/reporting
+    evidence_summary: dict[str, Any] = {}        # proof tuple: source/control/sink/path/boundary/impact/gaps
     quality_gate: dict[str, Any] = {}            # rule decisions, warnings, and submit-worthiness notes
     derived_severity: dict[str, Any] = {}        # deterministic severity/CVSS approximation
 

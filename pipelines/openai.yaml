@@ -33,7 +33,6 @@ models:
   # Frontier tier
   critic: chatgpt/gpt-5.5              # Wordfence/Patchstack scope + severity decisions
   developer: chatgpt/gpt-5.5           # WordPress-internals expert + initial sandbox setup
-  chain_synthesizer: chatgpt/gpt-5.5   # Cross-specialist exploit-chain reasoning
 
   # Balanced tier
   specialists: chatgpt/gpt-5.5
@@ -53,7 +52,6 @@ llm:
 reasoning:
   critic: high
   developer: high
-  chain_synthesizer: high
   specialists: high
   poc_author: high
   hypothesis_verifier: high
@@ -94,22 +92,10 @@ recon:
   max_entries_to_validate: 30
 
 hypothesis:
-  specialist_grep_read_tools: false
   specialist_wp_idioms: false
-  require_branch_enumeration: false
-  require_exploit_classification: false
-  iterative_verifier: false
-  verifier_max_iterations: 3
   verifier_require_citation: false
   verifier_wp_idioms: false
-  verifier_drop_categorisation: false
-  pre_verifier_dedup: false
-
-triage:
-  inject_review_md: false
-  cluster_aware: false
-  review_md_max_chars: 12000
-  verifier_votes: 1
+  pre_verifier_dedup: true
 
 quality:
   enabled: true
@@ -125,19 +111,10 @@ quality:
 verify:
   headless_browser_check: false
   persistent_sandbox: false
-  payload_variants: false
   state_introspection_on_failure: false
-  manual_review_handoff: false
   negative_control: false
   collaborative_dev_poc_loop: false
-  payload_variant_cap: 6
   headless_browser_timeout_s: 15
 
-dedup:
-  meaningful_scoring: false
-  submission_recommendation: false
-
 report:
-  claim_validation_pass: false
-  submission_readiness_gate: false
   screenshot_capture: false

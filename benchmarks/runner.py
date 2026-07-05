@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import time
@@ -14,7 +13,7 @@ from typing import Optional
 from pydantic import BaseModel
 
 from squadrone.orchestrator import _resolve_run_dir, run_scan
-from squadrone.schemas.finding import DedupStatus, Finding, PoCStatus
+from squadrone.schemas.finding import Finding, PoCStatus
 from squadrone.schemas.hypothesis import Confidence, Hypothesis
 
 logger = logging.getLogger(__name__)
@@ -102,7 +101,7 @@ def _load_hypotheses(run_id: str) -> list[Hypothesis]:
     return out
 
 
-async def _run_one(entry: CorpusEntry, config_path: str, budget: Optional[float], no_triage: bool = False, apply_scope_filter: bool = True) -> EntryResult:
+async def _run_one(entry: CorpusEntry, config_path: str, budget: Optional[float]) -> EntryResult:
     logger.info("benchmark: %s %s @ %s", entry.cve_id, entry.slug, entry.vulnerable_version)
     started = time.time()
     try:
@@ -111,8 +110,6 @@ async def _run_one(entry: CorpusEntry, config_path: str, budget: Optional[float]
             config_path=config_path,
             budget_override=budget,
             version=entry.vulnerable_version,
-            no_triage=no_triage,
-            apply_scope_filter=apply_scope_filter,
         )
     except Exception as e:
         logger.exception("benchmark: scan crashed for %s: %s", entry.slug, e)
@@ -198,8 +195,6 @@ async def run_benchmark(
     split: str = "train",
     config_path: str = "pipelines/default.yaml",
     budget_override: Optional[float] = None,
-    no_triage: bool = False,
-    apply_scope_filter: bool = True,
 ) -> BenchmarkResult:
     corpus_data = json.loads(Path(corpus_path).read_text())
     corpus = [CorpusEntry.model_validate(e) for e in corpus_data]
@@ -208,7 +203,7 @@ async def run_benchmark(
 
     entries: list[EntryResult] = []
     for c in filtered:
-        entries.append(await _run_one(c, config_path, budget_override, no_triage=no_triage, apply_scope_filter=apply_scope_filter))
+        entries.append(await _run_one(c, config_path, budget_override))
 
     metrics = _compute_metrics(entries, filtered)
     result = BenchmarkResult(

@@ -26,7 +26,6 @@ class SSRFDeserSpecialist:
         recon: ReconArtifact,
         code_slices: dict[str, str],
         hypothesis_cfg: HypothesisConfig | None = None,
-        diff_summary: str | None = None,
         plugin_path: str | None = None,
         priority_files: list[str] | None = None,
     ) -> HypothesesArtifact:
@@ -34,7 +33,6 @@ class SSRFDeserSpecialist:
             runtime=self.runtime, name=self.NAME, prompt_path=self.PROMPT,
             model=self.model, recon=recon, code_slices=code_slices,
             hypothesis_cfg=hypothesis_cfg,
-            diff_summary=diff_summary,
             plugin_path=plugin_path,
             priority_files=priority_files,
         )

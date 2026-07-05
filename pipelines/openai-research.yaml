@@ -2,8 +2,7 @@
 #
 # This uses the ChatGPT-subscription model routing from pipelines/openai.yaml,
 # including Squadrone's temporary chatgpt/gpt-5.5 LiteLLM compatibility patch,
-# and enables quality toggles that improve grounding, scope decisions,
-# deduplication, and manual follow-up artifacts.
+# and uses a higher budget plus the fixed research-oriented pipeline settings.
 #
 # Use with:
 #   squadrone scan <slug> --budget 10.00 --config pipelines/openai-research.yaml
@@ -17,7 +16,6 @@ developer_calls_per_agent: 7
 models:
   critic: chatgpt/gpt-5.5
   developer: chatgpt/gpt-5.5
-  chain_synthesizer: chatgpt/gpt-5.5
   specialists: chatgpt/gpt-5.5
   surveyor: chatgpt/gpt-5.5
   poc_author: chatgpt/gpt-5.5
@@ -33,7 +31,6 @@ llm:
 reasoning:
   critic: high
   developer: high
-  chain_synthesizer: high
   specialists: high
   poc_author: medium
   hypothesis_verifier: high
@@ -74,22 +71,10 @@ recon:
   max_entries_to_validate: 30
 
 hypothesis:
-  specialist_grep_read_tools: false
   specialist_wp_idioms: true
-  require_branch_enumeration: false
-  require_exploit_classification: false
-  iterative_verifier: true
-  verifier_max_iterations: 3
   verifier_require_citation: true
   verifier_wp_idioms: true
-  verifier_drop_categorisation: true
-  pre_verifier_dedup: false
-
-triage:
-  inject_review_md: true
-  cluster_aware: true
-  review_md_max_chars: 12000
-  verifier_votes: 1
+  pre_verifier_dedup: true
 
 quality:
   enabled: true
@@ -104,19 +89,10 @@ quality:
 verify:
   headless_browser_check: false
   persistent_sandbox: false
-  payload_variants: false
   state_introspection_on_failure: true
-  manual_review_handoff: true
   negative_control: true
   collaborative_dev_poc_loop: false
-  payload_variant_cap: 6
   headless_browser_timeout_s: 15
 
-dedup:
-  meaningful_scoring: true
-  submission_recommendation: true
-
 report:
-  claim_validation_pass: false
-  submission_readiness_gate: true
   screenshot_capture: false

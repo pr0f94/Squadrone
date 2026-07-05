@@ -1,17 +1,4 @@
-"""Surveyor — maps the plugin's attack surface (entry points, sinks). No vuln finding.
-
-Two execution paths:
-
-- **tool-loop path (default when `plugin_path` is provided)**: receives a slim
-  user prompt with ripgrep hit *counts* only, and is granted three
-  plugin-scoped tools (`grep_plugin`, `glob_plugin`, `read_plugin_file`) via
-  `PluginToolHandlers`. The agent drives its own exploration loop. Works for
-  any function-calling model LiteLLM supports.
-
-- **legacy dump fallback (only when `plugin_path` is missing)**: dumps
-  `file_tree` + `ripgrep_hits` inline. Kept for backwards compatibility but
-  quadratic in plugin size; production scans always supply `plugin_path`.
-"""
+"""Surveyor — maps the plugin's attack surface (entry points, sinks). No vuln finding."""
 
 from __future__ import annotations
 
@@ -74,47 +61,21 @@ class SurveyorAgent:
         plugin_slug: str,
         file_tree: list[str],
         ripgrep_hits: dict[str, list[str]],
-        plugin_path: str | None = None,
+        plugin_path: str,
     ) -> ReconArtifact:
         system = load_prompt(self.PROMPT) + (self.extra_system or "")
-
-        # Tool-loop path: works for every LiteLLM-backed function-calling model.
-        # The agent receives hit *counts* (not the full match list) plus three
-        # plugin-scoped tools, and drives exploration itself.
-        if plugin_path:
-            handlers = PluginToolHandlers(plugin_root=plugin_path)
-            hit_counts = {pattern: len(hits) for pattern, hits in ripgrep_hits.items()}
-            user_payload: dict = {
-                "plugin_slug": plugin_slug,
-                "file_count": len(file_tree),
-                "ripgrep_hit_counts": hit_counts,
-            }
-            user = (
-                json.dumps(user_payload, indent=2)
-                + "\n\n"
-                + _TOOL_LOOP_EXPLORATION_INSTRUCTIONS
-            )
-            return (await self.runtime.run(
-                agent_name=self.NAME,
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                tools=handlers.tool_definitions(),
-                tool_handlers=handlers.tool_handlers(),
-                output_schema=ReconArtifact,
-                max_iterations=40,
-                force_finalise_after=25,
-                max_tokens=32768,
-            )).output
-
-        # Legacy dump fallback (plugin_path missing): inline file_tree + full hits.
-        user = json.dumps({
+        handlers = PluginToolHandlers(plugin_root=plugin_path)
+        hit_counts = {pattern: len(hits) for pattern, hits in ripgrep_hits.items()}
+        user_payload: dict = {
             "plugin_slug": plugin_slug,
-            "file_tree": file_tree,
-            "ripgrep_hits": ripgrep_hits,
-        })
+            "file_count": len(file_tree),
+            "ripgrep_hit_counts": hit_counts,
+        }
+        user = (
+            json.dumps(user_payload, indent=2)
+            + "\n\n"
+            + _TOOL_LOOP_EXPLORATION_INSTRUCTIONS
+        )
         return (await self.runtime.run(
             agent_name=self.NAME,
             model=self.model,
@@ -122,6 +83,10 @@ class SurveyorAgent:
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
+            tools=handlers.tool_definitions(),
+            tool_handlers=handlers.tool_handlers(),
             output_schema=ReconArtifact,
+            max_iterations=40,
+            force_finalise_after=25,
             max_tokens=32768,
         )).output

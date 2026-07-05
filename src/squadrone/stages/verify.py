@@ -421,12 +421,6 @@ async def _verify_one(
                         + _summarise_setup_results(repair_results)
                     )
 
-        # W4: pre-fetch payload variants the PoC author can rotate through on retries
-        payload_variant_pool = (
-            verify_helpers.get_payload_variants(verify_cfg.payload_variant_cap)
-            if verify_cfg.payload_variants else []
-        )
-
         # Surface the credential table the sandbox provisioned. PoC author MUST
         # pick from this list rather than recalling credentials from system prompt.
         user_accounts = sb.baseline_user_accounts()
@@ -435,10 +429,6 @@ async def _verify_one(
             extra_ctx: dict = {"user_accounts": user_accounts}
             if setup_summary:
                 extra_ctx["setup_summary"] = setup_summary
-            # W4: surface the next variant to try on this iteration (PoC author can use or ignore)
-            if payload_variant_pool and iteration > 1:
-                idx = (iteration - 2) % len(payload_variant_pool)
-                extra_ctx["suggested_payload_variant"] = payload_variant_pool[idx]
             script = await poc_author.write(
                 hypothesis=hyp,
                 target_url=sb.target_url,
@@ -532,7 +522,7 @@ async def _verify_one(
                     #   - "exploit_shape": setup is fine, the bug just didn't fire → early-exit.
                     #   - "poc_code":     the script crashed before reaching the exploit →
                     #                     keep iterating; the PoC author needs another shot.
-                    #   - None / unset:   legacy behaviour, treat as exploit_shape.
+                    #   - None / unset:   treat as exploit_shape.
                     fc = followup.failure_class
                     stderr_blob = (result.error_log or "")
                     poc_crashed = (
@@ -571,23 +561,6 @@ async def _verify_one(
     successful = [a for a in attempts if a.result in (PoCStatus.SUCCESS, PoCStatus.PARTIAL)]
     if not successful:
         logger.info("verify: %s NOT confirmed after %d iterations", hyp.id, len(attempts))
-        # W5: state introspection on persistent failure (best-effort; SandboxManager may already be torn down here)
-        # Note: We exited the `async with SandboxManager` block, so live state-dump isn't possible
-        # from this point. The introspection happens inline before the sandbox tears down — see below.
-        # W6: emit to manual review queue if toggle on
-        if verify_cfg.manual_review_handoff:
-            verify_helpers.write_manual_scaffold(
-                hyp, poc_dir, plugin_slug, "",
-                attempts=attempts, setup_results=setup_exec_results,
-            )
-            verify_helpers.emit_to_manual_review_queue(
-                hyp, poc_dir.parent.parent, reason=f"failed after {len(attempts)} iterations",
-                attempts=[
-                    a.model_dump(mode="json") if hasattr(a, "model_dump") else a
-                    for a in attempts
-                ],
-                setup_results=setup_exec_results,
-            )
         return None
 
     finding = Finding(

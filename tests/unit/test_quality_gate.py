@@ -57,6 +57,66 @@ def test_quality_gate_rejects_missing_nonce_without_impact():
     assert "csrf_without_meaningful_impact" in grade.rules
 
 
+def test_quality_gate_rejects_missing_security_boundary():
+    h = _hypothesis(
+        id="h-boundary",
+        reasoning="Unauthenticated user can read a public style asset.",
+        sink="readfile",
+        sink_code="readfile($asset)",
+        taint_path=["$_GET['asset']", "readfile"],
+    )
+
+    grade = grade_hypothesis(h)
+
+    assert grade.accepted is False
+    assert "missing_security_boundary" in grade.rules
+
+
+def test_preverification_gate_warns_missing_impact_instead_of_rejecting():
+    h = _hypothesis(
+        id="h-preverify",
+        bug_class=BugClass.IDOR,
+        reasoning="Subscriber reaches a suspicious object read path but runtime result needs probing.",
+        sink="get_post_meta",
+        sink_code="get_post_meta($_GET['id'], '_field', true)",
+        taint_path=["$_GET['id']", "get_post_meta"],
+        evidence_summary={
+            "source": "$_GET['id']",
+            "control": "missing ownership check",
+            "sink": "get_post_meta",
+            "reachable_path": "wp_ajax_demo -> get_post_meta",
+        },
+    )
+
+    grade = grade_hypothesis(h, pre_verification=True)
+
+    assert grade.accepted is True
+    assert "missing_concrete_impact_preverify" in grade.warnings
+    assert "missing_concrete_impact" not in grade.rules
+
+
+def test_quality_gate_accepts_explicit_proof_tuple():
+    h = _hypothesis(
+        evidence_summary={
+            "attacker_role": "subscriber",
+            "source": "$_GET['id']",
+            "control": "missing current_user_can('edit_post', $id)",
+            "sink": "get_post_meta($id, '_secret', true)",
+            "reachable_path": "wp_ajax_demo -> demo() -> get_post_meta()",
+            "boundary": "subscriber reads another user's sensitive submission",
+            "impact": "subscriber can read private submission metadata",
+            "counterevidence": "nonce is present but only proves intent, not ownership",
+            "proof_gaps": "none",
+        }
+    )
+
+    grade = grade_hypothesis(h)
+
+    assert grade.accepted is True
+    assert grade.evidence["has_security_boundary"] is True
+    assert grade.evidence["has_impact_statement"] is True
+
+
 def test_apply_quality_gate_moves_rejections():
     accepted = _hypothesis()
     rejected = _hypothesis(
