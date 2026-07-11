@@ -44,8 +44,8 @@ class Finding(JSONFileMixin):
     dedup_matches: list[dict]
     cvss_estimate: Optional[str] = None
     suggested_fix: Optional[str] = None
-    # Stage 6 D4 (submission_recommendation toggle): structured next-action.
+    # Structured next-action derived after deduplication.
     # One of: submit_as_novel | submit_as_regression_of_<CVE> | skip_exact_dupe_of_<CVE> |
-    #          submit_with_dedup_rebuttal | None (toggle off / no decision)
+    #          submit_with_dedup_rebuttal | None
     submission_recommendation: Optional[str] = None
     submission_recommendation_reason: Optional[str] = None

@@ -51,7 +51,7 @@ Each scan writes artifacts under `plugins/<slug>/runs/<run_id>/`.
 Intake      version 1.7.2 · files 42 · lines 4,812
 Recon       entry points 8 · sinks 3
 Hypothesis  count 2
-Triage      accepted 1 · rejected 1 · merged 0 · manual review 0
+Triage      accepted 1 · rejected 1 · merged 0 · manual review candidates 0
 Verify      findings 1
 Report      reports 2
 ```
@@ -250,7 +250,7 @@ A confirmed finding typically has:
 ```json
 {
   "id": "f-...",
-  "poc_status": "confirmed",
+  "poc_status": "success",
   "dedup_status": "novel",
   "report_paths": [
     "plugins/<slug>/runs/<run_id>/report_f-..._wordfence.md",
