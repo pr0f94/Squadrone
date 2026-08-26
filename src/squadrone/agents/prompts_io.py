@@ -6,7 +6,7 @@ from importlib.resources import files
 
 
 def load_prompt(name: str) -> str:
-    """Load a prompt by relative name, e.g. 'surveyor' or 'specialists/auth'."""
+    """Load a prompt by relative name, e.g. 'surveyor' or 'specialists/authentication'."""
     parts = name.split("/")
     pkg = ".".join(["squadrone", "prompts", *parts[:-1]])
     fname = f"{parts[-1]}.md"

@@ -3,7 +3,7 @@
 This is HEURISTIC, not proof of execution. A True from check_reflection() means
 the literal payload bytes appear in the response in a context that COULD execute
 as code. It does NOT prove the JavaScript ran — that requires a headless browser
-(see W2 / browser_check.py).
+(see browser_check.py).
 
 USAGE inside a PoC:
 
@@ -11,28 +11,20 @@ USAGE inside a PoC:
 
     result = check_reflection(response.text, payload="<script>alert(1)</script>")
     if result.exploitable:
-        print(f"[+] SUCCESS: payload reflected unescaped at offset {result.offset}")
+        print(f"candidate reflection at offset {result.offset}")
         print(f"    Sink context: {result.sink_context}")
         print(f"    Excerpt: {result.context}")
     else:
-        print(f"[-] FAILURE: {result.reason}")
+        print(f"no candidate reflection: {result.reason}")
         print(f"    Sink context: {result.sink_context}")
 
-Use .exploitable as the boolean for SUCCESS/FAILURE — do NOT write your own
-substring check.
-
-Stage-5 W1 fix (2026-05-08): replaced the broken regex-based context detector
-with a proper html.parser-based tokenizer that tracks attribute name + delimiter,
-plus a delimiter-vs-payload-char compatibility check. The previous heuristic
-failed on nested-`=` patterns (e.g. `?referrer=` inside an `href="..."` value)
-and had no concept of attribute delimiter — see manual_reviews/wp-statistics for
-the wp-statistics xss-001 FP this fixes.
+Use `.exploitable` only to select a page for browser verification. Do not write
+your own substring check and do not treat this diagnostic as proof.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from html.parser import HTMLParser
 from typing import Optional
 
 # Encoding markers that indicate the payload was neutralised before reflection.
@@ -58,72 +50,6 @@ class ReflectionResult:
     suggested_next: Optional[str]
     attribute_delimiter: Optional[str] = None  # "'" | '"' | "" (unquoted) | None
     attribute_name: Optional[str] = None       # 'href', 'title', 'onclick', etc.
-
-
-# ---------- W1 fix: proper context detection via html.parser tokenizer ---------------
-
-class _ContextProbe(HTMLParser):
-    """Walks HTML up to a target byte offset and reports the parser state at that point.
-
-    Tracks:
-    - tag stack (which open tag are we inside?)
-    - inside <script>/<style> (raw-text contexts)
-    - HTML comment region
-
-    HTMLParser doesn't expose attribute delimiter, so attribute-context is detected
-    by analysing the source text directly (see _attribute_context_at_offset).
-    """
-
-    def __init__(self, target_offset: int) -> None:
-        super().__init__(convert_charrefs=False)
-        self.target = target_offset
-        self.tag_stack: list[str] = []
-        self.in_script = False
-        self.in_style = False
-        self.in_comment = False
-        self.context_at_target: str = "html_text"
-        self._reached = False
-
-    def _check_done(self) -> None:
-        if self._reached:
-            return
-        if self.getpos()[0] >= 1 and self._byte_offset() >= self.target:
-            self._reached = True
-            if self.in_script:
-                self.context_at_target = "js_string"
-            elif self.in_style:
-                self.context_at_target = "css"
-            elif self.in_comment:
-                self.context_at_target = "comment"
-            else:
-                self.context_at_target = "html_text"
-
-    def _byte_offset(self) -> int:
-        # HTMLParser exposes (line, col) — we approximate offset via internal rawdata
-        return getattr(self, "rawdata", "").find("", 0)  # not reliable; we drive offset externally
-
-    def handle_starttag(self, tag: str, attrs: list) -> None:
-        self.tag_stack.append(tag)
-        if tag == "script":
-            self.in_script = True
-        if tag == "style":
-            self.in_style = True
-        self._check_done()
-
-    def handle_endtag(self, tag: str) -> None:
-        if self.tag_stack and self.tag_stack[-1] == tag:
-            self.tag_stack.pop()
-        if tag == "script":
-            self.in_script = False
-        if tag == "style":
-            self.in_style = False
-        self._check_done()
-
-    def handle_data(self, data: str) -> None:
-        self._check_done()
-
-    def handle_comment(self, data: str) -> None:
-        self._check_done()
 
 
 def _attribute_context_at_offset(body: str, offset: int) -> tuple[str, Optional[str], Optional[str]]:
@@ -282,7 +208,7 @@ def _detect_sink_context(body: str, offset: int) -> tuple[str, Optional[str], Op
 def check_reflection(body: str, payload: str, ctx: int = 80) -> ReflectionResult:
     """Check whether `payload` appears in `body` in a form that could execute.
 
-    W1 fix: only flag exploitable if the payload contains characters that can
+    Only flag exploitable if the payload contains characters that can
     break out of THIS specific surrounding context. A `'`-only payload inside a
     `"`-delimited attribute is harmless; substring presence isn't enough.
     """
@@ -337,7 +263,7 @@ def check_reflection(body: str, payload: str, ctx: int = 80) -> ReflectionResult
             attribute_delimiter=delim, attribute_name=attr_name,
         )
 
-    # W1 core check: payload must contain chars that can break out of THIS context
+    # The payload must contain characters that can break out of this context.
     if not _payload_can_break_context(payload, sink_context, delim):
         # Special case: URL-typed attribute (href/src/etc.) — `'` and `"` in the URL
         # value are not breakout vectors per HTML spec; only the matching attribute
@@ -385,45 +311,3 @@ def check_reflection(body: str, payload: str, ctx: int = 80) -> ReflectionResult
         attribute_delimiter=delim,
         attribute_name=attr_name,
     )
-
-
-# ---------- W8: negative-control reflection ------------------------------------------
-
-def check_reflection_with_negative_control(
-    body: str,
-    payload: str,
-    benign_marker: str,
-    benign_body: Optional[str] = None,
-    ctx: int = 80,
-) -> ReflectionResult:
-    """Differential reflection check (W8).
-
-    Runs the standard check on `payload`. If exploitable, ALSO checks whether
-    `benign_marker` reflects in the SAME context in `benign_body` (if provided).
-    If yes → the reflection is generic input-echo, not attack-specific. Downgrade.
-
-    Caller is responsible for issuing the benign request and passing benign_body.
-    """
-    primary = check_reflection(body, payload, ctx)
-    if not primary.exploitable or benign_body is None:
-        return primary
-
-    benign = check_reflection(benign_body, benign_marker, ctx)
-    # If the benign marker reflects in the same context type with the same delimiter,
-    # treat the primary as generic input-echo not specific to attack chars.
-    if benign.exploitable and benign.sink_context == primary.sink_context:
-        return ReflectionResult(
-            exploitable=False,
-            reason="negative_control_also_reflected",
-            context=primary.context,
-            offset=primary.offset,
-            sink_context=primary.sink_context,
-            suggested_next=(
-                f"Both attack payload AND benign marker '{benign_marker}' reflect in "
-                f"context {primary.sink_context}. The reflection is generic input-echo, "
-                f"not attack-specific. Look for a different sink."
-            ),
-            attribute_delimiter=primary.attribute_delimiter,
-            attribute_name=primary.attribute_name,
-        )
-    return primary

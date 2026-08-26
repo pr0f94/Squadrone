@@ -17,36 +17,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-VerdictType = Literal[
-    "keep",
-    "keep_high_confidence",
-    "keep_conditional",
-    "keep_insufficient_evidence",
-    "drop",
-    "drop_definitely_not_a_bug",
-    "escalate_to_manual_review",
-]
+VerdictType = Literal["keep", "drop"]
 
 
 class VerifierVerdict(BaseModel):
     verdict: VerdictType
     reason: str
     citation: Optional[str] = None
-
-
-# Matches the callback portion of WP-style registrations:
-#   [&$this, 'methodName']  → group 1 = methodName
-#   array($this, "methodName")  → group 2 = methodName
-#   'callback' => 'methodName'  → group 3 = methodName  (REST route)
-# Anchored to the callback construct only, NOT to the action-name string.
-_CALLBACK_RE = re.compile(
-    r"""(?:
-        \[\s*[&]?\$this\s*,\s*['"]([A-Za-z_]\w*)['"]\s*\]      # [&$this, 'method']
-      | array\s*\(\s*[&]?\$this\s*,\s*['"]([A-Za-z_]\w*)['"]\s*\) # array($this, 'method')
-      | ['"]callback['"]\s*=>\s*['"]([A-Za-z_]\w*)['"]          # 'callback' => 'method'
-    )""",
-    re.VERBOSE,
-)
 
 
 def _resolve_path(plugin_root: Path, rel_file: str) -> Path | None:
@@ -74,110 +51,38 @@ def _slice_around(lines: list[str], line_1based: int, ctx: int = 15) -> str:
     return "\n".join(f"{i+1:5}  {lines[i]}" for i in range(start, end))
 
 
-def _find_method_definition(lines: list[str], method_name: str) -> int | None:
-    """Find the 1-based line number of `function methodName(` or `function & methodName(`."""
-    pat = re.compile(rf"\bfunction\s*&?\s*{re.escape(method_name)}\s*\(")
-    for i, line in enumerate(lines):
-        if pat.search(line):
-            return i + 1
-    return None
-
-
-def _read_source_slice(plugin_root: Path, rel_file: str, line: int, ctx: int = 15) -> str | None:
-    if not rel_file:
-        return None
-    path = _resolve_path(plugin_root, rel_file)
-    if path is None:
-        return None
-    lines = _read_lines(path)
-    if lines is None:
-        return None
-    return _slice_around(lines, line, ctx)
-
-
 def _normalise(text: str) -> str:
     """Collapse whitespace for fuzzy substring comparison."""
     return re.sub(r"\s+", " ", text).strip()
 
 
-def _find_sink_code_line(lines: list[str], sink_code: str, exclude_line: int | None = None) -> int | None:
-    """Search the file for the line where sink_code's first non-trivial fragment appears.
-
-    Whitespace-normalised match against ~80 chars of sink_code. Skips the cited line
-    so we find the *real* location, not the (wrong) cited one.
-    """
-    needle = _normalise(sink_code)[:80]
-    if len(needle) < 12:
-        return None
-    for i, line in enumerate(lines):
-        if exclude_line is not None and i + 1 == exclude_line:
-            continue
-        if needle in _normalise(line):
-            return i + 1
-    return None
-
-
-def _read_source_slice_with_handler_followup(
+def _read_verified_source_slice(
     plugin_root: Path,
     rel_file: str,
     line: int,
     sink_code: str,
     ctx: int = 15,
-) -> str | None:
-    """Read ±ctx lines around `line`. Apply two recovery strategies if the sink_code
-    isn't visible in the primary slice:
-
-    1. **Sink-code search**: scan the file for the actual location of sink_code and
-       append a slice around it. This rescues line-number drift (specialist cited
-       wrong line but the bug exists nearby in the same file).
-    2. **Handler followup**: if the slice contains an `add_action`/`register_rest_route`
-       callback registration, find the method definition and append a slice around it.
-
-    Both recoveries can fire — they're complementary."""
+) -> tuple[str | None, str]:
+    """Return a source window only when the sink quote matches its cited line."""
     if not rel_file:
-        return None
+        return None, "hypothesis has no cited source file"
     path = _resolve_path(plugin_root, rel_file)
     if path is None:
-        return None
+        return None, "cited source file could not be read"
     lines = _read_lines(path)
-    if lines is None:
-        return None
-    primary = _slice_around(lines, line, ctx)
-    appended_sections: list[str] = []
-
-    if not sink_code or len(sink_code.strip()) < 8:
-        return primary
-
-    sink_in_primary = _normalise(sink_code)[:80] in _normalise(primary)
-
-    # Recovery 1: line-number drift. If sink_code isn't in the primary slice, search
-    # the file for its actual location and append a slice around it.
-    if not sink_in_primary:
-        actual_line = _find_sink_code_line(lines, sink_code, exclude_line=line)
-        if actual_line is not None and abs(actual_line - line) > ctx:
-            appended_sections.append(
-                f"\n\n--- sink_code actually appears at line {actual_line} "
-                f"(specialist cited {line}; line-number drift) ---\n"
-                + _slice_around(lines, actual_line, ctx)
-            )
-            sink_in_primary = True  # we've now surfaced it
-
-    # Recovery 2: handler followup. Look for a callback registration on the cited line
-    # or anywhere in the primary slice, find the method definition, and append it.
-    if not sink_in_primary:
-        cited_line_text = lines[line - 1] if 0 < line <= len(lines) else ""
-        match = _CALLBACK_RE.search(cited_line_text) or _CALLBACK_RE.search(primary)
-        if match:
-            method_name = next((g for g in match.groups() if g), None)
-            if method_name:
-                method_line = _find_method_definition(lines, method_name)
-                if method_line is not None:
-                    appended_sections.append(
-                        f"\n\n--- handler implementation: {method_name}() at line {method_line} ---\n"
-                        + _slice_around(lines, method_line, ctx=25)
-                    )
-
-    return primary + "".join(appended_sections)
+    if lines is None or line < 1 or line > len(lines):
+        return None, "cited source line is outside the file"
+    needle = _normalise(sink_code)
+    if len(needle) < 8:
+        return None, "sink_code is missing or too short to verify"
+    first_fragment = _normalise(sink_code.splitlines()[0])
+    if first_fragment not in _normalise(lines[line - 1]):
+        return None, "sink_code does not begin at the cited line"
+    span = max(1, sink_code.count("\n") + 2)
+    cited_expression = "\n".join(lines[line - 1:line - 1 + span])
+    if needle not in _normalise(cited_expression):
+        return None, "sink_code does not match the expression at the cited line"
+    return _slice_around(lines, line, ctx), ""
 
 
 class HypothesisVerifier:
@@ -188,41 +93,26 @@ class HypothesisVerifier:
         self,
         runtime: "AgentRuntime",
         model: str,
-        *,
-        wp_idioms_enabled: bool = False,
-        require_citation: bool = False,
     ):
         self.runtime = runtime
         self.model = model
-        self.wp_idioms_enabled = wp_idioms_enabled
-        self.require_citation = require_citation
 
     def _build_system_prompt(self) -> str:
-        parts = [load_prompt(self.PROMPT)]
-        if self.wp_idioms_enabled:
-            parts.append("\n\n# Reference: WordPress idioms\n\n" + load_prompt("_wp_idioms"))
-        if self.require_citation:
-            parts.append(
-                "\n\n# V3: Citation requirement\n\n"
-                "Every load-bearing claim in `reason` MUST cite `file:line` and quote the line. "
-                "If you can't cite enough evidence to prove a drop, use "
-                "`keep_insufficient_evidence` or `escalate_to_manual_review` "
-                "(NOT `drop_definitely_not_a_bug`). "
-                "Conservative drops with 'I can't see X' framing are reliable; confident "
-                "drops with concrete-but-uncited claims about WP internals are the failure mode."
-            )
-        return "".join(parts)
+        return (
+            load_prompt(self.PROMPT)
+            + "\n\n# WordPress idiom reference\n\n"
+            + load_prompt("_wp_idioms")
+        )
 
     async def verify(self, hyp: Hypothesis, plugin_path: str) -> VerifierVerdict:
         plugin_root = Path(plugin_path)
-        slice_text = _read_source_slice_with_handler_followup(
+        slice_text, citation_error = _read_verified_source_slice(
             plugin_root, hyp.file, hyp.line, hyp.sink_code or ""
         )
         if slice_text is None:
-            # Can't read the file — keep by default; let triage/verify handle it.
             verdict = VerifierVerdict(
-                verdict="keep_insufficient_evidence",
-                reason="source file not found on disk; deferring to triage",
+                verdict="drop",
+                reason=f"{citation_error}, so the hypothesis is not source-grounded",
             )
             return verdict
 
@@ -242,11 +132,5 @@ class HypothesisVerifier:
             "output_schema": VerifierVerdict,
         }
 
-        try:
-            result = await self.runtime.run(**run_kwargs)
-            verdict = result.output
-        except Exception as e:
-            logger.warning("verifier: %s — keeping hypothesis %s by default", e, hyp.id)
-            verdict = VerifierVerdict(verdict="keep", reason=f"verifier error: {e}")
-
-        return verdict
+        result = await self.runtime.run(**run_kwargs)
+        return result.output

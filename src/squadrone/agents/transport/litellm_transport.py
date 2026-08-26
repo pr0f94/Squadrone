@@ -61,7 +61,9 @@ def _apply_cache_control(msgs: list[dict], model: str) -> list[dict]:
         elif role == "tool":
             last_tool_idx = i
 
-    cache_indices = {i for i in (sys_idx, first_user_idx, last_tool_idx) if i is not None}
+    cache_indices = {
+        i for i in (sys_idx, first_user_idx, last_tool_idx) if i is not None
+    }
     if not cache_indices:
         return msgs
 
@@ -72,7 +74,11 @@ def _apply_cache_control(msgs: list[dict], model: str) -> list[dict]:
             continue
         content = m.get("content")
         if isinstance(content, str):
-            block = {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}
+            block = {
+                "type": "text",
+                "text": content,
+                "cache_control": {"type": "ephemeral"},
+            }
             out.append({**m, "content": [block]})
         elif isinstance(content, list) and content:
             new_blocks = list(content)
@@ -119,7 +125,7 @@ def _strip_fences(text: str) -> str:
         elif ch == closer:
             depth -= 1
             if depth == 0:
-                return s[start:i + 1].strip()
+                return s[start : i + 1].strip()
     return s
 
 
@@ -188,7 +194,9 @@ def _normalise_schema_payload(parsed: object, output_schema: type[BaseModel]) ->
             candidate = value.get(key)
             if isinstance(candidate, list):
                 return candidate
-        list_values = [candidate for candidate in value.values() if isinstance(candidate, list)]
+        list_values = [
+            candidate for candidate in value.values() if isinstance(candidate, list)
+        ]
         if len(list_values) == 1:
             return list_values[0]
         if value and set(value).issubset(_EMPTY_RESULT_KEYS):
@@ -211,14 +219,20 @@ def _normalise_schema_payload(parsed: object, output_schema: type[BaseModel]) ->
 def _root_list_item_model(output_schema: type[BaseModel]) -> type[BaseModel] | None:
     if not getattr(output_schema, "__pydantic_root_model__", False):
         return None
-    ann = output_schema.model_fields.get("root").annotation
+    root_field = output_schema.model_fields.get("root")
+    if root_field is None:
+        return None
+    ann = root_field.annotation
     item_model = getattr(ann, "__args__", [None])[0] if ann is not None else None
     if isinstance(item_model, type) and issubclass(item_model, BaseModel):
         return item_model
     return None
 
 
-def _salvage_root_list_items(parsed: object, output_schema: type[BaseModel]) -> tuple[object | None, list[dict]]:
+def _salvage_root_list_items(
+    parsed: object,
+    output_schema: type[BaseModel],
+) -> tuple[list[dict] | None, list[dict]]:
     """Keep valid items from a root-list payload when some siblings are malformed."""
     normalised = _normalise_schema_payload(parsed, output_schema)
     if not isinstance(normalised, list):
@@ -258,13 +272,15 @@ def _write_schema_invalid_artifact(
     try:
         atomic_write_json(path, payload)
     except Exception as exc:
-        logger.warning("%s failed to write schema invalid artifact %s: %s", agent_name, path, exc)
+        logger.warning(
+            "%s failed to write schema invalid artifact %s: %s", agent_name, path, exc
+        )
 
 
 # Sliding-window trim defaults. 80KB is roughly 20K input tokens, leaving
-# headroom for the model's reply while keeping tool-loop conversations bounded.
+# headroom for the model's reply while keeping tool-enabled conversations bounded.
 _TRIM_THRESHOLD_BYTES = 80_000
-_TRIM_KEEP_TOOL_CYCLES = 5
+_TRIM_KEEP_TOOL_CYCLES = 12
 
 
 def _trim_history_for_budget(
@@ -327,16 +343,18 @@ def _trim_history_for_budget(
     dropped = len(cycles) - len(kept_cycles)
 
     result: list[dict] = list(prefix)
-    result.append({
-        "role": "user",
-        "content": (
-            f"[runtime] {dropped} earlier tool-call turn(s) were trimmed from this "
-            f"conversation to stay within the context budget. Below are the most "
-            f"recent {len(kept_cycles)} turn(s). Use the information you already "
-            "have to make progress or produce your final output — do not call the "
-            "same tools again expecting different results."
-        ),
-    })
+    result.append(
+        {
+            "role": "user",
+            "content": (
+                f"[runtime] {dropped} earlier tool-call turn(s) were trimmed from this "
+                f"conversation to stay within the context budget. Below are the most "
+                f"recent {len(kept_cycles)} turn(s). Use the information you already "
+                "have to make progress or produce your final output — do not call the "
+                "same tools again expecting different results."
+            ),
+        }
+    )
     for cycle in kept_cycles:
         result.extend(cycle)
     result.extend(tail)
@@ -366,19 +384,27 @@ class LiteLLMTransport:
         async def _one_call(call_msgs: list[dict]) -> dict:
             trimmed_msgs, dropped = _trim_history_for_budget(call_msgs)
             if dropped:
-                runtime._trace(agent_name, "history_trimmed", {
-                    "dropped_cycles": dropped,
-                    "kept_messages": len(trimmed_msgs),
-                    "original_messages": len(call_msgs),
-                })
+                runtime._trace(
+                    agent_name,
+                    "history_trimmed",
+                    {
+                        "dropped_cycles": dropped,
+                        "kept_messages": len(trimmed_msgs),
+                        "original_messages": len(call_msgs),
+                    },
+                )
             cached_msgs = _apply_cache_control(trimmed_msgs, model)
             llm_options = runtime.llm_options_for_agent(agent_name)
-            runtime._trace(agent_name, "request", {
-                "model": model,
-                "messages": trimmed_msgs,
-                "tools": tools,
-                "llm_options": llm_options,
-            })
+            runtime._trace(
+                agent_name,
+                "request",
+                {
+                    "model": model,
+                    "messages": trimmed_msgs,
+                    "tools": tools,
+                    "llm_options": llm_options,
+                },
+            )
             resp = await call_llm(
                 model=model,
                 messages=cached_msgs,
@@ -390,10 +416,14 @@ class LiteLLMTransport:
             )
             usage = resp.get("usage") if isinstance(resp, dict) else None
             _accumulate_usage(usage_acc, usage if isinstance(usage, dict) else None)
-            runtime._trace(agent_name, "response", {
-                "choices": resp.get("choices", []),
-                "usage": usage,
-            })
+            runtime._trace(
+                agent_name,
+                "response",
+                {
+                    "choices": resp.get("choices", []),
+                    "usage": usage,
+                },
+            )
             return resp
 
         iteration = 0
@@ -408,29 +438,40 @@ class LiteLLMTransport:
             tool_calls = message.get("tool_calls") or []
 
             if tool_calls:
-                msgs.append({
-                    "role": "assistant",
-                    "content": content or None,
-                    "tool_calls": tool_calls,
-                })
+                msgs.append(
+                    {
+                        "role": "assistant",
+                        "content": content or None,
+                        "tool_calls": tool_calls,
+                    }
+                )
                 for tc in tool_calls:
                     fn = tc.get("function", {}) or {}
                     name = fn.get("name", "")
                     raw_args = fn.get("arguments") or "{}"
                     try:
-                        args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                        args = (
+                            json.loads(raw_args)
+                            if isinstance(raw_args, str)
+                            else raw_args
+                        )
                     except json.JSONDecodeError:
                         args = {}
                     result = await runtime._dispatch_tool(
-                        agent_name, name, args, dev_calls,
+                        agent_name,
+                        name,
+                        args,
+                        dev_calls,
                         extra_handlers=tool_handlers,
                         call_history=call_history,
                     )
-                    msgs.append({
-                        "role": "tool",
-                        "tool_call_id": tc.get("id", ""),
-                        "content": result,
-                    })
+                    msgs.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc.get("id", ""),
+                            "content": result,
+                        }
+                    )
                     total_tool_calls += 1
 
                 if (
@@ -438,49 +479,68 @@ class LiteLLMTransport:
                     and force_finalise_after is not None
                     and total_tool_calls >= force_finalise_after
                 ):
-                    msgs.append({
-                        "role": "user",
-                        "content": (
-                            f"You have made {total_tool_calls} tool calls — that is enough investigation. "
-                            "Stop calling tools and produce your final output now using what you already know. "
-                            "Do not call any more tools. If you are uncertain about a detail, make a reasonable "
-                            "assumption and proceed."
-                        ),
-                    })
-                    runtime._trace(agent_name, "force_finalise", {"after_tool_calls": total_tool_calls})
+                    msgs.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                f"You have made {total_tool_calls} tool calls — that is enough investigation. "
+                                "Stop calling tools and produce your final output now using what you already know. "
+                                "Do not call any more tools. Do not invent uncertain source facts; omit an unproven "
+                                "candidate or use the schema's unreviewed disposition where available."
+                            ),
+                        }
+                    )
+                    runtime._trace(
+                        agent_name,
+                        "force_finalise",
+                        {"after_tool_calls": total_tool_calls},
+                    )
                     forced = True
                 continue
 
             final_content = content
             break
         else:
-            runtime._trace(agent_name, "forced_finalisation", {"reason": "max_iterations_exhausted"})
-            msgs.append({
-                "role": "user",
-                "content": (
-                    f"You have exhausted your investigation budget ({max_iterations} turns). "
-                    "Stop investigating. Output your final answer NOW based on what you know "
-                    "so far. NO tool calls — only the requested output format. "
-                    "If you are uncertain about a detail, make a reasonable assumption based "
-                    "on what you have read and proceed. Producing an imperfect answer is better "
-                    "than producing none."
-                ),
-            })
+            runtime._trace(
+                agent_name,
+                "forced_finalisation",
+                {"reason": "max_iterations_exhausted"},
+            )
+            msgs.append(
+                {
+                    "role": "user",
+                    "content": (
+                        f"You have exhausted your investigation budget ({max_iterations} turns). "
+                        "Stop investigating. Output your final answer NOW based on what you know "
+                        "so far. NO tool calls — only the requested output format. "
+                        "Do not invent uncertain source facts. Omit unproven candidates or use the "
+                        "schema's unreviewed disposition where available."
+                    ),
+                }
+            )
             trimmed_msgs, dropped = _trim_history_for_budget(msgs)
             if dropped:
-                runtime._trace(agent_name, "history_trimmed", {
-                    "dropped_cycles": dropped,
-                    "kept_messages": len(trimmed_msgs),
-                    "original_messages": len(msgs),
-                    "where": "forced_finalisation",
-                })
+                runtime._trace(
+                    agent_name,
+                    "history_trimmed",
+                    {
+                        "dropped_cycles": dropped,
+                        "kept_messages": len(trimmed_msgs),
+                        "original_messages": len(msgs),
+                        "where": "forced_finalisation",
+                    },
+                )
             cached_msgs = _apply_cache_control(trimmed_msgs, model)
             llm_options = runtime.llm_options_for_agent(agent_name)
-            runtime._trace(agent_name, "forced_request", {
-                "model": model,
-                "messages": trimmed_msgs,
-                "llm_options": llm_options,
-            })
+            runtime._trace(
+                agent_name,
+                "forced_request",
+                {
+                    "model": model,
+                    "messages": trimmed_msgs,
+                    "llm_options": llm_options,
+                },
+            )
             try:
                 resp = await call_llm(
                     model=model,
@@ -498,7 +558,11 @@ class LiteLLMTransport:
                 )
             usage = resp.get("usage") if isinstance(resp, dict) else None
             _accumulate_usage(usage_acc, usage if isinstance(usage, dict) else None)
-            runtime._trace(agent_name, "forced_response", {"choices": resp.get("choices", []), "usage": usage})
+            runtime._trace(
+                agent_name,
+                "forced_response",
+                {"choices": resp.get("choices", []), "usage": usage},
+            )
             choice = (resp.get("choices") or [{}])[0]
             message = choice.get("message") or {}
             final_content = message.get("content") or ""
@@ -534,12 +598,18 @@ class LiteLLMTransport:
                         iterations=iteration,
                     )
                 except ValidationError as e:
-                    salvaged, invalid_items = _salvage_root_list_items(parsed, output_schema)
+                    salvaged, invalid_items = _salvage_root_list_items(
+                        parsed, output_schema
+                    )
                     if salvaged is not None:
-                        runtime._trace(agent_name, "schema_salvaged_root_list", {
-                            "valid_items": len(salvaged),
-                            "invalid_items": len(invalid_items),
-                        })
+                        runtime._trace(
+                            agent_name,
+                            "schema_salvaged_root_list",
+                            {
+                                "valid_items": len(salvaged),
+                                "invalid_items": len(invalid_items),
+                            },
+                        )
                         _write_schema_invalid_artifact(
                             runtime,
                             agent_name,
@@ -554,7 +624,12 @@ class LiteLLMTransport:
                             developer_calls_made=dev_calls[0],
                             iterations=iteration,
                         )
-                    err = f"Your JSON failed schema validation:\n{e}\nFix it and return ONLY the corrected JSON."
+                    err = (
+                        f"Your JSON failed schema validation:\n{e}\n"
+                        "Preserve every valid value, use the exact canonical schema field "
+                        "names, add every missing field, and return the complete corrected "
+                        "JSON object only. Do not abbreviate it or return a patch."
+                    )
 
             if attempt == 2:
                 if getattr(output_schema, "__pydantic_root_model__", False):
@@ -569,12 +644,17 @@ class LiteLLMTransport:
                             reason=err,
                             final_content=final_content,
                         )
-                        runtime._trace(agent_name, "schema_fallback_empty_list", {"reason": err[:500]})
+                        runtime._trace(
+                            agent_name,
+                            "schema_fallback_empty_list",
+                            {"reason": err[:500]},
+                        )
                         logger.warning(
                             "%s returned invalid list JSON after retry; treating as empty result "
                             "(artifact: %s)",
                             agent_name,
-                            Path(runtime.run_dir) / f"schema_invalid_{re.sub(r'[^A-Za-z0-9_.-]+', '_', agent_name)}.json",
+                            Path(runtime.run_dir)
+                            / f"schema_invalid_{re.sub(r'[^A-Za-z0-9_.-]+', '_', agent_name)}.json",
                         )
                         return AgentResult(
                             output=empty,
@@ -582,7 +662,9 @@ class LiteLLMTransport:
                             developer_calls_made=dev_calls[0],
                             iterations=iteration,
                         )
-                raise AgentOutputError(f"{agent_name}: schema validation failed after retry — {err}")
+                raise AgentOutputError(
+                    f"{agent_name}: schema validation failed after retry — {err}"
+                )
 
             msgs.append({"role": "assistant", "content": final_content})
             msgs.append({"role": "user", "content": err})
@@ -591,4 +673,6 @@ class LiteLLMTransport:
             choice = (resp.get("choices") or [{}])[0]
             final_content = (choice.get("message") or {}).get("content") or ""
 
-        raise AgentOutputError(f"{agent_name}: schema validation loop exited unexpectedly")
+        raise AgentOutputError(
+            f"{agent_name}: schema validation loop exited unexpectedly"
+        )

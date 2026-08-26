@@ -10,13 +10,13 @@ from pathlib import Path
 from ..schemas.config import PipelineConfig
 from ..schemas.intake import IntakeArtifact
 from ..services.svn import SVNClient
-from ..services import intake_helpers, wp_core
+from ..services.intake_helpers import is_plugin_closed
 
 logger = logging.getLogger(__name__)
 
 
 class PluginClosedError(RuntimeError):
-    """Raised when intake.detect_closed=True and wp.org marks the plugin closed."""
+    """Raised when WordPress.org marks a latest-version target as closed."""
 
 
 def _count_files(root: Path) -> tuple[int, int]:
@@ -64,60 +64,34 @@ async def run(
     runs_root: str = "runs",
     version: str | None = None,
 ) -> IntakeArtifact:
-    intake_cfg = config.intake
-
-    # #6: closed-plugin detection (early bail; runs BEFORE svn.export so we don't waste a download)
     is_closed: bool | None = None
-    if intake_cfg.detect_closed:
-        is_closed = await intake_helpers.is_plugin_closed(plugin_slug)
+    if version is None:
+        is_closed = await is_plugin_closed(plugin_slug)
         if is_closed is True:
             raise PluginClosedError(
-                f"Plugin '{plugin_slug}' is marked closed on wp.org — refusing to scan "
-                "(set intake.detect_closed=false to bypass, but Wordfence treats closed "
-                "plugins as out of scope)"
+                f"Plugin '{plugin_slug}' is marked closed on WordPress.org and is not "
+                "eligible for the configured disclosure programs"
             )
-        # is_closed=False or None (lookup failed) → continue
 
     svn = SVNClient()
     if version is None:
-        version = await svn.get_latest_version(plugin_slug)
+        release = await svn.get_latest_release(plugin_slug)
+        version = release.version
         logger.info("intake: %s latest=%s", plugin_slug, version)
     else:
+        release = None
         logger.info("intake: %s pinned=%s", plugin_slug, version)
 
     run_dir = Path(runs_root) / run_id
     plugin_dir = run_dir / "plugin"
     plugin_dir.parent.mkdir(parents=True, exist_ok=True)
 
-    await svn.export(plugin_slug, version, str(plugin_dir))
+    if release is not None:
+        await svn.export_release(plugin_slug, release, str(plugin_dir))
+    else:
+        await svn.export(plugin_slug, version, str(plugin_dir))
     _maybe_unpack_zip_tag(plugin_dir, plugin_slug)
     file_count, total_lines = _count_files(plugin_dir)
-
-    # #1: WP core source bundle (cache hit on repeat scans)
-    wp_core_path: str | None = None
-    if intake_cfg.bundle_wp_core:
-        wp_core_dir = await wp_core.ensure_wp_core_cached(intake_cfg.wp_core_version)
-        wp_core_path = str(wp_core_dir) if wp_core_dir else None
-        if wp_core_path is None:
-            logger.warning("intake: WP core bundling enabled but cache fetch failed — continuing")
-
-    # #2: file classification (heuristic path-pattern bucketing)
-    file_classification: dict[str, list[str]] | None = None
-    if intake_cfg.classify_files:
-        file_classification = intake_helpers.classify_files(plugin_dir)
-        bucket_summary = ", ".join(f"{k}={len(v)}" for k, v in file_classification.items() if v)
-        logger.info("intake: file classification — %s", bucket_summary)
-
-    # #4: changelog parsing
-    recent_changelog: list[dict] | None = None
-    if intake_cfg.fetch_changelog:
-        recent_changelog = intake_helpers.parse_recent_changelog(plugin_dir)
-        if recent_changelog:
-            recent_versions = [c["version"] for c in recent_changelog]
-            logger.info("intake: parsed %d changelog entries (%s)",
-                         len(recent_changelog), ", ".join(recent_versions))
-        else:
-            logger.info("intake: changelog parse returned no entries")
 
     artifact = IntakeArtifact(
         run_id=run_id,
@@ -126,11 +100,12 @@ async def run(
         source_path=str(plugin_dir),
         file_count=file_count,
         total_lines=total_lines,
-        svn_url=f"https://plugins.svn.wordpress.org/{plugin_slug}/tags/{version}",
+        source_url=(
+            release.download_url
+            if release is not None
+            else f"https://plugins.svn.wordpress.org/{plugin_slug}/tags/{version}"
+        ),
         scanned_at=datetime.now(timezone.utc),
-        wp_core_path=wp_core_path,
-        file_classification=file_classification,
-        recent_changelog=recent_changelog,
         is_plugin_closed=is_closed,
     )
     artifact.to_json_file(str(run_dir / "intake.json"))

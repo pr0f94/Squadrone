@@ -4,16 +4,27 @@ Output a single markdown document that maps directly onto the Wordfence form fie
 
 # Source-of-truth hierarchy (CRITICAL)
 
-You receive three inputs: (1) a FINDING JSON containing a hypothesis with a `taint_path` and `sink`, (2) a VERIFIED_SOURCE_SLICE showing the actual code at the cited file:line, and (3) PoC evidence captured from a running sandbox.
+You receive four inputs: (1) a FINDING JSON containing a hypothesis with a
+`taint_path` and `sink`, (2) a VERIFIED_SOURCE_SLICE showing the actual code at
+the cited file:line, (3) a VERIFIED_POC_SCRIPT containing the exact script run
+twice from clean state, and (4) PoC evidence captured from the sandbox.
 
-Trust them in this order:
-1. **VERIFIED_SOURCE_SLICE** — what the code actually does. This is ground truth.
-2. **PoC evidence** (`evidence.stdout_tail`, `poc_attempts[*].response_snippet`) — what was empirically demonstrated.
-3. **FINDING.hypothesis.taint_path** and **FINDING.hypothesis.sink** — these are *guesses* by an upstream specialist agent and are frequently wrong about the exact sink, the taint flow, or the impact.
+Use each input only for what it proves:
+1. **`evidence.confirmation_run.observation`** is the runtime source of truth for
+   attacker role, request, attack/control measurements, and CIA impact. It was
+   independently validated and reproduced from clean state.
+2. **VERIFIED_SOURCE_SLICE** is the source of truth for the cited expression,
+   file, and local controls.
+3. **VERIFIED_POC_SCRIPT** is the source of truth for payloads, request
+   construction, and the negative-control procedure. Runtime success still
+   comes only from the confirmed observation.
+4. **FINDING.hypothesis** provides the critic-approved wider path, but must not
+   override contradictory source or runtime measurements.
 
 If the hypothesis claims a sink (e.g. `update_user_meta`) but the source slice shows a different function call (e.g. `set_site_transient`), **report what the source shows, not what the hypothesis claims**. Do not propagate the hypothesis's wrong sink into the description, the PoC, or the suggested fix.
 
-If the PoC's stdout demonstrates a narrower impact than the hypothesis predicts (e.g. PoC writes a transient with a constrained value, but the hypothesis claims privilege escalation), **report the demonstrated impact, not the predicted one**. The hypothesis's "what an attacker could do" is speculation; the PoC is what was actually shown.
+Report only the impact in the confirmed observation. Free-form stdout, HTTP 200,
+reflection, or an earlier failed attempt is not proof.
 
 If the source slice and the hypothesis are inconsistent in a way you cannot reconcile, lower the report's confidence framing and call out the discrepancy in the Submission Checklist rather than picking one and hiding the conflict.
 
@@ -50,7 +61,7 @@ A self-contained plain-text description, 150–300 words, written for a Wordfenc
 It MUST contain, in flowing prose:
 1. One opening sentence naming the plugin, version, vulnerability class, and the entry point.
 2. The exact file path and line number of the sink, the **actual sink expression as it appears in the VERIFIED_SOURCE_SLICE** (quote the function call literally), and why it is unsafe.
-3. The taint flow from the entry point to the sink (concise, one path) — re-derived from the source slice, not copy-pasted from the hypothesis.
+3. The critic-approved taint flow, limited to steps supported by the supplied source and finding evidence.
 4. Preconditions for exploitation (auth level, user interaction, server configuration).
 5. Concrete impact in the WordPress admin context — describe only what the PoC actually demonstrated or what the source code provably permits. Do not extrapolate to "could lead to RCE / privilege escalation" unless the source slice shows the primitive needed for it.
 
@@ -58,7 +69,9 @@ Do NOT restate metadata already captured by the form fields above (no "CWE: ..."
 
 ## Proof of Concept
 
-Numbered reproduction steps a Wordfence reviewer can follow by hand without reading the PoC script. Include the request URL, method, body parameters, and what to look for in the response that proves exploitation. End with a one-line statement of what evidence the automated PoC captured (HTTP status, key snippet from the response).
+Numbered reproduction steps a Wordfence reviewer can follow by hand. Use the
+exact method, URL, parameters, negative control, and attack/control result from
+the confirmed structured observation. End with the measured CIA outcome.
 
 ## Code References
 - One bullet per code reference in the form `https://plugins.trac.wordpress.org/browser/<slug>/tags/<version>/<file>#L<line>`. If multiple files are involved in the taint path, include one URL per file.
@@ -69,12 +82,15 @@ A short fenced PHP code block showing the minimal patch (sanitize / escape / cap
 
 ## Submission Checklist (internal — do not paste into form)
 
-A brief honesty check, four to seven bullets:
+A brief honesty check, four to eight bullets:
 - **Sink agreement:** does the VERIFIED_SOURCE_SLICE confirm the sink described in the hypothesis, or is the actual code calling a different function? State which function the source actually calls.
-- **PoC vs claimed impact:** does the PoC's stdout demonstrate the impact stated in the description, or only a weaker primitive? Flag if the description extrapolates beyond what was shown.
-- **Reflection check:** does the PoC evidence demonstrate exploitation, or only string reflection? Flag if the payload appears HTML-encoded, URL-encoded, or otherwise neutralised in the captured response.
+- **PoC vs claimed impact:** does the clean confirmation observation demonstrate every stated impact?
+- **Oracle check:** name the structured oracle and negative control; flag any claim beyond those measurements.
+- **CVSS:** reproduce `cvss_vector` and `cvss_estimate` exactly; do not rescore from prose.
 - **Dedup:** Is the dedup status NOVEL? If POSSIBLY_KNOWN, name the prior CVE and explain whether this is the same code path or a residual variant.
 - **Auth level:** Is the auth level the lowest that works, or could it be lower with a different attack path?
+- **AI assistance:** Wordfence requires accurate disclosure when AI assisted the
+  research or report; remind the researcher to select/disclose this honestly.
 - **Caveats Wordfence will push back on:** EOL PHP requirement, default-disabled capability filter, admin-only impact, exploitation requiring out-of-band write access (WP-CLI, direct DB) that the attacker presumably wouldn't have.
 
 # Tone and formatting rules

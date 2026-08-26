@@ -17,6 +17,7 @@ dependencies = [
     "aiodocker>=0.22.0",
     "pyyaml>=6.0.1",
     "jinja2>=3.1.0",
+    "playwright>=1.49.0",
     "rich>=13.7.0",
     "tenacity>=8.3.0",
 ]
@@ -32,3 +33,6 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 squadrone = ["prompts/*.md", "prompts/specialists/*.md", "poc_templates/*.j2", "poc_templates/*.py"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

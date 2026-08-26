@@ -20,8 +20,16 @@ class WPCli:
     def __init__(self, container_name: str):
         self.container = container_name
 
-    async def _exec_result(self, *args: str) -> tuple[int, str, str]:
-        cmd = ["docker", "exec", self.container, "wp", "--allow-root", *args]
+    async def _exec_result(
+        self, *args: str, user: str | None = None
+    ) -> tuple[int, str, str]:
+        cmd = ["docker", "exec"]
+        if user is not None:
+            cmd.extend(("--user", user))
+        cmd.extend((self.container, "wp"))
+        if user is None or user in {"root", "0"}:
+            cmd.append("--allow-root")
+        cmd.extend(args)
         logger.debug("wp-cli: %s", " ".join(shlex.quote(c) for c in cmd))
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -33,8 +41,10 @@ class WPCli:
         err = stderr.decode("utf-8", errors="replace")
         return proc.returncode or 0, out, err
 
-    async def _exec(self, *args: str, check: bool = True) -> str:
-        rc, out, err = await self._exec_result(*args)
+    async def _exec(
+        self, *args: str, check: bool = True, user: str | None = None
+    ) -> str:
+        rc, out, err = await self._exec_result(*args, user=user)
         if check and rc != 0:
             raise WPCliError(f"wp {' '.join(args)} exited {rc}: {err.strip()}")
         return out
@@ -51,8 +61,10 @@ class WPCli:
             "--porcelain",
         )
 
-    async def install_plugin(self, zip_path: str) -> None:
-        await self._exec("plugin", "install", zip_path, "--activate", "--force")
+    async def install_plugin(self, zip_path: str, *, user: str | None = None) -> None:
+        await self._exec(
+            "plugin", "install", zip_path, "--activate", "--force", user=user
+        )
 
     async def activate_plugin(self, slug: str) -> None:
         await self._exec("plugin", "activate", slug)

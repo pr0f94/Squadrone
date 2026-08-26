@@ -1,54 +1,152 @@
-# Shared rules — included as the tail of every specialist prompt
+# Shared source-review rules
 
-## Verbatim sink quotation (REQUIRED)
+## Coverage ledger
 
-The `sink_code` field is mandatory. It MUST contain the exact source line(s) from the file at `file:line` that contain the dangerous call — copy-pasted verbatim from `code_slices`, including indentation and the surrounding 1–2 lines for context if the sink is part of a multi-line expression. Do NOT paraphrase, summarize, or reconstruct from memory.
+Return exactly one coverage disposition for every `coverage_targets` item:
 
-If you cannot locate the literal sink expression in `code_slices` for the file you cited, do NOT raise the hypothesis. Read the file with `read_plugin_file` first and only emit the hypothesis once you can quote the actual code.
+- `candidate`: the item contributes to an emitted hypothesis
+- `reviewed`: the complete reachable path was reviewed and no candidate remains
+- `unreachable`: the registration/operation is dead or cannot be reached in the shipped plugin; cite why
 
-A downstream verifier cross-checks `sink_code` against the file on disk. Hypotheses with quotes that don't match the source are dropped automatically — saving you nothing in the long run.
+Never omit an item. `reason` must name the handler, guard, sanitizer, dead-code
+fact, or source path that supports the disposition. `evidence_locations` must
+include the assigned item's exact `file:line` and any handler/guard locations
+supporting the decision. You must obtain every cited line from
+`read_plugin_file` during this batch; manifest text alone is not reviewed source.
+When an assigned item has `column` greater than 1 on a minified line, use
+`read_plugin_file` with that `start_column`; reading only the beginning of the
+same line does not count as reviewing the item.
+The `reviewer` value must be the exact review area named in your area prompt.
+For `candidate`, `hypothesis_ids` must name the hypotheses supported by that
+item. For `reviewed` and `unreachable`, return an empty `hypothesis_ids` list.
 
-## Attacker-control discipline (REQUIRED)
+## Source grounding
 
-Do NOT raise hypotheses where the bug only fires under preconditions the attacker cannot satisfy:
+Every hypothesis must quote the exact dangerous expression in `sink_code` and
+cite its real `file` and `line` from a recent `read_plugin_file` result. Read the
+complete callback and every plugin helper on the claimed path. A 15-line window
+is not enough to assert that a guard or sanitizer is absent.
 
-- "Requires the admin to misconfigure the plugin" — out
-- "Requires another plugin to override filter X" — out
-- "Requires PHP option Y to be enabled" (where Y is a non-default unsafe setting) — out
-- "Requires the option to be written outside the Settings API" — out, unless you can name a routine attacker-reachable write path
-- "Assumes the WAF is not in front" — out
-- "Theoretical / future code change" — out
+Trace both directions:
 
-The attacker controls: HTTP requests, request bodies, cookies they own, files they upload, posts/comments/forms they submit. They do NOT control: server config, admin actions, other plugins' behaviour, or non-default WordPress settings.
+1. From each external handler forward to a guard, sanitizer, sensitive
+   operation, stored value, or response.
+2. From each assigned sensitive operation backward to a realistic external
+   source.
+3. For persistent input, continue from the write through the later read/render
+   path and identify the natural victim.
 
-If a precondition gates the bug behind something the victim has to do or misconfigure, drop the hypothesis. The downstream triage stage applies the Wordfence scope filter and rejects these anyway — raising them just inflates the hypothesis count and slows triage.
+`direct_php` entries are shipped scripts that can execute through their own URL,
+without a WordPress hook registration. Inspect them as independent request
+routes, including when a dispatcher such as `->run()` reads request data inside
+a dependency. A nonce or capability check on one WordPress callback does not
+protect a shared sink reached from a separate script. Directory-near
+`direct_php` entries may be included as conservative context for sink batches;
+trace them before deciding whether they reach the assigned operation.
 
-## Self-check before emitting
+`direct_php_candidate` entries have a top-level bootstrap and dispatcher but no
+visible top-level request signal. Review them for delegated request handling,
+but do not assume they are directly web-reachable, unauthenticated, or
+independent of WordPress. Establish those facts from source before emitting a
+hypothesis.
 
-For each hypothesis, before adding it to your output array:
-1. Re-read the source at `file:line` ±15 lines from `code_slices`.
-2. Confirm the function/expression you cited as the sink actually appears there.
-3. Confirm the upstream guard you claim is absent (no nonce, no capability check) really is absent — search the same code slice for `current_user_can`, `wp_verify_nonce`, `check_ajax_referer`, `permission_callback`. If present, either drop the hypothesis or downgrade confidence and explain why the guard is bypassable.
-4. Confirm the precondition is attacker-reachable per the discipline above.
-5. Confirm the claim crosses a real security boundary and has a concrete C/I/A impact.
+Coalesce nearby assigned locations into range reads when practical. Leave tool
+calls available to trace callers, alternate routes, guards, and downstream
+effects instead of spending one call on every individual sink line.
 
-If any check fails, do not emit. The verifier's bar is "the literal `sink_code` appears at the cited line and there is no obvious upstream guard the specialist missed" — meet that bar yourself before emitting.
+Bundled dependencies and built JavaScript are inspectable. Review dependency
+code when the plugin path reaches it; do not report a dependency issue merely
+because vulnerable-looking code exists in `vendor`.
 
-## Evidence summary proof tuple
+## Candidate bar
 
-Every emitted Hypothesis must include an `evidence_summary` object with these
-keys:
+Emit only when all of these are concrete:
 
-- `attacker_role`: lowest realistic role
-- `source`: attacker-controlled request/value/event
-- `control`: nearest missing, wrong, or bypassed security control
-- `sink`: dangerous operation or security outcome
-- `reachable_path`: concrete route/callback/helper path
-- `boundary`: why this crosses a WordPress/plugin security boundary
-- `impact`: what the attacker can read, change, execute, or deny
-- `counterevidence`: nearby facts that could defeat the claim
-- `proof_gaps`: narrow remaining facts for sandbox/manual validation
+- lowest realistic attacker role and exact shipped configuration
+- attacker-controlled source and exact reachable callback/helper path
+- nearest effective or bypassed nonce, capability, ownership, token, validation, or escaping control
+- dangerous operation and actual security outcome
+- a plain confidentiality, integrity, or availability consequence
+- nearby counterevidence and one narrow runtime proof gap
 
-If `boundary`, `impact`, or `reachable_path` would be vague, do not emit the
-hypothesis. Manual review is for nearly proven candidates with one narrow
-runtime question, not for broad uncertainty.
+The structured `security_outcome` dimensions must agree with the impact text.
+Mark each demonstrated confidentiality, integrity, or availability dimension as
+`low` or `high`; never leave all three as `none` while claiming disclosure,
+file modification, deletion, code execution, or loss of availability.
+
+A normal victim action such as opening the plugin's submissions page can be a
+valid stored-XSS trigger. Enabling a shipped feature through its intended UI is
+also a valid prerequisite, even when the feature is disabled by default, if its
+security subsettings remain at the defaults for that feature. State the toggle
+and subsettings precisely. An administrator disabling or weakening a security
+control, granting an extra capability, modifying source, enabling debug behavior,
+or installing another component is not a valid prerequisite. Absence of a WAF
+is normal and is not a precondition.
+
+Do not emit admin-only behavior, self/own-object behavior, cosmetic changes,
+public counters, open redirects, HTML/CSS-only injection, generic HTTP 200
+responses, or primitives with no demonstrated CIA consequence.
+
+## Evidence schema
+
+Every hypothesis must populate `evidence_summary` with short concrete values for
+`attacker_role`, `source`, `control`, `sink`, `reachable_path`, `boundary`,
+`impact`, `counterevidence`, and `proof_gaps`.
+Use the supplied `hypothesis_id_prefix` when choosing hypothesis IDs; the runner
+will canonicalize them when the batch is checkpointed.
+
+Output only this JSON shape:
+
+```json
+{
+  "hypotheses": [
+    {
+      "id": "the supplied hypothesis_id_prefix plus a unique suffix",
+      "specialist": "the exact assigned review area",
+      "bug_class": "a canonical CWE id or supported CWE-79 variant",
+      "entry_point": "the exact external route",
+      "file": "the sink source file",
+      "line": 123,
+      "sink": "the dangerous operation",
+      "sink_code": "the exact source expression",
+      "taint_path": ["external source", "helper", "sink"],
+      "reasoning": "why the controls do not stop the demonstrated outcome",
+      "confidence": "high | medium | low",
+      "preconditions": "lowest role and shipped configuration",
+      "affected_versions": "the source-grounded affected range",
+      "security_outcome": {
+        "confidentiality": "none | low | high",
+        "integrity": "none | low | high",
+        "availability": "none | low | high",
+        "description": "plain CIA consequence"
+      },
+      "evidence_summary": {
+        "attacker_role": "lowest demonstrated role",
+        "source": "attacker-controlled input",
+        "control": "nearest effective or missing control",
+        "sink": "dangerous operation",
+        "reachable_path": "entry -> helpers -> sink",
+        "boundary": "crossed security boundary",
+        "impact": "demonstrated CIA outcome",
+        "counterevidence": "nearby contrary evidence considered",
+        "proof_gaps": "one narrow runtime question"
+      }
+    }
+  ],
+  "coverage": [
+    {
+      "item_id": "cov-0001",
+      "reviewer": "the exact assigned review area",
+      "status": "candidate | reviewed | unreachable",
+      "reason": "source-grounded disposition",
+      "evidence_locations": ["assigned/file.php:123", "handler/file.php:456"],
+      "hypothesis_ids": ["batch-prefix-001"]
+    }
+  ]
+}
+```
+
+Inside `hypotheses`, use exactly `id`, `specialist`, `bug_class`, and
+`confidence`; do not substitute `hypothesis_id`, `reviewer`,
+`vulnerability_class`, or `cwe`. Return every required field even when fixing a
+prior response.

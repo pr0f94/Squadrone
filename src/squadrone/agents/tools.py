@@ -12,7 +12,8 @@ READ_PLUGIN_FILE_TOOL: dict = {
             "(e.g. helper classes, included files, JS that consumes server output, "
             "shortcode rendering files). Path is relative to the plugin root. For long "
             "files, prefer the line-range form (start_line + end_line) over reading the "
-            "whole file."
+            "whole file. For a minified line, set start_line and start_column to read "
+            "the relevant character window."
         ),
         "parameters": {
             "type": "object",
@@ -33,6 +34,14 @@ READ_PLUGIN_FILE_TOOL: dict = {
                     "type": "integer",
                     "description": "Optional cap on lines returned (default 500). Applies after start_line/end_line slicing.",
                 },
+                "start_column": {
+                    "type": "integer",
+                    "description": "Optional 1-indexed first character on start_line. When set, returns only that line from this column.",
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "description": "Optional character cap for start_column reads (default and hard cap 60000).",
+                },
             },
             "required": ["path"],
         },
@@ -51,7 +60,7 @@ REQUEST_ADDITIONAL_SETUP_TOOL: dict = {
             "claimed vulnerable storage location; stored bugs must submit malicious input "
             "through the real plugin entry point. The runner will dispatch to the developer "
             "agent, run the proposed setup commands inside the sandbox, and return a summary. "
-            "Then write your PoC against the new state. (Stage-3 W9: collaborative dev+poc loop)"
+            "Then write your PoC against the new state."
         ),
         "parameters": {
             "type": "object",

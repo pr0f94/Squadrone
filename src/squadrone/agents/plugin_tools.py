@@ -40,7 +40,8 @@ GREP_PLUGIN_TOOL: dict = {
             "Search the plugin source for a regular expression. Use this to locate "
             "entry points (e.g. `register_rest_route`, `add_action.*wp_ajax_`), sinks "
             "(e.g. `\\$wpdb->query`, `file_put_contents`), or any other pattern. "
-            "Returns up to `max_results` matches as `path:line:content` lines. "
+            "Returns up to `max_results` matches as `path:line:column:content` lines, "
+            "with long minified lines centered on the match. "
             "Prefer narrowing with `path_glob` (e.g. `**/*.php`) on large plugins."
         ),
         "parameters": {
@@ -78,9 +79,10 @@ GLOB_PLUGIN_TOOL: dict = {
     "function": {
         "name": "glob_plugin",
         "description": (
-            "List plugin files matching a glob pattern. Use this to discover the "
-            "directory layout before grepping or reading. Returns paths relative to "
-            "the plugin root, one per line."
+            "List plugin files and directories matching a glob pattern. Use this to "
+            "discover the directory layout before grepping or reading, including "
+            "empty or hidden-file-only directories. Returns paths relative to the "
+            "plugin root, one per line; directory paths end with '/'."
         ),
         "parameters": {
             "type": "object",
@@ -104,9 +106,10 @@ GLOB_PLUGIN_TOOL: dict = {
 # Handlers
 # ---------------------------------------------------------------------------
 
-# Directories typically excluded — dependencies / build output / VCS noise.
+# Only non-shipped or duplicate source trees are excluded. Bundled vendor,
+# dist, and build code can be security-relevant and must remain inspectable.
 _DEFAULT_EXCLUDED_DIRS = frozenset({
-    "vendor", "node_modules", ".git", ".svn", "dist", "build", "__pycache__",
+    "node_modules", ".git", ".svn", "__pycache__",
 })
 
 # Text-y extensions we'll read/grep. Anything else returns "[binary or unsupported]".
@@ -119,6 +122,19 @@ _TEXT_EXTENSIONS = frozenset({
 
 _READ_FILE_HARD_BYTE_CAP = 60_000
 _GREP_OUTPUT_HARD_BYTE_CAP = 30_000
+
+
+def _line_excerpt(value: str, center: int, width: int = 1200) -> str:
+    """Return a bounded line excerpt centered on a regex match."""
+    if len(value) <= width:
+        return value
+    start = max(0, min(center - width // 2, len(value) - width))
+    end = start + width
+    return (
+        ("..." if start else "")
+        + value[start:end]
+        + ("..." if end < len(value) else "")
+    )
 
 
 class PluginToolHandlers:
@@ -138,6 +154,24 @@ class PluginToolHandlers:
         if not self.plugin_root.is_dir():
             raise ValueError(f"plugin_root is not a directory: {self.plugin_root}")
         self.excluded_dirs = excluded_dirs if excluded_dirs is not None else _DEFAULT_EXCLUDED_DIRS
+        self.read_columns: dict[tuple[str, int], list[tuple[int, int]]] = {}
+
+    def was_read(self, path: str, line: int, column: int | None = 1) -> bool:
+        """Return whether a read result included this exact source position."""
+        target = self._resolve_safely(path)
+        if target is None:
+            return False
+        rel = str(target.relative_to(self.plugin_root))
+        spans = self.read_columns.get((rel, line), [])
+        if column is None:
+            return bool(spans)
+        return any(
+            start <= column <= end
+            for start, end in spans
+        )
+
+    def _record_read(self, rel: str, line: int, start_column: int, end_column: int) -> None:
+        self.read_columns.setdefault((rel, line), []).append((start_column, end_column))
 
     # -- public wiring -----------------------------------------------------
 
@@ -207,18 +241,28 @@ class PluginToolHandlers:
                 continue
             lines = text.splitlines()
             for i, line in enumerate(lines):
-                if not regex.search(line):
+                match = regex.search(line)
+                if not match:
                     continue
+                match_column = match.start() + 1
                 if context_lines:
                     lo = max(0, i - context_lines)
                     hi = min(len(lines), i + context_lines + 1)
                     block_lines = [
-                        f"{rel}:{lo + j + 1}{'>' if (lo + j) == i else ':'}{lines[lo + j]}"
+                        (
+                            f"{rel}:{lo + j + 1}:"
+                            f"{match_column if (lo + j) == i else 1}"
+                            f"{'>' if (lo + j) == i else ':'}"
+                            f"{_line_excerpt(lines[lo + j], match.start() if (lo + j) == i else 0)}"
+                        )
                         for j in range(hi - lo)
                     ]
                     block = "\n".join(block_lines) + "\n--"
                 else:
-                    block = f"{rel}:{i + 1}:{line}"
+                    block = (
+                        f"{rel}:{i + 1}:{match_column}:"
+                        f"{_line_excerpt(line, match.start())}"
+                    )
                 if output_bytes + len(block) + 1 > _GREP_OUTPUT_HARD_BYTE_CAP:
                     truncated_files += 1
                     break
@@ -253,20 +297,23 @@ class PluginToolHandlers:
         paths: list[str] = []
         truncated = False
         for abs_path in sorted(self.plugin_root.glob(pattern)):
-            if not abs_path.is_file():
+            if not (abs_path.is_file() or abs_path.is_dir()):
                 continue
             rel = abs_path.relative_to(self.plugin_root)
             if self._is_excluded(rel):
                 continue
-            paths.append(str(rel))
+            rendered = str(rel)
+            if abs_path.is_dir():
+                rendered += "/"
+            paths.append(rendered)
             if len(paths) >= max_results:
                 truncated = True
                 break
 
         if not paths:
-            return f"[glob_plugin] 0 files match {pattern}"
+            return f"[glob_plugin] 0 paths match {pattern}"
         suffix = "\n... [truncated; tighten pattern]" if truncated else ""
-        return f"[glob_plugin] {len(paths)} file(s) matching {pattern}\n" + "\n".join(paths) + suffix
+        return f"[glob_plugin] {len(paths)} path(s) matching {pattern}\n" + "\n".join(paths) + suffix
 
     def read_plugin_file(self, args: dict) -> str:
         rel = (args.get("path") or "").strip()
@@ -279,6 +326,7 @@ class PluginToolHandlers:
             return f"[read_plugin_file] not found: {rel}"
         if target.suffix.lower() and target.suffix.lower() not in _TEXT_EXTENSIONS:
             return f"[read_plugin_file] refused: {rel} is not a recognised text file"
+        rel = str(target.relative_to(self.plugin_root))
 
         try:
             text = target.read_text(encoding="utf-8", errors="replace")
@@ -288,6 +336,41 @@ class PluginToolHandlers:
         all_lines = text.splitlines()
         total_lines = len(all_lines)
         start_line = max(1, int(args.get("start_line") or 1))
+        if start_line > total_lines:
+            return (
+                f"[read_plugin_file] refused: start_line {start_line} is beyond "
+                f"the end of {rel} ({total_lines} lines)"
+            )
+        start_column_arg = args.get("start_column")
+        if start_column_arg is not None:
+            line = all_lines[start_line - 1]
+            start_column = max(1, int(start_column_arg))
+            if start_column > max(len(line), 1):
+                return (
+                    f"[read_plugin_file] refused: start_column {start_column} is beyond "
+                    f"the end of {rel}:{start_line} ({len(line)} characters)"
+                )
+            max_chars = max(
+                1,
+                min(
+                    int(args.get("max_chars") or _READ_FILE_HARD_BYTE_CAP),
+                    _READ_FILE_HARD_BYTE_CAP,
+                ),
+            )
+            body = line[start_column - 1:start_column - 1 + max_chars]
+            end_column = start_column + max(len(body) - 1, 0)
+            self._record_read(rel, start_line, start_column, end_column)
+            header = (
+                f"--- {rel} (line {start_line}, columns {start_column}-{end_column} "
+                f"of {len(line)}) ---"
+            )
+            footer = ""
+            if end_column < len(line):
+                footer = (
+                    f"\n\n... [truncated; re-call with start_line={start_line}, "
+                    f"start_column={end_column + 1}]"
+                )
+            return f"{header}\n{body}{footer}"
         end_line_arg = args.get("end_line")
         end_line = int(end_line_arg) if end_line_arg is not None else total_lines
         end_line = max(start_line, min(end_line, total_lines))
@@ -306,11 +389,39 @@ class PluginToolHandlers:
             body = body[:_READ_FILE_HARD_BYTE_CAP]
             byte_truncated = True
 
+        # Track source columns actually returned. This matters for minified files,
+        # where one physical line can be much larger than the output cap.
+        remaining = len(body)
+        last_line = start_line
+        last_column = 1
+        for offset, source_line in enumerate(sliced):
+            if offset:
+                if remaining < 1:
+                    break
+                remaining -= 1
+            line_no = start_line + offset
+            if not source_line:
+                self._record_read(rel, line_no, 1, 1)
+                last_line, last_column = line_no, 1
+                continue
+            visible_chars = min(len(source_line), remaining)
+            if visible_chars < 1:
+                break
+            self._record_read(rel, line_no, 1, visible_chars)
+            last_line, last_column = line_no, visible_chars
+            remaining -= visible_chars
+        end_line = last_line
+
         header = f"--- {rel} (lines {start_line}-{end_line} of {total_lines}) ---"
         footer = ""
         if sliced_truncated or byte_truncated or end_line < total_lines:
+            source_line_length = len(all_lines[end_line - 1]) if total_lines else 0
+            if last_column < source_line_length:
+                continuation = f"start_line={end_line}, start_column={last_column + 1}"
+            else:
+                continuation = f"start_line={end_line + 1}"
             footer = (
                 f"\n\n... [truncated; full file is {total_lines} lines. "
-                f"Re-call with start_line={end_line + 1} to continue]"
+                f"Re-call with {continuation} to continue]"
             )
         return f"{header}\n{body}{footer}"

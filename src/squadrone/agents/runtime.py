@@ -56,10 +56,13 @@ class AgentRuntime:
     @staticmethod
     def _role_for_agent(agent_name: str) -> str:
         base = agent_name.split(".", 1)[0]
-        if base in {"auth", "auth_flow", "file_ops", "injection", "logic_flaw", "ssrf_deser", "xss"}:
+        if base in {
+            "authentication",
+            "authorization_workflows",
+            "injection_files",
+            "xss_lifecycle",
+        }:
             return "specialists"
-        if base == "entry_point_validator":
-            return "hypothesis_verifier"
         return base
 
     def llm_options_for_agent(self, agent_name: str) -> dict:

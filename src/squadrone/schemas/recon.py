@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
+
+from pydantic import Field
 
 from ._base import JSONFileMixin
 
@@ -17,15 +19,10 @@ class EntryPoint(JSONFileMixin):
     has_nonce_check: bool
     has_capability_check: bool
     capability: Optional[str] = None
-    body_slice: Optional[str] = None              # Function body lifted into recon.json.
-    confidence: Optional[str] = None              # "high" | "medium" | "low"
-    # Per-entry-point validation output overrides pattern-derived flags when present.
-    validated_auth_gating: Optional[str] = None   # "logged_in_only" | "capability:<X>" |
-                                                  # "nonce_only:<action>" | "none" | "mixed"
-    validated_nonce_action: Optional[str] = None  # action name if nonce-gated
-    validated_capability: Optional[str] = None    # capability if cap-gated
-    validation_citation: Optional[str] = None     # "file:line — quote of the gating call"
-    validation_notes: Optional[str] = None        # short prose
+    body_slice: Optional[str] = None
+    confidence: Optional[str] = None
+    source: str = "surveyor"
+    access_known: bool = True
 
 
 class Sink(JSONFileMixin):
@@ -34,6 +31,7 @@ class Sink(JSONFileMixin):
     file: str
     line: int
     tainted_args: list[str]
+    source: str = "surveyor"
 
 
 class StaticCallback(JSONFileMixin):
@@ -57,7 +55,7 @@ class StaticCallEdge(JSONFileMixin):
 
 
 class SecurityProfile(JSONFileMixin):
-    """V2 plugin-level security map produced by the surveyor.
+    """Plugin-level security map produced by the surveyor.
 
     All fields are optional/additive from the pipeline's perspective. The
     specialist stage consumes this as grounding context when present, but older
@@ -79,16 +77,55 @@ class SecurityProfile(JSONFileMixin):
     notes: str | None = None
 
 
+ReviewArea = Literal[
+    "authorization_workflows",
+    "injection_files",
+    "xss_lifecycle",
+    "authentication",
+]
+CoverageKind = Literal["entry_point", "sink", "storage_read", "storage_write"]
+CoverageStatus = Literal["candidate", "reviewed", "unreachable", "unreviewed"]
+
+
+class CoverageItem(JSONFileMixin):
+    id: str
+    kind: CoverageKind
+    review_areas: list[ReviewArea]
+    type: str
+    name: str
+    file: str
+    line: int
+    column: int = 1
+    snippet: str
+    handler_function: str = ""
+    dependency: bool = False
+
+
+class CoverageDisposition(JSONFileMixin):
+    item_id: str
+    reviewer: ReviewArea
+    status: CoverageStatus
+    reason: str
+    evidence_locations: list[str] = Field(default_factory=list)
+    hypothesis_ids: list[str] = Field(default_factory=list)
+
+
+class CoverageArtifact(JSONFileMixin):
+    production_files: list[str] = Field(default_factory=list)
+    dependency_files: list[str] = Field(default_factory=list)
+    items: list[CoverageItem] = Field(default_factory=list)
+    dispositions: list[CoverageDisposition] = Field(default_factory=list)
+
+
 class ReconArtifact(JSONFileMixin):
     plugin_slug: str
     entry_points: list[EntryPoint]
     sinks: list[Sink]
     entry_to_sink_paths: dict[str, list[str]]
     raw_grep_hits: dict[str, list[str]]
-    # Stage 2 opt-in additions:
-    nonce_emission_sites: Optional[dict[str, list[str]]] = None  # #3: nonce_action -> ["file:line — context"]
-    cross_file_callees: Optional[dict[str, list[str]]] = None    # #2: handler_name -> ["file:line callee_name"]
-    excluded_buckets: Optional[list[str]] = None                  # #4: which intake.file_classification buckets we skipped
-    static_callbacks: Optional[list[StaticCallback]] = None       # deterministic hook/route/shortcode registrations
-    static_call_edges: Optional[list[StaticCallEdge]] = None      # best-effort callback -> helper call edges
-    security_profile: Optional[SecurityProfile] = None            # V2: plugin type/object/workflow map
+    nonce_emission_sites: Optional[dict[str, list[str]]] = None
+    cross_file_callees: Optional[dict[str, list[str]]] = None
+    static_callbacks: Optional[list[StaticCallback]] = None
+    static_call_edges: Optional[list[StaticCallEdge]] = None
+    security_profile: Optional[SecurityProfile] = None
+    coverage: Optional[CoverageArtifact] = None

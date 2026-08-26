@@ -38,6 +38,13 @@ class LoginResult:
     reason: str
 
 
+@dataclass
+class RestNonceResult:
+    success: bool
+    nonce: str
+    reason: str
+
+
 _AUTH_MARKERS = (
     "wp-admin-bar-my-account",   # admin bar list-item ID, present on every admin page
     "wp-admin-bar-user-info",    # user-info sub-item, same context
@@ -102,3 +109,24 @@ def wp_login(session, base_url: str, username: str, password: str, timeout: int 
         return LoginResult(False, "GET /wp-admin/ returned 200 but no auth marker found in body")
 
     return LoginResult(True, f"authenticated as {username}")
+
+
+def wp_rest_nonce(session, base_url: str, timeout: int = 20) -> RestNonceResult:
+    """Fetch a `wp_rest` nonce for an already authenticated session."""
+    try:
+        response = session.get(
+            f"{base_url}/wp-admin/admin-ajax.php?action=rest-nonce",
+            timeout=timeout,
+        )
+    except Exception as e:
+        return RestNonceResult(False, "", f"REST nonce request failed: {e}")
+    if response.status_code != 200:
+        return RestNonceResult(
+            False,
+            "",
+            f"REST nonce request returned HTTP {response.status_code}",
+        )
+    nonce = response.text.strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{6,32}", nonce):
+        return RestNonceResult(False, "", "REST nonce response was not a nonce")
+    return RestNonceResult(True, nonce, "wp_rest nonce acquired")

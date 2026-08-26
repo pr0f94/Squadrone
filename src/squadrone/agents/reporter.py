@@ -7,6 +7,7 @@ qualified for multiple programs at triage time.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..schemas.finding import Finding
@@ -50,6 +51,18 @@ class ReporterAgent:
                 "ground all sink/taint claims in this, NOT in the hypothesis taint_path which may be wrong):\n"
                 f"```php\n{code_slice}\n```"
             )
+        poc_path = Path(finding.poc_script_path)
+        if poc_path.is_file():
+            try:
+                poc_script = poc_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                poc_script = ""
+            if poc_script:
+                parts.append(
+                    "VERIFIED_POC_SCRIPT (the exact script used for both successful "
+                    "sandbox runs; use it for payloads and request construction):\n"
+                    f"```python\n{poc_script}\n```"
+                )
         parts.append(f"FINDING:\n{finding.model_dump_json(indent=2)}")
         user = "\n\n".join(parts)
         result = await self.runtime.run(

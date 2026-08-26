@@ -3,22 +3,28 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import shutil
 import socket
+import statistics
 import sys
 import tempfile
 import time
 import uuid
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 import httpx
 from jinja2 import Template
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ValidationError
 
 from ..schemas.config import SandboxConfig
+from ..schemas.observation import PoCObservation
+from ..schemas.taxonomy import KNOWN_CWE_REGISTRY
+from .roles import UNKNOWN_ATTACKER_ROLE, normalize_attacker_role
 from .wp_cli import WPCli
 
 logger = logging.getLogger(__name__)
@@ -28,6 +34,18 @@ _PORT_MAX = 8200
 _PROJECT_PREFIX = "squadrone"
 _DOCKER_DIR = Path(__file__).resolve().parents[3] / "docker"
 _PORT_ALLOC_LOCK = asyncio.Lock()
+_PLUGIN_SLUG_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,199}\Z")
+WORDPRESS_WEB_USER = "www-data"
+
+
+def validate_plugin_slug(plugin_slug: str) -> str:
+    """Return a slug that is safe to use as one plugin-directory component."""
+    if not isinstance(plugin_slug, str) or not _PLUGIN_SLUG_RE.fullmatch(plugin_slug):
+        raise ValueError(
+            "plugin slug must contain only lowercase ASCII letters, digits, "
+            "hyphens, and underscores, and must start with a letter or digit"
+        )
+    return plugin_slug
 
 
 class SandboxRunResult(BaseModel):
@@ -37,7 +55,233 @@ class SandboxRunResult(BaseModel):
     http_status: Optional[int] = None
     response: Optional[str] = None
     error_log: Optional[str] = None
-    evidence: dict = {}
+    evidence: dict = Field(default_factory=dict)
+    observation: Optional[PoCObservation] = None
+    validation_reason: str = ""
+
+
+POC_RESULT_PREFIX = "SQUADRONE_RESULT="
+
+_ALLOWED_ORACLES: dict[str, set[str]] = {
+    bug_class.name: set(profile.allowed_oracles)
+    for bug_class, profile in KNOWN_CWE_REGISTRY.items()
+    if profile.allowed_oracles
+}
+
+
+def _parse_poc_observation(stdout: str) -> tuple[PoCObservation | None, str]:
+    nonempty_lines = [line for line in stdout.splitlines() if line.strip()]
+    payload_lines = [
+        line for line in nonempty_lines if line.startswith(POC_RESULT_PREFIX)
+    ]
+    if not payload_lines:
+        return None, f"missing final {POC_RESULT_PREFIX}<json> observation"
+    if len(payload_lines) != 1:
+        return None, "PoC emitted more than one structured result observation"
+    payload_line = payload_lines[0]
+    if nonempty_lines[-1] != payload_line:
+        return None, "structured result observation is not the final output line"
+    raw = payload_line[len(POC_RESULT_PREFIX) :].strip()
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return None, f"invalid observation JSON: {exc}"
+    try:
+        return PoCObservation.model_validate(payload), ""
+    except ValidationError as exc:
+        return None, f"observation schema validation failed: {exc}"
+
+
+def validate_confirmation_observations(
+    first: PoCObservation,
+    confirmation: PoCObservation,
+) -> tuple[bool, str]:
+    """Require the clean rerun to prove the same security claim."""
+    if first.oracle != confirmation.oracle:
+        return False, "confirmation used a different oracle"
+    first_role = normalize_attacker_role(first.attacker_role)
+    confirmation_role = normalize_attacker_role(confirmation.attacker_role)
+    if UNKNOWN_ATTACKER_ROLE in {first_role, confirmation_role}:
+        return False, "confirmation used an unrecognized attacker role"
+    if first_role != confirmation_role:
+        return False, "confirmation used a different attacker role"
+    first_method = str(first.request.get("method") or "").strip().upper()
+    confirmation_method = str(confirmation.request.get("method") or "").strip().upper()
+    if first_method != confirmation_method:
+        return False, "confirmation used a different request method"
+    first_url = str(first.request.get("url") or "").strip()
+    confirmation_url = str(confirmation.request.get("url") or "").strip()
+    if first_url != confirmation_url:
+        return False, "confirmation targeted a different request URL"
+    first_impact = first.impact.model_dump(exclude={"description"})
+    confirmation_impact = confirmation.impact.model_dump(exclude={"description"})
+    if first_impact != confirmation_impact:
+        return False, "confirmation reported different CIA impact dimensions"
+    return True, "clean rerun reproduced the same oracle, role, request, and CIA impact"
+
+
+def _number_list(value: object) -> list[float]:
+    if not isinstance(value, list):
+        return []
+    out: list[float] = []
+    for item in value:
+        if isinstance(item, int | float) and not isinstance(item, bool):
+            out.append(float(item))
+    return out
+
+
+def validate_poc_observation(
+    observation: PoCObservation,
+    expected_bug_class: str | None = None,
+    expected_attacker_role: str | None = None,
+) -> tuple[bool, str]:
+    """Validate measurements without trusting a model-authored success string."""
+    if observation.verdict != "vulnerable":
+        return False, "PoC reported not_vulnerable"
+    if not observation.attacker_role.strip():
+        return False, "attacker_role is empty"
+    if not str(observation.request.get("method") or "").strip():
+        return False, "request.method is missing"
+    request_url = str(observation.request.get("url") or "").strip()
+    if not request_url:
+        return False, "request.url is missing"
+    if urlparse(request_url).hostname not in {"localhost", "127.0.0.1", "::1"}:
+        return False, "request.url is not a local sandbox target"
+    if expected_attacker_role:
+        observed_role = normalize_attacker_role(observation.attacker_role)
+        required_role = normalize_attacker_role(expected_attacker_role)
+        if required_role == UNKNOWN_ATTACKER_ROLE:
+            return False, "source review has an unrecognized attacker role"
+        if observed_role == UNKNOWN_ATTACKER_ROLE:
+            return False, "PoC reported an unrecognized attacker role"
+        if observed_role != required_role:
+            return False, (
+                f"PoC used attacker role {observation.attacker_role!r}; "
+                f"source review requires {expected_attacker_role!r}"
+            )
+    if not observation.impact.description.strip():
+        return False, "impact.description is empty"
+    if {
+        observation.impact.confidentiality,
+        observation.impact.integrity,
+        observation.impact.availability,
+    } == {"none"}:
+        return (
+            False,
+            "no confidentiality, integrity, or availability impact was observed",
+        )
+
+    if expected_bug_class:
+        allowed = _ALLOWED_ORACLES.get(expected_bug_class)
+        if not allowed:
+            return False, f"no automatic oracle is defined for {expected_bug_class}"
+        if observation.oracle not in allowed:
+            return False, (
+                f"oracle {observation.oracle!r} cannot prove {expected_bug_class}; "
+                f"expected one of {sorted(allowed)}"
+            )
+
+    attack = observation.attack
+    control = observation.control
+    if attack.get("observed") is not True:
+        return False, "attack observation did not record observed=true"
+    if control.get("observed") is not False:
+        return False, "negative control did not record observed=false"
+
+    oracle = observation.oracle
+    if oracle == "timing":
+        attack_samples = _number_list(attack.get("samples_seconds"))
+        control_samples = _number_list(control.get("samples_seconds"))
+        if len(attack_samples) < 3 or len(control_samples) < 3:
+            return (
+                False,
+                "timing oracle requires at least three attack and three control samples",
+            )
+        attack_median = statistics.median(attack_samples)
+        control_median = statistics.median(control_samples)
+        if attack_median - control_median < 3.0 or attack_median < max(
+            2.0, control_median * 2.0
+        ):
+            return False, (
+                "timing differential is too small "
+                f"(attack median={attack_median:.2f}s, control median={control_median:.2f}s)"
+            )
+    elif oracle == "response_marker":
+        marker = str(attack.get("marker") or "")
+        if len(marker) < 8 or attack.get("marker_present") is not True:
+            return (
+                False,
+                "response-marker oracle lacks a unique marker observed in the attack response",
+            )
+        if control.get("marker_present") is not False:
+            return False, "negative-control response also contains the marker"
+    elif oracle == "state_change":
+        if (
+            "before" not in attack
+            or "after" not in attack
+            or attack.get("before") == attack.get("after")
+        ):
+            return False, "state-change oracle does not show a before/after difference"
+        if control.get("before") != control.get("after"):
+            return False, "negative control also changed state"
+    elif oracle == "authorization":
+        if attack.get("allowed") is not True or control.get("allowed") is not False:
+            return (
+                False,
+                "authorization oracle does not show attack allowed and control denied",
+            )
+        if not str(attack.get("privileged_effect") or "").strip():
+            return False, "authorization oracle lacks the privileged effect"
+    elif oracle == "cross_object_access":
+        attacker_user_id = str(attack.get("attacker_user_id") or "").strip()
+        owner_user_id = str(attack.get("owner_user_id") or "").strip()
+        if not attacker_user_id or not owner_user_id:
+            return False, "cross-object oracle lacks attacker and owner identifiers"
+        if attacker_user_id == owner_user_id:
+            return False, "cross-object oracle used the object's owner as attacker"
+        if (
+            attack.get("secret_present") is not True
+            or control.get("secret_present") is not False
+        ):
+            return (
+                False,
+                "cross-object oracle lacks a private marker absent from the control",
+            )
+    elif oracle == "callback":
+        if (
+            int(attack.get("hit_count") or 0) < 1
+            or int(control.get("hit_count") or 0) != 0
+        ):
+            return (
+                False,
+                "callback oracle did not observe attack-only server-side callbacks",
+            )
+        marker = str(attack.get("marker") or "")
+        if len(marker) < 8 or attack.get("marker_present") is not True:
+            return False, "callback oracle did not capture a unique sensitive marker"
+        if control.get("marker_present") is not False:
+            return False, "negative-control callback also captured the sensitive marker"
+    elif oracle == "browser_execution":
+        if attack.get("executed") is not True or control.get("executed") is not False:
+            return (
+                False,
+                "browser oracle did not observe attack-only JavaScript execution",
+            )
+    elif oracle == "file_effect":
+        path = str(attack.get("path") or "")
+        marker_hash = str(
+            attack.get("marker_sha256") or attack.get("file_sha256") or ""
+        )
+        if (
+            not path
+            or attack.get("exists") is not True
+            or re.fullmatch(r"[0-9a-fA-F]{64}", marker_hash) is None
+        ):
+            return False, "file oracle lacks an observed path and SHA-256 marker"
+        if control.get("exists") is not False:
+            return False, "negative control produced the same file effect"
+
+    return True, "structured attack observation passed its independent oracle"
 
 
 def _alloc_port() -> int:
@@ -51,7 +295,9 @@ def _alloc_port() -> int:
     raise RuntimeError(f"no free port in {_PORT_MIN}-{_PORT_MAX}")
 
 
-async def _run(*cmd: str, cwd: Optional[str] = None, check: bool = True) -> tuple[int, str, str]:
+async def _run(
+    *cmd: str, cwd: Optional[str] = None, check: bool = True
+) -> tuple[int, str, str]:
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=cwd,
@@ -69,7 +315,9 @@ async def _run(*cmd: str, cwd: Optional[str] = None, check: bool = True) -> tupl
 class SandboxManager:
     """Boots a fresh WordPress + MariaDB stack and tears it down on exit."""
 
-    def __init__(self, config: SandboxConfig, boot_timeout_s: int = 60, poc_timeout_s: int = 120):
+    def __init__(
+        self, config: SandboxConfig, boot_timeout_s: int = 60, poc_timeout_s: int = 120
+    ):
         self.config = config
         self.boot_timeout_s = boot_timeout_s
         self.poc_timeout_s = poc_timeout_s
@@ -119,7 +367,12 @@ class SandboxManager:
 
             logger.info("sandbox boot project=%s port=%d", self.project, self.port)
             await _run(
-                "docker", "compose", "-p", self.project, "up", "-d",
+                "docker",
+                "compose",
+                "-p",
+                self.project,
+                "up",
+                "-d",
                 cwd=str(self.workdir),
             )
 
@@ -136,7 +389,12 @@ class SandboxManager:
         try:
             logger.info("sandbox teardown project=%s", self.project)
             await _run(
-                "docker", "compose", "-p", self.project, "down", "-v",
+                "docker",
+                "compose",
+                "-p",
+                self.project,
+                "down",
+                "-v",
                 cwd=str(self.workdir) if self.workdir else None,
                 check=False,
             )
@@ -145,83 +403,110 @@ class SandboxManager:
                 shutil.rmtree(self.workdir, ignore_errors=True)
             self._booted = False
 
-    # ── W3: snapshot + restore for persistent-sandbox mode ──────────────────
+    # ── snapshot + restore ──────────────────────────────────────────────────
 
     @property
     def db_container_name(self) -> str:
         return f"{self.project}-db-1"
 
     async def snapshot(self) -> Path:
-        """Capture DB + uploads dir to a temp directory. Returns the snapshot path.
+        """Capture DB + wp-content to a temp directory. Returns the snapshot path.
 
-        DB is dumped via mariadb-dump in the db container; uploads are tarred from
-        the wordpress container. Both are restorable via restore().
+        Capturing all of wp-content prevents a failed or successful PoC from
+        contaminating a later attempt through files outside uploads.
         """
         if not self._booted:
             raise RuntimeError("snapshot called before sandbox booted")
         snap_dir = Path(tempfile.mkdtemp(prefix=f"{self.project}-snap-"))
         # DB dump
         rc, dump, err = await _run(
-            "docker", "exec", self.db_container_name,
-            "mariadb-dump", "-uwpuser", "-pwppass",
-            "--add-drop-database", "--databases", "wordpress",
+            "docker",
+            "exec",
+            self.db_container_name,
+            "mariadb-dump",
+            "-uwpuser",
+            "-pwppass",
+            "--add-drop-database",
+            "--databases",
+            "wordpress",
             check=False,
         )
-        if rc != 0:
-            logger.warning("snapshot: mariadb-dump rc=%d err=%s", rc, err.strip()[:200])
+        if rc != 0 or not dump.strip():
+            shutil.rmtree(snap_dir, ignore_errors=True)
+            raise RuntimeError(
+                f"snapshot database dump failed (rc={rc}): {err.strip()[:200]}"
+            )
         (snap_dir / "db.sql").write_text(dump)
-        # Uploads tar (best-effort — may not exist on a freshly-installed WP)
+        # Full wp-content archive, including the installed plugin and uploads.
         await _run(
-            "docker", "exec", self.container_name,
-            "sh", "-c",
-            "mkdir -p /var/www/html/wp-content/uploads && "
-            "tar czf /tmp/squadrone_uploads.tar.gz -C /var/www/html/wp-content uploads || true",
-            check=False,
+            "docker",
+            "exec",
+            self.container_name,
+            "sh",
+            "-c",
+            "mkdir -p /var/www/html/wp-content && "
+            "tar czf /tmp/squadrone_wp_content.tar.gz -C /var/www/html wp-content",
         )
         await _run(
-            "docker", "cp",
-            f"{self.container_name}:/tmp/squadrone_uploads.tar.gz",
-            str(snap_dir / "uploads.tar.gz"),
-            check=False,
+            "docker",
+            "cp",
+            f"{self.container_name}:/tmp/squadrone_wp_content.tar.gz",
+            str(snap_dir / "wp-content.tar.gz"),
         )
+        content_tar = snap_dir / "wp-content.tar.gz"
+        if not content_tar.exists() or content_tar.stat().st_size == 0:
+            shutil.rmtree(snap_dir, ignore_errors=True)
+            raise RuntimeError("snapshot wp-content archive is missing or empty")
         logger.info("sandbox snapshot → %s (db=%d bytes)", snap_dir, len(dump))
         return snap_dir
 
     async def restore(self, snap_dir: Path) -> None:
-        """Restore DB + uploads from a previous snapshot()."""
+        """Restore DB and all of wp-content from a previous snapshot."""
         if not self._booted:
             raise RuntimeError("restore called before sandbox booted")
         db_sql_path = snap_dir / "db.sql"
-        if not db_sql_path.exists():
-            logger.warning("restore: no db.sql at %s — skipping DB restore", snap_dir)
-        else:
-            sql_bytes = db_sql_path.read_bytes()
-            proc = await asyncio.create_subprocess_exec(
-                "docker", "exec", "-i", self.db_container_name,
-                "mariadb", "-uwpuser", "-pwppass",
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+        if not db_sql_path.exists() or db_sql_path.stat().st_size == 0:
+            raise RuntimeError(f"restore snapshot has no database dump: {snap_dir}")
+        sql_bytes = db_sql_path.read_bytes()
+        proc = await asyncio.create_subprocess_exec(
+            "docker",
+            "exec",
+            "-i",
+            self.db_container_name,
+            "mariadb",
+            "-uwpuser",
+            "-pwppass",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _stdout, _stderr = await proc.communicate(sql_bytes)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                "restore database import failed: "
+                + (_stderr.decode(errors="replace") or "")[:200]
             )
-            _stdout, _stderr = await proc.communicate(sql_bytes)
-            if proc.returncode != 0:
-                logger.warning("restore: mariadb rc=%d stderr=%s",
-                               proc.returncode, (_stderr.decode(errors='replace') or '')[:200])
 
-        uploads_tar = snap_dir / "uploads.tar.gz"
-        if uploads_tar.exists() and uploads_tar.stat().st_size > 0:
-            await _run(
-                "docker", "cp", str(uploads_tar),
-                f"{self.container_name}:/tmp/squadrone_uploads.tar.gz",
-                check=False,
+        content_tar = snap_dir / "wp-content.tar.gz"
+        if not content_tar.exists() or content_tar.stat().st_size == 0:
+            raise RuntimeError(
+                f"restore snapshot has no wp-content archive: {snap_dir}"
             )
-            await _run(
-                "docker", "exec", self.container_name,
-                "sh", "-c",
-                "rm -rf /var/www/html/wp-content/uploads && "
-                "tar xzf /tmp/squadrone_uploads.tar.gz -C /var/www/html/wp-content",
-                check=False,
-            )
+        await _run(
+            "docker",
+            "cp",
+            str(content_tar),
+            f"{self.container_name}:/tmp/squadrone_wp_content.tar.gz",
+        )
+        await _run(
+            "docker",
+            "exec",
+            self.container_name,
+            "sh",
+            "-c",
+            "rm -rf /var/www/html/wp-content && "
+            "tar xzf /tmp/squadrone_wp_content.tar.gz -C /var/www/html",
+        )
         logger.info("sandbox restore from %s — done", snap_dir)
 
     # ── helpers ─────────────────────────────────────────────────
@@ -239,20 +524,29 @@ class SandboxManager:
                 except (httpx.HTTPError, OSError):
                     pass
                 await asyncio.sleep(2)
-        raise RuntimeError(f"WordPress not reachable at {url} within {self.boot_timeout_s}s")
+        raise RuntimeError(
+            f"WordPress not reachable at {url} within {self.boot_timeout_s}s"
+        )
 
     async def _ensure_wp_installed(self) -> None:
         """Make sure wp-cli is installed and `wp core install` has been run."""
         # 1. Install wp-cli inside container if missing.
         rc, _, _ = await _run(
-            "docker", "exec", self.container_name,
-            "sh", "-c", "command -v wp >/dev/null 2>&1",
+            "docker",
+            "exec",
+            self.container_name,
+            "sh",
+            "-c",
+            "command -v wp >/dev/null 2>&1",
             check=False,
         )
         if rc != 0:
             await _run(
-                "docker", "exec", self.container_name,
-                "sh", "-c",
+                "docker",
+                "exec",
+                self.container_name,
+                "sh",
+                "-c",
                 "curl -sSLo /usr/local/bin/wp "
                 "https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar "
                 "&& chmod +x /usr/local/bin/wp",
@@ -262,8 +556,13 @@ class SandboxManager:
         deadline = time.time() + self.boot_timeout_s
         while time.time() < deadline:
             rc, _, _ = await _run(
-                "docker", "exec", self.container_name,
-                "wp", "--allow-root", "db", "check",
+                "docker",
+                "exec",
+                self.container_name,
+                "wp",
+                "--allow-root",
+                "db",
+                "check",
                 check=False,
             )
             if rc == 0:
@@ -272,14 +571,24 @@ class SandboxManager:
 
         # 3. Run wp core install if not already installed.
         rc, _, _ = await _run(
-            "docker", "exec", self.container_name,
-            "wp", "--allow-root", "core", "is-installed",
+            "docker",
+            "exec",
+            self.container_name,
+            "wp",
+            "--allow-root",
+            "core",
+            "is-installed",
             check=False,
         )
         if rc != 0:
             await _run(
-                "docker", "exec", self.container_name,
-                "wp", "--allow-root", "core", "install",
+                "docker",
+                "exec",
+                self.container_name,
+                "wp",
+                "--allow-root",
+                "core",
+                "install",
                 f"--url={self.target_url}",
                 "--title=Squadrone Sandbox",
                 f"--admin_user={self.config.wp_admin_user}",
@@ -290,11 +599,19 @@ class SandboxManager:
 
     # ── operations ──────────────────────────────────────────────
 
-    async def install_plugin(self, zip_path: str) -> None:
+    async def install_plugin(self, zip_path: str, plugin_slug: str) -> None:
+        """Install one scanned plugin with production-like filesystem ownership.
+
+        Run both extraction and activation as the WordPress web-service identity.
+        This matches a web-admin install without broadening package modes, and it
+        also gives activation-created runtime state the identity that later HTTP
+        requests use.
+        """
         assert self.wp_cli is not None
-        dest = f"/tmp/{Path(zip_path).name}"
+        slug = validate_plugin_slug(plugin_slug)
+        dest = f"/tmp/squadrone-{slug}.zip"
         await _run("docker", "cp", zip_path, f"{self.container_name}:{dest}")
-        await self.wp_cli.install_plugin(dest)
+        await self.wp_cli.install_plugin(dest, user=WORDPRESS_WEB_USER)
         await self._fire_admin_init()
 
     async def _fire_admin_init(self) -> None:
@@ -314,12 +631,28 @@ class SandboxManager:
                 "-b 'wordpress_test_cookie=WP+Cookie+check' "
                 "http://localhost/wp-login.php -o /dev/null"
             )
-            await _run("docker", "exec", self.container_name, "sh", "-c", login_cmd, check=False)
+            await _run(
+                "docker",
+                "exec",
+                self.container_name,
+                "sh",
+                "-c",
+                login_cmd,
+                check=False,
+            )
             visit_cmd = (
                 "curl -s -b /tmp/squadrone_cookies.txt "
                 "http://localhost/wp-admin/ -o /dev/null -w '%{http_code}'"
             )
-            _, status, _ = await _run("docker", "exec", self.container_name, "sh", "-c", visit_cmd, check=False)
+            _, status, _ = await _run(
+                "docker",
+                "exec",
+                self.container_name,
+                "sh",
+                "-c",
+                visit_cmd,
+                check=False,
+            )
             logger.info("post-install admin_init: GET /wp-admin/ -> %s", status.strip())
         except Exception as e:
             logger.warning("post-install admin_init dispatch failed: %s", e)
@@ -330,6 +663,7 @@ class SandboxManager:
     # uniform "password" for ease; the admin password comes from sandbox config.
     BASELINE_USERS: list[tuple[str, str]] = [
         ("subscriber_user", "subscriber"),
+        ("customer_user", "customer"),
         ("contributor_user", "contributor"),
         ("author_user", "author"),
         ("editor_user", "editor"),
@@ -341,7 +675,9 @@ class SandboxManager:
             try:
                 await self.wp_cli.create_user(login, role, password="password")
             except Exception as e:
-                logger.warning("create_user %s/%s failed (may already exist): %s", login, role, e)
+                logger.warning(
+                    "create_user %s/%s failed (may already exist): %s", login, role, e
+                )
 
     def baseline_user_accounts(self) -> list[dict]:
         """Return the credential table for users provisioned at sandbox boot.
@@ -350,26 +686,36 @@ class SandboxManager:
         PoC author so it picks credentials from a known table instead of
         recalling them from the system prompt (which can drift).
         """
-        accounts = [{
-            "login": self.config.wp_admin_user,
-            "password": self.config.wp_admin_pass,
-            "role": "administrator",
-        }]
+        accounts = [
+            {
+                "login": self.config.wp_admin_user,
+                "password": self.config.wp_admin_pass,
+                "role": "administrator",
+            }
+        ]
         for login, role in self.BASELINE_USERS:
             accounts.append({"login": login, "password": "password", "role": role})
         return accounts
 
-    async def run_poc(self, script_path: str) -> SandboxRunResult:
+    async def run_poc(
+        self,
+        script_path: str,
+        *,
+        expected_bug_class: str | None = None,
+        expected_attacker_role: str | None = None,
+    ) -> SandboxRunResult:
         start = time.time()
         try:
             proc = await asyncio.create_subprocess_exec(
-                sys.executable, script_path,
+                sys.executable,
+                script_path,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
             try:
                 stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(), timeout=self.poc_timeout_s,
+                    proc.communicate(),
+                    timeout=self.poc_timeout_s,
                 )
             except asyncio.TimeoutError:
                 proc.kill()
@@ -392,7 +738,19 @@ class SandboxManager:
         elapsed = time.time() - start
         out = stdout.decode("utf-8", errors="replace")
         err = stderr.decode("utf-8", errors="replace")
-        success = proc.returncode == 0 and "SUCCESS" in out and "FAILURE" not in out
+        observation, parse_reason = _parse_poc_observation(out)
+        if proc.returncode != 0:
+            success = False
+            validation_reason = f"PoC process exited {proc.returncode}"
+        elif observation is None:
+            success = False
+            validation_reason = parse_reason
+        else:
+            success, validation_reason = validate_poc_observation(
+                observation,
+                expected_bug_class=expected_bug_class,
+                expected_attacker_role=expected_attacker_role,
+            )
 
         http_status = None
         m = re.search(r"\bstatus[=:]\s*(\d{3})\b", out, re.IGNORECASE)
@@ -417,5 +775,14 @@ class SandboxManager:
             http_status=http_status,
             response=out[-2000:] if out else None,
             error_log=error_log or None,
-            evidence={"stdout_tail": out[-500:], "returncode": proc.returncode},
+            observation=observation,
+            validation_reason=validation_reason,
+            evidence={
+                "observation": observation.model_dump(mode="json")
+                if observation
+                else None,
+                "validation_reason": validation_reason,
+                "stdout_tail": out[-500:],
+                "returncode": proc.returncode,
+            },
         )

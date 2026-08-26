@@ -1,41 +1,82 @@
-"""Hypothesis stage — runs specialists sequentially with filtered code-slice subsets."""
+"""Hypothesis stage — accountable review of the deterministic coverage ledger."""
 
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
+import hashlib
+import json
 import logging
-import re
 from pathlib import Path
 
 from typing import Any
 
 from ..agents.hypothesis_verifier import HypothesisVerifier
+from ..agents._specialist_base import FocusedSpecialist, _compact_recon
 from ..agents.runtime import AgentRuntime
-from ..agents.specialists.auth import AuthSpecialist
-from ..agents.specialists.auth_flow import AuthFlowSpecialist
-from ..agents.specialists.file_ops import FileOpsSpecialist
-from ..agents.specialists.injection import InjectionSpecialist
-from ..agents.specialists.logic_flaw import LogicFlawSpecialist
-from ..agents.specialists.object_authz import ObjectAuthzSpecialist
-from ..agents.specialists.payment_logic import PaymentLogicSpecialist
-from ..agents.specialists.ssrf_deser import SSRFDeserSpecialist
-from ..agents.specialists.state_change import StateChangeSpecialist
-from ..agents.specialists.stored_to_admin import StoredToAdminSpecialist
-from ..agents.specialists.xss import XSSSpecialist
 from ..schemas.config import PipelineConfig
-from ..schemas.hypothesis import HypothesesArtifact, Hypothesis
-from ..schemas.recon import ReconArtifact
+from ..schemas.hypothesis import (
+    HypothesesArtifact,
+    Hypothesis,
+    SpecialistReviewArtifact,
+)
+from ..schemas.recon import CoverageDisposition, CoverageItem, ReconArtifact, ReviewArea
+from ..schemas.taxonomy import get_known_cwe_profile
 from ..services.artifacts import atomic_write_json, atomic_write_jsonl
 from ..services.budget import BudgetTracker
 from ..services.console_format import format_verifier_decision
 from ..services.decision_ledger import append_decision
-from ..services.quality_gate import build_focus_area_summary
-from ..services.wp_leads import generate_wp_leads
 
 
-# X1: pre-verifier dedup. Group hypotheses by (file, line, bug_class) and keep the
-# highest-confidence representative. Conservative: only merges exact-match keys.
-def _pre_verifier_dedup(hypotheses: list[Hypothesis]) -> tuple[list[Hypothesis], dict[str, str]]:
+_VERIFIER_BATCH_SIZE = 3
+# Specialists force-finalise after 20 tool calls. Keep enough headroom after
+# reading every assigned target to trace alternate callers, controls, and impact.
+_REVIEW_BATCH_MAX_ITEMS = 8
+_REVIEW_BATCH_MAX_BYTES = 60_000
+_REVIEW_BATCH_MAX_FILES = 6
+_REVIEW_BATCH_ATTEMPTS = 2
+_REVIEW_CHECKPOINT_VERSION = 3
+_REVIEWABLE_SUPPORT = {"active", "partial", "review_only"}
+
+
+def _batch_input_fingerprint(
+    recon: ReconArtifact,
+    targets: list[CoverageItem],
+    reviewer: ReviewArea,
+) -> str:
+    """Digest every semantic input used to decide whether a batch is reusable."""
+    payload = {
+        "version": _REVIEW_CHECKPOINT_VERSION,
+        "reviewer": reviewer,
+        "targets": [target.model_dump(mode="json") for target in targets],
+        "related_recon": _compact_recon(recon, targets),
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+async def _verify_hypotheses(
+    verifier: HypothesisVerifier,
+    hypotheses: list[Hypothesis],
+    plugin_path: str,
+) -> list[Any]:
+    """Verify hypotheses in small batches and stop on transport failure."""
+    verdicts: list[Any] = []
+    for start in range(0, len(hypotheses), _VERIFIER_BATCH_SIZE):
+        batch = hypotheses[start : start + _VERIFIER_BATCH_SIZE]
+        verdicts.extend(
+            await asyncio.gather(
+                *(verifier.verify(hypothesis, plugin_path) for hypothesis in batch)
+            )
+        )
+    return verdicts
+
+
+# Group hypotheses by (file, line, bug_class) and keep the highest-confidence
+# representative. This only merges exact-match keys.
+def _pre_verifier_dedup(
+    hypotheses: list[Hypothesis],
+) -> tuple[list[Hypothesis], dict[str, str]]:
     """Return (deduped, merge_log: merged_id -> kept_id)."""
     by_key: dict[tuple, Hypothesis] = {}
     merge_log: dict[str, str] = {}
@@ -47,138 +88,166 @@ def _pre_verifier_dedup(hypotheses: list[Hypothesis]) -> tuple[list[Hypothesis],
             by_key[key] = h
             continue
         # Keep the higher-confidence one; if tied, keep the earlier one
-        if conf_rank.get(h.confidence.value, 1) < conf_rank.get(existing.confidence.value, 1):
+        if conf_rank.get(h.confidence.value, 1) < conf_rank.get(
+            existing.confidence.value, 1
+        ):
             merge_log[existing.id] = h.id
             by_key[key] = h
         else:
             merge_log[h.id] = existing.id
     return list(by_key.values()), merge_log
 
-# Per-specialist file relevance patterns. A file is sent to a specialist if it matches
-# any of that specialist's regexes. Conservative — overlap is fine; we'd rather include
-# a file the specialist might not need than miss one it does.
-_SPECIALIST_PATTERNS: dict[str, list[re.Pattern[str]]] = {
-    "auth": [
-        re.compile(r"add_action\(['\"]wp_ajax|register_rest_route|admin_post|admin_init"),
-        re.compile(r"current_user_can|wp_verify_nonce|check_ajax_referer|permission_callback"),
-    ],
-    "injection": [
-        re.compile(r"\$wpdb->|wpdb::"),
-        re.compile(r"\b(exec|shell_exec|system|passthru|popen|proc_open)\s*\("),
-        re.compile(r"\bheader\s*\(|\bwp_redirect\s*\("),
-    ],
-    "xss": [
-        re.compile(r"\becho\b|\bprint\b|\bprintf\b|\bvprintf\b|wp_send_json|json_encode\s*\("),
-        re.compile(r"esc_html|esc_attr|esc_url|wp_kses|esc_js"),  # files with escaping (also check for missing)
-    ],
-    "file_ops": [
-        re.compile(r"\b(move_uploaded_file|wp_handle_upload|file_put_contents|fwrite|fopen|copy)\s*\("),
-        re.compile(r"\b(file_get_contents|readfile|unlink|rmdir)\s*\("),
-        re.compile(r"\b(include|require|include_once|require_once)\s*[\(\$]"),
-        re.compile(r"ZipArchive::|extractTo"),
-    ],
-    "ssrf_deser": [
-        re.compile(r"\bwp_remote_(get|post|head|request)\s*\(|\bcurl_(init|exec|setopt)"),
-        re.compile(r"\bunserialize\s*\(|maybe_unserialize\s*\("),
-        re.compile(r"simplexml_load|DOMDocument|SimpleXMLElement"),
-    ],
-    "auth_flow": [
-        re.compile(r"wp_(set_current_user|set_auth_cookie|signon|authenticate|create_user|insert_user)\s*\("),
-        re.compile(r"retrieve_password|reset_password|password_reset|check_password_reset_key|get_password_reset_key"),
-        re.compile(r"two[_-]?factor|2fa|totp|otp|backup_codes?|recovery_codes?", re.IGNORECASE),
-        re.compile(r"\bjwt\b|JsonWebToken|firebase\\\\JWT|tymon\\\\jwtauth", re.IGNORECASE),
-        re.compile(r"users_can_register|register_new_user|wp_new_user_notification|wp_login_failed"),
-        re.compile(r"login_form|login_url|wp_login_url|do_action\(['\"]wp_(login|logout|authenticate)['\"]"),
-        re.compile(r"\b(md5|sha1)\s*\(|\bmt_rand\s*\(|\brand\s*\(|\buniqid\s*\("),
-        re.compile(r"\bhash_equals\s*\(|password_(hash|verify)|openssl_(encrypt|decrypt)"),
-    ],
-    "object_authz": [
-        re.compile(r"\b(id|post_id|user_id|entry_id|submission_id|form_id|order_id|booking_id|event_id|invoice_id|file_id)\b", re.IGNORECASE),
-        re.compile(r"get_post|get_user|wc_get_order|get_user_meta|get_post_meta|update_post_meta|delete_post_meta", re.IGNORECASE),
-        re.compile(r"current_user_can|permission_callback|author|owner|user_id|customer_id", re.IGNORECASE),
-        re.compile(r"\$wpdb->(get_var|get_row|get_results|query|update|delete)", re.IGNORECASE),
-    ],
-    "state_change": [
-        re.compile(r"\b(update|delete|insert|create|save|approve|reject|publish|trash|restore|status|enable|disable)\b", re.IGNORECASE),
-        re.compile(r"update_option|delete_option|update_user_meta|update_post_meta|wp_update_user|wp_insert_user|wp_update_post|wp_insert_post|wp_delete_post", re.IGNORECASE),
-        re.compile(r"current_user_can|wp_verify_nonce|check_ajax_referer|permission_callback", re.IGNORECASE),
-        re.compile(r"add_action\(['\"]wp_ajax|register_rest_route|admin_post", re.IGNORECASE),
-    ],
-    "payment_logic": [
-        re.compile(r"woocommerce|wc_get_(order|cart|product)|WC\(\)|WC_Order|WC_Cart", re.IGNORECASE),
-        re.compile(r"easy[_-]digital[_-]downloads|edd_(get_|add_|update_)|EDD_Payment", re.IGNORECASE),
-        re.compile(r"\b(payment|paid|pay|checkout|order|invoice|refund|subscription|coupon|discount|downloadable|webhook|gateway|stripe|paypal)\b", re.IGNORECASE),
-        re.compile(r"update_status|payment_complete|set_status|verify_signature|hash_hmac", re.IGNORECASE),
-    ],
-    "logic_flaw": [
-        re.compile(r"woocommerce|wc_get_(order|cart|product)|WC\(\)|WC_Order|WC_Cart", re.IGNORECASE),
-        re.compile(r"easy[_-]digital[_-]downloads|edd_(get_|add_|update_)|EDD_Payment", re.IGNORECASE),
-        re.compile(r"\b(coupon|discount|cart|checkout|order|invoice|refund|subscription|membership|paywall)\b", re.IGNORECASE),
-        re.compile(r"\b(booking|appointment|reservation|schedule|slot)\b", re.IGNORECASE),
-        re.compile(r"\b(quiz|certificate|grade|lesson|enrollment|course)\b", re.IGNORECASE),
-        re.compile(r"\b(donation|campaign|fundrais|pledge|goal_amount)\b", re.IGNORECASE),
-        re.compile(r"payment_(complete|status|method)|gateway_callback|webhook"),
-    ],
-    "stored_to_admin": [
-        re.compile(r"update_(post|user|comment)_meta|update_option|\$wpdb->(insert|update)|wp_insert_(post|comment|user)", re.IGNORECASE),
-        re.compile(r"get_(post|user|comment)_meta|get_option|\$wpdb->(get_var|get_row|get_results)", re.IGNORECASE),
-        re.compile(r"\becho\b|\bprint\b|\bprintf\b|wp_send_json|admin_menu|admin_page|list_table", re.IGNORECASE),
-        re.compile(r"esc_html|esc_attr|esc_url|esc_js|wp_kses|sanitize_text_field|sanitize_textarea_field", re.IGNORECASE),
-    ],
-}
+
+def _build_review_batches(targets: list[CoverageItem]) -> list[list[CoverageItem]]:
+    """Create deterministic source-local batches with bounded initial payloads."""
+    ordered = sorted(
+        targets, key=lambda item: (item.file, item.line, item.kind, item.id)
+    )
+    batches: list[list[CoverageItem]] = []
+    current: list[CoverageItem] = []
+    current_bytes = 0
+    current_files: set[str] = set()
+    for target in ordered:
+        target_bytes = len(json.dumps(target.model_dump(mode="json"), default=str))
+        if current and (
+            len(current) >= _REVIEW_BATCH_MAX_ITEMS
+            or current_bytes + target_bytes > _REVIEW_BATCH_MAX_BYTES
+            or (
+                target.file not in current_files
+                and len(current_files) >= _REVIEW_BATCH_MAX_FILES
+            )
+        ):
+            batches.append(current)
+            current = []
+            current_bytes = 0
+            current_files = set()
+        current.append(target)
+        current_bytes += target_bytes
+        current_files.add(target.file)
+    if current:
+        batches.append(current)
+    return batches
 
 
-def _filter_slices_for_specialist(
-    code_slices: dict[str, str],
-    specialist_name: str,
+def _reconcile_batch_coverage(
+    result: SpecialistReviewArtifact,
+    targets: list[CoverageItem],
+    reviewer: ReviewArea,
+) -> tuple[list[CoverageDisposition], list[CoverageItem], set[str]]:
+    """Accept exactly one evidence-backed disposition for every assigned item."""
+    target_by_id = {target.id: target for target in targets}
+    by_id: dict[str, CoverageDisposition] = {}
+    invalid_ids: set[str] = set()
+    hypothesis_id_counts = Counter(hypothesis.id for hypothesis in result.hypotheses)
+    result_hypothesis_ids = {
+        hypothesis_id
+        for hypothesis_id, count in hypothesis_id_counts.items()
+        if count == 1
+    }
+    accepted_hypothesis_ids: set[str] = set()
+    for disposition in result.coverage:
+        if disposition.item_id not in target_by_id or disposition.reviewer != reviewer:
+            continue
+        if disposition.item_id in by_id:
+            invalid_ids.add(disposition.item_id)
+            continue
+        target = target_by_id[disposition.item_id]
+        target_location = f"{target.file}:{target.line}"
+        candidate_links = set(disposition.hypothesis_ids)
+        if (
+            disposition.status == "unreviewed"
+            or target_location not in disposition.evidence_locations
+            or (
+                disposition.status == "candidate"
+                and (
+                    not candidate_links
+                    or not candidate_links.issubset(result_hypothesis_ids)
+                )
+            )
+            or (disposition.status != "candidate" and bool(candidate_links))
+        ):
+            invalid_ids.add(disposition.item_id)
+            continue
+        by_id[disposition.item_id] = disposition
+        accepted_hypothesis_ids.update(candidate_links)
+    for item_id in invalid_ids:
+        by_id.pop(item_id, None)
+    unresolved = [target for target in targets if target.id not in by_id]
+    return list(by_id.values()), unresolved, accepted_hypothesis_ids
+
+
+def _canonicalize_batch_hypotheses(
+    hypotheses: list[Hypothesis],
+    reviewer: ReviewArea,
+    batch_number: int,
+    *,
+    start_index: int = 1,
 ) -> dict[str, str]:
-    """Return only the code slices likely relevant to this specialist's bug class."""
-    patterns = _SPECIALIST_PATTERNS.get(specialist_name)
-    if not patterns:
-        return code_slices  # unknown specialist — fall back to full corpus
-    filtered: dict[str, str] = {}
-    for path, text in code_slices.items():
-        if any(p.search(text) for p in patterns):
-            filtered[path] = text
-    # Always include at least 1 file so the specialist has *something* to look at —
-    # if filtering eliminates everything, the specialist's bug class isn't represented
-    # in this plugin and an empty hypothesis list is the correct output.
-    return filtered
+    """Assign stable IDs and canonical taxonomy ownership, returning the ID map."""
+    prefixes = {
+        "authorization_workflows": "authz",
+        "injection_files": "inject",
+        "xss_lifecycle": "xss",
+        "authentication": "authn",
+    }
+    id_map: dict[str, str] = {}
+    for index, hypothesis in enumerate(hypotheses, start_index):
+        model_id = hypothesis.id
+        hypothesis.id = f"{prefixes[reviewer]}-b{batch_number:03d}-{index:03d}"
+        profile = get_known_cwe_profile(hypothesis.bug_class)
+        hypothesis.specialist = (
+            profile.reviewer
+            if profile is not None
+            and profile.reviewer is not None
+            and profile.analysis_support in _REVIEWABLE_SUPPORT
+            else reviewer
+        )
+        id_map[model_id] = hypothesis.id
+    return id_map
+
 
 logger = logging.getLogger(__name__)
-
-MAX_LINES_PER_SLICE = 500
 
 
 def _build_specialists(runtime: AgentRuntime, model: str) -> list[Any]:
     return [
-        AuthSpecialist(runtime, model=model),
-        InjectionSpecialist(runtime, model=model),
-        FileOpsSpecialist(runtime, model=model),
-        SSRFDeserSpecialist(runtime, model=model),
-        XSSSpecialist(runtime, model=model),
-        AuthFlowSpecialist(runtime, model=model),
-        LogicFlawSpecialist(runtime, model=model),
-        ObjectAuthzSpecialist(runtime, model=model),
-        StateChangeSpecialist(runtime, model=model),
-        PaymentLogicSpecialist(runtime, model=model),
-        StoredToAdminSpecialist(runtime, model=model),
+        FocusedSpecialist(
+            runtime,
+            model,
+            name="authorization_workflows",
+            prompt_path="specialists/authorization_workflows",
+        ),
+        FocusedSpecialist(
+            runtime,
+            model,
+            name="injection_files",
+            prompt_path="specialists/injection_files",
+        ),
+        FocusedSpecialist(
+            runtime,
+            model,
+            name="xss_lifecycle",
+            prompt_path="specialists/xss_lifecycle",
+        ),
+        FocusedSpecialist(
+            runtime,
+            model,
+            name="authentication",
+            prompt_path="specialists/authentication",
+        ),
     ]
 
 
-def _build_code_slices(recon: ReconArtifact, plugin_path: Path) -> dict[str, str]:
-    """v1 approximation — full file (capped to 500 lines) for every file referenced
-    by an entry point or a sink. Computing transitive callees properly is left for v2."""
-    relevant: set[str] = set()
-    for ep in recon.entry_points:
-        if ep.file:
-            relevant.add(ep.file)
-    for sink in recon.sinks:
-        if sink.file:
-            relevant.add(sink.file)
-
+def _build_code_slices(
+    hypotheses: list[Hypothesis], plugin_path: Path
+) -> dict[str, str]:
+    """Build line-numbered source windows around emitted hypotheses."""
+    target_lines: dict[str, set[int]] = {}
+    for hypothesis in hypotheses:
+        if hypothesis.file:
+            target_lines.setdefault(hypothesis.file, set()).add(hypothesis.line)
     slices: dict[str, str] = {}
-    for rel in relevant:
+    for rel, lines_of_interest in target_lines.items():
         full = (plugin_path / rel) if not Path(rel).is_absolute() else Path(rel)
         if not full.is_file():
             continue
@@ -187,9 +256,17 @@ def _build_code_slices(recon: ReconArtifact, plugin_path: Path) -> dict[str, str
         except OSError:
             continue
         lines = text.splitlines()
-        if len(lines) > MAX_LINES_PER_SLICE:
-            lines = lines[:MAX_LINES_PER_SLICE] + [f"... [truncated at {MAX_LINES_PER_SLICE} lines]"]
-        slices[rel] = "\n".join(lines)
+        selected: set[int] = set()
+        for line in lines_of_interest:
+            selected.update(range(max(1, line - 30), min(len(lines), line + 30) + 1))
+        rendered: list[str] = []
+        previous = 0
+        for line in sorted(selected):
+            if previous and line > previous + 1:
+                rendered.append("...")
+            rendered.append(f"{line:5}  {lines[line - 1]}")
+            previous = line
+        slices[rel] = "\n".join(rendered)
     return slices
 
 
@@ -202,116 +279,197 @@ async def run(
     runs_root: str = "runs",
     run_id: str = "",
 ) -> HypothesesArtifact:
-    code_slices = _build_code_slices(recon, Path(plugin_path))
-    logger.info("hypothesis: %d code slices for %d entry points",
-                len(code_slices), len(recon.entry_points))
-    deterministic_leads = generate_wp_leads(recon, plugin_path)
-    if deterministic_leads:
-        leads_path = Path(runs_root) / run_id / "deterministic_wp_leads.jsonl"
-        atomic_write_jsonl(leads_path, deterministic_leads)
-        logger.info("hypothesis: deterministic WP leads generated %d -> %s", len(deterministic_leads), leads_path)
-    if config.quality.enabled and config.quality.focus_area_fanout:
-        focus = build_focus_area_summary(recon)
-        focus_path = Path(runs_root) / run_id / "focus_areas.json"
-        focus_path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_json(focus_path, focus)
-        logger.info("hypothesis: focus-area fanout mapped %d review areas -> %s", len(focus), focus_path)
-
     model = config.models.specialists
-    hyp_cfg = config.hypothesis
     specialists = _build_specialists(runtime, model)
 
-    # Run specialists sequentially, each with a slice corpus filtered to its bug class.
-    # Sequential avoids the rate-limit bursts we hit with asyncio.gather; per-specialist
-    # filtering cuts each call's input size by roughly 50-70% on a typical plugin.
-    #
-    # Per-specialist checkpoint: each specialist writes its output to
-    # hypotheses_<specialist>.jsonl as soon as it completes. On a crashed/resumed
-    # scan, completed specialists' files are loaded and that specialist is skipped.
-    from ..schemas.hypothesis import Hypothesis as _Hyp
+    # Reviewers run sequentially to avoid rate-limit bursts. Each reviewer gets
+    # fresh, source-local batches rather than the complete recon artifact, and
+    # every completed batch is checkpointed independently for resume.
     spec_dir = Path(runs_root) / run_id
     spec_dir.mkdir(parents=True, exist_ok=True)
-    merged = list(deterministic_leads)
+    batch_root = spec_dir / "review_batches"
+    merged: list[Hypothesis] = []
+    coverage_dispositions: list[CoverageDisposition] = []
     for spec in specialists:
         spec_path = spec_dir / f"hypotheses_{spec.NAME}.jsonl"
-        if spec_path.exists():
-            cached = [
-                _Hyp.model_validate_json(line)
-                for line in spec_path.read_text().splitlines() if line.strip()
-            ]
-            logger.info("specialist %s: loaded %d cached hypotheses (skipping)", spec.NAME, len(cached))
-            merged.extend(cached)
-            continue
-        spec_slices = _filter_slices_for_specialist(code_slices, spec.NAME)
-        priority_files = sorted(spec_slices)
-        logger.info("specialist %s: prioritizing %d/%d files",
-                    spec.NAME, len(spec_slices), len(code_slices))
-        try:
-            res = await spec.analyze(
-                recon, spec_slices, hypothesis_cfg=hyp_cfg,
-                plugin_path=plugin_path, priority_files=priority_files,
-            )
-        except BaseException as e:
-            logger.warning("specialist %s failed: %s", spec.NAME, e)
-            continue
-        # Persist this specialist's output BEFORE moving on, so a crash mid-loop
-        # doesn't lose its work.
-        atomic_write_jsonl(spec_path, res.hypotheses)
-        merged.extend(res.hypotheses)
+        coverage_path = spec_dir / f"coverage_{spec.NAME}.json"
+        targets = [
+            item
+            for item in (recon.coverage.items if recon.coverage else [])
+            if spec.NAME in item.review_areas
+        ]
+        batches = _build_review_batches(targets)
+        logger.info(
+            "specialist %s: reviewing %d coverage items in %d bounded batches",
+            spec.NAME,
+            len(targets),
+            len(batches),
+        )
+        specialist_hypotheses: list[Hypothesis] = []
+        specialist_dispositions: list[CoverageDisposition] = []
+        area_batch_dir = batch_root / spec.NAME
+        area_batch_dir.mkdir(parents=True, exist_ok=True)
 
-    # X1: pre-verifier dedup (config-toggled). Merges (file, line, bug_class) duplicates
-    # before paying for verification of each.
+        for batch_number, batch_targets in enumerate(batches, 1):
+            batch_id = f"b{batch_number:03d}"
+            checkpoint = area_batch_dir / f"{batch_id}.json"
+            target_ids = {target.id for target in batch_targets}
+            input_fingerprint = _batch_input_fingerprint(
+                recon,
+                batch_targets,
+                spec.NAME,
+            )
+            if checkpoint.exists():
+                cached = SpecialistReviewArtifact.model_validate_json(
+                    checkpoint.read_text()
+                )
+                cached_dispositions, cached_unresolved, cached_hypothesis_ids = (
+                    _reconcile_batch_coverage(cached, batch_targets, spec.NAME)
+                )
+                cached_ids = {item.item_id for item in cached_dispositions}
+                if (
+                    cached.input_fingerprint == input_fingerprint
+                    and not cached_unresolved
+                    and cached_ids == target_ids
+                    and cached_hypothesis_ids == {item.id for item in cached.hypotheses}
+                ):
+                    logger.info(
+                        "specialist %s: loaded batch %d/%d checkpoint",
+                        spec.NAME,
+                        batch_number,
+                        len(batches),
+                    )
+                    specialist_hypotheses.extend(cached.hypotheses)
+                    specialist_dispositions.extend(cached.coverage)
+                    continue
+
+            unresolved = list(batch_targets)
+            batch_hypotheses: list[Hypothesis] = []
+            batch_dispositions: dict[str, CoverageDisposition] = {}
+            for attempt in range(1, _REVIEW_BATCH_ATTEMPTS + 1):
+                attempt_id = batch_id if attempt == 1 else f"{batch_id}-retry"
+                priority_files = sorted({item.file for item in unresolved})
+                logger.info(
+                    "specialist %s: batch %d/%d attempt %d reviewing %d items across %d files",
+                    spec.NAME,
+                    batch_number,
+                    len(batches),
+                    attempt,
+                    len(unresolved),
+                    len(priority_files),
+                )
+                try:
+                    result = await spec.analyze(
+                        recon,
+                        plugin_path=plugin_path,
+                        priority_files=priority_files,
+                        coverage_targets=unresolved,
+                        batch_id=attempt_id,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "specialist %s batch %s failed; aborting hypothesis stage: %s",
+                        spec.NAME,
+                        attempt_id,
+                        exc,
+                    )
+                    raise
+                accepted, unresolved, accepted_hypothesis_ids = (
+                    _reconcile_batch_coverage(
+                        result,
+                        unresolved,
+                        spec.NAME,
+                    )
+                )
+                accepted_hypotheses = [
+                    hypothesis
+                    for hypothesis in result.hypotheses
+                    if hypothesis.id in accepted_hypothesis_ids
+                ]
+                id_map = _canonicalize_batch_hypotheses(
+                    accepted_hypotheses,
+                    spec.NAME,
+                    batch_number,
+                    start_index=len(batch_hypotheses) + 1,
+                )
+                for disposition in accepted:
+                    disposition.hypothesis_ids = [
+                        id_map[hypothesis_id]
+                        for hypothesis_id in disposition.hypothesis_ids
+                    ]
+                batch_dispositions.update({item.item_id: item for item in accepted})
+                batch_hypotheses.extend(accepted_hypotheses)
+                if not unresolved:
+                    break
+
+            if unresolved:
+                unresolved_ids = ", ".join(item.id for item in unresolved)
+                raise ValueError(
+                    f"specialist {spec.NAME} batch {batch_id} left evidence-unreviewed "
+                    f"coverage items after retry: {unresolved_ids}"
+                )
+
+            batch_result = SpecialistReviewArtifact(
+                hypotheses=batch_hypotheses,
+                coverage=[batch_dispositions[item.id] for item in batch_targets],
+                input_fingerprint=input_fingerprint,
+            )
+            atomic_write_json(checkpoint, batch_result.model_dump(mode="json"))
+            specialist_hypotheses.extend(batch_result.hypotheses)
+            specialist_dispositions.extend(batch_result.coverage)
+
+        # Aggregate compatibility artifacts remain convenient for users, while
+        # review_batches/ contains the actual crash-safe checkpoints.
+        atomic_write_jsonl(spec_path, specialist_hypotheses)
+        atomic_write_json(
+            coverage_path,
+            [item.model_dump(mode="json") for item in specialist_dispositions],
+        )
+        coverage_dispositions.extend(specialist_dispositions)
+        merged.extend(specialist_hypotheses)
+
+    if recon.coverage is not None:
+        recon.coverage.dispositions = coverage_dispositions
+        coverage_path = spec_dir / "coverage.json"
+        atomic_write_json(coverage_path, recon.coverage.model_dump(mode="json"))
+        recon.to_json_file(str(spec_dir / "recon.json"))
+        unresolved_count = sum(
+            item.status == "unreviewed" for item in coverage_dispositions
+        )
+        logger.info(
+            "hypothesis: coverage ledger recorded %d dispositions; unreviewed=%d -> %s",
+            len(coverage_dispositions),
+            unresolved_count,
+            coverage_path,
+        )
+
+    # Merge exact duplicate candidates before paying for verification of each.
     pre_dedup_count = len(merged)
-    if hyp_cfg.pre_verifier_dedup and merged:
+    if merged:
         merged, merge_log = _pre_verifier_dedup(merged)
         if merge_log:
-            logger.info("hypothesis: pre-verifier dedup merged %d -> %d (saved %d verifier calls)",
-                        pre_dedup_count, len(merged), pre_dedup_count - len(merged))
+            logger.info(
+                "hypothesis: pre-verifier dedup merged %d -> %d (saved %d verifier calls)",
+                pre_dedup_count,
+                len(merged),
+                pre_dedup_count - len(merged),
+            )
 
     # Self-verification pass: cheap source-quote + guard check per hypothesis.
     # Drops hallucinated sinks and missed-guard claims before they reach triage/verify.
-    # All verifier toggles flow through the verifier constructor.
     verifier = HypothesisVerifier(
         runtime,
         model=config.models.hypothesis_verifier,
-        wp_idioms_enabled=hyp_cfg.verifier_wp_idioms,
-        require_citation=hyp_cfg.verifier_require_citation,
     )
-    verdicts = await asyncio.gather(
-        *[verifier.verify(h, plugin_path) for h in merged],
-        return_exceptions=True,
-    )
-
-    # V5 routing: 5-state verdicts route to kept / dropped / manual-review queue.
-    # Legacy "keep"/"drop" still supported (drop_categorisation_enabled=False path).
-    KEEP_VERDICTS = {"keep", "keep_high_confidence", "keep_conditional", "keep_insufficient_evidence"}
-    DROP_VERDICTS = {"drop", "drop_definitely_not_a_bug"}
-    ESCALATE_VERDICTS = {"escalate_to_manual_review"}
+    verdicts = await _verify_hypotheses(verifier, merged, plugin_path)
 
     kept: list = []
     drop_reasons: dict[str, str] = {}
-    drop_categories: dict[str, str] = {}      # V5: track category per drop for reporting
-    manual_review_queue: list[dict] = []       # V5: hypotheses needing human review
-    keep_conditional: dict[str, str] = {}      # V5: track conditional keeps + their condition
     run_dir = Path(runs_root) / run_id
 
     for h, v in zip(merged, verdicts):
-        if isinstance(v, BaseException):
-            logger.warning("verifier crashed for %s: %s — keeping by default", h.id, v)
+        if v.verdict == "keep":
             kept.append(h)
-            append_decision(
-                run_dir,
-                stage="hypothesis_verifier",
-                action="keep",
-                result="kept_by_default",
-                hypothesis_id=h.id,
-                reason=str(v),
-            )
-            continue
-        if v.verdict in KEEP_VERDICTS:
-            kept.append(h)
-            if v.verdict == "keep_conditional":
-                keep_conditional[h.id] = v.reason
             append_decision(
                 run_dir,
                 stage="hypothesis_verifier",
@@ -321,10 +479,11 @@ async def run(
                 reason=v.reason,
                 details={"citation": v.citation} if v.citation else None,
             )
-        elif v.verdict in DROP_VERDICTS:
+        elif v.verdict == "drop":
             drop_reasons[h.id] = v.reason
-            drop_categories[h.id] = v.verdict
-            logger.info(format_verifier_decision(h, v.verdict, v.reason, citation=v.citation))
+            logger.info(
+                format_verifier_decision(h, v.verdict, v.reason, citation=v.citation)
+            )
             append_decision(
                 run_dir,
                 stage="hypothesis_verifier",
@@ -335,60 +494,31 @@ async def run(
                 artifact=run_dir / "hypothesis_verifier_drops.json",
                 details={"citation": v.citation} if v.citation else None,
             )
-        elif v.verdict in ESCALATE_VERDICTS:
-            manual_review_queue.append({
-                "id": h.id, "reason": v.reason, "citation": v.citation,
-                "hypothesis": h.model_dump(mode="json"),
-            })
-            logger.info(format_verifier_decision(h, v.verdict, v.reason, citation=v.citation))
-            append_decision(
-                run_dir,
-                stage="hypothesis_verifier",
-                action="manual_review",
-                result=v.verdict,
-                hypothesis_id=h.id,
-                reason=v.reason,
-                artifact=run_dir / "hypothesis_manual_review_queue.json",
-                details={"citation": v.citation} if v.citation else None,
-            )
         else:
-            logger.warning("verifier returned unknown verdict %r for %s — keeping by default", v.verdict, h.id)
-            kept.append(h)
-            append_decision(
-                run_dir,
-                stage="hypothesis_verifier",
-                action="keep",
-                result="unknown_verdict_kept_by_default",
-                hypothesis_id=h.id,
-                reason=f"unknown verdict: {v.verdict}",
+            raise ValueError(
+                f"verifier returned unknown verdict {v.verdict!r} for {h.id}"
             )
 
     if drop_reasons:
         verifier_path = run_dir / "hypothesis_verifier_drops.json"
         verifier_path.parent.mkdir(parents=True, exist_ok=True)
-        # Store reason + category (when V5 enabled) for downstream analysis
-        drops_dump = {
-            hid: {"reason": reason, "category": drop_categories.get(hid, "drop")}
-            for hid, reason in drop_reasons.items()
-        }
+        drops_dump = {hid: {"reason": reason} for hid, reason in drop_reasons.items()}
         atomic_write_json(verifier_path, drops_dump)
-        logger.info("hypothesis: verifier dropped %d/%d -> %s",
-                    len(drop_reasons), len(merged), verifier_path)
-    if manual_review_queue:
-        manual_path = run_dir / "hypothesis_manual_review_queue.json"
-        manual_path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_json(manual_path, manual_review_queue)
-        logger.info("hypothesis: %d hypotheses escalated to manual review queue -> %s",
-                    len(manual_review_queue), manual_path)
-    if keep_conditional:
-        cond_path = Path(runs_root) / run_id / "hypothesis_kept_conditional.json"
-        cond_path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_json(cond_path, keep_conditional)
-
+        logger.info(
+            "hypothesis: verifier dropped %d/%d -> %s",
+            len(drop_reasons),
+            len(merged),
+            verifier_path,
+        )
     artifact = HypothesesArtifact(plugin_slug=recon.plugin_slug, hypotheses=kept)
     out_path = Path(runs_root) / run_id / "hypotheses.jsonl"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_jsonl(out_path, kept)
-    logger.info("hypothesis: wrote %d hypotheses to %s (verifier kept %d/%d)",
-                len(kept), out_path, len(kept), len(merged))
+    logger.info(
+        "hypothesis: wrote %d hypotheses to %s (verifier kept %d/%d)",
+        len(kept),
+        out_path,
+        len(kept),
+        len(merged),
+    )
     return artifact

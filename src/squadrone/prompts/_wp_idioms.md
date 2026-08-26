@@ -18,10 +18,9 @@ calls. The list below is a defensive reference, not exhaustive.
 - `esc_js` escapes for inline JS string context only — does NOT escape for
   attribute or HTML context. A common mistake is `onclick="<?php echo esc_js($x); ?>"`
   which still allows attribute breakout via `&quot;` decoding.
-- `wp_kses_post($html)` strips `<script>`, `<iframe>`, event handlers, `javascript:`
-  URLs, but **PRESERVES `<a target="_blank" rel="opener">` verbatim**. This is the
-  reverse-tabnabbing primitive — flag any sink that uses `wp_kses_post()` as the
-  only sanitiser for user-supplied HTML.
+- `wp_kses_post($html)` strips `<script>`, `<iframe>`, event handlers, and
+  `javascript:` URLs. Preserved links or markup are not XSS unless JavaScript
+  execution is demonstrated in a supported browser.
 - `sanitize_text_field` strips tags + line breaks but keeps `=()`, quotes, etc.
 - `sanitize_file_name` aggressively strips `<>"|?*\:` — filenames cannot carry
   HTML-attribute breakout payloads through this filter.

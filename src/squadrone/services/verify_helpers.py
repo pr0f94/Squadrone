@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 from datetime import datetime, timezone
@@ -17,27 +16,13 @@ logger = logging.getLogger(__name__)
 MANUAL_REVIEW_QUEUE = Path("cache/findings_for_manual_review.jsonl")
 
 
-# ---------- W2: Headless browser execution check (Playwright, optional dep) ---------
-
-# Sentinel injected into payloads — if it gets set on `window`, the script ran.
-BROWSER_SENTINEL_GLOBAL = "__squadrone_xss_fired"
-
-
-def make_browser_payload_marker() -> str:
-    """Return a unique payload that, if executed, sets window.__squadrone_xss_fired."""
-    nonce = hashlib.sha256(datetime.now(timezone.utc).isoformat().encode()).hexdigest()[:8]
-    return f"<script>window.{BROWSER_SENTINEL_GLOBAL}_{nonce}=true;</script>"
-
-
 async def screenshot_url(url: str, output_path: Path, timeout_s: int = 15,
                           full_page: bool = True) -> bool:
-    """R5: Take a screenshot of the rendered page. Returns True on success.
-    Same Playwright dependency as W2; gracefully no-ops if Playwright not installed.
-    """
+    """Take a screenshot of the rendered page. Return True on success."""
     try:
         from playwright.async_api import async_playwright  # type: ignore
     except ImportError:
-        logger.warning("R5: playwright not installed — skipping screenshot")
+        logger.warning("playwright not installed — skipping screenshot")
         return False
     try:
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -49,57 +34,14 @@ async def screenshot_url(url: str, output_path: Path, timeout_s: int = 15,
                 await page.goto(url, timeout=timeout_s * 1000)
                 await asyncio.sleep(0.5)
                 await page.screenshot(path=str(output_path), full_page=full_page)
-                logger.info("R5: screenshot → %s", output_path)
+                logger.info("screenshot saved to %s", output_path)
             finally:
                 await browser.close()
         return True
     except Exception as e:
-        logger.warning("R5: screenshot failed for %s: %s", url, e)
+        logger.warning("screenshot failed for %s: %s", url, e)
         return False
-
-
-async def check_xss_executes(url: str, sentinel_var: str, timeout_s: int = 15) -> bool | None:
-    """Use Playwright to fetch `url` and check whether `sentinel_var` got set on window.
-
-    Returns:
-    - True   = sentinel set, script executed
-    - False  = page rendered but sentinel not set
-    - None   = Playwright unavailable / fetch failed (graceful degradation)
-
-    Playwright is a heavy optional dep. Install with:
-        pip install playwright && playwright install chromium
-    """
-    try:
-        from playwright.async_api import async_playwright  # type: ignore
-    except ImportError:
-        logger.warning("W2: playwright not installed — skipping headless check (pip install playwright)")
-        return None
-
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context()
-            page = await context.new_page()
-            try:
-                await page.goto(url, timeout=timeout_s * 1000)
-            except Exception as e:
-                logger.warning("W2: page.goto(%s) failed: %s", url, e)
-                await browser.close()
-                return None
-            # Allow inline + stored scripts a moment to run
-            await asyncio.sleep(0.5)
-            try:
-                value = await page.evaluate(f"() => window.{sentinel_var} === true")
-            except Exception:
-                value = False
-            await browser.close()
-            return bool(value)
-    except Exception as e:
-        logger.warning("W2: headless check failed: %s", e)
-        return None
-
-
-# ---------- W5: state introspection on failure --------------------------------------
+# ---------- State introspection on failure ------------------------------------------
 
 async def dump_sandbox_state(sb, dump_dir: Path) -> None:
     """Dump DB tables of interest, apache log, uploads listing into dump_dir.
@@ -140,7 +82,7 @@ async def dump_sandbox_state(sb, dump_dir: Path) -> None:
     logger.info("verify: state dump → %s", dump_dir)
 
 
-# ---------- W6: manual-review queue handoff -----------------------------------------
+# ---------- Manual-review queue handoff ---------------------------------------------
 
 def emit_to_manual_review_queue(
     hyp: Hypothesis,
@@ -248,7 +190,7 @@ def write_manual_scaffold(
         f"## To pick up manually\n"
         f"1. Look at the standing `manual_reviews/<plugin>/sandbox/` if it exists, or follow that pattern\n"
         f"2. The auto-pipeline left findings under `runs/<id>/verifications/{hyp.id}/`\n"
-        f"3. If `state_dump/` exists (W5), inspect it for clues about why the PoC didn't fire\n"
+        f"3. If `state_dump/` exists, inspect it for clues about why the PoC didn't fire\n"
     )
     atomic_write_text(scaffold / "context.json", json.dumps({
         "plugin_slug": plugin_slug,

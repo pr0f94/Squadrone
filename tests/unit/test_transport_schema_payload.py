@@ -6,7 +6,10 @@ import pytest
 from pydantic import BaseModel, RootModel
 
 from squadrone.agents.runtime import AgentRuntime
-from squadrone.agents.transport.litellm_transport import LiteLLMTransport, _normalise_schema_payload
+from squadrone.agents.transport.litellm_transport import (
+    LiteLLMTransport,
+    _normalise_schema_payload,
+)
 
 
 class _Item(BaseModel):
@@ -149,10 +152,12 @@ async def test_root_list_schema_falls_back_to_empty_after_retry(monkeypatch, tmp
 
 @pytest.mark.asyncio
 async def test_root_list_schema_salvages_after_retry(monkeypatch, tmp_path):
-    responses = iter([
-        '{"summary": "bad wrapper"}',
-        '[{"id": "kept"}, {"missing": "id"}]',
-    ])
+    responses = iter(
+        [
+            '{"summary": "bad wrapper"}',
+            '[{"id": "kept"}, {"missing": "id"}]',
+        ]
+    )
 
     async def fake_call_llm(**kwargs):
         return {
@@ -183,3 +188,46 @@ async def test_root_list_schema_salvages_after_retry(monkeypatch, tmp_path):
     artifact = tmp_path / "schema_invalid_auth.json"
     assert artifact.exists()
     assert "missing" in artifact.read_text()
+
+
+@pytest.mark.asyncio
+async def test_schema_retry_requests_a_complete_canonical_object(monkeypatch, tmp_path):
+    responses = iter(
+        [
+            '{"items": [{}]}',
+            '{"items": [{"id": "fixed"}]}',
+        ]
+    )
+    requests = []
+
+    async def fake_call_llm(**kwargs):
+        requests.append(kwargs["messages"])
+        return {
+            "choices": [{"message": {"content": next(responses)}}],
+            "usage": {},
+        }
+
+    monkeypatch.setattr(
+        "squadrone.agents.transport.litellm_transport.call_llm",
+        fake_call_llm,
+    )
+    runtime = AgentRuntime(run_dir=str(tmp_path))
+
+    result = await LiteLLMTransport().run_agent(
+        runtime=runtime,
+        agent_name="canonical-retry",
+        model="test-model",
+        messages=[{"role": "user", "content": "Return items"}],
+        tools=[],
+        max_iterations=1,
+        output_schema=_Envelope,
+        tool_handlers=None,
+        force_finalise_after=None,
+        max_tokens=100,
+    )
+
+    retry_instruction = requests[1][-1]["content"]
+    assert result.output.items[0].id == "fixed"
+    assert "Preserve every valid value" in retry_instruction
+    assert "exact canonical schema field names" in retry_instruction
+    assert "complete corrected JSON object" in retry_instruction

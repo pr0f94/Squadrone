@@ -25,7 +25,9 @@ For stored bugs, only create the legitimate container object (for example the qu
 **Exploit-shaped failure signs** (return empty commands AND set `failure_class: "exploit_shape"`):
 
 - HTTP 200 with the expected DOM, but the marker isn't reflected → escaping is happening, not a setup issue
-- Auth check returned -1 / 401 → access control is doing its job, not a setup issue
+- Auth check returned -1 / 401 after the PoC proved it used the correct role and,
+  for cookie-authenticated REST, a valid `X-WP-Nonce` → access control is doing
+  its job, not a setup issue
 - PoC found the form/record fine but the payload didn't survive sanitisation → not a setup issue
 - The PoC clearly reached the sink but the bug class doesn't fire → not a setup issue
 - For an `admin_init` hypothesis, a 403 on the plugin's own admin menu/settings page is not enough to conclude the vulnerability is blocked. `admin_init` also runs on generic admin URLs that lower-privilege users may access. If the attempt did not try a generic accessible admin URL such as `/wp-admin/profile.php` or `/wp-admin/index.php` with the same exploit parameters, classify this as `poc_code`, not `exploit_shape`, so the PoC author retries the route.
@@ -37,6 +39,10 @@ For stored bugs, only create the legitimate container object (for example the qu
 - `KeyError`, `IndexError`, `JSONDecodeError`, `AttributeError`, `NameError`, `TypeError` — the script's own logic broke
 - The script tried to use an auth-required endpoint (e.g. `/wp-json/wp/v2/users` without admin auth) and crashed parsing the empty response
 - The PoC never made the actual exploit request (e.g. crashed during user enumeration / setup helpers, before sending the malicious request)
+- A cookie-authenticated REST request omitted `X-WP-Nonce`, so WordPress treated
+  the logged-in session as user ID 0
+- The script used `/wp-json/...` with plain permalinks and received an HTML page
+  instead of the route's JSON response; retry with `/?rest_route=/...`
 - Connection errors / timeouts hitting the sandbox before the exploit POST
 
 These are NOT exploit-shape failures — the bug may still be real. The PoC author needs another iteration to fix the script. The verifier will retry with a fresh PoC against the same setup.

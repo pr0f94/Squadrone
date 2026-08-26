@@ -32,49 +32,9 @@ vuln_dbs:
   wpscan:
     base_url: https://wpscan.com/api/v3
 
-# Stage 1 — all approved features ON except WP core bundling (skip the 70MB download for the test)
-intake:
-  bundle_wp_core: false           # skip for test (one-time but slow)
-  classify_files: true
-  fetch_changelog: true
-  detect_closed: true
-  wp_core_version: latest
-
-# Stage 2 — every approved feature ON
-recon:
-  deterministic_analysis: true
-  validate_entry_points: true
-  trace_cross_file_callees: true
-  scan_nonce_emissions: true
-  exclude_vendor_tests_lang: true
-  enrich_entry_points: true
-  negative_pattern_reference: true
-  max_entries_to_validate: 30
-
-hypothesis:
-  specialist_wp_idioms: true
-  verifier_require_citation: true
-  verifier_wp_idioms: true
-  pre_verifier_dedup: true
-
-# Strict quality controls — every quality feature ON
-quality:
-  enabled: true
-  require_evidence_schema: true
-  false_positive_rules: true
-  recompute_severity: true
-  finding_grader: true
-  report_grader: true
-  focus_area_fanout: true
-  reject_below_submit_bar: true
-  borderline_to_manual_review: true
-
 verify:
-  headless_browser_check: true        # requires Playwright
-  persistent_sandbox: true            # exercises mariadb-dump snapshot/restore
+  persistent_sandbox: true
   state_introspection_on_failure: true
-  negative_control: true
-  collaborative_dev_poc_loop: true
   headless_browser_timeout_s: 15
 
 report:

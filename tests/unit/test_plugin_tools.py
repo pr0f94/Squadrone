@@ -14,7 +14,7 @@ def fake_plugin(tmp_path: Path) -> Path:
     - PHP entry point with a sink
     - included class file
     - JS file
-    - vendor/ subtree that must be skipped
+    - bundled vendor/ subtree that remains inspectable
     - long file for line-range slicing
     - binary-extension file that must be refused
     """
@@ -40,8 +40,11 @@ def fake_plugin(tmp_path: Path) -> Path:
     )
     (root / "assets").mkdir()
     (root / "assets" / "main.js").write_text("console.log('fp');\n")
+    (root / "assets" / "minified.js").write_text(
+        "x" * 70_000 + "new Function('return 1')();\n"
+    )
 
-    # vendor/ — must be excluded from grep & glob
+    # Bundled vendor code remains inspectable for reachable dependency paths.
     (root / "vendor").mkdir()
     (root / "vendor" / "noise.php").write_text("<?php $wpdb->query('noise');\n")
 
@@ -71,8 +74,8 @@ def test_grep_finds_sink(fake_plugin):
     out = h.grep_plugin({"pattern": r"\$wpdb->query"})
     assert "fake-plugin.php" in out
     assert "DELETE FROM x" in out
-    # vendor/noise.php must NOT appear
-    assert "vendor/noise.php" not in out
+    # Bundled dependencies remain inspectable when plugin code reaches them.
+    assert "vendor/noise.php" in out
 
 
 def test_grep_no_matches(fake_plugin):
@@ -126,6 +129,16 @@ def test_grep_max_results_cap(fake_plugin):
     assert len(body_lines) == 3
 
 
+def test_grep_centers_long_minified_line_on_match(fake_plugin):
+    h = PluginToolHandlers(plugin_root=fake_plugin)
+
+    out = h.grep_plugin({"pattern": r"new Function\("})
+
+    assert "assets/minified.js:1:70001:" in out
+    assert "new Function('return 1')" in out
+    assert len(out) < 5000
+
+
 # ----- glob_plugin ---------------------------------------------------------
 
 def test_glob_basic(fake_plugin):
@@ -133,14 +146,40 @@ def test_glob_basic(fake_plugin):
     out = h.glob_plugin({"pattern": "**/*.php"})
     assert "fake-plugin.php" in out
     assert "includes/helper.php" in out
-    # Vendor must be excluded
-    assert "vendor/noise.php" not in out
+    assert "vendor/noise.php" in out
 
 
 def test_glob_no_matches(fake_plugin):
     h = PluginToolHandlers(plugin_root=fake_plugin)
     out = h.glob_plugin({"pattern": "**/*.nonexistent"})
-    assert "0 files match" in out
+    assert "0 paths match" in out
+
+
+def test_glob_reports_directories(fake_plugin):
+    h = PluginToolHandlers(plugin_root=fake_plugin)
+
+    out = h.glob_plugin({"pattern": "*"})
+
+    assert "assets/" in out
+    assert "includes/" in out
+    assert "fake-plugin.php" in out
+
+
+def test_glob_reports_hidden_only_and_empty_directories(fake_plugin):
+    hidden_only = fake_plugin / "runtime-files"
+    hidden_only.mkdir()
+    (hidden_only / ".gitkeep").write_text("")
+    (fake_plugin / "empty-runtime-files").mkdir()
+    h = PluginToolHandlers(plugin_root=fake_plugin)
+
+    parent_out = h.glob_plugin({"pattern": "runtime-files*"})
+    recursive_out = h.glob_plugin({"pattern": "runtime-files/**"})
+    children_out = h.glob_plugin({"pattern": "runtime-files/*"})
+
+    assert "runtime-files/" in parent_out
+    assert "runtime-files/" in recursive_out
+    assert "runtime-files/.gitkeep" in children_out
+    assert "empty-runtime-files/" in h.glob_plugin({"pattern": "empty-runtime-files*"})
 
 
 def test_glob_refuses_absolute(fake_plugin):
@@ -176,6 +215,48 @@ def test_read_line_range(fake_plugin):
     assert "// line 99" in out  # line 100 is "// line 99" (line 1 is "<?php")
     assert "// line 104" in out
     assert "// line 200" not in out
+
+
+def test_read_line_range_is_recorded_for_coverage_evidence(fake_plugin):
+    h = PluginToolHandlers(plugin_root=fake_plugin)
+
+    h.read_plugin_file({"path": "long.php", "start_line": 100, "end_line": 105})
+
+    assert h.was_read("long.php", 100)
+    assert h.was_read("long.php", 105)
+    assert not h.was_read("long.php", 106)
+
+
+def test_read_evidence_uses_canonical_path_and_rejects_out_of_range(fake_plugin):
+    h = PluginToolHandlers(plugin_root=fake_plugin)
+
+    output = h.read_plugin_file({"path": "./long.php", "start_line": 1999})
+
+    assert "beyond the end" in output
+    assert not h.was_read("long.php", 1999)
+
+    h.read_plugin_file({"path": "./long.php", "start_line": 10, "end_line": 12})
+    assert h.was_read("long.php", 10)
+
+
+def test_minified_line_requires_reading_the_target_column(fake_plugin):
+    h = PluginToolHandlers(plugin_root=fake_plugin)
+
+    initial = h.read_plugin_file({"path": "assets/minified.js", "start_line": 1})
+
+    assert "new Function" not in initial
+    assert h.was_read("assets/minified.js", 1, 1)
+    assert not h.was_read("assets/minified.js", 1, 70_005)
+
+    window = h.read_plugin_file({
+        "path": "assets/minified.js",
+        "start_line": 1,
+        "start_column": 69_950,
+        "max_chars": 200,
+    })
+
+    assert "new Function('return 1')" in window
+    assert h.was_read("assets/minified.js", 1, 70_005)
 
 
 def test_read_max_lines_truncates(fake_plugin):

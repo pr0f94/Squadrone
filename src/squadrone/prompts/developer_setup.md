@@ -24,6 +24,12 @@ Read the hypothesis carefully — especially `entry_point`, `file`, `taint_path`
 - **Bug needs a pre-existing record** (file in upload dir, DB row, option value) → seed benign prerequisite state via `wp post create`, `wp option update`, `wp user meta update`, or the plugin's own APIs.
 - **Bug needs the plugin in a configured state** (e.g., a feature toggle, a default upload directory) → use `wp option update <option_name> <value>`. Plugin-specific option names will be visible in the code slice or hypothesis preconditions.
 
+Every plugin-specific option key, table, post type, status, and setting value in
+your commands must appear verbatim in the supplied source context. Never derive
+an identifier from a human feature label: for example, a feature called "Public
+API" might use `public_api`, not `module_api`. If the exact identifier is not
+source-grounded, do not guess it.
+
 ### Critical: setup must not plant the exploit
 
 Setup commands may create legitimate prerequisite state: a published page with a shortcode, a normal form/quiz/event record, feature toggles, benign users, benign taxonomy terms, upload directories, and other state a real site would already have.

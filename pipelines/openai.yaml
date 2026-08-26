@@ -74,46 +74,9 @@ vuln_dbs:
   wpscan:
     base_url: https://wpscan.com/api/v3
 
-intake:
-  bundle_wp_core: false
-  classify_files: false
-  fetch_changelog: false
-  detect_closed: false
-  wp_core_version: latest
-
-recon:
-  deterministic_analysis: false
-  validate_entry_points: false
-  trace_cross_file_callees: false
-  scan_nonce_emissions: false
-  exclude_vendor_tests_lang: false
-  enrich_entry_points: false
-  negative_pattern_reference: false
-  max_entries_to_validate: 30
-
-hypothesis:
-  specialist_wp_idioms: false
-  verifier_require_citation: false
-  verifier_wp_idioms: false
-  pre_verifier_dedup: true
-
-quality:
-  enabled: true
-  require_evidence_schema: true
-  false_positive_rules: true
-  recompute_severity: true
-  finding_grader: true
-  report_grader: true
-  focus_area_fanout: true
-  reject_below_submit_bar: true
-  borderline_to_manual_review: true
-
 verify:
-  headless_browser_check: false
   persistent_sandbox: false
   state_introspection_on_failure: false
-  negative_control: false
-  collaborative_dev_poc_loop: false
   headless_browser_timeout_s: 15
 
 report:

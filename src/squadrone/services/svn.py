@@ -5,32 +5,29 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
-import re
 import shutil
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 
 logger = logging.getLogger(__name__)
 
 _SVN_BASE = "https://plugins.svn.wordpress.org"
-_TAG_HREF = re.compile(r'<a\s+href="([^"]+?)/?">', re.IGNORECASE)
+_PLUGIN_INFO_URL = "https://api.wordpress.org/plugins/info/1.2/"
+_PLUGIN_DOWNLOAD_HOST = "downloads.wordpress.org"
 
 
 class PluginNotFoundError(LookupError):
     pass
 
 
-def _version_key(v: str) -> tuple:
-    parts = []
-    for piece in v.split("."):
-        m = re.match(r"^(\d+)(.*)$", piece)
-        if m:
-            parts.append((int(m.group(1)), m.group(2)))
-        else:
-            parts.append((-1, piece))
-    return tuple(parts)
+@dataclass(frozen=True)
+class PluginRelease:
+    version: str
+    download_url: str
 
 
 class SVNClient:
@@ -39,21 +36,55 @@ class SVNClient:
     def __init__(self, timeout: float = 30.0):
         self.timeout = timeout
 
-    async def get_latest_version(self, slug: str) -> str:
-        url = f"{_SVN_BASE}/{slug}/tags/"
+    async def get_latest_release(self, slug: str) -> PluginRelease:
+        params = {
+            "action": "plugin_information",
+            "request[slug]": slug,
+            "request[fields][sections]": "0",
+            "request[fields][downloadlink]": "1",
+        }
         async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as c:
-            r = await c.get(url)
+            r = await c.get(_PLUGIN_INFO_URL, params=params)
         if r.status_code == 404:
             raise PluginNotFoundError(f"plugin {slug!r} not found on wordpress.org")
         r.raise_for_status()
 
-        tags = [
-            href for href in _TAG_HREF.findall(r.text)
-            if href not in ("..",) and not href.startswith("/")
-        ]
-        if not tags:
-            raise PluginNotFoundError(f"plugin {slug!r} has no tags")
-        return max(tags, key=_version_key)
+        try:
+            payload = r.json()
+        except ValueError as exc:
+            raise RuntimeError(
+                f"wordpress.org returned invalid plugin metadata for {slug!r}"
+            ) from exc
+        if not isinstance(payload, dict) or payload.get("error"):
+            error = payload.get("error") if isinstance(payload, dict) else None
+            raise PluginNotFoundError(
+                f"plugin {slug!r} not found on wordpress.org"
+                + (f": {error}" if error else "")
+            )
+
+        version = payload.get("version")
+        download_url = payload.get("download_link")
+        if not isinstance(version, str) or not version.strip():
+            raise RuntimeError(f"wordpress.org metadata for {slug!r} has no version")
+        if not isinstance(download_url, str) or not download_url.strip():
+            raise RuntimeError(f"wordpress.org metadata for {slug!r} has no download link")
+        if urlparse(download_url).hostname != _PLUGIN_DOWNLOAD_HOST:
+            raise RuntimeError(
+                f"wordpress.org returned an unexpected download host for {slug!r}"
+            )
+
+        return PluginRelease(version=version.strip(), download_url=download_url)
+
+    async def export_release(
+        self,
+        slug: str,
+        release: PluginRelease,
+        dest: str,
+    ) -> str:
+        dest_path = Path(dest)
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        await self._download_and_extract(slug, release.download_url, dest_path)
+        return str(dest_path)
 
     async def export(self, slug: str, version: str, dest: str) -> str:
         url = f"{_SVN_BASE}/{slug}/tags/{version}"
@@ -83,11 +114,22 @@ class SVNClient:
 
     async def _export_zip(self, slug: str, version: str, dest_path: Path) -> None:
         url = f"https://downloads.wordpress.org/plugin/{slug}.{version}.zip"
+        await self._download_and_extract(slug, url, dest_path, version=version)
+
+    async def _download_and_extract(
+        self,
+        slug: str,
+        url: str,
+        dest_path: Path,
+        *,
+        version: str | None = None,
+    ) -> None:
         async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as c:
             r = await c.get(url)
         if r.status_code == 404:
+            target = f" version {version!r}" if version else ""
             raise PluginNotFoundError(
-                f"plugin {slug!r} version {version!r} zip not found on wordpress.org"
+                f"plugin {slug!r}{target} zip not found on wordpress.org"
             )
         r.raise_for_status()
 

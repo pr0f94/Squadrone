@@ -66,6 +66,7 @@ class BudgetTracker:
         # boundary; each call_llm passes its agent_name. Cheap (one append per call).
         self.current_stage: str = "unknown"
         self.calls: list[CallRecord] = []
+        self._reserved_usd = 0.0
 
     @property
     def cache_hit_rate(self) -> float:
@@ -121,7 +122,50 @@ class BudgetTracker:
                 )
         return summary_path
 
-    async def add(self, usage: Any, model: str, agent: str = "unknown") -> None:
+    @staticmethod
+    def estimate_call_cost(
+        model: str,
+        input_tokens: int,
+        max_output_tokens: int,
+    ) -> float:
+        """Conservatively estimate an uncached call before it is dispatched."""
+        rates = COST_PER_1M.get(model, {"input": 3.0, "output": 15.0})
+        return (
+            max(input_tokens, 0) * rates["input"]
+            + max(max_output_tokens, 0) * rates["output"]
+        ) / 1_000_000
+
+    async def reserve(
+        self,
+        model: str,
+        input_tokens: int,
+        max_output_tokens: int,
+    ) -> float:
+        """Reserve the worst-case estimated cost or reject the call up front."""
+        estimate = self.estimate_call_cost(model, input_tokens, max_output_tokens)
+        async with self._lock:
+            projected = self.spent + self._reserved_usd + estimate
+            if projected > self.ceiling:
+                remaining = max(self.ceiling - self.spent - self._reserved_usd, 0.0)
+                raise BudgetExceededError(
+                    f"Budget ceiling ${self.ceiling:.2f} would be exceeded by the next "
+                    f"LLM call (estimated ${estimate:.2f}, remaining ${remaining:.2f})"
+                )
+            self._reserved_usd += estimate
+        return estimate
+
+    async def release(self, reservation_usd: float) -> None:
+        """Release a reservation after a failed or cancelled provider call."""
+        async with self._lock:
+            self._reserved_usd = max(self._reserved_usd - reservation_usd, 0.0)
+
+    async def add(
+        self,
+        usage: Any,
+        model: str,
+        agent: str = "unknown",
+        reservation_usd: float = 0.0,
+    ) -> None:
         rates = COST_PER_1M.get(model, {"input": 3.0, "output": 15.0})
         # Standard fields
         prompt_tokens = _get(usage, "prompt_tokens")
@@ -147,6 +191,7 @@ class BudgetTracker:
             + completion_tokens * rates["output"]
         ) / 1_000_000
         async with self._lock:
+            self._reserved_usd = max(self._reserved_usd - reservation_usd, 0.0)
             self.input_tokens += uncached_input
             self.output_tokens += completion_tokens
             self.cache_write_tokens += cache_write
@@ -162,7 +207,3 @@ class BudgetTracker:
                 cache_write_tokens=cache_write,
                 cost_usd=cost,
             ))
-            if self.spent >= self.ceiling:
-                raise BudgetExceededError(
-                    f"Budget ceiling ${self.ceiling:.2f} reached (spent ${self.spent:.2f})"
-                )

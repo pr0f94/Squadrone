@@ -122,7 +122,7 @@ def _stage_done_summary(stage: str, info: dict[str, Any]) -> str:
         "intake": ("version", "files", "lines"),
         "recon": ("entry_points", "sinks"),
         "hypothesis": ("count",),
-        "triage": ("accepted", "rejected", "merged", "manual_review_candidates"),
+        "triage": ("accepted", "rejected", "merged", "deferred", "manual_review_candidates"),
         "manual_queue": ("candidates", "manual_queued", "already_queued", "unavailable", "reason"),
         "verify": ("findings", "manual_queued", "already_queued"),
         "dedup": ("novel", "possibly_known", "known_dupe"),
@@ -216,6 +216,7 @@ async def _run_scan_cli(
     resume: str | None,
     resume_from: str | None,
     verbose: bool,
+    verify_only: bool = False,
     batch_prefix: str | None = None,
 ) -> Any:
     from .orchestrator import run_scan
@@ -266,6 +267,7 @@ async def _run_scan_cli(
         version=version,
         resume_run_id=resume,
         resume_from=resume_from,
+        verify_only=verify_only,
     )
 
     _print_scan_result(result)
@@ -447,6 +449,11 @@ def scan(
         None, "--from",
         help="Force re-run from a specific stage (requires --resume). One of: intake, recon, hypothesis, triage, verify, dedup, report.",
     ),
+    verify_only: bool = typer.Option(
+        False,
+        "--verify-only",
+        help="Stop successfully after verification; skip vulnerability DB dedup and report generation.",
+    ),
     verbose: bool = typer.Option(
         False, "--verbose", "-v",
         help="Show detailed INFO logs from stages, agents, sandbox setup, and LLM calls. Default output stays concise.",
@@ -462,6 +469,7 @@ def scan(
         resume=resume,
         resume_from=resume_from,
         verbose=verbose,
+        verify_only=verify_only,
     ))
 
     if result.status != "complete":
@@ -585,36 +593,51 @@ def benchmark(
     table = Table(title=f"Benchmark — {corpus} (split={split})")
     table.add_column("metric")
     table.add_column("value")
-    table.add_row("entries", str(result.entry_count))
-    table.add_row("recall@1", f"{result.recall_at_1:.2%}")
-    table.add_row("recall@3", f"{result.recall_at_3:.2%}")
-    table.add_row("recall@10", f"{result.recall_at_10:.2%}")
-    table.add_row("precision", f"{result.precision:.2%}")
-    table.add_row("PoC success rate", f"{result.poc_success_rate:.2%}")
-    table.add_row("cost / finding", f"${result.cost_per_finding:.4f}")
+    table.add_row("version pairs", str(result.pair_count))
+    table.add_row("scans", str(result.scan_count))
+    table.add_row("hypothesis recall@1", f"{result.hypothesis_recall_at_1:.2%}")
+    table.add_row("hypothesis recall@3", f"{result.hypothesis_recall_at_3:.2%}")
+    table.add_row("hypothesis recall@10", f"{result.hypothesis_recall_at_10:.2%}")
+    table.add_row("verified recall", f"{result.verified_recall:.2%}")
+    table.add_row("target confirmation", f"{result.target_confirmation_rate:.2%}")
+    table.add_row("fixed-version target FP", f"{result.fixed_target_false_positive_rate:.2%}")
+    table.add_row("paired verified precision", f"{result.paired_verified_precision:.2%}")
+    table.add_row("cost / confirmed target", f"${result.cost_per_confirmed_target:.4f}")
     table.add_row("total cost", f"${result.total_cost_usd:.4f}")
     console.print(table)
 
     per_bc = Table(title="Per bug class")
     per_bc.add_column("CWE")
-    per_bc.add_column("count")
-    per_bc.add_column("recall")
+    per_bc.add_column("pairs")
+    per_bc.add_column("hypothesis recall")
+    per_bc.add_column("verified recall")
+    per_bc.add_column("fixed FP")
     for bc, v in result.per_bug_class.items():
-        per_bc.add_row(bc, str(v["count"]), f"{v['recall']:.2%}")
+        per_bc.add_row(
+            bc,
+            str(v["pairs"]),
+            f"{v['hypothesis_recall']:.2%}",
+            f"{v['verified_recall']:.2%}",
+            str(v["fixed_false_positives"]),
+        )
     console.print(per_bc)
 
     detail = Table(title="Per entry")
     detail.add_column("CVE")
     detail.add_column("slug")
+    detail.add_column("version")
+    detail.add_column("expected")
     detail.add_column("status")
-    detail.add_column("matched")
-    detail.add_column("via")
+    detail.add_column("candidate rank")
+    detail.add_column("confirmed")
     detail.add_column("cost")
-    for e in result.entries:
+    for e in result.variants:
         detail.add_row(
-            e.cve_id, e.slug, e.status,
-            str(e.matched_at_rank) if e.matched_at_rank else "—",
-            e.matched_via or "—",
+            e.cve_id, e.slug, e.version,
+            "vulnerable" if e.expected_vulnerable else "fixed",
+            e.status,
+            str(e.candidate_rank) if e.candidate_rank else "—",
+            "yes" if e.target_confirmed else "no",
             f"${e.cost_usd:.4f}",
         )
     console.print(detail)
@@ -651,7 +674,10 @@ def review(run_id: str = typer.Argument(..., help="Run ID to review")) -> None:
         prior = decisions.get(f.id, {})
         console.clear()
         console.rule(f"[b]Finding {idx+1}/{len(findings)} — {f.id}[/b]")
-        console.print(f"[b]bug_class:[/b] {f.hypothesis.bug_class.name} ({f.hypothesis.bug_class.value})")
+        console.print(
+            f"[b]vulnerability:[/b] {f.hypothesis.vulnerability_type} "
+            f"({f.hypothesis.root_cause_cwe})"
+        )
         console.print(f"[b]confidence:[/b] {f.hypothesis.confidence.value}")
         console.print(f"[b]entry:[/b] {f.hypothesis.entry_point}  [b]sink:[/b] {f.hypothesis.sink}")
         console.print(f"[b]file:[/b] {f.hypothesis.file}:{f.hypothesis.line}")

@@ -3,19 +3,23 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Optional
+from typing import Literal, Optional
 
 from ._base import JSONFileMixin
 from .hypothesis import Hypothesis
+from .observation import PoCObservation
 
 
 class PoCStatus(str, Enum):
     SUCCESS = "success"
     FAILED = "failed"
+    # Retained only so historical run artifacts can still be loaded. New
+    # verification code never emits or accepts PARTIAL as a finding.
     PARTIAL = "partial"
 
 
 class DedupStatus(str, Enum):
+    NOT_CHECKED = "not_checked"
     NOVEL = "novel"
     POSSIBLY_KNOWN = "possibly_known"
     KNOWN_DUPE = "known_dupe"
@@ -23,6 +27,7 @@ class DedupStatus(str, Enum):
 
 class PoCAttempt(JSONFileMixin):
     iteration: int
+    phase: Literal["attack", "confirmation"] = "attack"
     script_path: str
     result: PoCStatus
     http_status: Optional[int] = None
@@ -30,6 +35,8 @@ class PoCAttempt(JSONFileMixin):
     timing_seconds: Optional[float] = None
     error_log_snippet: Optional[str] = None
     developer_analysis: Optional[str] = None
+    observation: Optional[PoCObservation] = None
+    validation_reason: Optional[str] = None
 
 
 class Finding(JSONFileMixin):
@@ -43,6 +50,7 @@ class Finding(JSONFileMixin):
     dedup_status: DedupStatus
     dedup_matches: list[dict]
     cvss_estimate: Optional[str] = None
+    cvss_vector: Optional[str] = None
     suggested_fix: Optional[str] = None
     # Structured next-action derived after deduplication.
     # One of: submit_as_novel | submit_as_regression_of_<CVE> | skip_exact_dupe_of_<CVE> |

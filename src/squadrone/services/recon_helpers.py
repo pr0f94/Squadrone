@@ -1,10 +1,4 @@
-"""Stage-2 recon helpers (pure static analysis, no LLM cost).
-
-#2 cross_file_callees    — best-effort regex-based call-graph for entry-point handlers
-#3 nonce_emission_sites  — JS + PHP scan for wp_localize_script / wp_create_nonce sites
-#5 extract_body_slice    — function body slice for an entry-point file:line
-#6 score_confidence      — heuristic confidence per entry point
-"""
+"""Recon helpers for static callbacks, call edges, nonce sites, and source slices."""
 
 from __future__ import annotations
 
@@ -16,16 +10,19 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
-# ---------- #5: extract function body slice -------------------------------------------
+# ---------- Extract function body slice ----------------------------------------------
 
 # A naïve "find the next function/class boundary" scanner. Doesn't parse PHP — works
 # on indentation + brace heuristics, which is enough for typical WP plugin code where
 # functions are at file scope or within classes with consistent indentation.
 _FN_BOUNDARY = re.compile(
-    r"^\s*(?:public|private|protected|static|abstract|final|\s)*\bfunction\s+\w+\s*\(",
+    r"^[ \t]*(?:(?:public|private|protected|static|abstract|final)[ \t]+)*function[ \t]+\w+[ \t]*\(",
     re.MULTILINE,
 )
-_CLASS_BOUNDARY = re.compile(r"^\s*(?:abstract\s+|final\s+)?class\s+\w+", re.MULTILINE)
+_CLASS_BOUNDARY = re.compile(
+    r"^[ \t]*(?:(?:abstract|final)[ \t]+)?class[ \t]+\w+",
+    re.MULTILINE,
+)
 
 
 def extract_body_slice(plugin_dir: Path, file_rel: str, line: int, max_lines: int = 80) -> str | None:
@@ -64,13 +61,16 @@ def extract_body_slice(plugin_dir: Path, file_rel: str, line: int, max_lines: in
     return body_text
 
 
-# ---------- #2: cross-file callee tracing ---------------------------------------------
+# ---------- Cross-file callee tracing -------------------------------------------------
 
 # Build a map: function_name -> "file:line" of its definition. Best effort.
-_FN_DEF = re.compile(r"^\s*(?:public|private|protected|static|abstract|final|\s)*\bfunction\s+(\w+)\s*\(",
-                      re.MULTILINE)
+_FN_DEF = re.compile(
+    r"^[ \t]*(?:(?:public|private|protected|static|abstract|final)[ \t]+)*function[ \t]+(\w+)[ \t]*\(",
+    re.MULTILINE,
+)
 # Match function calls — naïve: any identifier followed by `(` that isn't a keyword.
 _CALL = re.compile(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(")
+_SAME_OBJECT_CALL = re.compile(r"(?:\$this\s*->|self\s*::|static\s*::)\s*$")
 _KEYWORDS = {
     "if", "else", "elseif", "while", "for", "foreach", "switch", "function",
     "isset", "empty", "array", "list", "return", "echo", "print", "die", "exit",
@@ -80,13 +80,20 @@ _KEYWORDS = {
 
 
 _ADD_ACTION_RE = re.compile(
-    r"\badd_action\s*\(\s*['\"](?P<hook>[^'\"]+)['\"]\s*,\s*(?P<callback>[^;\n]+?)\s*(?:,\s*\d+\s*)?\)\s*;",
+    r"\badd_action\s*\(\s*['\"](?P<hook>[^'\"]+)['\"]\s*,\s*(?P<callback>[^;]{1,800}?)\s*(?:,\s*\d+\s*)?\)\s*;",
+    re.DOTALL,
 )
 _ADD_SHORTCODE_RE = re.compile(
-    r"\badd_shortcode\s*\(\s*['\"](?P<name>[^'\"]+)['\"]\s*,\s*(?P<callback>[^;\n]+?)\s*\)\s*;",
+    r"\badd_shortcode\s*\(\s*['\"](?P<name>[^'\"]+)['\"]\s*,\s*(?P<callback>[^;]{1,800}?)\s*\)\s*;",
+    re.DOTALL,
 )
 _REST_ROUTE_RE = re.compile(
-    r"\bregister_rest_route\s*\(\s*(?P<args>[^\n;]{0,1600})\)\s*;",
+    r"\bregister_rest_route\s*\(\s*(?P<args>[^;]{0,2400})\)\s*;",
+    re.DOTALL,
+)
+_BLOCK_RE = re.compile(
+    r"\bregister_block_type\s*\(\s*(?P<args>[^;]{0,2400})\)\s*;",
+    re.DOTALL,
 )
 _CALLBACK_ARRAY_RE = re.compile(
     r"(?:array\s*\(\s*)?(?:\$this|self|static|[A-Za-z_][\w\\]*)(?:::class)?\s*,\s*['\"](?P<method>[A-Za-z_]\w*)['\"]",
@@ -122,7 +129,11 @@ def _entry_type_for_hook(hook: str) -> str | None:
         return "ajax_priv"
     if hook.startswith("admin_post_nopriv_") or hook.startswith("admin_post_"):
         return "form_handler"
-    if hook in {"admin_init", "init", "template_redirect"}:
+    if hook.startswith("wc_ajax_"):
+        return "wc_ajax"
+    if hook.startswith("woocommerce_api_"):
+        return "webhook"
+    if hook in {"admin_init", "init", "parse_request", "template_redirect", "wp_loaded"}:
         return "form_handler"
     return None
 
@@ -206,6 +217,34 @@ def extract_static_callbacks(plugin_dir: Path, php_files: list[str] | None = Non
                 "callback_kind": kind,
                 "raw": text[m.start():m.end()].replace("\n", " ")[:500],
             })
+
+        for m in _BLOCK_RE.finditer(text):
+            args = m.group("args")
+            callback_raw = ""
+            cb = re.search(
+                r"['\"]render_callback['\"]\s*=>\s*(?P<callback>array\s*\([^)]+\)|\[[^\]]+\]|['\"][^'\"]+['\"]|[A-Za-z_]\w*)",
+                args,
+                re.DOTALL,
+            )
+            if cb:
+                callback_raw = cb.group("callback")
+            callback, kind = _callback_name(callback_raw)
+            block_names = re.findall(r"['\"]([^'\"]+)['\"]", args)
+            block_name = block_names[0] if block_names else "register_block_type"
+            line = _line_number(text, m.start())
+            key = ("block", block_name, rel, line)
+            if key in seen:
+                continue
+            seen.add(key)
+            callbacks.append({
+                "type": "block",
+                "name": block_name,
+                "file": rel,
+                "line": line,
+                "handler_function": callback,
+                "callback_kind": kind,
+                "raw": text[m.start():m.end()].replace("\n", " ")[:500],
+            })
     return callbacks
 
 
@@ -213,83 +252,130 @@ def trace_static_call_edges(
     plugin_dir: Path,
     callbacks: list[dict[str, Any]],
     *,
-    max_edges_per_callback: int = 25,
+    max_edges_per_function: int = 25,
+    max_depth: int = 4,
+    max_definitions_per_call: int = 6,
 ) -> list[dict[str, Any]]:
-    """Best-effort direct call edges from each static callback's function body."""
-    fn_map = build_function_def_map(plugin_dir)
+    """Best-effort transitive call edges rooted at request callbacks.
+
+    PHP method names are not globally unique. For direct ``$this->method()``
+    calls, a same-file definition is preferred. Ambiguous property-chain calls
+    retain a bounded set of definitions so a protected caller cannot hide an
+    unsafe caller to the same helper.
+    """
+    definitions = _build_function_definitions(plugin_dir)
     edges: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, str, int]] = set()
+    seen_edges: set[tuple[str, str, int, str, str | None, int | None, int]] = set()
+    scanned: set[tuple[str, str, int]] = set()
+
+    def resolve_definitions(
+        callee: str,
+        caller_file: str,
+        call_prefix: str,
+    ) -> list[tuple[str, int]]:
+        candidates = definitions.get(callee, [])
+        if _SAME_OBJECT_CALL.search(call_prefix):
+            same_file = [candidate for candidate in candidates if candidate[0] == caller_file]
+            if same_file:
+                return same_file[:max_definitions_per_call]
+        return candidates[:max_definitions_per_call]
+
     for cb in callbacks:
         handler = cb.get("handler_function") or ""
         if not handler:
             continue
-        body_file = cb.get("file", "")
-        body_line = int(cb.get("line") or 1)
-        handler_def = fn_map.get(handler)
-        if handler_def and ":" in handler_def:
-            maybe_file, maybe_line = handler_def.rsplit(":", 1)
-            try:
-                body_file = maybe_file
-                body_line = int(maybe_line)
-            except ValueError:
-                pass
-        body = extract_body_slice(plugin_dir, body_file, body_line, max_lines=120) or ""
-        if not body:
-            continue
-        count = 0
-        for m in _CALL.finditer(body):
-            callee = m.group(1)
-            if callee in _KEYWORDS or callee == handler:
+        handler_defs = definitions.get(handler, [])
+        same_file_defs = [item for item in handler_defs if item[0] == cb.get("file", "")]
+        seeds = same_file_defs or handler_defs
+        queue = [(handler, file, line, 0) for file, line in seeds[:max_definitions_per_call]]
+
+        while queue:
+            caller, body_file, body_line, depth = queue.pop(0)
+            node = (caller, body_file, body_line)
+            if node in scanned:
                 continue
-            call_line = body_line + body[:m.start()].count("\n")
-            defloc = fn_map.get(callee)
-            callee_file = None
-            callee_line = None
-            if defloc and ":" in defloc:
-                callee_file, raw_line = defloc.rsplit(":", 1)
-                try:
-                    callee_line = int(raw_line)
-                except ValueError:
-                    callee_line = None
-            key = (handler, callee, cb.get("file", ""), call_line)
-            if key in seen:
+            scanned.add(node)
+            body = extract_body_slice(plugin_dir, body_file, body_line, max_lines=240) or ""
+            if not body:
                 continue
-            seen.add(key)
-            edges.append({
-                "caller": handler,
-                "callee": callee,
-                "caller_file": body_file,
-                "caller_line": call_line,
-                "callee_file": callee_file,
-                "callee_line": callee_line,
-                "confidence": "high" if callee_file else "low",
-            })
-            count += 1
-            if count >= max_edges_per_callback:
-                break
+            count = 0
+            for m in _CALL.finditer(body):
+                callee = m.group(1)
+                if callee in _KEYWORDS or callee == caller:
+                    continue
+                call_line = body_line + body[:m.start()].count("\n")
+                prefix = body[max(0, m.start() - 80):m.start()]
+                callee_defs = resolve_definitions(callee, body_file, prefix)
+                resolved: list[tuple[str | None, int | None]] = list(callee_defs)
+                if not resolved:
+                    resolved.append((None, None))
+                confidence = "high" if len(callee_defs) == 1 else "low"
+                for callee_file, callee_line in resolved:
+                    key = (
+                        caller,
+                        body_file,
+                        body_line,
+                        callee,
+                        callee_file,
+                        callee_line,
+                        call_line,
+                    )
+                    if key in seen_edges:
+                        continue
+                    seen_edges.add(key)
+                    edges.append({
+                        "caller": caller,
+                        "callee": callee,
+                        "caller_file": body_file,
+                        "caller_line": call_line,
+                        "callee_file": callee_file,
+                        "callee_line": callee_line,
+                        "confidence": confidence,
+                    })
+                    if (
+                        depth < max_depth
+                        and callee_file is not None
+                        and callee_line is not None
+                    ):
+                        queue.append((callee, callee_file, callee_line, depth + 1))
+                count += 1
+                if count >= max_edges_per_function:
+                    break
     return edges
+
+
+def _build_function_definitions(
+    plugin_dir: Path,
+    php_files: list[str] | None = None,
+) -> dict[str, list[tuple[str, int]]]:
+    """Return every named PHP function/method definition grouped by name."""
+    definitions: dict[str, list[tuple[str, int]]] = {}
+    targets = php_files if php_files is not None else [
+        str(path.relative_to(plugin_dir))
+        for path in plugin_dir.rglob("*.php")
+        if path.is_file()
+    ]
+    for rel in targets:
+        path = plugin_dir / rel
+        if not path.exists() or not path.is_file():
+            continue
+        try:
+            text = path.read_text(errors="replace")
+        except OSError:
+            continue
+        for match in _FN_DEF.finditer(text):
+            line = text.count("\n", 0, match.start()) + 1
+            definitions.setdefault(match.group(1), []).append((rel, line))
+    return definitions
 
 
 def build_function_def_map(plugin_dir: Path, php_files: list[str] | None = None) -> dict[str, str]:
     """Walk PHP files, return {function_name: 'file:line'} of every top-level function definition."""
-    fn_map: dict[str, str] = {}
-    targets = php_files if php_files is not None else [
-        str(p.relative_to(plugin_dir)) for p in plugin_dir.rglob("*.php") if p.is_file()
-    ]
-    for rel in targets:
-        f = plugin_dir / rel
-        if not f.exists() or not f.is_file():
-            continue
-        try:
-            text = f.read_text(errors="replace")
-        except OSError:
-            continue
-        for m in _FN_DEF.finditer(text):
-            name = m.group(1)
-            line_no = text.count("\n", 0, m.start()) + 1
-            # First-wins: don't overwrite if duplicate (preserves the first definition site)
-            fn_map.setdefault(name, f"{rel}:{line_no}")
-    return fn_map
+    return {
+        name: f"{locations[0][0]}:{locations[0][1]}"
+        for name, locations in _build_function_definitions(plugin_dir, php_files).items()
+        if locations
+    }
 
 
 def trace_callees(body_slice: str, fn_def_map: dict[str, str]) -> list[str]:
@@ -311,7 +397,7 @@ def trace_callees(body_slice: str, fn_def_map: dict[str, str]) -> list[str]:
     return out
 
 
-# ---------- #3: JS nonce-emission scanner ---------------------------------------------
+# ---------- JS nonce-emission scanner -------------------------------------------------
 
 # wp_localize_script(handle, var, ['nonce' => wp_create_nonce('action')])
 _LOCALIZE = re.compile(
@@ -371,26 +457,17 @@ def scan_nonce_emissions(plugin_dir: Path, files_to_scan: list[str] | None = Non
     return out
 
 
-# ---------- #6: confidence scorer -----------------------------------------------------
+# ---------- Confidence scorer ---------------------------------------------------------
 
 def score_confidence(
-    entry_point_file: str,
     handler_function: str,
     body_slice: str | None,
-    excluded_buckets: list[str] | None,
-    file_classification: dict[str, list[str]] | None,
 ) -> str:
     """Return 'high' | 'medium' | 'low' based on:
-    - file is in vendor/tests/lang bucket → low (likely false-positive entry point)
     - handler exists in body_slice (we could extract a slice) → high
     - no slice extracted (file:line resolution failed) → low
     - default → medium
     """
-    if file_classification:
-        for bucket in ("vendor", "tests", "lang"):
-            if entry_point_file in file_classification.get(bucket, []):
-                return "low"
-
     if body_slice is None:
         return "low"
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from enum import Enum
 import logging
 import os
 from typing import Any, Optional
@@ -23,6 +24,31 @@ class VulnMatch(BaseModel):
     bug_class: Optional[str] = None
     published_at: Optional[str] = None
     similarity_score: float = 1.0
+
+
+class VulnSourceStatus(str, Enum):
+    AVAILABLE = "available"
+    UNAVAILABLE = "unavailable"
+    DISABLED = "disabled"
+
+
+class VulnSourceResult(BaseModel):
+    source: str
+    status: VulnSourceStatus
+    matches: list[VulnMatch]
+    status_reason: Optional[str] = None
+
+
+class VulnLookupResult(BaseModel):
+    matches: list[VulnMatch]
+    sources: dict[str, VulnSourceResult]
+
+    def source(self, name: str) -> VulnSourceResult:
+        """Return one named source result, failing loudly on malformed results."""
+        try:
+            return self.sources[name]
+        except KeyError as exc:
+            raise RuntimeError(f"vulnerability lookup omitted required source {name!r}") from exc
 
 
 def _str_or_none(v: Any) -> Optional[str]:
@@ -128,12 +154,12 @@ class VulnDBClient:
         self._wordfence_feed: Optional[dict] = None
         self._wordfence_lock = asyncio.Lock()
 
-    async def _get_wordfence_feed(self) -> Optional[dict]:
+    async def _get_wordfence_feed(self) -> tuple[Optional[dict], Optional[str]]:
         if self._wordfence_feed is not None:
-            return self._wordfence_feed
+            return self._wordfence_feed, None
         async with self._wordfence_lock:
             if self._wordfence_feed is not None:
-                return self._wordfence_feed
+                return self._wordfence_feed, None
             api_key = os.environ.get("WORDFENCE_API_KEY")
             headers = {}
             if api_key:
@@ -145,56 +171,148 @@ class VulnDBClient:
                     r = await c.get(WORDFENCE_FEED_URL, headers=headers)
             except httpx.HTTPError as e:
                 logger.warning("wordfence feed request failed: %s", e)
-                return None
+                return None, f"request failed: {e}"
             if r.status_code >= 400:
                 logger.warning("wordfence feed returned %d", r.status_code)
-                return None
+                retry_after = r.headers.get("Retry-After")
+                reason = f"HTTP {r.status_code}"
+                if retry_after:
+                    reason += f" (Retry-After: {retry_after})"
+                return None, reason
             try:
-                self._wordfence_feed = r.json()
+                payload = r.json()
             except ValueError:
-                return None
-            return self._wordfence_feed
+                return None, "invalid JSON response"
+            if not isinstance(payload, dict):
+                return None, "unexpected non-object JSON response"
+            self._wordfence_feed = payload
+            return self._wordfence_feed, None
+
+    async def lookup_wordfence_with_status(self, plugin_slug: str) -> VulnSourceResult:
+        feed, error = await self._get_wordfence_feed()
+        if feed is None:
+            return VulnSourceResult(
+                source="wordfence",
+                status=VulnSourceStatus.UNAVAILABLE,
+                matches=[],
+                status_reason=error or "feed unavailable",
+            )
+        try:
+            matches = _parse_wordfence(plugin_slug, feed)
+        except Exception as exc:
+            logger.warning("wordfence feed parsing failed for %s: %s", plugin_slug, exc)
+            return VulnSourceResult(
+                source="wordfence",
+                status=VulnSourceStatus.UNAVAILABLE,
+                matches=[],
+                status_reason=f"feed parsing failed: {exc}",
+            )
+        return VulnSourceResult(
+            source="wordfence",
+            status=VulnSourceStatus.AVAILABLE,
+            matches=matches,
+        )
 
     async def lookup_wordfence(self, plugin_slug: str) -> list[VulnMatch]:
-        feed = await self._get_wordfence_feed()
-        if feed is None:
-            return []
-        return _parse_wordfence(plugin_slug, feed)
+        """Compatibility wrapper returning only matches."""
+        return (await self.lookup_wordfence_with_status(plugin_slug)).matches
 
-    async def lookup_wpscan(self, plugin_slug: str) -> list[VulnMatch]:
+    async def lookup_wpscan_with_status(self, plugin_slug: str) -> VulnSourceResult:
         api_key = os.environ.get("WPSCAN_API_KEY")
         if not api_key:
             logger.warning("WPSCAN_API_KEY not set — skipping WPScan lookup")
-            return []
+            return VulnSourceResult(
+                source="wpscan",
+                status=VulnSourceStatus.DISABLED,
+                matches=[],
+                status_reason="WPSCAN_API_KEY not set",
+            )
         url = f"https://wpscan.com/api/v3/plugins/{plugin_slug}"
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as c:
                 r = await c.get(url, headers={"Authorization": f"Token token={api_key}"})
-        except httpx.HTTPError as e:
-            logger.warning("wpscan request failed for %s: %s", plugin_slug, e)
-            return []
+        except httpx.HTTPError as exc:
+            logger.warning("wpscan request failed for %s: %s", plugin_slug, exc)
+            return VulnSourceResult(
+                source="wpscan",
+                status=VulnSourceStatus.UNAVAILABLE,
+                matches=[],
+                status_reason=f"request failed: {exc}",
+            )
         if r.status_code == 404:
-            return []
+            return VulnSourceResult(
+                source="wpscan",
+                status=VulnSourceStatus.AVAILABLE,
+                matches=[],
+                status_reason="HTTP 404 (plugin not present)",
+            )
         if r.status_code >= 400:
             logger.warning("wpscan %s returned %d", plugin_slug, r.status_code)
-            return []
+            return VulnSourceResult(
+                source="wpscan",
+                status=VulnSourceStatus.UNAVAILABLE,
+                matches=[],
+                status_reason=f"HTTP {r.status_code}",
+            )
         try:
-            return _parse_wpscan(plugin_slug, r.json())
+            payload = r.json()
         except ValueError:
-            return []
-
-    async def lookup_all(self, plugin_slug: str) -> list[VulnMatch]:
-        results = await asyncio.gather(
-            self.lookup_wordfence(plugin_slug),
-            self.lookup_wpscan(plugin_slug),
+            return VulnSourceResult(
+                source="wpscan",
+                status=VulnSourceStatus.UNAVAILABLE,
+                matches=[],
+                status_reason="invalid JSON response",
+            )
+        if not isinstance(payload, dict):
+            return VulnSourceResult(
+                source="wpscan",
+                status=VulnSourceStatus.UNAVAILABLE,
+                matches=[],
+                status_reason="unexpected non-object JSON response",
+            )
+        try:
+            matches = _parse_wpscan(plugin_slug, payload)
+        except Exception as exc:
+            logger.warning("wpscan response parsing failed for %s: %s", plugin_slug, exc)
+            return VulnSourceResult(
+                source="wpscan",
+                status=VulnSourceStatus.UNAVAILABLE,
+                matches=[],
+                status_reason=f"response parsing failed: {exc}",
+            )
+        return VulnSourceResult(
+            source="wpscan",
+            status=VulnSourceStatus.AVAILABLE,
+            matches=matches,
         )
+
+    async def lookup_wpscan(self, plugin_slug: str) -> list[VulnMatch]:
+        """Compatibility wrapper returning only matches."""
+        return (await self.lookup_wpscan_with_status(plugin_slug)).matches
+
+    async def lookup_all_with_status(self, plugin_slug: str) -> VulnLookupResult:
+        wordfence, wpscan = await asyncio.gather(
+            self.lookup_wordfence_with_status(plugin_slug),
+            self.lookup_wpscan_with_status(plugin_slug),
+        )
+
         merged: dict[str, VulnMatch] = {}
         anon: list[VulnMatch] = []
-        for batch in results:
-            for m in batch:
+        for source_result in (wordfence, wpscan):
+            for m in source_result.matches:
                 if m.cve_id:
                     if m.cve_id not in merged:
                         merged[m.cve_id] = m
                 else:
                     anon.append(m)
-        return list(merged.values()) + anon
+        return VulnLookupResult(
+            matches=list(merged.values()) + anon,
+            sources={
+                wordfence.source: wordfence,
+                wpscan.source: wpscan,
+            },
+        )
+
+    async def lookup_all(self, plugin_slug: str) -> list[VulnMatch]:
+        """Compatibility wrapper returning only merged matches."""
+        return (await self.lookup_all_with_status(plugin_slug)).matches

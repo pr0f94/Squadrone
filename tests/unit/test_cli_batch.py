@@ -94,6 +94,7 @@ def test_run_scan_cli_uses_fixed_scan_path(monkeypatch):
         resume=None,
         resume_from=None,
         verbose=False,
+        verify_only=True,
     ))
 
     assert seen["plugin_slug"] == "alpha"
@@ -106,4 +107,21 @@ def test_run_scan_cli_uses_fixed_scan_path(monkeypatch):
         "version",
         "resume_run_id",
         "resume_from",
+        "verify_only",
     }
+    assert seen["verify_only"] is True
+
+
+def test_scan_accepts_verify_only_flag(monkeypatch):
+    seen: dict = {}
+
+    async def fake_run_scan_cli(**kwargs):
+        seen.update(kwargs)
+        return _scan_result(kwargs["plugin_slug"])
+
+    monkeypatch.setattr(cli, "_run_scan_cli", fake_run_scan_cli)
+
+    result = runner.invoke(cli.app, ["scan", "alpha", "--verify-only"])
+
+    assert result.exit_code == 0
+    assert seen["verify_only"] is True

@@ -10,17 +10,19 @@ A plugin must satisfy ALL hard requirements to be a valid scan target. The quali
 
 ## Hard requirements (must all pass)
 
-### 1. Active maintenance
-- Last release within the past 6 months on wordpress.org/plugins/&lt;slug&gt;/
-- "Tested up to" within 1 major WP version of current
-- At least one resolved issue in the last 2 months on the support forum
-- Reject if last update >12 months ago, or if the readme says "looking for new maintainer", or if the WP.org page is closed/abandoned.
+### 1. Public, eligible release
+- The latest unmodified release must be publicly downloadable.
+- Reject a closed/removed WordPress.org component.
+- Patchstack requires the latest release to be no older than three years.
+- Do not reject an otherwise eligible Wordfence target merely because it has
+  not shipped in the past six or twelve months.
 
 ### 2. Disclosure channel determines submission path (not whether to scan)
 We submit to **both Wordfence and Patchstack**. The plugin's disclosure channel determines which program a finding goes to, not whether the plugin is worth scanning.
 
 Check the readme's "How can I report security bugs?" / "Report a security vulnerability" section and tag the candidate:
-- **Patchstack VDP** (`https://patchstack.com/database/vdp/...`) → findings submit through Patchstack (consult `patchstack_scope.md` — note CVSS ≥6.5 floor)
+- **Patchstack mVDP** (`https://patchstack.com/database/vdp/...`) → findings may
+  use the mVDP exception described in `patchstack_scope.md`
 - **Vendor program** (HackerOne / Bugcrowd / Intigriti / vendor bounty like WPMU DEV) → **reject** the plugin; we don't compete with vendor programs
 - **No security section, vendor support email, or wordpress.org support** → findings submit through Wordfence (default channel)
 
@@ -44,18 +46,15 @@ Reject any plugin authored by:
   - 1337 tier: drops to 500
 
 **Patchstack** (cross-reference `patchstack_scope.md`):
-- Min **1,000 active installs** (or 100+ for CVSS 8.5+ unauth/Subscriber/Customer)
-- All findings need **CVSS ≥ 6.5**
+- Standard program: at least **1,000 active installs**
+- Patchstack mVDP: no install floor when the component is explicitly enrolled
+- There is no blanket CVSS 6.5 floor; apply Patchstack's role, complexity,
+  vulnerability-type, and minor-CIA exclusions to each confirmed finding
 
 **Evaluate each program independently — do NOT mix the rule sets.** A plugin is a valid scan target if it satisfies the install-count requirements of *at least one* of the two programs. Whether any specific finding from that plugin is bountyable, and through which program, is decided per-finding at the triage stage using each program's full rules. Do not pre-narrow the scan target by guessing which bug classes are likely to be found.
 
 ### 5. Plugin must not have been scanned in this project before
 Check the runs/ directory for prior intake.json files containing the plugin slug. Don't re-scan unless explicitly asked.
-
-### 6. Plugin must NOT be closed or removed from wordpress.org
-The readme will say "This plugin has been closed as of YYYY-MM-DD and is not available for download." Wordfence considers closed plugins out of scope.
-
----
 
 ## Quality heuristics (rank candidates that pass hard requirements)
 
@@ -68,6 +67,7 @@ Higher score = better candidate. These are tie-breakers, not hard requirements.
 - **Niche functionality**: classifieds, recipes, events, memberships, directories, file managers — often have unusual data models that lead to overlooked bugs.
 
 ### Weak positive signals
+- A release in the past 6 months and current "Tested up to" metadata
 - Active issue resolution (>50% of issues resolved in last 2 months)
 - Multiple contributors (less likely to have a sole-maintainer mistake pattern)
 - WordPress 6.x+ tested
@@ -80,7 +80,8 @@ Higher score = better candidate. These are tie-breakers, not hard requirements.
 - Recent vendor security wave just shipped (likely all the obvious bugs are gone, only deeper bugs remain)
 
 ### Anti-patterns to avoid
-- Plugins with <1,000 installs (below the lowest Patchstack floor; only worth scanning if you're 1337 tier on Wordfence and targeting High Threat / Stored XSS / SQLi specifically)
+- Plugins with <1,000 installs unless they qualify for a Wordfence low-install
+  class or are explicitly enrolled in Patchstack mVDP
 - Plugins where the only attack surface is admin-only (PR:H bugs are out of scope)
 - Plugins that primarily wrap external services (the bugs are usually in the service, not the plugin)
 

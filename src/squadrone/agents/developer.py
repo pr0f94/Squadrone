@@ -248,7 +248,7 @@ class DeveloperAgent:
         if code_slice:
             # Cap to keep token cost bounded; the developer just needs to see entry-point context.
             snippet = code_slice if len(code_slice) <= 12000 else code_slice[:12000] + "\n... [truncated]"
-            user_parts.append(f"CODE AT/AROUND ENTRY POINT ({hypothesis.file}):\n```php\n{snippet}\n```")
+            user_parts.append(f"SOURCE CONTEXT FOR REACHABILITY:\n```php\n{snippet}\n```")
         if readme_excerpt:
             excerpt = readme_excerpt[:2000]
             user_parts.append(f"README EXCERPT:\n{excerpt}")

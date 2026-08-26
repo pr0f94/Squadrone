@@ -162,3 +162,31 @@ def test_recognises_wpadminbar_marker_alone():
     })
     result = WP_LOGIN.wp_login(session, "http://localhost:8100", "admin", "password")
     assert result.success
+
+
+def test_fetches_rest_nonce_for_authenticated_session():
+    session = FakeSession({
+        "admin-ajax.php": lambda s, u, p: _Resp(200, "abc123def0", url=u),
+    })
+
+    result = WP_LOGIN.wp_rest_nonce(session, "http://localhost:8100")
+
+    assert result.success
+    assert result.nonce == "abc123def0"
+    assert session.calls == [
+        (
+            "GET",
+            "http://localhost:8100/wp-admin/admin-ajax.php?action=rest-nonce",
+        ),
+    ]
+
+
+def test_rejects_non_nonce_rest_response():
+    session = FakeSession({
+        "admin-ajax.php": lambda s, u, p: _Resp(200, "<html>login</html>", url=u),
+    })
+
+    result = WP_LOGIN.wp_rest_nonce(session, "http://localhost:8100")
+
+    assert not result.success
+    assert "not a nonce" in result.reason

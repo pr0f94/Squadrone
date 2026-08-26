@@ -9,10 +9,11 @@ from ..agents.reporter import ReporterAgent
 from ..agents.runtime import AgentRuntime
 from ..schemas.config import PipelineConfig
 from ..schemas.finding import DedupStatus, Finding
-from ..services.artifacts import atomic_write_text
+from ..services.artifacts import atomic_write_jsonl, atomic_write_text
 from ..services.budget import BudgetTracker
 from ..services.decision_ledger import append_decision
 from ..services.quality_gate import grade_finding_for_report
+from ..services.scope import verified_programs
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,33 @@ async def run(
     plugin_root = Path(plugin_path) if plugin_path else None
 
     for f in findings:
+        grade = grade_finding_for_report(f)
+        f.hypothesis.evidence_summary = grade.evidence
+        f.hypothesis.derived_severity = grade.severity
+        f.hypothesis.quality_gate = {
+            "accepted": grade.accepted,
+            "reason": grade.reason,
+            "warnings": grade.warnings,
+            "rules": grade.rules,
+        }
+        score = grade.severity.get("cvss_estimate")
+        vector = grade.severity.get("cvss_vector")
+        f.cvss_estimate = str(score) if score is not None else None
+        f.cvss_vector = str(vector) if vector else None
+        if not grade.accepted:
+            logger.info("report: quality gate blocked %s — %s", f.id, grade.reason)
+            append_decision(
+                run_dir,
+                stage="report",
+                action="block",
+                result="quality_gate_blocked",
+                hypothesis_id=f.hypothesis.id,
+                finding_id=f.id,
+                reason=grade.reason,
+                details={"rules": grade.rules, "warnings": grade.warnings},
+            )
+            continue
+
         if f.dedup_status == DedupStatus.KNOWN_DUPE:
             logger.info("report: skipping %s (KNOWN_DUPE)", f.id)
             append_decision(
@@ -71,59 +99,30 @@ async def run(
             )
             continue
 
-        if config.quality.enabled and config.quality.report_grader:
-            grade = grade_finding_for_report(
-                f,
-                require_evidence_schema=config.quality.require_evidence_schema,
-                false_positive_rules=config.quality.false_positive_rules,
-                recompute=config.quality.recompute_severity,
+        programs, scope_reasons = verified_programs(f)
+        f.hypothesis.bounty_programs = programs
+        if not programs:
+            reason = "; ".join(
+                f"{program}: {detail}" for program, detail in scope_reasons.items()
             )
-            f.hypothesis.evidence_summary = grade.evidence
-            f.hypothesis.derived_severity = grade.severity
-            f.hypothesis.quality_gate = {
-                "accepted": grade.accepted,
-                "reason": grade.reason,
-                "warnings": grade.warnings,
-                "rules": grade.rules,
-            }
-            if f.cvss_estimate is None:
-                f.cvss_estimate = str(grade.severity.get("cvss_estimate"))
-            if not grade.accepted:
-                programs = list(f.hypothesis.bounty_programs) or ["wordfence"]
-                for program in programs:
-                    blocked_path = run_dir / f"report_{f.id}_{program}_QUALITY_BLOCKED.md"
-                    atomic_write_text(
-                        blocked_path,
-                        f"# QUALITY GATE BLOCKED: {f.id} ({program})\n\n"
-                        f"**Reason:** {grade.reason}\n\n"
-                        f"**Derived severity:** {grade.severity}\n\n"
-                        f"**Evidence summary:** {grade.evidence}\n\n"
-                        f"**Warnings:** {grade.warnings or 'none'}\n\n"
-                        "This confirmed finding was not converted into a submission draft because "
-                        "the quality gate did not find enough submit-worthy impact."
-                    )
-                    out_paths.append(str(blocked_path))
-                    logger.info("report: quality gate blocked %s (%s) — wrote %s", f.id, program, blocked_path)
-                    append_decision(
-                        run_dir,
-                        stage="report",
-                        action="block",
-                        result="quality_gate_blocked",
-                        hypothesis_id=f.hypothesis.id,
-                        finding_id=f.id,
-                        reason=grade.reason,
-                        artifact=blocked_path,
-                        details={"program": program, "rules": grade.rules, "warnings": grade.warnings},
-                    )
-                continue
+            logger.info("report: skipping %s (no current disclosure route: %s)", f.id, reason)
+            append_decision(
+                run_dir,
+                stage="report",
+                action="skip",
+                result="no_eligible_program_after_verification",
+                hypothesis_id=f.hypothesis.id,
+                finding_id=f.id,
+                reason=reason,
+            )
+            continue
 
         code_slice = None
         if plugin_root is not None:
             code_slice = _read_code_slice(plugin_root, f.hypothesis.file, f.hypothesis.line)
 
-        # Generate one report per qualifying program. Default to Wordfence if
-        # routing metadata is unexpectedly absent.
-        programs = list(f.hypothesis.bounty_programs) or ["wordfence"]
+        # Generate one report per qualifying program.
+        programs = list(f.hypothesis.bounty_programs)
         for program in programs:
             md = await reporter.write(
                 f,
@@ -147,4 +146,5 @@ async def run(
                 artifact=out,
                 details={"program": program, "bytes": len(md)},
             )
+    atomic_write_jsonl(run_dir / "findings.jsonl", findings)
     return out_paths
