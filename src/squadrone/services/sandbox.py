@@ -381,6 +381,7 @@ class SandboxManager:
         # wp-init.sh may not have completed `wp core install` by the time the port answers;
         # ensure it has, then we are ready.
         await self._ensure_wp_installed()
+        await self._ensure_wp_upload_path()
         self._booted = True
 
     async def teardown(self) -> None:
@@ -584,9 +585,10 @@ class SandboxManager:
             await _run(
                 "docker",
                 "exec",
+                "--user",
+                WORDPRESS_WEB_USER,
                 self.container_name,
                 "wp",
-                "--allow-root",
                 "core",
                 "install",
                 f"--url={self.target_url}",
@@ -596,6 +598,34 @@ class SandboxManager:
                 f"--admin_email={self.config.wp_admin_email}",
                 "--skip-email",
             )
+
+    async def _ensure_wp_upload_path(self) -> None:
+        """Create and validate WordPress's current upload path as the web identity.
+
+        A fresh site has not necessarily handled a media upload yet. Establishing
+        this ordinary WordPress prerequisite prevents plugin file operations from
+        failing only because the disposable baseline lacks its dated uploads
+        directory. No permissions or ownership are changed: an image that already
+        contains an unwritable path fails closed instead of being broadened.
+        """
+        assert self.wp_cli is not None
+        php = (
+            "$upload = wp_upload_dir(); $path = $upload['path'] ?? ''; "
+            "if (!$path || !wp_mkdir_p($path) || !is_writable($path)) { "
+            "WP_CLI::error('WordPress upload path is not writable by the web user.'); "
+            "} echo $path;"
+        )
+        rc, out, err = await self.wp_cli._exec_result(
+            "eval", php, user=WORDPRESS_WEB_USER
+        )
+        if rc != 0:
+            raise RuntimeError(
+                "failed to prepare WordPress upload path as web user: "
+                + (err or out).strip()[:300]
+            )
+        logger.info(
+            "sandbox upload path ready as %s: %s", WORDPRESS_WEB_USER, out.strip()
+        )
 
     # ── operations ──────────────────────────────────────────────
 

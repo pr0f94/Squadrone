@@ -115,7 +115,9 @@ def _parse_json_resilient(content: str) -> Optional[dict]:
     # candidate `{` start. Must come BEFORE the trailing-data fallback —
     # otherwise raw_decode finds a small INNER complete object and returns
     # it instead of recovering the outer (unclosed) one.
-    if stripped.count("{") + stripped.count("[") > stripped.count("}") + stripped.count("]"):
+    if stripped.count("{") + stripped.count("[") > stripped.count("}") + stripped.count(
+        "]"
+    ):
         for start in (i for i, ch in enumerate(stripped) if ch == "{"):
             candidate = _autoclose_unbalanced(stripped[start:])
             try:
@@ -161,7 +163,9 @@ class DeveloperAgent:
             return self.followup_llm_options
         return self.llm_options
 
-    async def _call_setup_json(self, *, model: str, messages: list[dict], agent_name: str) -> dict | None:
+    async def _call_setup_json(
+        self, *, model: str, messages: list[dict], agent_name: str
+    ) -> dict | None:
         """Call a setup-oriented prompt and retry once if no JSON object is recoverable."""
         content = await call_llm_oneshot(
             model=model,
@@ -175,8 +179,11 @@ class DeveloperAgent:
         if parsed is not None:
             return parsed
 
-        logger.warning("%s: could not extract JSON object from response (len=%d); retrying once",
-                       agent_name, len(content))
+        logger.warning(
+            "%s: could not extract JSON object from response (len=%d); retrying once",
+            agent_name,
+            len(content),
+        )
         retry_messages = [
             *messages,
             {
@@ -188,8 +195,8 @@ class DeveloperAgent:
                 "content": (
                     "Your previous response was empty or not valid JSON. "
                     "Return ONLY one JSON object matching this shape: "
-                    "{\"rationale\":\"...\",\"commands\":[[\"eval\",\"...\"]],"
-                    "\"failure_class\":null}. Use an empty commands array if no setup is needed."
+                    '{"rationale":"...","commands":[["eval","..."]],'
+                    '"failure_class":null}. Use an empty commands array if no setup is needed.'
                 ),
             },
         ]
@@ -203,8 +210,11 @@ class DeveloperAgent:
         )
         parsed = _parse_json_resilient(retry_content)
         if parsed is None:
-            logger.warning("%s: retry also failed to produce JSON (len=%d)",
-                           agent_name, len(retry_content))
+            logger.warning(
+                "%s: retry also failed to produce JSON (len=%d)",
+                agent_name,
+                len(retry_content),
+            )
         return parsed
 
     async def consult(
@@ -247,8 +257,14 @@ class DeveloperAgent:
         user_parts.append(f"HYPOTHESIS:\n{hypothesis.model_dump_json(indent=2)}")
         if code_slice:
             # Cap to keep token cost bounded; the developer just needs to see entry-point context.
-            snippet = code_slice if len(code_slice) <= 12000 else code_slice[:12000] + "\n... [truncated]"
-            user_parts.append(f"SOURCE CONTEXT FOR REACHABILITY:\n```php\n{snippet}\n```")
+            snippet = (
+                code_slice
+                if len(code_slice) <= 12000
+                else code_slice[:12000] + "\n... [truncated]"
+            )
+            user_parts.append(
+                f"SOURCE CONTEXT FOR REACHABILITY:\n```php\n{snippet}\n```"
+            )
         if readme_excerpt:
             excerpt = readme_excerpt[:2000]
             user_parts.append(f"README EXCERPT:\n{excerpt}")
@@ -268,11 +284,18 @@ class DeveloperAgent:
             commands_raw = []
         out: list[list[str]] = []
         for cmd in commands_raw:
-            if isinstance(cmd, list) and all(isinstance(x, (str, int, float)) for x in cmd):
+            if isinstance(cmd, list) and all(
+                isinstance(x, (str, int, float)) for x in cmd
+            ):
                 out.append([str(x) for x in cmd])
         rationale = str(parsed.get("rationale") or "").strip()
         if rationale or out:
-            logger.info("propose_setup [%s]: %s — %d commands", hypothesis.id, rationale[:200], len(out))
+            logger.info(
+                "propose_setup [%s]: %s — %d commands",
+                hypothesis.id,
+                rationale[:200],
+                len(out),
+            )
         return SetupPlan(rationale=rationale, commands=out)
 
     async def propose_setup_followup(
@@ -284,6 +307,8 @@ class DeveloperAgent:
         last_stderr: str,
         last_error_log: str,
         schema_diagnostics: str = "",
+        code_slice: Optional[str] = None,
+        setup_execution_feedback: Optional[str] = None,
     ) -> SetupPlan:
         """After a failed PoC iteration, ask the developer if the failure was setup-shaped.
 
@@ -291,16 +316,36 @@ class DeveloperAgent:
         looks like an exploit-shape problem the PoC author should handle). Caller is
         responsible for capping how many followups it requests per hypothesis.
         """
-        prior_cmds = "\n".join(f"  - wp {' '.join(c)}" for c in prior_plan.commands) or "  (none)"
+        prior_cmds = (
+            "\n".join(f"  - wp {' '.join(c)}" for c in prior_plan.commands)
+            or "  (none)"
+        )
         parts = [
             f"HYPOTHESIS:\n{hypothesis.model_dump_json(indent=2)}",
             f"PRIOR SETUP RATIONALE:\n{prior_plan.rationale or '(none)'}",
-            f"PRIOR SETUP COMMANDS (already executed):\n{prior_cmds}",
+            (
+                "PRIOR SETUP COMMANDS (PROPOSED; NOT NECESSARILY EXECUTED):\n"
+                f"{prior_cmds}"
+            ),
             f"FAILED PoC ITERATION: #{last_iteration}",
             f"PoC STDOUT (truncated):\n{(last_stdout or '')[:3000]}",
             f"PoC STDERR (truncated):\n{(last_stderr or '')[:1500]}",
             f"WP DEBUG.LOG (truncated):\n{(last_error_log or '')[:1500]}",
         ]
+        if setup_execution_feedback:
+            parts.append(
+                "AUTHORITATIVE SETUP EXECUTION FEEDBACK:\n"
+                f"{setup_execution_feedback[:6000]}"
+            )
+        if code_slice:
+            snippet = (
+                code_slice
+                if len(code_slice) <= 12000
+                else code_slice[:12000] + "\n... [truncated]"
+            )
+            parts.append(
+                f"BOUNDED SOURCE CONTEXT FOR REACHABILITY:\n```php\n{snippet}\n```"
+            )
         if schema_diagnostics:
             parts.append(f"SCHEMA DIAGNOSTICS:\n{schema_diagnostics[:4000]}")
         messages = [
@@ -319,13 +364,20 @@ class DeveloperAgent:
             commands_raw = []
         out: list[list[str]] = []
         for cmd in commands_raw:
-            if isinstance(cmd, list) and all(isinstance(x, (str, int, float)) for x in cmd):
+            if isinstance(cmd, list) and all(
+                isinstance(x, (str, int, float)) for x in cmd
+            ):
                 out.append([str(x) for x in cmd])
         rationale = str(parsed.get("rationale") or "").strip()
         failure_class = parsed.get("failure_class")
         if failure_class not in ("setup", "exploit_shape", "poc_code"):
             failure_class = None
-        logger.info("propose_setup_followup [%s] iter %d: class=%s %s — %d commands",
-                    hypothesis.id, last_iteration, failure_class or "(unset)",
-                    rationale[:200], len(out))
+        logger.info(
+            "propose_setup_followup [%s] iter %d: class=%s %s — %d commands",
+            hypothesis.id,
+            last_iteration,
+            failure_class or "(unset)",
+            rationale[:200],
+            len(out),
+        )
         return SetupPlan(rationale=rationale, commands=out, failure_class=failure_class)

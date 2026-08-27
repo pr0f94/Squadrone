@@ -22,13 +22,17 @@ Read the hypothesis carefully — especially `entry_point`, `file`, `taint_path`
 - **Admin AJAX (`wp_ajax_*` / `wp_ajax_nopriv_*`)** → fires from the start; usually needs no setup beyond the test users.
 - **Standalone PHP file in the plugin dir** (file accessed directly without `wp-load.php`) → reachable immediately; nothing to configure unless its behaviour depends on plugin options.
 - **Bug needs a pre-existing record** (file in upload dir, DB row, option value) → seed benign prerequisite state via `wp post create`, `wp option update`, `wp user meta update`, or the plugin's own APIs.
-- **Bug needs the plugin in a configured state** (e.g., a feature toggle, a default upload directory) → use `wp option update <option_name> <value>`. Plugin-specific option names will be visible in the code slice or hypothesis preconditions.
+- **Bug needs the plugin in a configured state** (e.g., a feature toggle, a default upload directory) → use `wp option update <option_name> <value>` only when the exact option name and value are grounded in the supplied source context.
 
-Every plugin-specific option key, table, post type, status, and setting value in
-your commands must appear verbatim in the supplied source context. Never derive
-an identifier from a human feature label: for example, a feature called "Public
-API" might use `public_api`, not `module_api`. If the exact identifier is not
-source-grounded, do not guess it.
+Every plugin-specific option key, table, column, post type, status, hook, class,
+method, and setting value in your commands must appear verbatim in the supplied
+source context. Never derive an identifier from a human feature label or from a
+similar plugin. If the exact identifier is not source-grounded, do not guess it.
+
+The hypothesis `preconditions` are requirements for reachability, not observations
+of the current sandbox. Establish them only through source-grounded commands, or
+leave commands empty and explain which identifier or path is not grounded. Do not
+claim a precondition is already satisfied merely because the hypothesis names it.
 
 ### Critical: setup must not plant the exploit
 
@@ -44,9 +48,32 @@ If a stored bug requires attacker-controlled data, setup should only create the 
 
 If the hypothesis's `preconditions` field already names what's needed in plain language, treat it as your spec.
 
+### Critical: preserve sandbox ownership and permissions
+
+WP-CLI runs under the sandbox's managed web-server operating-system user. Never
+change filesystem permissions, ownership, or the process umask. This prohibition
+includes `chmod`, `chown`, `chgrp`, `umask`, `wp_chmod`, equivalent WordPress or
+filesystem APIs, and indirect permission-mutation techniques.
+
+If source-grounded reachability requires a legitimate runtime directory, issue a
+clean `wp eval` command that calls `wp_mkdir_p($path)` alone. Let the managed web
+user and normal defaults determine ownership and mode. Do not combine directory
+creation with any permission or ownership operation.
+
+Setup commands are safety-checked atomically. If one command mixes an allowed
+operation with a prohibited one, the whole command is blocked and none of it is
+executed. Reissue the allowed operation as a clean, self-contained command without
+the prohibited operation.
+
 ### Critical: WP-CLI runs without a logged-in user
 
-`wp eval` executes with **no current user** (user ID 0). Most plugins gate their model `save()` / `update()` / `delete()` methods behind capability checks (`current_user_can('edit_X')`, `can_manage()`, etc.) — these silently return `false` in CLI context, with no exception thrown and no error logged. The data you tried to seed simply never gets written, and the next stage's PoC has nothing to attack.
+Although WP-CLI runs as the managed web-server operating-system user, `wp eval`
+executes with **no WordPress current user** (user ID 0). Most plugins gate their
+model `save()` / `update()` / `delete()` methods behind capability checks
+(`current_user_can('edit_X')`, `can_manage()`, etc.) — these silently return
+`false` in CLI context, with no exception thrown and no error logged. The data you
+tried to seed simply never gets written, and the next stage's PoC has nothing to
+attack.
 
 **Always prefix `wp eval` calls that invoke plugin model methods with `wp_set_current_user(1);`** to assume the admin user. Example:
 

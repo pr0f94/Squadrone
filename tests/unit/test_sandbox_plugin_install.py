@@ -25,6 +25,115 @@ def _manager() -> SandboxManager:
 
 
 @pytest.mark.asyncio
+async def test_ensure_upload_path_runs_as_web_identity_without_permission_changes():
+    calls: list[tuple[tuple[str, ...], str | None]] = []
+
+    class FakeWPCli:
+        async def _exec_result(self, *args: str, user: str | None = None):
+            calls.append((args, user))
+            return 0, "/var/www/html/wp-content/uploads/2026/08", ""
+
+    manager = _manager()
+    manager.wp_cli = FakeWPCli()  # type: ignore[assignment]
+
+    await manager._ensure_wp_upload_path()
+
+    assert len(calls) == 1
+    args, user = calls[0]
+    assert args[0] == "eval"
+    assert "wp_upload_dir()" in args[1]
+    assert "wp_mkdir_p($path)" in args[1]
+    assert "is_writable($path)" in args[1]
+    assert "chmod" not in args[1]
+    assert "chown" not in args[1]
+    assert user == "www-data"
+
+
+@pytest.mark.asyncio
+async def test_ensure_upload_path_fails_closed_when_web_user_cannot_write():
+    class FakeWPCli:
+        async def _exec_result(self, *args: str, user: str | None = None):
+            return (
+                1,
+                "",
+                "Error: WordPress upload path is not writable by the web user.",
+            )
+
+    manager = _manager()
+    manager.wp_cli = FakeWPCli()  # type: ignore[assignment]
+
+    with pytest.raises(RuntimeError, match="failed to prepare WordPress upload path"):
+        await manager._ensure_wp_upload_path()
+
+
+@pytest.mark.asyncio
+async def test_boot_prepares_upload_path_before_becoming_ready(
+    monkeypatch, tmp_path
+):
+    events: list[str] = []
+    workdir = tmp_path / "sandbox-workdir"
+    workdir.mkdir()
+
+    async def fake_run(*_args: str, **_kwargs) -> tuple[int, str, str]:
+        events.append("compose")
+        return 0, "", ""
+
+    async def fake_wait() -> None:
+        events.append("wait")
+
+    async def fake_ensure() -> None:
+        events.append("ensure")
+
+    async def fake_upload_path() -> None:
+        assert manager._booted is False
+        events.append("upload_path")
+
+    manager = _manager()
+    monkeypatch.setattr(sandbox_module, "_alloc_port", lambda: 8199)
+    monkeypatch.setattr(
+        sandbox_module.tempfile,
+        "mkdtemp",
+        lambda **_kwargs: str(workdir),
+    )
+    monkeypatch.setattr(sandbox_module, "_run", fake_run)
+    monkeypatch.setattr(manager, "_wait_for_wordpress", fake_wait)
+    monkeypatch.setattr(manager, "_ensure_wp_installed", fake_ensure)
+    monkeypatch.setattr(manager, "_ensure_wp_upload_path", fake_upload_path)
+
+    await manager.boot()
+
+    assert events == ["compose", "wait", "ensure", "upload_path"]
+    assert manager._booted is True
+
+
+@pytest.mark.asyncio
+async def test_fallback_core_install_runs_as_wordpress_web_identity(monkeypatch):
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_run(*args: str, **_kwargs) -> tuple[int, str, str]:
+        calls.append(args)
+        if "is-installed" in args:
+            return 1, "", "not installed"
+        return 0, "", ""
+
+    manager = _manager()
+    monkeypatch.setattr(sandbox_module, "_run", fake_run)
+
+    await manager._ensure_wp_installed()
+
+    install = next(args for args in calls if "install" in args)
+    assert install[:6] == (
+        "docker",
+        "exec",
+        "--user",
+        "www-data",
+        "test-project-wordpress-1",
+        "wp",
+    )
+    assert "--allow-root" not in install
+
+
+@pytest.mark.asyncio
 async def test_install_and_activation_run_as_wordpress_web_identity(monkeypatch):
     events: list[tuple] = []
 

@@ -12,7 +12,7 @@ from importlib.resources import files as _pkg_files
 from pathlib import Path
 from typing import Any
 
-from ..agents.developer import DeveloperAgent
+from ..agents.developer import DeveloperAgent, SetupPlan
 from ..agents.poc_author import PoCAuthorAgent
 from ..agents.runtime import AgentRuntime
 from ..schemas.config import PipelineConfig
@@ -83,7 +83,7 @@ def _next_finding_id() -> str:
 
 _WP_SETUP_ERROR_RE = re.compile(
     r"WordPress database error|Unknown column|Table .* doesn't exist|does not exist|"
-    r"PHP Fatal error|Parse error|Warning:",
+    r"PHP (?:Fatal error|Warning):|Parse error",
     re.IGNORECASE,
 )
 
@@ -122,6 +122,9 @@ _FILESYSTEM_PERMISSION_MUTATION_RE = re.compile(
     re.IGNORECASE,
 )
 
+_SETUP_FOLLOWUP_CAP = 2
+_ATOMIC_SETUP_RETRY_CAP = 1
+
 
 def _setup_command_plants_exploit_payload(
     args: list[str], hyp: Hypothesis | None
@@ -156,7 +159,7 @@ def _setup_command_plants_exploit_payload(
 
 
 def _summarise_forbidden_setup(results: list[dict]) -> str:
-    blocked = [item for item in results if item.get("forbidden_payload_seed")]
+    blocked = [item for item in results if _setup_result_taints_confirmation(item)]
     lines: list[str] = []
     for item in blocked:
         cmd = " ".join(item.get("args", [])[:10])
@@ -170,15 +173,41 @@ def _summarise_forbidden_setup(results: list[dict]) -> str:
 def _summarise_setup_results(results: list[dict]) -> str:
     lines: list[str] = []
     for item in results:
-        status = "FAILED" if item.get("failed") else "OK"
+        blocked = item.get("blocked_before_execution") is True
+        status = (
+            "BLOCKED BEFORE EXECUTION"
+            if blocked
+            else ("FAILED" if item.get("failed") else "OK")
+        )
         cmd = " ".join(item.get("args", [])[:8])
-        output = (
-            (item.get("output") or item.get("stderr") or "").strip().replace("\n", " ")
+        output = " ".join(
+            part.strip().replace("\n", " ")
+            for part in (item.get("output") or "", item.get("stderr") or "")
+            if part.strip()
         )
         if len(output) > 500:
             output = output[:500] + "..."
+        if blocked:
+            suffix = (
+                " No part of this command ran. Submit a new command containing only "
+                "permitted prerequisite operations."
+            )
+            output = (output + suffix).strip()
         lines.append(f"{status}: wp {cmd} -> {output}")
     return "\n".join(lines)
+
+
+def _setup_result_taints_confirmation(item: dict) -> bool:
+    """Whether a forbidden setup result can have contaminated the sandbox.
+
+    New results explicitly record atomic pre-execution blocks. Older artifacts did
+    not, so a legacy forbidden result remains conservatively tainting.
+    """
+    if not item.get("forbidden_payload_seed"):
+        return False
+    if item.get("blocked_before_execution") is True:
+        return False
+    return item.get("executed", True) is not False
 
 
 async def _run_setup_commands(
@@ -208,6 +237,8 @@ async def _run_setup_commands(
                     "failed": True,
                     "forbidden_payload_seed": True,
                     "forbidden_payload_seed_reason": forbidden_reason,
+                    "blocked_before_execution": True,
+                    "executed": False,
                 }
             )
             continue
@@ -223,6 +254,8 @@ async def _run_setup_commands(
                 "failed": failed,
                 "forbidden_payload_seed": bool(forbidden_reason),
                 "forbidden_payload_seed_reason": forbidden_reason,
+                "blocked_before_execution": False,
+                "executed": True,
             }
             results.append(result)
             log = logger.warning if failed or forbidden_reason else logger.info
@@ -244,6 +277,9 @@ async def _run_setup_commands(
                     "failed": True,
                     "forbidden_payload_seed": bool(forbidden_reason),
                     "forbidden_payload_seed_reason": forbidden_reason,
+                    "blocked_before_execution": False,
+                    # The WP-CLI call was dispatched and could have partially run.
+                    "executed": True,
                 }
             )
     return results
@@ -293,6 +329,103 @@ _SOURCE_LOCATION_RE = re.compile(
     r"(?P<path>[A-Za-z0-9_./-]+\.php):(?P<line>[1-9][0-9]*)",
 )
 
+_SETUP_SEMANTIC_TOKEN_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]{4,}\b")
+_SETUP_ROUTE_PATH_RE = re.compile(r"/[A-Za-z0-9_./-]+")
+_SETUP_SEMANTIC_TOKEN_STOPWORDS = frozenset(
+    {
+        "attacker",
+        "callback",
+        "classes",
+        "filename",
+        "logged",
+        "multipart",
+        "plugin",
+        "request",
+        "response",
+        "subscriber",
+        "target",
+        "uploads",
+        "wordpress",
+    }
+)
+
+
+def _setup_semantic_tokens(hypothesis: Hypothesis) -> list[str]:
+    """Extract source identifiers that can locate an uncited entry-point guard."""
+    # Setup needs the registration and reachability guard, not every downstream
+    # symbol in a potentially long taint path. Keeping this entry-focused also
+    # prevents common sink helpers from pulling unrelated files into the bounded
+    # context ahead of the real route.
+    source_text = "\n".join([hypothesis.entry_point, *hypothesis.taint_path[:2]])
+    tokens: list[str] = []
+
+    # Preserve the final route segment, including dashed/all-lowercase routes that
+    # do not look like PHP identifiers. The leading slash makes short route names
+    # substantially less noisy when searched in source.
+    route_paths = _SETUP_ROUTE_PATH_RE.findall(hypothesis.entry_point)
+    if route_paths:
+        tail = route_paths[-1].rstrip("/").rsplit("/", 1)[-1]
+        route_token = f"/{tail}"
+        if len(tail) >= 4 and route_token not in tokens:
+            tokens.append(route_token)
+
+    for token in _SETUP_SEMANTIC_TOKEN_RE.findall(source_text):
+        lowered = token.lower()
+        if lowered in _SETUP_SEMANTIC_TOKEN_STOPWORDS:
+            continue
+        # Prefer identifiers over prose. Underscores and camelCase are strong PHP
+        # source signals; an all-lowercase route component is too noisy on its own.
+        # Class names are retained at lower priority because their bootstrap site
+        # often carries the option storage or module construction needed for setup.
+        if "_" not in token and re.search(r"[a-z][A-Z]", token) is None:
+            continue
+        if token not in tokens:
+            tokens.append(token)
+    return tokens[:16]
+
+
+def _add_semantic_setup_locations(
+    plugin_root: Path,
+    hypothesis: Hypothesis,
+    locations: dict[str, set[int]],
+    *,
+    max_extra_files: int = 4,
+) -> None:
+    """Add bounded snippets for entry identifiers when hypotheses omit file:line refs."""
+    tokens = _setup_semantic_tokens(hypothesis)
+    if not tokens:
+        return
+
+    matches: list[tuple[int, int, str, set[int]]] = []
+    for candidate in sorted(plugin_root.rglob("*.php")):
+        try:
+            lines = candidate.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        first_line_by_token: dict[int, int] = {}
+        for line_number, line in enumerate(lines, start=1):
+            for token_rank, token in enumerate(tokens):
+                if token_rank not in first_line_by_token and token in line:
+                    first_line_by_token[token_rank] = line_number
+        if first_line_by_token:
+            rel_file = candidate.relative_to(plugin_root).as_posix()
+            matches.append(
+                (
+                    -len(first_line_by_token),
+                    min(first_line_by_token),
+                    rel_file,
+                    set(first_line_by_token.values()),
+                )
+            )
+
+    added_files = 0
+    for _term_count, _rank, rel_file, matched_lines in sorted(matches):
+        if rel_file not in locations:
+            if added_files >= max_extra_files:
+                continue
+            added_files += 1
+        locations.setdefault(rel_file, set()).update(matched_lines)
+
 
 def _resolve_plugin_file(plugin_root: Path, rel_file: str) -> Path | None:
     candidate = plugin_root / rel_file
@@ -326,8 +459,19 @@ def _build_setup_code_context(
     )
     for match in _SOURCE_LOCATION_RE.finditer(source_text):
         locations.setdefault(match.group("path"), set()).add(int(match.group("line")))
+
     if hypothesis.file:
         locations.setdefault(hypothesis.file, set()).add(hypothesis.line)
+
+    # Specialist output does not always retain file:line citations for the entry
+    # route. Recover the registration/feature-gate file from source identifiers so
+    # setup agents do not have to invent plugin option names after a route-level 404.
+    _add_semantic_setup_locations(plugin_root, hypothesis, locations)
+    if hypothesis.file:
+        sink_lines = locations.pop(hypothesis.file)
+        # Keep the primary sink, but render entry/registration files first so a
+        # large sink file cannot consume the bounded context before its guard.
+        locations[hypothesis.file] = sink_lines
 
     sections: list[str] = []
     used = 0
@@ -340,9 +484,9 @@ def _build_setup_code_context(
         except OSError:
             continue
 
-        selected = set(range(1, min(len(lines), 120) + 1))
+        selected = set(range(1, min(len(lines), 35) + 1))
         for line in cited_lines:
-            selected.update(range(max(1, line - 35), min(len(lines), line + 35) + 1))
+            selected.update(range(max(1, line - 25), min(len(lines), line + 25) + 1))
 
         rendered = [f"--- {rel_file} ---"]
         previous = 0
@@ -399,48 +543,181 @@ async def _verify_one(
     attempts: list[PoCAttempt] = []
     last_evidence: dict = {}
     expected_attacker_role = infer_attacker_role(hyp)
+    code_slice: str | None = None
+    readme: str | None = None
+    if developer is not None:
+        plugin_root = Path(plugin_path)
+        code_slice = _build_setup_code_context(plugin_root, hyp)
+        readme = _read_readme(plugin_root)
+    setup_plan = SetupPlan()
+    setup_exec_results: list[dict] = []
+    followups_used = 0
+    # Preserve the historical per-hypothesis limit. Callback and stage-requested
+    # repairs share it, so neither route can bypass the cost bound.
+    followup_cap = _SETUP_FOLLOWUP_CAP
+
+    def _checkpoint_setup_results() -> None:
+        """Persist exact setup execution state for audit and interrupted runs."""
+        atomic_write_json(
+            poc_dir / "setup_results.json",
+            {
+                "followups_used": followups_used,
+                "followup_cap": followup_cap,
+                "proposed_commands": setup_plan.commands,
+                "results": setup_exec_results,
+            },
+        )
 
     # Bound once the sandbox and developer are available.
-    setup_callback_state: dict[str, Any] = {"sb": None, "setup_plan_ref": None}
+    setup_callback_state: dict[str, Any] = {"sb": None}
+
+    async def _request_setup_followup(
+        sb_local: SandboxManager,
+        *,
+        last_iteration: int,
+        last_stdout: str,
+        last_stderr: str,
+        last_error_log: str,
+        schema_diagnostics: str = "",
+        setup_execution_feedback: str = "",
+    ) -> tuple[SetupPlan | None, list[tuple[SetupPlan, list[dict]]]]:
+        """Request and apply bounded setup repairs, retrying atomic blocks directly."""
+        nonlocal followups_used
+
+        rounds: list[tuple[SetupPlan, list[dict]]] = []
+        followup: SetupPlan | None = None
+        feedback = setup_execution_feedback
+        diagnostics = schema_diagnostics
+        atomic_retries = 0
+        while developer is not None and followups_used < followup_cap:
+            # Count every developer request, including empty or errored responses.
+            followups_used += 1
+            try:
+                followup = await developer.propose_setup_followup(
+                    hypothesis=hyp,
+                    prior_plan=setup_plan,
+                    last_iteration=last_iteration,
+                    last_stdout=last_stdout,
+                    last_stderr=last_stderr,
+                    last_error_log=last_error_log,
+                    schema_diagnostics=diagnostics,
+                    code_slice=code_slice,
+                    setup_execution_feedback=feedback,
+                )
+            except Exception as exc:
+                logger.warning("propose_setup_followup for %s failed: %s", hyp.id, exc)
+                _checkpoint_setup_results()
+                return None, rounds
+
+            if not followup.commands:
+                _checkpoint_setup_results()
+                return followup, rounds
+
+            logger.info(
+                "verify: %s applying %d followup setup commands (round %d/%d)",
+                hyp.id,
+                len(followup.commands),
+                followups_used,
+                followup_cap,
+            )
+            results = await _run_setup_commands(
+                sb_local, followup.commands, hypothesis=hyp
+            )
+            setup_exec_results.extend(results)
+            # Preserve proposed history, but execution status is carried separately.
+            setup_plan.commands.extend(followup.commands)
+            rounds.append((followup, results))
+            _checkpoint_setup_results()
+
+            if not any(item.get("failed") for item in results):
+                return followup, rounds
+
+            # A mixed safe/forbidden argv is rejected atomically. Feed the exact
+            # non-execution back once so a clean replacement can be issued without
+            # spending a PoC iteration. Ordinary execution failures return to the
+            # PoC loop instead of consuming the whole followup budget up front.
+            blocked_before_execution = any(
+                item.get("blocked_before_execution") is True for item in results
+            )
+            if (
+                not blocked_before_execution
+                or atomic_retries >= _ATOMIC_SETUP_RETRY_CAP
+            ):
+                return followup, rounds
+            atomic_retries += 1
+
+            latest_feedback = _summarise_setup_results(results)
+            cumulative_feedback = _summarise_setup_results(setup_exec_results)
+            feedback = (
+                f"LATEST SETUP ROUND:\n{latest_feedback}\n\n"
+                f"CUMULATIVE SETUP HISTORY:\n{cumulative_feedback}"
+            )
+            retry_diagnostics = await _collect_schema_diagnostics(
+                sb_local, followup.commands
+            )
+            if retry_diagnostics:
+                diagnostics = "\n".join(
+                    part for part in (diagnostics, retry_diagnostics) if part
+                )
+
+        return followup, rounds
 
     async def _setup_callback(description: str) -> str:
         sb_local = setup_callback_state["sb"]
-        plan_ref = setup_callback_state["setup_plan_ref"]
         if sb_local is None or developer is None:
             return "[request_additional_setup] sandbox or developer not yet ready"
-        try:
-            from ..agents.developer import SetupPlan as _SetupPlan
-
-            followup = await developer.propose_setup_followup(
-                hypothesis=hyp,
-                prior_plan=plan_ref or _SetupPlan(),
-                last_iteration=0,
-                last_stdout="",
-                last_stderr="",
-                last_error_log="",
-                schema_diagnostics=f"PoC author requested additional setup:\n{description}",
-            )
-            if not followup or not followup.commands:
-                return f"[request_additional_setup] developer returned 0 commands (rationale: {(followup.rationale if followup else 'none')!r})"
-            applied_results = await _run_setup_commands(
-                sb_local, followup.commands, hypothesis=hyp
-            )
-            setup_exec_results.extend(applied_results)
-            if any(item.get("forbidden_payload_seed") for item in applied_results):
-                return (
-                    "[request_additional_setup] rejected: setup attempted to directly plant "
-                    "the exploit payload into storage. Submit malicious input through the "
-                    "real plugin entry point instead."
-                )
-            if plan_ref:
-                plan_ref.commands.extend(followup.commands)
-            cmd_summary = "; ".join(" ".join(c) for c in followup.commands[:5])
+        if followups_used >= followup_cap:
             return (
-                f"[request_additional_setup] applied {len(followup.commands)} commands. "
-                f"Rationale: {followup.rationale or '(none)'}\nCommands: {cmd_summary}"
+                "[request_additional_setup] setup followup limit reached "
+                f"({followup_cap}/{followup_cap})"
             )
-        except Exception as e:
-            return f"[request_additional_setup] developer call failed: {e}"
+
+        followup, rounds = await _request_setup_followup(
+            sb_local,
+            last_iteration=0,
+            last_stdout="",
+            last_stderr="",
+            last_error_log="",
+            schema_diagnostics=(
+                f"PoC author requested additional setup:\n{description}"
+            ),
+            setup_execution_feedback=_summarise_setup_results(setup_exec_results),
+        )
+        if not rounds:
+            rationale = followup.rationale if followup else "none"
+            return (
+                "[request_additional_setup] developer returned no applicable commands "
+                f"(rationale: {rationale!r})"
+            )
+
+        final_plan, final_results = rounds[-1]
+        all_round_results = [item for _plan, results in rounds for item in results]
+        result_summary = "\n".join(
+            f"Round {round_number}:\n{_summarise_setup_results(results)}"
+            for round_number, (_plan, results) in enumerate(rounds, start=1)
+        )
+        if any(item.get("failed") for item in final_results):
+            applied = sum(
+                1
+                for item in all_round_results
+                if item.get("executed") and not item.get("failed")
+            )
+            return (
+                "[request_additional_setup] setup remains incomplete; "
+                f"{applied} permitted commands were applied. "
+                "Execution feedback is authoritative:\n"
+                f"{result_summary}"
+            )
+        executed = sum(
+            1
+            for item in all_round_results
+            if item.get("executed") and not item.get("failed")
+        )
+        return (
+            f"[request_additional_setup] applied {executed} permitted commands. "
+            f"Rationale: {final_plan.rationale or '(none)'}\n"
+            f"Execution feedback:\n{result_summary}"
+        )
 
     poc_author = PoCAuthorAgent(
         runtime,
@@ -448,18 +725,11 @@ async def _verify_one(
         plugin_root=plugin_path,
         setup_callback=_setup_callback,
     )
-    setup_exec_results: list[dict] = []
 
     # Every route type can depend on plugin-created objects, forms, pages, nonces,
     # or settings. Ask for legitimate setup even when the HTTP endpoint itself is
     # directly reachable.
-    from ..agents.developer import SetupPlan
-
-    setup_plan: SetupPlan = SetupPlan()
     if developer is not None:
-        plugin_root = Path(plugin_path)
-        code_slice = _build_setup_code_context(plugin_root, hyp)
-        readme = _read_readme(plugin_root)
         try:
             setup_plan = await developer.propose_setup(
                 hyp,
@@ -485,6 +755,7 @@ async def _verify_one(
                     persistent_sb, setup_plan.commands, hypothesis=hyp
                 ),
             )
+            _checkpoint_setup_results()
             yield persistent_sb
             return
         async with SandboxManager(
@@ -499,28 +770,28 @@ async def _verify_one(
                     fresh_sb, setup_plan.commands, hypothesis=hyp
                 ),
             )
+            _checkpoint_setup_results()
             yield fresh_sb
 
     async with _sb_ctx() as sb:
-        # Bind the live sandbox and current setup plan into the callback.
+        # Bind the live sandbox into the PoC author's setup callback.
         setup_callback_state["sb"] = sb
-        setup_callback_state["setup_plan_ref"] = setup_plan
 
-        # Build a plain-language setup summary the PoC author can act on.
+        # Build a plain-language, execution-grounded setup summary. Proposed
+        # commands are not described as executed when the preflight blocked them.
         setup_summary = None
-        if setup_plan.rationale or setup_plan.commands:
-            cmd_lines = "\n".join(f"  - wp {' '.join(c)}" for c in setup_plan.commands)
+        if setup_plan.rationale or setup_exec_results:
+            execution_summary = (
+                _summarise_setup_results(setup_exec_results)
+                or "(no setup commands were executed)"
+            )
             setup_summary = (
                 f"The runner has just configured the sandbox before the PoC runs.\n"
                 f"Reason: {setup_plan.rationale or '(none stated)'}\n"
-                f"Commands executed:\n{cmd_lines}\n"
-                f"You may use any state these commands established (created pages, "
-                f"option values, seeded files). You are not required to use them — "
-                f"if you have a better attack path, take it."
+                f"Authoritative setup execution results:\n{execution_summary}\n"
+                "Use only state whose result is OK. A BLOCKED BEFORE EXECUTION "
+                "command made no state change."
             )
-
-        followups_used = 0
-        followup_cap = 2  # bound the developer's re-setup attempts per hypothesis
 
         setup_failed = any(item.get("failed") for item in setup_exec_results)
         if setup_failed:
@@ -530,40 +801,22 @@ async def _verify_one(
                 + _summarise_setup_results(setup_exec_results)
             )
             if developer is not None and followups_used < followup_cap:
-                try:
-                    diagnostics = await _collect_schema_diagnostics(
-                        sb, setup_plan.commands
-                    )
-                    followup = await developer.propose_setup_followup(
-                        hypothesis=hyp,
-                        prior_plan=setup_plan,
-                        last_iteration=0,
-                        last_stdout=_summarise_setup_results(setup_exec_results),
-                        last_stderr="",
-                        last_error_log="",
-                        schema_diagnostics=diagnostics,
-                    )
-                except Exception as e:
-                    logger.warning(
-                        "initial setup followup for %s failed: %s", hyp.id, e
-                    )
-                    followup = None
-                if followup and followup.commands:
-                    followups_used += 1
-                    logger.info(
-                        "verify: %s repairing failed setup with %d commands (round %d/%d)",
-                        hyp.id,
-                        len(followup.commands),
-                        followups_used,
-                        followup_cap,
-                    )
-                    repair_results = await _run_setup_commands(
-                        sb, followup.commands, hypothesis=hyp
-                    )
-                    setup_exec_results.extend(repair_results)
-                    setup_plan.commands.extend(followup.commands)
+                diagnostics = await _collect_schema_diagnostics(sb, setup_plan.commands)
+                _followup, repair_rounds = await _request_setup_followup(
+                    sb,
+                    last_iteration=0,
+                    last_stdout="",
+                    last_stderr="",
+                    last_error_log="",
+                    schema_diagnostics=diagnostics,
+                    setup_execution_feedback=_summarise_setup_results(
+                        setup_exec_results
+                    ),
+                )
+                for repair_plan, repair_results in repair_rounds:
                     setup_summary += (
-                        f"\n\nSETUP REPAIR before PoC iteration 1: {followup.rationale or '(no rationale)'}\n"
+                        "\n\nSETUP REPAIR before PoC iteration 1: "
+                        f"{repair_plan.rationale or '(no rationale)'}\n"
                         + _summarise_setup_results(repair_results)
                     )
 
@@ -635,7 +888,8 @@ async def _verify_one(
 
             if result.success:
                 forbidden_setup = any(
-                    item.get("forbidden_payload_seed") for item in setup_exec_results
+                    _setup_result_taints_confirmation(item)
+                    for item in setup_exec_results
                 )
                 if forbidden_setup:
                     reason = (
@@ -728,49 +982,28 @@ async def _verify_one(
                 and iteration
                 < config.verify_max_iterations  # no point on the last iter
             ):
-                try:
-                    diagnostics = await _collect_schema_diagnostics(
-                        sb, setup_plan.commands
-                    )
-                    followup = await developer.propose_setup_followup(
-                        hypothesis=hyp,
-                        prior_plan=setup_plan,
-                        last_iteration=iteration,
-                        last_stdout=result.response or "",
-                        last_stderr=result.error_log or "",
-                        last_error_log=result.error_log or "",
-                        schema_diagnostics=diagnostics,
-                    )
-                except Exception as e:
-                    logger.warning(
-                        "propose_setup_followup for %s failed: %s", hyp.id, e
-                    )
-                    followup = None
-                if followup is not None:
-                    followups_used += 1
-                if followup and followup.commands:
-                    logger.info(
-                        "verify: %s applying %d followup setup commands (round %d/%d)",
-                        hyp.id,
-                        len(followup.commands),
-                        followups_used,
-                        followup_cap,
-                    )
-                    followup_results = await _run_setup_commands(
-                        sb, followup.commands, hypothesis=hyp
-                    )
-                    setup_exec_results.extend(followup_results)
-                    # Merge into the plan so future followups see full history.
-                    setup_plan.commands.extend(followup.commands)
-                    fu_lines = "\n".join(
-                        f"  - wp {' '.join(c)}" for c in followup.commands
-                    )
+                diagnostics = await _collect_schema_diagnostics(sb, setup_plan.commands)
+                followup, followup_rounds = await _request_setup_followup(
+                    sb,
+                    last_iteration=iteration,
+                    last_stdout=result.response or "",
+                    last_stderr=result.error_log or "",
+                    last_error_log=result.error_log or "",
+                    schema_diagnostics=diagnostics,
+                    setup_execution_feedback=_summarise_setup_results(
+                        setup_exec_results
+                    ),
+                )
+                for followup_plan, followup_results in followup_rounds:
                     setup_summary = (
-                        (setup_summary or "Setup state:") + "\n\n"
-                        f"FOLLOWUP after iter {iteration}: {followup.rationale or '(no rationale)'}\n"
-                        f"Additional commands executed:\n{fu_lines}"
+                        (setup_summary or "Setup state:")
+                        + "\n\n"
+                        + f"FOLLOWUP after iter {iteration}: "
+                        f"{followup_plan.rationale or '(no rationale)'}\n"
+                        + "Authoritative execution results:\n"
+                        + _summarise_setup_results(followup_results)
                     )
-                elif followup is not None:
+                if followup is not None and not followup.commands:
                     # No setup change is needed, but a failed generated request is not proof
                     # that the source candidate is safe. Give the PoC author the diagnosis
                     # and continue within the configured iteration bound.
@@ -808,6 +1041,8 @@ async def _verify_one(
                 await verify_helpers.dump_sandbox_state(sb, poc_dir / "state_dump")
             except Exception as e:
                 logger.warning("verify: state dump for %s failed: %s", hyp.id, e)
+
+        _checkpoint_setup_results()
 
     successful = [
         attempt for attempt in attempts if attempt.result == PoCStatus.SUCCESS
