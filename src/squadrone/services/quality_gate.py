@@ -9,7 +9,14 @@ from pathlib import Path
 from typing import Any
 
 from ..schemas.finding import Finding
-from ..schemas.hypothesis import BugClass, Confidence, Hypothesis, TriagedArtifact
+from ..schemas.hypothesis import (
+    BugClass,
+    Confidence,
+    Hypothesis,
+    SecurityOutcome,
+    TriagedArtifact,
+)
+from ..schemas.observation import CIAImpact
 from ..schemas.taxonomy import get_known_cwe_profile
 from .artifacts import atomic_write_json
 from .roles import UNKNOWN_ATTACKER_ROLE, normalize_attacker_role
@@ -35,8 +42,52 @@ SOURCE_RE = re.compile(
     r"\$_(?:GET|POST|REQUEST|COOKIE|FILES|SERVER)|REST|AJAX|shortcode|form|upload|webhook",
     re.IGNORECASE,
 )
-BOUNDARY_RE = re.compile(
-    r"\b(another user's|cross-user|higher[- ]priv|privilege|private|protected|sensitive|ownership|authorization|payment|approval|paid|token|secret|admin browser|internal service|filesystem|file system|uploads? (?:directory|tree))\b",
+BOUNDARY_PLACEHOLDER_RE = re.compile(
+    r"^(?:n/?a|none(?: identified)?|unknown|unclear|unspecified|tbd|todo|"
+    r"not (?:applicable|known|identified|established)|"
+    r"no (?:security |trust )?boundary(?: (?:exists|is crossed|identified))?|"
+    r"(?:a |the )?(?:crossed )?(?:security|trust) boundary|"
+    r"boundary (?:unknown|unclear|unspecified))$",
+    re.IGNORECASE,
+)
+SELF_OWNED_TARGET_RE = re.compile(
+    r"\b(?:(?:their|his|her|its|one[’']s|the (?:attacker|caller|user|requester|"
+    r"registrant|owner)[’']s) own|"
+    r"(?:attacker|caller|user|requester)[- ]controlled (?:callback )?"
+    r"(?:server|service|endpoint|host|url|resource)|"
+    r"(?:callback )?(?:server|service|endpoint|host|url|resource) controlled by "
+    r"(?:the )?(?:attacker|caller|user|requester)|"
+    r"(?:their|his|her|its|one[’']s) (?:account|object|record|resource|user|profile)|"
+    r"(?:current|same) (?:attacker|caller|user|requester|registrant|owner)[’']s "
+    r"(?:account|object|record|resource|user|profile)|"
+    r"self[- ](?:owned|created|registration)|"
+    r"(?:newly|just)[- ]created (?:account|object|record|resource|user|profile)|"
+    r"(?:account|object|record|resource|user|profile) (?:that )?(?:the )?"
+    r"(?:attacker|caller|user|requester|registrant) (?:owns?|created)|"
+    r"(?:account|object|record|resource|user|profile) (?:owned|created) by "
+    r"(?:the )?(?:same )?(?:attacker|caller|user|requester|registrant|owner)|"
+    r"belongs? to (?:the )?(?:same user|attacker|caller|user|requester|"
+    r"registrant|owner))\b",
+    re.IGNORECASE,
+)
+PROTECTED_SELF_TARGET_RE = re.compile(
+    r"\b(?:admin(?:istrator|istrative)?|roles?|capabilit(?:y|ies)|"
+    r"privileg(?:e|es|ed)|(?:administrative|elevated|privileged) permissions?|"
+    r"(?:authori[sz]ation|access|permission) level|"
+    r"(?:protected|restricted|system[- ]managed|security[- ]sensitive) "
+    r"(?:attribute|field|setting|state|resource|record|data)|"
+    r"approval (?:status|state|authority)|moderation (?:status|state|authority)|"
+    r"payment (?:status|state|authority)|paid (?:status|state|access)|"
+    r"billing (?:status|state|authority)|ownership|victim|another user|other user|"
+    r"internal (?:network|service|resource)|database|filesystem|code execution|"
+    r"server[- ]side execut(?:e|ion)|execut(?:e|ion))\b",
+    re.IGNORECASE,
+)
+FLOW_ONLY_BOUNDARY_RE = re.compile(
+    r"^(?:the )?(?:(?:(?:attacker|caller|user|request)\s+)?"
+    r"(?:request|input|data|value)|(?:attacker|caller|user))\s+"
+    r"(?:reaches|flows? (?:to|into)|is (?:passed|sent) to|is processed by|"
+    r"is stored (?:by|in)|is returned by)\b",
     re.IGNORECASE,
 )
 PROOF_GAP_RE = re.compile(
@@ -109,6 +160,21 @@ def _impact_dimensions(hypothesis: Hypothesis, description: str) -> dict[str, st
     return dimensions
 
 
+def _has_explicit_security_boundary(boundary: str) -> bool:
+    """Validate structured boundary evidence without a closed CWE vocabulary."""
+    value = boundary.strip().rstrip(".!:;").strip()
+    if not value or BOUNDARY_PLACEHOLDER_RE.fullmatch(value):
+        return False
+    if len(re.findall(r"[A-Za-z0-9]+", value)) < 2:
+        return False
+    protected_effect = PROTECTED_SELF_TARGET_RE.search(value) is not None
+    if SELF_OWNED_TARGET_RE.search(value) and not protected_effect:
+        return False
+    if FLOW_ONLY_BOUNDARY_RE.search(value) and not protected_effect:
+        return False
+    return True
+
+
 def infer_evidence(hypothesis: Hypothesis) -> dict[str, Any]:
     supplied = dict(hypothesis.evidence_summary or {})
     taint = [str(value) for value in hypothesis.taint_path]
@@ -144,9 +210,7 @@ def infer_evidence(hypothesis: Hypothesis) -> dict[str, Any]:
         "line": hypothesis.line,
         "has_source_indicator": bool(source and (SOURCE_RE.search(source) or taint)),
         "has_reachable_path": bool(path and len(path.split("->")) >= 2),
-        "has_security_boundary": bool(
-            boundary and BOUNDARY_RE.search(boundary + " " + impact)
-        ),
+        "has_security_boundary": _has_explicit_security_boundary(boundary),
         "has_impact_statement": bool(
             impact and any(value != "none" for value in dimensions.values())
         ),
@@ -224,14 +288,6 @@ def grade_hypothesis(
         value == "high" for value in evidence["impact_dimensions"].values()
     ):
         rules.append("csrf_without_high_impact_outcome")
-    if hypothesis.bug_class == BugClass.SSRF:
-        impact = evidence["impact"].lower()
-        if not re.search(
-            r"internal|metadata|credential|secret|private|protected|write|change|delete|admin",
-            impact,
-        ):
-            rules.append("ssrf_without_cia_impact")
-
     accepted = not rules
     reason = (
         "passes source and impact gate"
@@ -380,9 +436,41 @@ def _confirmed_observation(finding: Finding) -> dict[str, Any] | None:
     return None
 
 
-def severity_from_finding(finding: Finding) -> dict[str, Any]:
+def reconcile_verified_impact(finding: Finding) -> CIAImpact | None:
+    """Make the clean replay's CIA measurements authoritative downstream.
+
+    Older artifacts did not carry ``verified_impact`` explicitly, so they are
+    upgraded from their structured confirmation observation on load/use.  A
+    finding that already carries a conflicting explicit value is left
+    unreconciled and is rejected by the report gate instead of silently choosing
+    one claim.
+    """
     observation = _confirmed_observation(finding)
     if observation is None:
+        return None
+    try:
+        confirmed = CIAImpact.model_validate(observation.get("impact"))
+    except (TypeError, ValueError):
+        return None
+    if finding.verified_impact is not None and finding.verified_impact != confirmed:
+        return None
+
+    finding.verified_impact = confirmed.model_copy(deep=True)
+    # Keep the source hypothesis immutable outside the finding while ensuring
+    # every consumer of the persisted finding sees only reproduced impact.
+    finding.hypothesis.security_outcome = SecurityOutcome(
+        confidentiality=confirmed.confidentiality,
+        integrity=confirmed.integrity,
+        availability=confirmed.availability,
+        description=confirmed.description,
+    )
+    return finding.verified_impact
+
+
+def severity_from_finding(finding: Finding) -> dict[str, Any]:
+    observation = _confirmed_observation(finding)
+    verified_impact = reconcile_verified_impact(finding)
+    if observation is None or verified_impact is None:
         return {
             "cvss_estimate": None,
             "cvss_vector": None,
@@ -417,7 +505,7 @@ def severity_from_finding(finding: Finding) -> dict[str, Any]:
         else "N"
     )
     scope = "C" if bug_class in {BugClass.XSS_REFLECTED, BugClass.XSS_STORED} else "U"
-    impact = observation.get("impact") or {}
+    impact = verified_impact.model_dump(mode="json")
     level = {"none": "N", "low": "L", "high": "H"}
     metrics = {
         "AV": "N",
@@ -453,6 +541,12 @@ def severity_from_finding(finding: Finding) -> dict[str, Any]:
 def grade_finding_for_report(
     finding: Finding,
 ) -> Grade:
+    explicit_impact = (
+        finding.verified_impact.model_copy(deep=True)
+        if finding.verified_impact
+        else None
+    )
+    verified_impact = reconcile_verified_impact(finding)
     grade = grade_hypothesis(finding.hypothesis)
     grade.severity = severity_from_finding(finding)
     if finding.poc_status.value != "success":
@@ -461,6 +555,8 @@ def grade_finding_for_report(
         grade.rules.append("clean_confirmation_missing")
     if _confirmed_observation(finding) is None:
         grade.rules.append("structured_poc_evidence_missing")
+    if verified_impact is None and explicit_impact is not None:
+        grade.rules.append("verified_impact_mismatch")
     grade.rules = list(dict.fromkeys(grade.rules))
     grade.accepted = not grade.rules
     grade.reason = (

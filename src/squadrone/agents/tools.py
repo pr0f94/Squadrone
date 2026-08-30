@@ -48,6 +48,53 @@ READ_PLUGIN_FILE_TOOL: dict = {
     },
 }
 
+READ_PLUGIN_RANGES_TOOL: dict = {
+    "type": "function",
+    "function": {
+        "name": "read_plugin_ranges",
+        "description": (
+            "Read up to eight independent bounded line ranges from plugin source "
+            "in one call. Prefer this over separate read_plugin_file calls when "
+            "the relevant source-local ranges are already known. Results preserve "
+            "the requested order and share a 60000-byte output cap. Use "
+            "read_plugin_file for a minified-line character window or when you need "
+            "to expand one range iteratively."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ranges": {
+                    "type": "array",
+                    "description": "One to eight bounded source ranges, returned in this order.",
+                    "minItems": 1,
+                    "maxItems": 8,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "File path relative to the plugin root.",
+                            },
+                            "start_line": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "description": "1-indexed first line to return.",
+                            },
+                            "end_line": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "description": "1-indexed inclusive last line to return.",
+                            },
+                        },
+                        "required": ["path", "start_line", "end_line"],
+                    },
+                }
+            },
+            "required": ["ranges"],
+        },
+    },
+}
+
 REQUEST_ADDITIONAL_SETUP_TOOL: dict = {
     "type": "function",
     "function": {

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 import traceback
@@ -55,6 +56,7 @@ def _resolve_run_dir(run_id: str) -> Path:
         raise FileNotFoundError(f"plugins/*/runs/{run_id} not found")
     return matches[0]
 
+
 EventCallback = Callable[[str, str, dict], Awaitable[None] | None]
 
 
@@ -67,7 +69,9 @@ class ScanResult(BaseModel):
     cost_usd: float
     duration_seconds: float
     report_paths: list[str]
-    cache_hit_rate: float = 0.0  # 0.0–1.0; fraction of input tokens served from prompt cache
+    cache_hit_rate: float = (
+        0.0  # 0.0–1.0; fraction of input tokens served from prompt cache
+    )
 
 
 def _hypothesis_from_manual_item(item: dict) -> Optional[Hypothesis]:
@@ -119,7 +123,9 @@ def _emit_triage_manual_review_queue(
             continue
         hyp_dir = run_dir / "verifications" / hyp.id
         hyp_dir.mkdir(parents=True, exist_ok=True)
-        reason = str(item.get("reason") or "triage/manual quality gate requested manual review")
+        reason = str(
+            item.get("reason") or "triage/manual quality gate requested manual review"
+        )
         verify_helpers.write_manual_scaffold(
             hyp,
             hyp_dir,
@@ -185,7 +191,9 @@ async def _record_run_start(run_id: str, plugin_slug: str) -> None:
         await db.commit()
 
 
-async def _record_run_finish(run_id: str, status: str, cost: float, finding_count: int) -> None:
+async def _record_run_finish(
+    run_id: str, status: str, cost: float, finding_count: int
+) -> None:
     async with connect_sqlite(DB_PATH) as db:
         # Cumulative cost across resumes: add this run's spend to the previous
         # value rather than overwriting (an empty cost row is 0, so first
@@ -193,7 +201,13 @@ async def _record_run_finish(run_id: str, status: str, cost: float, finding_coun
         await db.execute(
             "UPDATE runs SET finished_at=?, status=?, "
             "cost_usd=COALESCE(cost_usd,0)+?, finding_count=? WHERE run_id=?",
-            (datetime.now(timezone.utc).isoformat(), status, cost, finding_count, run_id),
+            (
+                datetime.now(timezone.utc).isoformat(),
+                status,
+                cost,
+                finding_count,
+                run_id,
+            ),
         )
         await db.execute(
             "UPDATE plugins SET last_scanned_at=?, finding_count=finding_count+? WHERE slug="
@@ -209,30 +223,59 @@ async def _record_run_finish(run_id: str, status: str, cost: float, finding_coun
         await db.commit()
 
 
-async def _persist_findings(run_id: str, plugin_slug: str, findings: list[Finding]) -> None:
-    if not findings:
-        return
+async def _persist_findings(
+    run_id: str, plugin_slug: str, findings: list[Finding]
+) -> None:
     async with connect_sqlite(DB_PATH) as db:
         for f in findings:
             await db.execute(
-                "INSERT OR REPLACE INTO findings(finding_id, run_id, plugin_slug, bug_class, "
+                "INSERT INTO findings(finding_id, run_id, plugin_slug, bug_class, "
                 "cwe, confidence, poc_status, dedup_status, created_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?)",
+                "VALUES (?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(finding_id) DO UPDATE SET "
+                "run_id=excluded.run_id, plugin_slug=excluded.plugin_slug, "
+                "bug_class=excluded.bug_class, cwe=excluded.cwe, "
+                "confidence=excluded.confidence, poc_status=excluded.poc_status, "
+                "dedup_status=excluded.dedup_status, created_at=excluded.created_at",
                 (
-                    f.id, run_id, plugin_slug,
-                    f.hypothesis.vulnerability_type, f.hypothesis.root_cause_cwe,
+                    f.id,
+                    run_id,
+                    plugin_slug,
+                    f.hypothesis.vulnerability_type,
+                    f.hypothesis.root_cause_cwe,
                     f.hypothesis.confidence.value,
-                    f.poc_status.value, f.dedup_status.value,
+                    f.poc_status.value,
+                    f.dedup_status.value,
                     datetime.now(timezone.utc).isoformat(),
                 ),
             )
+
+        current_ids = sorted({finding.id for finding in findings})
+        current_filter = ""
+        params: list[str] = [run_id]
+        if current_ids:
+            placeholders = ",".join("?" for _ in current_ids)
+            current_filter = f"AND finding_id NOT IN ({placeholders}) "
+            params.extend(current_ids)
+        await db.execute(
+            "DELETE FROM findings WHERE run_id=? "
+            f"{current_filter}"
+            "AND NOT EXISTS ("
+            "SELECT 1 FROM disclosures "
+            "WHERE disclosures.finding_id=findings.finding_id"
+            ")",
+            params,
+        )
         await db.commit()
 
 
-async def _emit(cb: Optional[EventCallback], stage: str, status: str, info: dict) -> None:
+async def _emit(
+    cb: Optional[EventCallback], stage: str, status: str, info: dict
+) -> None:
     if cb is None:
         return
     import inspect
+
     res = cb(stage, status, info)
     if inspect.isawaitable(res):
         await res
@@ -246,9 +289,55 @@ def _stage_is_forced(stage: str, force_idx: int | None) -> bool:
 
 
 def _verify_checkpoint_complete(run_dir: Path) -> bool:
+    return (run_dir / verify_stage.VERIFY_COMPLETE_FILENAME).exists() and (
+        run_dir / "findings.jsonl"
+    ).exists()
+
+
+def _verify_checkpoint_matches_triage(
+    run_dir: Path,
+    triaged: TriagedArtifact,
+) -> bool:
+    """Reject complete markers produced for another scope mode or candidate set."""
+    if not _verify_checkpoint_complete(run_dir):
+        return False
+    try:
+        marker = json.loads(
+            (run_dir / verify_stage.VERIFY_COMPLETE_FILENAME).read_text()
+        )
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(marker, dict):
+        return False
+    # Missing markers are historical and therefore came from enforced-scope runs.
+    stored_scope = marker.get("submission_scope_enforced", True)
+    stored_ids = marker.get("accepted_hypothesis_ids", [])
+    expected_ids = [hypothesis.id for hypothesis in triaged.accepted]
+    expected_manual_ids = [
+        hypothesis.id
+        for hypothesis in triaged.accepted
+        if not hypothesis.bug_class.is_known
+    ]
+    # Historical markers remain valid for registry-backed candidates. An open CWE
+    # requires an explicit manual-resolution record so a pre-policy automatic
+    # confirmation cannot be silently resumed.
+    stored_manual_ids = marker.get("manual_review_hypothesis_ids", [])
+    findings, corrupt_count = read_jsonl_models(
+        run_dir / "findings.jsonl",
+        Finding,
+    )
+    if corrupt_count:
+        return False
+    finding_ids = [finding.id for finding in findings]
+    finding_hypothesis_ids = {finding.hypothesis.id for finding in findings}
+    stored_finding_ids = marker.get("finding_ids", [])
     return (
-        (run_dir / verify_stage.VERIFY_COMPLETE_FILENAME).exists()
-        and (run_dir / "findings.jsonl").exists()
+        stored_scope is triaged.submission_scope_enforced
+        and stored_ids == expected_ids
+        and stored_manual_ids == expected_manual_ids
+        and finding_hypothesis_ids <= set(expected_ids)
+        and all(finding.hypothesis.bug_class.is_known for finding in findings)
+        and stored_finding_ids == finding_ids
     )
 
 
@@ -263,7 +352,9 @@ async def run_scan(
     verify_only: bool = False,
 ) -> ScanResult:
     config = PipelineConfig.from_yaml(config_path)
-    ceiling = budget_override if budget_override is not None else config.cost_ceiling_usd
+    ceiling = (
+        budget_override if budget_override is not None else config.cost_ceiling_usd
+    )
 
     if resume_from is not None and resume_from not in STAGE_ORDER:
         raise ValueError(f"--from must be one of {STAGE_ORDER}, got {resume_from!r}")
@@ -302,7 +393,8 @@ async def run_scan(
         # Mark the existing run record as running again
         async with connect_sqlite(DB_PATH) as db:
             await db.execute(
-                "UPDATE runs SET status='running', finished_at=NULL WHERE run_id=?", (run_id,),
+                "UPDATE runs SET status='running', finished_at=NULL WHERE run_id=?",
+                (run_id,),
             )
             await db.commit()
 
@@ -342,86 +434,203 @@ async def run_scan(
         budget.set_stage("intake")
         if _should_load("intake") and intake_path.exists():
             intake = IntakeArtifact.from_json_file(str(intake_path))
-            await _emit(on_event, "intake", "skipped", {
-                "version": intake.plugin_version, "files": intake.file_count, "lines": intake.total_lines,
-            })
+            await _emit(
+                on_event,
+                "intake",
+                "skipped",
+                {
+                    "version": intake.plugin_version,
+                    "files": intake.file_count,
+                    "lines": intake.total_lines,
+                },
+            )
         else:
-            await _emit(on_event, "intake", "start", {"plugin_slug": plugin_slug, "run_id": run_id, "version": version or "latest"})
+            await _emit(
+                on_event,
+                "intake",
+                "start",
+                {
+                    "plugin_slug": plugin_slug,
+                    "run_id": run_id,
+                    "version": version or "latest",
+                },
+            )
             intake = await intake_stage.run(
-                plugin_slug, run_id, config,
+                plugin_slug,
+                run_id,
+                config,
                 runs_root=_runs_root(plugin_slug),
                 version=version,
             )
-            await _emit(on_event, "intake", "done", {
-                "version": intake.plugin_version, "files": intake.file_count, "lines": intake.total_lines,
-                "spent": budget.spent,
-            })
+            await _emit(
+                on_event,
+                "intake",
+                "done",
+                {
+                    "version": intake.plugin_version,
+                    "files": intake.file_count,
+                    "lines": intake.total_lines,
+                    "spent": budget.spent,
+                },
+            )
 
         # ---- recon ----
         budget.set_stage("recon")
         if _should_load("recon") and recon_path.exists():
             recon = ReconArtifact.from_json_file(str(recon_path))
-            await _emit(on_event, "recon", "skipped", {
-                "entry_points": len(recon.entry_points), "sinks": len(recon.sinks),
-            })
+            await _emit(
+                on_event,
+                "recon",
+                "skipped",
+                {
+                    "entry_points": len(recon.entry_points),
+                    "sinks": len(recon.sinks),
+                },
+            )
         else:
             await _emit(on_event, "recon", "start", {})
-            recon = await recon_stage.run(intake, config, runtime, runs_root=_runs_root(plugin_slug))
-            await _emit(on_event, "recon", "done", {
-                "entry_points": len(recon.entry_points), "sinks": len(recon.sinks), "spent": budget.spent,
-            })
+            recon = await recon_stage.run(
+                intake, config, runtime, runs_root=_runs_root(plugin_slug)
+            )
+            await _emit(
+                on_event,
+                "recon",
+                "done",
+                {
+                    "entry_points": len(recon.entry_points),
+                    "sinks": len(recon.sinks),
+                    "spent": budget.spent,
+                },
+            )
 
         # ---- hypothesis ----
         budget.set_stage("hypothesis")
         if _should_load("hypothesis") and hyps_path.exists():
             hypotheses = [
                 Hypothesis.model_validate_json(line)
-                for line in hyps_path.read_text().splitlines() if line.strip()
+                for line in hyps_path.read_text().splitlines()
+                if line.strip()
             ]
-            hyps = HypothesesArtifact(plugin_slug=intake.plugin_slug, hypotheses=hypotheses)
+            hyps = HypothesesArtifact(
+                plugin_slug=intake.plugin_slug, hypotheses=hypotheses
+            )
             await _emit(on_event, "hypothesis", "skipped", {"count": len(hypotheses)})
         else:
             await _emit(on_event, "hypothesis", "start", {})
             hyps = await hypothesis_stage.run(
-                recon, intake.source_path, config, budget, runtime,
-                runs_root=_runs_root(plugin_slug), run_id=run_id,
+                recon,
+                intake.source_path,
+                config,
+                budget,
+                runtime,
+                runs_root=_runs_root(plugin_slug),
+                run_id=run_id,
             )
-            await _emit(on_event, "hypothesis", "done", {
-                "count": len(hyps.hypotheses), "spent": budget.spent,
-            })
+            await _emit(
+                on_event,
+                "hypothesis",
+                "done",
+                {
+                    "count": len(hyps.hypotheses),
+                    "spent": budget.spent,
+                },
+            )
 
         # ---- triage ----
         budget.set_stage("triage")
+        expected_submission_scope = not verify_only
+        triage_scope_changed = False
+        loaded_triage = False
         if _should_load("triage") and triaged_path.exists():
             triaged = TriagedArtifact.from_json_file(str(triaged_path))
-            await _emit(on_event, "triage", "skipped", {
-                "accepted": len(triaged.accepted), "rejected": len(triaged.rejected),
-                "merged": len(triaged.merged), "deferred": len(triaged.deferred),
-            })
-        else:
+            triage_scope_changed = (
+                triaged.submission_scope_enforced != expected_submission_scope
+            )
+            if triage_scope_changed:
+                logger.info(
+                    "triage: submission-scope mode changed on resume; "
+                    "invalidating triage and verify checkpoints"
+                )
+                append_decision(
+                    run_dir,
+                    stage="triage",
+                    action="invalidate",
+                    result="submission_scope_mode_changed",
+                    reason=(
+                        "resume changed submission-scope enforcement from "
+                        f"{triaged.submission_scope_enforced} to "
+                        f"{expected_submission_scope}"
+                    ),
+                    artifact=triaged_path,
+                )
+            else:
+                loaded_triage = True
+                await _emit(
+                    on_event,
+                    "triage",
+                    "skipped",
+                    {
+                        "accepted": len(triaged.accepted),
+                        "rejected": len(triaged.rejected),
+                        "merged": len(triaged.merged),
+                        "deferred": len(triaged.deferred),
+                    },
+                )
+        if not loaded_triage:
             await _emit(on_event, "triage", "start", {})
             triaged = await triage_stage.run(
-                hyps, intake.source_path, config, budget, runtime,
-                runs_root=_runs_root(plugin_slug), run_id=run_id,
+                hyps,
+                intake.source_path,
+                config,
+                budget,
+                runtime,
+                runs_root=_runs_root(plugin_slug),
+                run_id=run_id,
+                enforce_submission_scope=expected_submission_scope,
             )
-            await _emit(on_event, "triage", "done", {
-                "accepted": len(triaged.accepted), "rejected": len(triaged.rejected),
-                "merged": len(triaged.merged), "deferred": len(triaged.deferred),
-                "manual_review_candidates": len(triaged.manual_review),
-                "spent": budget.spent,
-            })
+            await _emit(
+                on_event,
+                "triage",
+                "done",
+                {
+                    "accepted": len(triaged.accepted),
+                    "rejected": len(triaged.rejected),
+                    "merged": len(triaged.merged),
+                    "deferred": len(triaged.deferred),
+                    "manual_review_candidates": len(triaged.manual_review),
+                    "spent": budget.spent,
+                },
+            )
 
-        triage_manual_queue = _emit_triage_manual_review_queue(triaged, run_dir, intake.plugin_slug)
+        triage_manual_queue = _emit_triage_manual_review_queue(
+            triaged, run_dir, intake.plugin_slug
+        )
         if triage_manual_queue["candidates"]:
-            await _emit(on_event, "manual_queue", "done", {
-                **triage_manual_queue,
-                "reason": "triage_or_quality_gate",
-            })
+            await _emit(
+                on_event,
+                "manual_queue",
+                "done",
+                {
+                    **triage_manual_queue,
+                    "reason": "triage_or_quality_gate",
+                },
+            )
 
         # ---- verify ----
         budget.set_stage("verify")
-        force_verify = _stage_is_forced("verify", force_idx)
-        if _should_load("verify") and _verify_checkpoint_complete(run_dir):
+        verify_checkpoint_stale = _verify_checkpoint_complete(
+            run_dir
+        ) and not _verify_checkpoint_matches_triage(run_dir, triaged)
+        force_verify = (
+            _stage_is_forced("verify", force_idx)
+            or triage_scope_changed
+            or verify_checkpoint_stale
+        )
+        if (
+            not force_verify
+            and _should_load("verify")
+            and _verify_checkpoint_complete(run_dir)
+        ):
             findings, corrupt_count = read_jsonl_models(
                 findings_path,
                 Finding,
@@ -438,11 +647,18 @@ async def run_scan(
                 )
             await _emit(on_event, "verify", "skipped", {"findings": len(findings)})
         else:
-            await _emit(on_event, "verify", "start", {"to_verify": len(triaged.accepted)})
+            await _emit(
+                on_event, "verify", "start", {"to_verify": len(triaged.accepted)}
+            )
             try:
                 findings = await verify_stage.run(
-                    triaged, intake.source_path, config, budget, runtime,
-                    runs_root=_runs_root(plugin_slug), run_id=run_id,
+                    triaged,
+                    intake.source_path,
+                    config,
+                    budget,
+                    runtime,
+                    runs_root=_runs_root(plugin_slug),
+                    run_id=run_id,
                     developer=developer,
                     force=force_verify,
                 )
@@ -451,7 +667,12 @@ async def run_scan(
                 # record; findings.jsonl remains the crash-safe source of truth.
                 findings = exc.findings
                 raise
-            await _emit(on_event, "verify", "done", {"findings": len(findings), "spent": budget.spent})
+            await _emit(
+                on_event,
+                "verify",
+                "done",
+                {"findings": len(findings), "spent": budget.spent},
+            )
 
         if verify_only:
             # Verification already checkpoints this artifact, but write it once more
@@ -464,13 +685,31 @@ async def run_scan(
             budget.set_stage("dedup")
             await _emit(on_event, "dedup", "start", {})
             findings = await dedup_stage.run(
-                findings, plugin_slug, config, runs_root=_runs_root(plugin_slug), run_id=run_id,
+                findings,
+                plugin_slug,
+                config,
+                runs_root=_runs_root(plugin_slug),
+                run_id=run_id,
             )
-            novel_count = sum(1 for f in findings if f.dedup_status == DedupStatus.NOVEL)
-            await _emit(on_event, "dedup", "done", {
-                "novel": novel_count, "possibly_known": sum(1 for f in findings if f.dedup_status == DedupStatus.POSSIBLY_KNOWN),
-                "known_dupe": sum(1 for f in findings if f.dedup_status == DedupStatus.KNOWN_DUPE),
-            })
+            novel_count = sum(
+                1 for f in findings if f.dedup_status == DedupStatus.NOVEL
+            )
+            await _emit(
+                on_event,
+                "dedup",
+                "done",
+                {
+                    "novel": novel_count,
+                    "possibly_known": sum(
+                        1
+                        for f in findings
+                        if f.dedup_status == DedupStatus.POSSIBLY_KNOWN
+                    ),
+                    "known_dupe": sum(
+                        1 for f in findings if f.dedup_status == DedupStatus.KNOWN_DUPE
+                    ),
+                },
+            )
 
             await _persist_findings(run_id, plugin_slug, findings)
 
@@ -478,14 +717,25 @@ async def run_scan(
             budget.set_stage("report")
             await _emit(on_event, "report", "start", {})
             report_paths = await report_stage.run(
-                findings, plugin_slug, config, budget, runtime,
-                runs_root=_runs_root(plugin_slug), run_id=run_id,
+                findings,
+                plugin_slug,
+                config,
+                budget,
+                runtime,
+                runs_root=_runs_root(plugin_slug),
+                run_id=run_id,
                 plugin_path=intake.source_path,
                 plugin_version=intake.plugin_version,
             )
-            await _emit(on_event, "report", "done", {
-                "reports": len(report_paths), "spent": budget.spent,
-            })
+            await _emit(
+                on_event,
+                "report",
+                "done",
+                {
+                    "reports": len(report_paths),
+                    "spent": budget.spent,
+                },
+            )
 
         status = "complete"
         append_decision(

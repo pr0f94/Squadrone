@@ -12,10 +12,22 @@ from pathlib import Path
 from typing import Any
 
 from ..agents.hypothesis_verifier import HypothesisVerifier
-from ..agents._specialist_base import FocusedSpecialist, _compact_recon
+from ..agents._specialist_base import (
+    AUTHENTICATION_ALTERNATE_PATH_AUDIT_VERSION,
+    _AUTHENTICATION_ALTERNATE_PATH_INSTRUCTIONS,
+    FocusedSpecialist,
+    _METHODOLOGY,
+    _SOURCE_EXPLORATION_INSTRUCTIONS,
+    _compact_recon,
+    _requires_authentication_alternate_path_audit,
+    _requires_dynamic_key_trace,
+    _specialist_iteration_limits,
+)
+from ..agents.prompts_io import load_prompt
 from ..agents.runtime import AgentRuntime
 from ..schemas.config import PipelineConfig
 from ..schemas.hypothesis import (
+    canonicalize_new_candidate_taxonomy,
     HypothesesArtifact,
     Hypothesis,
     SpecialistReviewArtifact,
@@ -29,13 +41,19 @@ from ..services.decision_ledger import append_decision
 
 
 _VERIFIER_BATCH_SIZE = 3
-# Specialists force-finalise after 20 tool calls. Keep enough headroom after
-# reading every assigned target to trace alternate callers, controls, and impact.
+# Ordinary specialists retain the existing bounded batching policy. Potentially
+# dynamic field/key writes get singleton authorization batches so unrelated
+# workflows cannot consume their trace budget.
 _REVIEW_BATCH_MAX_ITEMS = 8
+_REVIEW_BATCH_MAX_ITEMS_WIDE = 16
+_REVIEW_BATCH_MAX_ITEMS_DENSE = 32
 _REVIEW_BATCH_MAX_BYTES = 60_000
 _REVIEW_BATCH_MAX_FILES = 6
+_REVIEW_BATCH_MAX_WINDOWS = 6
+_REVIEW_BATCH_WINDOW_LINES = 250
 _REVIEW_BATCH_ATTEMPTS = 2
-_REVIEW_CHECKPOINT_VERSION = 3
+_REVIEW_CHECKPOINT_VERSION = 5
+_REVIEW_BATCH_POLICY_VERSION = 1
 _REVIEWABLE_SUPPORT = {"active", "partial", "review_only"}
 
 
@@ -45,9 +63,53 @@ def _batch_input_fingerprint(
     reviewer: ReviewArea,
 ) -> str:
     """Digest every semantic input used to decide whether a batch is reusable."""
+    max_iterations, force_finalise_after = _specialist_iteration_limits(
+        reviewer,
+        targets,
+    )
+    execution_policy = {
+        "batch_policy_version": _REVIEW_BATCH_POLICY_VERSION,
+        "review_batch_max_items": _review_batch_max_items(reviewer),
+        "review_batch_max_bytes": _REVIEW_BATCH_MAX_BYTES,
+        "review_batch_max_files": _REVIEW_BATCH_MAX_FILES,
+        "dynamic_authorization_batches": "singleton",
+        "max_iterations": max_iterations,
+        "force_finalise_after": force_finalise_after,
+    }
+    if reviewer == "authentication":
+        execution_policy["authentication_state_batches"] = "isolated"
+    review_policy_parts = [
+        load_prompt(f"specialists/{reviewer}"),
+        load_prompt("specialists/_shared_rules"),
+        _METHODOLOGY,
+        load_prompt("_wp_idioms"),
+        _SOURCE_EXPLORATION_INSTRUCTIONS,
+    ]
+    if _requires_authentication_alternate_path_audit(reviewer, targets):
+        execution_policy["authentication_alternate_path_audit_version"] = (
+            AUTHENTICATION_ALTERNATE_PATH_AUDIT_VERSION
+        )
+        review_policy_parts.append(_AUTHENTICATION_ALTERNATE_PATH_INSTRUCTIONS)
+    # Preserve the authorization checkpoint contract while documenting the
+    # wider reviewers' additional source-locality bound.
+    if reviewer != "authorization_workflows":
+        execution_policy.update(
+            {
+                "review_batch_max_windows": _REVIEW_BATCH_MAX_WINDOWS,
+                "review_batch_window_lines": _REVIEW_BATCH_WINDOW_LINES,
+            }
+        )
+        if len(targets) > _REVIEW_BATCH_MAX_ITEMS_WIDE:
+            execution_policy["review_batch_dense_same_file_max_items"] = (
+                _REVIEW_BATCH_MAX_ITEMS_DENSE
+            )
     payload = {
         "version": _REVIEW_CHECKPOINT_VERSION,
         "reviewer": reviewer,
+        "execution_policy": execution_policy,
+        "review_policy": hashlib.sha256(
+            "\n\n".join(review_policy_parts).encode("utf-8")
+        ).hexdigest(),
         "targets": [target.model_dump(mode="json") for target in targets],
         "related_recon": _compact_recon(recon, targets),
     }
@@ -72,8 +134,9 @@ async def _verify_hypotheses(
     return verdicts
 
 
-# Group hypotheses by (file, line, bug_class) and keep the highest-confidence
-# representative. This only merges exact-match keys.
+# Group only semantically identical source-to-boundary paths and keep the
+# highest-confidence representative. Distinct routes can reach the same sink
+# with the same CWE and must survive for the critic's path-aware review.
 def _pre_verifier_dedup(
     hypotheses: list[Hypothesis],
 ) -> tuple[list[Hypothesis], dict[str, str]]:
@@ -82,7 +145,16 @@ def _pre_verifier_dedup(
     merge_log: dict[str, str] = {}
     conf_rank = {"high": 0, "medium": 1, "low": 2}
     for h in hypotheses:
-        key = (h.file, h.line, h.bug_class.value)
+        key = (
+            h.file,
+            h.line,
+            h.bug_class.value,
+            h.entry_point.strip(),
+            tuple(step.strip() for step in h.taint_path),
+            str(h.evidence_summary.get("source", "")).strip(),
+            str(h.evidence_summary.get("control", "")).strip(),
+            str(h.evidence_summary.get("boundary", "")).strip(),
+        )
         existing = by_key.get(key)
         if existing is None:
             by_key[key] = h
@@ -98,35 +170,131 @@ def _pre_verifier_dedup(
     return list(by_key.values()), merge_log
 
 
-def _build_review_batches(targets: list[CoverageItem]) -> list[list[CoverageItem]]:
-    """Create deterministic source-local batches with bounded initial payloads."""
-    ordered = sorted(
-        targets, key=lambda item: (item.file, item.line, item.kind, item.id)
-    )
+def _target_sort_key(item: CoverageItem) -> tuple[str, int, str, str]:
+    return item.file, item.line, item.kind, item.id
+
+
+def _review_batch_max_items(reviewer: ReviewArea) -> int:
+    """Use wider source-local batches where no target needs a dedicated trace."""
+    if reviewer == "authorization_workflows":
+        return _REVIEW_BATCH_MAX_ITEMS
+    return _REVIEW_BATCH_MAX_ITEMS_WIDE
+
+
+def _source_window_key(item: CoverageItem) -> tuple[str, int]:
+    """Return a deterministic fallback source window for batching."""
+    line = max(1, item.line)
+    return item.file, (line - 1) // _REVIEW_BATCH_WINDOW_LINES
+
+
+def _build_bounded_review_batches(
+    targets: list[CoverageItem],
+    *,
+    max_items: int = _REVIEW_BATCH_MAX_ITEMS,
+    max_windows: int | None = None,
+    dense_same_file_max_items: int | None = None,
+) -> list[list[CoverageItem]]:
+    """Create deterministic batches bounded by size and source locality."""
     batches: list[list[CoverageItem]] = []
     current: list[CoverageItem] = []
     current_bytes = 0
     current_files: set[str] = set()
-    for target in ordered:
+    current_windows: set[tuple[str, int]] = set()
+    for target in sorted(targets, key=_target_sort_key):
         target_bytes = len(json.dumps(target.model_dump(mode="json"), default=str))
+        target_window = _source_window_key(target)
+        prospective_files = current_files | {target.file}
+        prospective_windows = current_windows | {target_window}
+        item_limit = max_items
+        if (
+            dense_same_file_max_items is not None
+            and len(prospective_files) == 1
+            and (
+                max_windows is None
+                or len(prospective_windows) <= max_windows
+            )
+        ):
+            item_limit = dense_same_file_max_items
         if current and (
-            len(current) >= _REVIEW_BATCH_MAX_ITEMS
+            len(current) >= item_limit
             or current_bytes + target_bytes > _REVIEW_BATCH_MAX_BYTES
             or (
                 target.file not in current_files
                 and len(current_files) >= _REVIEW_BATCH_MAX_FILES
+            )
+            or (
+                max_windows is not None
+                and target_window not in current_windows
+                and len(current_windows) >= max_windows
             )
         ):
             batches.append(current)
             current = []
             current_bytes = 0
             current_files = set()
+            current_windows = set()
         current.append(target)
         current_bytes += target_bytes
         current_files.add(target.file)
+        current_windows.add(target_window)
     if current:
         batches.append(current)
     return batches
+
+
+def _build_review_batches(
+    targets: list[CoverageItem],
+    reviewer: ReviewArea,
+) -> list[list[CoverageItem]]:
+    """Create bounded batches, isolating security-state traces from noise."""
+    if reviewer == "authentication":
+        authentication_state_targets = [
+            target for target in targets if target.type == "authentication_state"
+        ]
+        authentication_state_ids = {
+            target.id for target in authentication_state_targets
+        }
+        ordinary_batches = _build_bounded_review_batches(
+            [target for target in targets if target.id not in authentication_state_ids],
+            max_items=_review_batch_max_items(reviewer),
+            max_windows=_REVIEW_BATCH_MAX_WINDOWS,
+            dense_same_file_max_items=_REVIEW_BATCH_MAX_ITEMS_DENSE,
+        )
+        focused_batches = _build_bounded_review_batches(
+            authentication_state_targets,
+            max_items=_REVIEW_BATCH_MAX_ITEMS,
+            max_windows=_REVIEW_BATCH_MAX_WINDOWS,
+        )
+        return sorted(
+            [*ordinary_batches, *focused_batches],
+            key=lambda batch: _target_sort_key(batch[0]),
+        )
+
+    if reviewer != "authorization_workflows":
+        return _build_bounded_review_batches(
+            targets,
+            max_items=_review_batch_max_items(reviewer),
+            max_windows=_REVIEW_BATCH_MAX_WINDOWS,
+            dense_same_file_max_items=_REVIEW_BATCH_MAX_ITEMS_DENSE,
+        )
+
+    dynamic_targets = [
+        target for target in targets if _requires_dynamic_key_trace([target])
+    ]
+    dynamic_ids = {target.id for target in dynamic_targets}
+    ordinary_batches = _build_bounded_review_batches(
+        [target for target in targets if target.id not in dynamic_ids]
+    )
+    focused_batches = [
+        [target] for target in sorted(dynamic_targets, key=_target_sort_key)
+    ]
+
+    # Keep approximate source order without splitting efficient ordinary
+    # batches around every focused target. Each target remains present once.
+    return sorted(
+        [*ordinary_batches, *focused_batches],
+        key=lambda batch: _target_sort_key(batch[0]),
+    )
 
 
 def _reconcile_batch_coverage(
@@ -193,6 +361,7 @@ def _canonicalize_batch_hypotheses(
     id_map: dict[str, str] = {}
     for index, hypothesis in enumerate(hypotheses, start_index):
         model_id = hypothesis.id
+        canonicalize_new_candidate_taxonomy(hypothesis)
         hypothesis.id = f"{prefixes[reviewer]}-b{batch_number:03d}-{index:03d}"
         profile = get_known_cwe_profile(hypothesis.bug_class)
         hypothesis.specialist = (
@@ -298,7 +467,7 @@ async def run(
             for item in (recon.coverage.items if recon.coverage else [])
             if spec.NAME in item.review_areas
         ]
-        batches = _build_review_batches(targets)
+        batches = _build_review_batches(targets, spec.NAME)
         logger.info(
             "specialist %s: reviewing %d coverage items in %d bounded batches",
             spec.NAME,
@@ -386,12 +555,41 @@ async def run(
                     for hypothesis in result.hypotheses
                     if hypothesis.id in accepted_hypothesis_ids
                 ]
+                original_bug_classes = {
+                    hypothesis.id: hypothesis.bug_class.value
+                    for hypothesis in accepted_hypotheses
+                }
                 id_map = _canonicalize_batch_hypotheses(
                     accepted_hypotheses,
                     spec.NAME,
                     batch_number,
                     start_index=len(batch_hypotheses) + 1,
                 )
+                canonical_by_id = {
+                    hypothesis.id: hypothesis for hypothesis in accepted_hypotheses
+                }
+                for model_id, canonical_id in id_map.items():
+                    previous_bug_class = original_bug_classes[model_id]
+                    current_bug_class = canonical_by_id[canonical_id].bug_class.value
+                    if previous_bug_class == current_bug_class:
+                        continue
+                    append_decision(
+                        spec_dir,
+                        stage="hypothesis",
+                        action="normalize_taxonomy",
+                        result="new_candidate_taxonomy_normalized",
+                        hypothesis_id=canonical_id,
+                        reason=(
+                            f"new authenticated candidate normalized from "
+                            f"{previous_bug_class} to {current_bug_class}; loaded "
+                            "historical artifacts are never rewritten"
+                        ),
+                        details={
+                            "model_hypothesis_id": model_id,
+                            "original_bug_class": previous_bug_class,
+                            "canonical_bug_class": current_bug_class,
+                        },
+                    )
                 for disposition in accepted:
                     disposition.hypothesis_ids = [
                         id_map[hypothesis_id]

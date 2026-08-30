@@ -156,6 +156,15 @@ def test_hypothesis_artifacts():
     assert ha.hypotheses[0].bug_class == BugClass.MISSING_CAP_CHECK
     ta = TriagedArtifact(plugin_slug="x", accepted=[h], rejected=[], merged=[])
     assert ta.accepted == [h]
+    assert ta.submission_scope_enforced is True
+
+    local_only = ta.model_copy(update={"submission_scope_enforced": False})
+    assert (
+        TriagedArtifact.model_validate_json(
+            local_only.model_dump_json()
+        ).submission_scope_enforced
+        is False
+    )
 
 
 def test_xss_taxonomy_keeps_stored_and_reflected_distinct():
@@ -181,6 +190,54 @@ def test_xss_taxonomy_keeps_stored_and_reflected_distinct():
     assert reflected.bug_class.value == "CWE-79:reflected"
     assert stored.root_cause_cwe == reflected.root_cause_cwe == "CWE-79"
     assert stored.vulnerability_type != reflected.vulnerability_type
+
+
+def test_authenticated_cwe306_history_is_preserved_on_deserialization():
+    data = _hypothesis().model_dump(mode="json")
+    data.update(
+        {
+            "bug_class": BugClass.MISSING_AUTH_CRITICAL_FUNCTION.value,
+            "root_cause_cwe": BugClass.MISSING_AUTH_CRITICAL_FUNCTION.value,
+            "vulnerability_type": "missing_authentication_for_critical_function",
+            "evidence_summary": {"attacker_role": "authenticated Subscriber"},
+        }
+    )
+
+    parsed = Hypothesis.model_validate(data)
+
+    assert parsed.bug_class == BugClass.MISSING_AUTH_CRITICAL_FUNCTION
+    assert parsed.root_cause_cwe == "CWE-306"
+    assert parsed.vulnerability_type == "missing_authentication_for_critical_function"
+    round_tripped = Hypothesis.model_validate_json(parsed.model_dump_json())
+    assert round_tripped.bug_class == BugClass.MISSING_AUTH_CRITICAL_FUNCTION
+
+
+def test_unauthenticated_cwe306_remains_missing_authentication():
+    data = _hypothesis().model_dump(mode="json")
+    data.update(
+        {
+            "bug_class": BugClass.MISSING_AUTH_CRITICAL_FUNCTION.value,
+            "evidence_summary": {"attacker_role": "unauthenticated"},
+        }
+    )
+
+    parsed = Hypothesis.model_validate(data)
+
+    assert parsed.bug_class == BugClass.MISSING_AUTH_CRITICAL_FUNCTION
+    assert parsed.root_cause_cwe == "CWE-306"
+    assert (
+        parsed.vulnerability_type
+        == "missing_authentication_for_critical_function"
+    )
+
+
+def test_authorization_prompt_distinguishes_authentication_from_authorization():
+    prompt = load_prompt("specialists/authorization_workflows")
+
+    assert "Use CWE-306 only when" in prompt
+    assert "lowest\ndemonstrated attacker is unauthenticated" in prompt
+    assert "Use CWE-862 when WordPress authenticated" in prompt
+    assert "including a Subscriber through `wp_ajax_*`" in prompt
 
 
 def test_legacy_cwe79_artifact_is_upgraded_from_context():

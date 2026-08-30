@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -11,7 +12,10 @@ from squadrone.services.sandbox import SandboxRunResult
 from squadrone.stages import verify as verify_stage
 from squadrone.stages.verify import (
     _build_setup_code_context,
+    _managed_setup_state_drift,
+    _required_attacker_account,
     _run_setup_commands,
+    _setup_command_mutates_managed_context,
     _setup_command_plants_exploit_payload,
     _setup_result_taints_confirmation,
     _summarise_forbidden_setup,
@@ -60,12 +64,768 @@ def test_allows_benign_prerequisite_seed():
     assert reason is None
 
 
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["eval", "update_option('demo', '<script>alert(1)</script>');"],
+        [
+            "eval",
+            "file_put_contents('/tmp/demo.html', '<svg onload=alert(1)>');",
+        ],
+        ["post", "create", "--post_content=<img src=x onerror=alert(1)>"],
+        [
+            "eval",
+            "call_user_func('update_user_meta', 7, 'demo', "
+            "'<details ontoggle=alert(1)>');",
+        ],
+    ],
+)
+def test_blocks_xss_seed_through_raw_core_option_meta_post_and_file_writes(args):
+    reason = _setup_command_plants_exploit_payload(
+        args,
+        _hyp(BugClass.XSS_STORED),
+    )
+
+    assert reason and "XSS payload" in reason
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["option", "update", "demo_enabled", "1"],
+        ["post", "create", "--post_title=Normal prerequisite"],
+        ["post", "create", "--post_content=<img src=/normal-image.png>"],
+        ["eval", "Plugin_Setup::install_defaults();"],
+    ],
+)
+def test_allows_benign_raw_prerequisites_and_source_defined_setup_apis(args):
+    reason = _setup_command_plants_exploit_payload(
+        args,
+        _hyp(BugClass.XSS_STORED),
+    )
+
+    assert reason is None
+
+
 def test_allows_runtime_directory_creation_without_permission_mutation():
     reason = _setup_command_plants_exploit_payload(
         ["eval", "$dir = WP_PLUGIN_DIR . '/demo/files'; wp_mkdir_p($dir);"],
         _hyp(BugClass.ARBITRARY_FILE_WRITE),
     )
     assert reason is None
+
+
+@pytest.mark.parametrize(
+    ("args", "reason_fragment"),
+    [
+        (["--user=1", "plugin", "deactivate", "demo-plugin"], "plugin lifecycle"),
+        (["plugin", "--quiet", "activate", "demo-plugin"], "plugin lifecycle"),
+        (["plugin", "install", "demo-plugin"], "plugin lifecycle"),
+        (["plugin", "update", "demo-plugin"], "plugin lifecycle"),
+        (["eval", "activate_plugin('demo-plugin/demo-plugin.php');"], "lifecycle API"),
+        (
+            ["eval", "deactivate_plugins('demo-plugin/demo-plugin.php');"],
+            "lifecycle API",
+        ),
+        (["--user=admin@example.test", "option", "get", "siteurl"], "WordPress user"),
+        (["--user", "1", "option", "get", "siteurl"], "WordPress user"),
+        (
+            ["eval", "wp_set_current_user(1); update_option('demo', 1);"],
+            "wp_set_current_user",
+        ),
+    ],
+)
+def test_blocks_managed_identity_and_plugin_lifecycle_mutations(args, reason_fragment):
+    reason = _setup_command_mutates_managed_context(args)
+
+    assert reason and reason_fragment in reason
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["user", "set-role", "subscriber_user", "administrator"],
+        ["user", "add-cap", "subscriber_user", "manage_options"],
+        ["user", "update", "subscriber_user", "--role=administrator"],
+        [
+            "eval",
+            "$user = get_user_by('login', 'subscriber_user'); "
+            "$user->set_role('administrator');",
+        ],
+        ["eval", "wp_set_password('changed', 7);"],
+        [
+            "eval",
+            "call_user_func('wp_update_user', ['ID' => 7, 'user_pass' => 'changed']);",
+        ],
+        [
+            "eval",
+            "$update = 'wp_update_user'; "
+            "$update(['ID' => 7, 'user_pass' => 'changed']);",
+        ],
+        [
+            "user",
+            "application-password",
+            "create",
+            "subscriber_user",
+            "setup credential",
+        ],
+        [
+            "user",
+            "--quiet",
+            "application-password",
+            "--porcelain",
+            "delete",
+            "subscriber_user",
+            "credential-uuid",
+        ],
+        [
+            "eval",
+            "WP_CLI::runcommand('user application-password update "
+            "subscriber_user credential-uuid --name=changed');",
+        ],
+        [
+            "eval",
+            "WP_Application_Passwords::create_new_application_password(7, "
+            "['name' => 'setup credential']);",
+        ],
+        [
+            "eval",
+            "call_user_func(['WP_Application_Passwords', "
+            "'delete_application_password'], 7, 'credential-uuid');",
+        ],
+        [
+            "eval",
+            "$method = 'update_application_password'; "
+            "WP_Application_Passwords::$method(7, 'credential-uuid', []);",
+        ],
+        [
+            "eval",
+            "update_user_meta(7, '_application_passwords', []);",
+        ],
+        [
+            "user",
+            "meta",
+            "update",
+            "subscriber_user",
+            "_application_passwords",
+            "[]",
+        ],
+        [
+            "eval",
+            "global $wpdb; $wpdb->delete($wpdb->usermeta, "
+            "['meta_key' => WP_Application_Passwords::"
+            "USERMETA_KEY_APPLICATION_PASSWORDS]);",
+        ],
+        [
+            "eval",
+            "global $wpdb; $wpdb->update($wpdb->users, "
+            "['user_pass' => 'changed'], ['ID' => 1]);",
+        ],
+        ["eval", "call_user_func('add_role', 'elevated', ['manage_options'=>1]);"],
+        [
+            "eval",
+            "update_user_meta(7, $wpdb->prefix . 'capabilities', "
+            "['administrator' => true]);",
+        ],
+        ["option", "update", "wp_user_roles", "{}"],
+        ["option", "update", "active_plugins", "[]"],
+        ["eval", "update_option('active_sitewide_plugins', []);"],
+        [
+            "eval",
+            "call_user_func('update_option', 'active_plugins', []);",
+        ],
+        [
+            "eval",
+            "WP_CLI::runcommand('plugin deactivate demo-plugin');",
+        ],
+        [
+            "user",
+            "create",
+            "extra-owner",
+            "owner@example.test",
+            "--role=administrator",
+        ],
+        [
+            "--role",
+            "ADMIN",
+            "user",
+            "create",
+            "extra-owner",
+            "owner@example.test",
+        ],
+        [
+            "user",
+            "--role=administrator",
+            "update",
+            "subscriber_user",
+        ],
+        [
+            "user",
+            "create",
+            "extra-owner",
+            "owner@example.test",
+            "--role",
+            "super administrator",
+        ],
+        ["super-admin", "add", "extra-owner"],
+        [
+            "eval",
+            "$id = wp_create_user('extra-owner', 'secret'); "
+            "$user = new WP_User($id); $user->set_role('administrator');",
+        ],
+        [
+            "eval",
+            "wp_insert_user(['user_login' => 'extra-owner', "
+            "'user_pass' => 'secret', 'role' => 'administrator']);",
+        ],
+        [
+            "eval",
+            "WP_CLI::runcommand('user create extra-owner owner@example.test "
+            "--role=administrator');",
+        ],
+    ],
+)
+def test_blocks_direct_role_capability_and_active_plugin_state_mutations(args):
+    reason = _setup_command_mutates_managed_context(args)
+
+    assert reason is not None
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        [
+            "user",
+            "create",
+            "object-owner",
+            "owner@example.test",
+            "--role=subscriber",
+        ],
+        [
+            "user",
+            "create",
+            "object-owner",
+            "owner@example.test",
+            "--role",
+            "author",
+        ],
+        ["eval", "wp_create_user('object-owner', 'secret');"],
+    ],
+)
+def test_allows_low_privilege_owner_or_control_user_creation(args):
+    assert _setup_command_mutates_managed_context(args) is None
+
+
+def test_allows_indirect_noncredential_user_profile_setup():
+    assert (
+        _setup_command_mutates_managed_context(
+            [
+                "eval",
+                "$update = 'wp_update_user'; "
+                "$update(['ID' => 7, 'display_name' => 'Object Owner']);",
+            ]
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["user", "application-password", "list", "subscriber_user"],
+        [
+            "user",
+            "--format=json",
+            "application-password",
+            "get",
+            "subscriber_user",
+            "credential-uuid",
+        ],
+        [
+            "eval",
+            "WP_Application_Passwords::get_user_application_passwords(7);",
+        ],
+        ["user", "meta", "get", "subscriber_user", "_application_passwords"],
+    ],
+)
+def test_allows_read_only_application_password_diagnostics(args):
+    assert _setup_command_mutates_managed_context(args) is None
+
+
+def test_managed_context_guard_allows_benign_installer_and_object_setup():
+    assert (
+        _setup_command_mutates_managed_context(
+            ["eval", "Plugin_Setup::install_defaults();"]
+        )
+        is None
+    )
+    assert (
+        _setup_command_mutates_managed_context(
+            ["option", "update", "demo_enabled", "1"]
+        )
+        is None
+    )
+
+
+def test_allows_read_only_plugin_diagnostics():
+    reason = _setup_command_mutates_managed_context(
+        ["plugin", "is-active", "demo-plugin"]
+    )
+
+    assert reason is None
+
+
+@pytest.mark.asyncio
+async def test_managed_context_violation_is_blocked_before_execution():
+    class FailIfCalledWPCli:
+        async def _exec_result(self, *args, user=None, wp_user=None):
+            raise AssertionError("managed-context mutation reached WP-CLI")
+
+    sandbox = type("FakeSandbox", (), {"wp_cli": FailIfCalledWPCli()})()
+
+    results = await _run_setup_commands(
+        sandbox,
+        [["--user=1", "plugin", "deactivate", "demo-plugin"]],
+        hypothesis=_hyp(BugClass.ARBITRARY_FILE_WRITE),
+    )
+
+    assert results[0]["failed"] is True
+    assert results[0]["forbidden_payload_seed"] is False
+    assert "plugin lifecycle" in results[0]["forbidden_setup_reason"]
+    assert results[0]["blocked_before_execution"] is True
+    assert results[0]["executed"] is False
+
+
+def _managed_state(*, subscriber_caps=None, active_plugins=None, privileged_users=None):
+    return {
+        "users": {
+            "sandbox-owner": {
+                "id": 1,
+                "login": "sandbox-owner",
+                "roles": ["administrator"],
+                "caps": {"administrator": True},
+                "allcaps": ["manage_options"],
+                "privileged_caps": ["manage_options"],
+                "network_super_admin": False,
+                "credential_fingerprint": "a" * 64,
+            },
+            "subscriber_user": {
+                "id": 2,
+                "login": "subscriber_user",
+                "roles": ["subscriber"],
+                "caps": {"subscriber": True},
+                "allcaps": subscriber_caps or ["read"],
+                "privileged_caps": [],
+                "network_super_admin": False,
+                "credential_fingerprint": "b" * 64,
+            },
+        },
+        "active_plugins": (
+            ["demo-plugin/demo-plugin.php"]
+            if active_plugins is None
+            else active_plugins
+        ),
+        "active_sitewide_plugins": [],
+        "privileged_users": (
+            {
+                "sandbox-owner": {
+                    "id": 1,
+                    "roles": ["administrator"],
+                    "caps": ["manage_options"],
+                    "super_admin": False,
+                }
+            }
+            if privileged_users is None
+            else privileged_users
+        ),
+        "target_plugin_active": True,
+    }
+
+
+def test_managed_setup_state_drift_detects_stable_id_replacement():
+    before = _managed_state()
+    after = _managed_state()
+    after["users"]["subscriber_user"]["id"] = 99
+
+    reason = _managed_setup_state_drift(before, after)
+
+    assert reason is not None
+    assert "identity, or credentials" in reason
+
+
+def test_managed_setup_state_drift_detects_password_or_token_change():
+    before = _managed_state()
+    after = _managed_state()
+    after["users"]["subscriber_user"]["credential_fingerprint"] = "c" * 64
+
+    reason = _managed_setup_state_drift(before, after)
+
+    assert reason is not None
+    assert "identity, or credentials" in reason
+
+
+def test_required_attacker_account_is_hypothesis_specific():
+    editor = {
+        "id": 7,
+        "login": "editor_user",
+        "password": "verified",
+        "role": "editor",
+    }
+
+    assert _required_attacker_account([], "unauthenticated") is None
+    assert _required_attacker_account([editor], "editor") is editor
+    with pytest.raises(RuntimeError, match="subscriber"):
+        _required_attacker_account([editor], "subscriber")
+
+
+def test_low_priv_attacker_uses_lowest_verified_concrete_account():
+    customer = {"login": "customer_user", "password": "x", "role": "customer"}
+    subscriber = {
+        "login": "subscriber_user",
+        "password": "y",
+        "role": "subscriber",
+    }
+
+    assert _required_attacker_account([customer, subscriber], "low_priv") is subscriber
+
+
+@pytest.mark.asyncio
+async def test_post_execution_state_monitor_taints_indirect_capability_mutation():
+    states = iter(
+        [
+            _managed_state(),
+            _managed_state(subscriber_caps=["manage_options", "read"]),
+        ]
+    )
+
+    class RecordingWPCli:
+        called = False
+
+        async def _exec_result(self, *args, user=None, wp_user=None):
+            self.called = True
+            return 0, "installer complete", ""
+
+    class FakeSandbox:
+        config = SimpleNamespace(wp_admin_email="owner@example.test")
+
+        def __init__(self):
+            self.wp_cli = RecordingWPCli()
+
+        async def capture_setup_security_state(self, _plugin_slug):
+            return next(states)
+
+    sandbox = FakeSandbox()
+    results = await _run_setup_commands(
+        sandbox,
+        [["eval", "Plugin_Setup::install_defaults();"]],
+        hypothesis=_hyp(BugClass.XSS_STORED),
+        plugin_slug="demo-plugin",
+    )
+
+    assert sandbox.wp_cli.called is True
+    assert results[0]["failed"] is True
+    assert results[0]["managed_context_violation"] is True
+    assert "roles or capabilities" in results[0]["forbidden_setup_reason"]
+    assert _setup_result_taints_confirmation(results[0]) is True
+
+
+@pytest.mark.asyncio
+async def test_post_execution_state_monitor_taints_configured_admin_mutation():
+    before = _managed_state()
+    after = _managed_state()
+    after["users"]["sandbox-owner"] = {
+        "roles": ["subscriber"],
+        "caps": {"subscriber": True},
+        "allcaps": ["read"],
+    }
+    after["privileged_users"] = {}
+    states = iter([before, after])
+
+    class RecordingWPCli:
+        async def _exec_result(self, *args, user=None, wp_user=None):
+            return 0, "installer complete", ""
+
+    class FakeSandbox:
+        config = SimpleNamespace(wp_admin_email="owner@example.test")
+        wp_cli = RecordingWPCli()
+
+        async def capture_setup_security_state(self, _plugin_slug):
+            return next(states)
+
+    results = await _run_setup_commands(
+        FakeSandbox(),
+        [["eval", "Plugin_Setup::install_defaults();"]],
+        hypothesis=_hyp(BugClass.XSS_STORED),
+        plugin_slug="demo-plugin",
+    )
+
+    assert results[0]["failed"] is True
+    assert results[0]["managed_context_violation"] is True
+    assert "sandbox-owner" in results[0]["forbidden_setup_reason"]
+
+
+@pytest.mark.asyncio
+async def test_post_execution_state_monitor_taints_indirect_plugin_deactivation():
+    before = _managed_state()
+    after = _managed_state(active_plugins=[])
+    after["target_plugin_active"] = False
+    states = iter([before, after])
+
+    class RecordingWPCli:
+        async def _exec_result(self, *args, user=None, wp_user=None):
+            return 0, "installer complete", ""
+
+    class FakeSandbox:
+        config = SimpleNamespace(wp_admin_email="owner@example.test")
+        wp_cli = RecordingWPCli()
+
+        async def capture_setup_security_state(self, _plugin_slug):
+            return next(states)
+
+    results = await _run_setup_commands(
+        FakeSandbox(),
+        [["eval", "Plugin_Setup::install_defaults();"]],
+        hypothesis=_hyp(BugClass.XSS_STORED),
+        plugin_slug="demo-plugin",
+    )
+
+    assert results[0]["failed"] is True
+    assert results[0]["managed_context_violation"] is True
+    assert "deactivated the target plugin" in results[0]["forbidden_setup_reason"]
+
+
+@pytest.mark.asyncio
+async def test_post_execution_state_monitor_taints_new_elevated_user():
+    before = _managed_state()
+    after_privileged = dict(before["privileged_users"])
+    after_privileged["extra-owner"] = {
+        "roles": ["custom-owner"],
+        "caps": ["manage_options"],
+        "super_admin": False,
+    }
+    after = _managed_state(privileged_users=after_privileged)
+    states = iter([before, after])
+
+    class RecordingWPCli:
+        async def _exec_result(self, *args, user=None, wp_user=None):
+            return 0, "installer complete", ""
+
+    class FakeSandbox:
+        config = SimpleNamespace(wp_admin_email="owner@example.test")
+        wp_cli = RecordingWPCli()
+
+        async def capture_setup_security_state(self, _plugin_slug):
+            return next(states)
+
+    results = await _run_setup_commands(
+        FakeSandbox(),
+        [["eval", "Plugin_Setup::install_defaults();"]],
+        hypothesis=_hyp(BugClass.XSS_STORED),
+        plugin_slug="demo-plugin",
+    )
+
+    assert results[0]["failed"] is True
+    assert results[0]["managed_context_violation"] is True
+    assert "elevated WordPress user" in results[0]["forbidden_setup_reason"]
+
+
+@pytest.mark.asyncio
+async def test_post_execution_state_monitor_normalises_plugin_list_order():
+    before = _managed_state(
+        active_plugins=["other/other.php", "demo-plugin/demo-plugin.php"]
+    )
+    before["active_sitewide_plugins"] = ["network/network.php", "mu/mu.php"]
+    after = _managed_state(
+        active_plugins=["demo-plugin/demo-plugin.php", "other/other.php"]
+    )
+    after["active_sitewide_plugins"] = ["mu/mu.php", "network/network.php"]
+    states = iter([before, after])
+
+    class RecordingWPCli:
+        async def _exec_result(self, *args, user=None, wp_user=None):
+            return 0, "installer complete", ""
+
+    class FakeSandbox:
+        config = SimpleNamespace(wp_admin_email="owner@example.test")
+        wp_cli = RecordingWPCli()
+
+        async def capture_setup_security_state(self, _plugin_slug):
+            return next(states)
+
+    results = await _run_setup_commands(
+        FakeSandbox(),
+        [["eval", "Plugin_Setup::install_defaults();"]],
+        hypothesis=_hyp(BugClass.XSS_STORED),
+        plugin_slug="demo-plugin",
+    )
+
+    assert results[0]["failed"] is False
+    assert results[0]["managed_context_violation"] is False
+
+
+@pytest.mark.asyncio
+async def test_post_execution_state_monitor_allows_safe_source_defined_setup_api():
+    state = _managed_state()
+
+    class RecordingWPCli:
+        async def _exec_result(self, *args, user=None, wp_user=None):
+            return 0, "normal object created", ""
+
+    class FakeSandbox:
+        config = SimpleNamespace(wp_admin_email="owner@example.test")
+        wp_cli = RecordingWPCli()
+
+        async def capture_setup_security_state(self, _plugin_slug):
+            return state
+
+    results = await _run_setup_commands(
+        FakeSandbox(),
+        [["eval", "Plugin_Setup::install_defaults();"]],
+        hypothesis=_hyp(BugClass.XSS_STORED),
+        plugin_slug="demo-plugin",
+    )
+
+    assert results[0]["failed"] is False
+    assert results[0]["managed_context_violation"] is False
+    assert _setup_result_taints_confirmation(results[0]) is False
+
+
+@pytest.mark.asyncio
+async def test_setup_is_blocked_if_managed_state_cannot_be_captured():
+    class FailIfCalledWPCli:
+        async def _exec_result(self, *args, user=None, wp_user=None):
+            raise AssertionError("setup ran without a managed-state baseline")
+
+    class FakeSandbox:
+        config = SimpleNamespace(wp_admin_email="owner@example.test")
+        wp_cli = FailIfCalledWPCli()
+
+        async def capture_setup_security_state(self, _plugin_slug):
+            raise RuntimeError("state unavailable")
+
+    results = await _run_setup_commands(
+        FakeSandbox(),
+        [["eval", "Plugin_Setup::install_defaults();"]],
+        hypothesis=_hyp(BugClass.XSS_STORED),
+        plugin_slug="demo-plugin",
+    )
+
+    assert results[0]["blocked_before_execution"] is True
+    assert results[0]["executed"] is False
+    assert "could not establish managed setup security state" in results[0]["stderr"]
+
+
+@pytest.mark.asyncio
+async def test_verification_rejects_success_after_indirect_managed_state_drift(
+    monkeypatch,
+    tmp_path,
+):
+    plugin_root = tmp_path / "plugin"
+    plugin_root.mkdir()
+    (plugin_root / "x.php").write_text("<?php\nPlugin_Setup::install_defaults();\n")
+    poc_dir = tmp_path / "verification"
+    states = iter(
+        [
+            _managed_state(),
+            _managed_state(subscriber_caps=["manage_options", "read"]),
+        ]
+    )
+
+    class FakeWPCli:
+        async def _exec_result(self, *args, user=None, wp_user=None):
+            return 0, "installer complete", ""
+
+    class FakeSandbox:
+        target_url = "http://sandbox.invalid"
+        config = SimpleNamespace(wp_admin_email="owner@example.test")
+        wp_cli = FakeWPCli()
+
+        def __init__(self):
+            self.poc_runs = 0
+            self.restores = 0
+
+        async def capture_setup_security_state(self, _plugin_slug):
+            return next(states)
+
+        def baseline_user_accounts(self):
+            return [
+                {
+                    "login": "subscriber_user",
+                    "password": "password",
+                    "role": "subscriber",
+                }
+            ]
+
+        async def snapshot(self):
+            path = tmp_path / "snapshot"
+            path.mkdir(exist_ok=True)
+            return path
+
+        async def restore(self, _snapshot):
+            self.restores += 1
+
+        async def run_poc(self, *_args, **_kwargs):
+            self.poc_runs += 1
+            return SandboxRunResult(
+                success=True,
+                output="SQUADRONE_RESULT={}",
+                elapsed=0,
+                response="claimed success",
+            )
+
+    class FakeDeveloper:
+        async def propose_setup(self, *_args, **_kwargs):
+            return SetupPlan(
+                rationale="Run the normal source-defined installer.",
+                commands=[["eval", "Plugin_Setup::install_defaults();"]],
+            )
+
+        async def propose_setup_followup(self, **_kwargs):
+            return SetupPlan(
+                rationale="Do not repair a protected-state change.",
+                commands=[],
+                failure_class="setup",
+            )
+
+    class FakePoCAuthor:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def write(self, **_kwargs):
+            return "import requests\n"
+
+    monkeypatch.setattr(verify_stage, "PoCAuthorAgent", FakePoCAuthor)
+    config = PipelineConfig.from_yaml("pipelines/test.yaml")
+    config.verify_max_iterations = 1
+    sandbox = FakeSandbox()
+
+    finding = await verify_stage._verify_one(
+        _hyp(BugClass.XSS_STORED),
+        str(plugin_root),
+        str(tmp_path / "plugin.zip"),
+        "demo-plugin",
+        config,
+        object(),
+        poc_dir,
+        developer=FakeDeveloper(),
+        persistent_sb=sandbox,
+    )
+
+    assert finding is None
+    assert sandbox.poc_runs == 1
+    assert sandbox.restores == 1
+    checkpoint = json.loads((poc_dir / "setup_results.json").read_text())
+    assert checkpoint["results"][0]["managed_context_violation"] is True
+    attempts_checkpoint = json.loads((poc_dir / "attempts.json").read_text())
+    assert attempts_checkpoint["schema_version"] == 1
+    assert attempts_checkpoint["hypothesis_id"] == "h"
+    assert attempts_checkpoint["status"] == "not_confirmed"
+    assert len(attempts_checkpoint["attempts"]) == 1
+    assert attempts_checkpoint["attempts"][0]["result"] == "failed"
+    assert attempts_checkpoint["attempts"][0]["validation_reason"]
+    assert "protected verification boundary" in (
+        attempts_checkpoint["attempts"][0]["developer_analysis"]
+    )
 
 
 @pytest.mark.parametrize(
@@ -85,12 +845,78 @@ def test_blocks_setup_filesystem_permission_mutation(php):
     assert reason and "filesystem permissions or ownership" in reason
 
 
+@pytest.mark.parametrize(
+    "args",
+    [
+        [
+            "eval",
+            """file_put_contents(WP_CONTENT_DIR . '/uploads/proof.php',
+            '<?php echo "SQUADRONE_MARKER";');""",
+        ],
+        [
+            "eval",
+            "copy('/tmp/proof.php', WP_CONTENT_DIR . '/uploads/proof.php');",
+        ],
+        ["eval", "touch(WP_CONTENT_DIR . '/uploads/proof.phtml');"],
+        [
+            "eval",
+            "$wp_filesystem->put_contents(WP_CONTENT_DIR . "
+            "'/uploads/proof.php', 'marker');",
+        ],
+        ["media", "import", "/tmp/proof.php"],
+        [
+            "db",
+            "query",
+            "SELECT '<?php echo 1;' INTO OUTFILE '/tmp/proof.php'",
+        ],
+    ],
+)
+def test_blocks_direct_file_seed_for_file_write_or_upload_finding(args):
+    reason = _setup_command_plants_exploit_payload(
+        args,
+        _hyp(BugClass.ARBITRARY_FILE_WRITE),
+    )
+
+    assert reason and "directly" in reason
+
+
+def test_blocks_direct_executable_file_seed_without_hypothesis_metadata():
+    reason = _setup_command_plants_exploit_payload(
+        [
+            "eval",
+            """file_put_contents('/tmp/proof.php',
+            '<?php system($_GET["cmd"]);');""",
+        ],
+        None,
+    )
+
+    assert reason and "executable file content" in reason
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["eval", "wp_mkdir_p(WP_CONTENT_DIR . '/uploads/demo');"],
+        ["post", "create", "--post_title=Normal prerequisite page"],
+        ["eval", "Plugin_Setup::install_defaults();"],
+    ],
+)
+def test_file_seed_guard_allows_directory_page_and_source_defined_setup(args):
+    assert (
+        _setup_command_plants_exploit_payload(
+            args,
+            _hyp(BugClass.ARBITRARY_FILE_WRITE),
+        )
+        is None
+    )
+
+
 @pytest.mark.asyncio
 async def test_forbidden_permission_setup_is_not_executed():
     class FakeWPCli:
         called = False
 
-        async def _exec_result(self, *args, user=None):
+        async def _exec_result(self, *args, user=None, wp_user=None):
             self.called = True
             return 0, "", ""
 
@@ -113,7 +939,7 @@ async def test_forbidden_permission_setup_is_not_executed():
 @pytest.mark.asyncio
 async def test_mixed_safe_and_forbidden_setup_is_blocked_atomically():
     class FailIfCalledWPCli:
-        async def _exec_result(self, *args, user=None):
+        async def _exec_result(self, *args, user=None, wp_user=None):
             raise AssertionError("mixed setup reached WP-CLI")
 
     sandbox = type("FakeSandbox", (), {"wp_cli": FailIfCalledWPCli()})()
@@ -158,7 +984,7 @@ def test_pre_execution_block_does_not_taint_later_confirmation():
 @pytest.mark.asyncio
 async def test_permission_guard_does_not_depend_on_hypothesis_metadata():
     class FailIfCalledWPCli:
-        async def _exec_result(self, *args, user=None):
+        async def _exec_result(self, *args, user=None, wp_user=None):
             raise AssertionError("forbidden setup reached WP-CLI")
 
     sandbox = type("FakeSandbox", (), {"wp_cli": FailIfCalledWPCli()})()
@@ -172,15 +998,22 @@ async def test_permission_guard_does_not_depend_on_hypothesis_metadata():
 
 
 @pytest.mark.asyncio
-async def test_allowed_setup_runs_as_wordpress_web_identity():
-    calls: list[tuple[tuple[str, ...], str | None]] = []
+async def test_allowed_setup_runs_as_web_and_configured_wordpress_admin_identities():
+    calls: list[tuple[tuple[str, ...], str | None, str | None]] = []
 
     class RecordingWPCli:
-        async def _exec_result(self, *args, user=None):
-            calls.append((args, user))
+        async def _exec_result(self, *args, user=None, wp_user=None):
+            calls.append((args, user, wp_user))
             return 0, "updated", ""
 
-    sandbox = type("FakeSandbox", (), {"wp_cli": RecordingWPCli()})()
+    sandbox = type(
+        "FakeSandbox",
+        (),
+        {
+            "wp_cli": RecordingWPCli(),
+            "config": SimpleNamespace(wp_admin_email="owner@example.test"),
+        },
+    )()
 
     results = await _run_setup_commands(
         sandbox,
@@ -188,7 +1021,13 @@ async def test_allowed_setup_runs_as_wordpress_web_identity():
         hypothesis=_hyp(BugClass.ARBITRARY_FILE_WRITE),
     )
 
-    assert calls == [(("option", "update", "demo_enabled", "1"), "www-data")]
+    assert calls == [
+        (
+            ("option", "update", "demo_enabled", "1"),
+            "www-data",
+            "owner@example.test",
+        )
+    ]
     assert results[0]["failed"] is False
 
 
@@ -202,10 +1041,17 @@ async def test_allowed_setup_runs_as_wordpress_web_identity():
 )
 async def test_successful_wp_cli_command_is_not_failed_by_advisory_output(advisory):
     class WarningWPCli:
-        async def _exec_result(self, *args, user=None):
+        async def _exec_result(self, *args, user=None, wp_user=None):
             return 0, "Success: Rewrite rules flushed.", advisory
 
-    sandbox = type("FakeSandbox", (), {"wp_cli": WarningWPCli()})()
+    sandbox = type(
+        "FakeSandbox",
+        (),
+        {
+            "wp_cli": WarningWPCli(),
+            "config": SimpleNamespace(wp_admin_email="owner@example.test"),
+        },
+    )()
 
     results = await _run_setup_commands(
         sandbox,
@@ -221,22 +1067,113 @@ async def test_successful_wp_cli_command_is_not_failed_by_advisory_output(adviso
 
 
 @pytest.mark.asyncio
-async def test_php_warning_still_fails_setup_even_with_zero_exit_status():
-    class PhpWarningWPCli:
-        async def _exec_result(self, *args, user=None):
-            return 0, "", "PHP Warning: mkdir(): Permission denied"
+async def test_structured_postcondition_survives_unrelated_plugin_bootstrap_warning():
+    bootstrap_warning = (
+        'PHP Warning: Attempt to read property "current_options" on null in '
+        "/var/www/html/wp-content/plugins/example/includes/block.php on line 25"
+    )
 
-    sandbox = type("FakeSandbox", (), {"wp_cli": PhpWarningWPCli()})()
+    class BootstrapWarningWPCli:
+        async def _exec_result(self, *args, user=None, wp_user=None):
+            return 0, '{"foreign_id":41,"control_id":42}\n', bootstrap_warning
+
+    sandbox = type(
+        "FakeSandbox",
+        (),
+        {
+            "wp_cli": BootstrapWarningWPCli(),
+            "config": SimpleNamespace(wp_admin_email="owner@example.test"),
+        },
+    )()
+    command = [
+        "eval",
+        "$rows = array('foreign_id' => 41, 'control_id' => 42); "
+        "WP_CLI::log(wp_json_encode($rows));",
+    ]
 
     results = await _run_setup_commands(
         sandbox,
-        [["eval", "wp_mkdir_p('/srv/site/uploads');"]],
+        [command],
+        hypothesis=_hyp(BugClass.IDOR),
+    )
+
+    assert results[0]["failed"] is False
+    assert results[0]["advisory_bootstrap_warning"] is True
+    summary = _summarise_setup_results(results)
+    assert "OK WITH WARNINGS: wp eval" in summary
+    assert '"foreign_id":41' in summary
+    assert bootstrap_warning in summary
+
+
+@pytest.mark.asyncio
+async def test_wp_cli_error_remains_failed_despite_structured_output_and_warning():
+    stderr = (
+        'PHP Warning: Attempt to read property "state" on null in '
+        "/var/www/html/wp-content/plugins/example/bootstrap.php on line 9\n"
+        "Error: setup postcondition failed"
+    )
+
+    class ErrorWPCli:
+        async def _exec_result(self, *args, user=None, wp_user=None):
+            return 0, '{"foreign_id":41}\n', stderr
+
+    sandbox = type(
+        "FakeSandbox",
+        (),
+        {
+            "wp_cli": ErrorWPCli(),
+            "config": SimpleNamespace(wp_admin_email="owner@example.test"),
+        },
+    )()
+
+    results = await _run_setup_commands(
+        sandbox,
+        [["eval", "WP_CLI::log(wp_json_encode(array('foreign_id' => 41)));"]],
+        hypothesis=_hyp(BugClass.IDOR),
+    )
+
+    assert results[0]["failed"] is True
+    assert results[0]["advisory_bootstrap_warning"] is False
+
+
+@pytest.mark.asyncio
+async def test_php_warning_still_fails_setup_even_with_zero_exit_status():
+    class PhpWarningWPCli:
+        async def _exec_result(self, *args, user=None, wp_user=None):
+            return (
+                0,
+                '{"directory":"/srv/site/uploads"}',
+                "PHP Warning: mkdir(): Permission denied in "
+                "/var/www/html/wp-includes/functions.php on line 2047",
+            )
+
+    sandbox = type(
+        "FakeSandbox",
+        (),
+        {
+            "wp_cli": PhpWarningWPCli(),
+            "config": SimpleNamespace(wp_admin_email="owner@example.test"),
+        },
+    )()
+
+    results = await _run_setup_commands(
+        sandbox,
+        [
+            [
+                "eval",
+                "$ok = wp_mkdir_p('/srv/site/uploads'); "
+                "WP_CLI::log(wp_json_encode(array('directory' => "
+                "'/srv/site/uploads')));",
+            ]
+        ],
         hypothesis=_hyp(BugClass.ARBITRARY_FILE_WRITE),
     )
 
     assert results[0]["executed"] is True
     assert results[0]["blocked_before_execution"] is False
     assert results[0]["failed"] is True
+    summary = _summarise_setup_results(results)
+    assert "FAILED AFTER EXECUTION — STATE MAY BE PARTIAL" in summary
 
 
 def test_setup_context_includes_cited_entry_point_and_sink_files(tmp_path):
@@ -316,10 +1253,79 @@ def test_setup_context_recovers_uncited_entry_guard_from_semantic_identifier(tmp
     assert context.index("--- includes/routes.php ---") < context.index(
         "--- includes/storage.php ---"
     )
+    assert len(context) <= 12_000
+
+
+def test_setup_context_reserves_primary_sink_and_config_when_auxiliary_overflows(
+    tmp_path,
+):
+    primary_lines = ["// primary filler"] * 360
+    primary_lines[49] = "private $option_name = 'demo_options'; // PRIMARY_CONFIG"
+    primary_lines[69] = "add_action('wp_ajax_demo_store_asset', 'demo_store_asset');"
+    primary_lines[299] = "$wpdb->query($sql); // PRIMARY_SINK"
+    (tmp_path / "main.php").write_text("\n".join(primary_lines))
+
+    includes = tmp_path / "includes"
+    includes.mkdir()
+    for index, name in enumerate(("a_route", "b_noise", "c_noise", "d_noise")):
+        auxiliary_lines = [f"// {name} " + ("x" * 100)] * 90
+        auxiliary_lines[index + 1] = (
+            f"demo_store_asset(); // {name.upper()}_SEMANTIC_MATCH"
+        )
+        (includes / f"{name}.php").write_text("\n".join(auxiliary_lines))
+
+    hypothesis = _hyp(BugClass.IDOR)
+    hypothesis.entry_point = "wp_ajax_demo_store_asset"
+    hypothesis.file = "main.php"
+    hypothesis.line = 300
+    hypothesis.sink_code = "$wpdb->query($sql);"
+    hypothesis.taint_path = [
+        "demo_store_asset receives the object ID",
+        "demo_store_asset dispatches the update",
+    ]
+
+    context = _build_setup_code_context(tmp_path, hypothesis, max_chars=8_000)
+
+    assert context is not None
+    assert len(context) <= 8_000
+    assert "ROUTE_SEMANTIC_MATCH" in context
+    assert "--- main.php ---" in context
+    assert "PRIMARY_CONFIG" in context
+    assert "PRIMARY_SINK" in context
+    assert context.index("--- includes/a_route.php ---") < context.index(
+        "--- main.php ---"
+    )
+
+
+def test_setup_context_keeps_sink_when_primary_itself_overflows(tmp_path):
+    primary_lines = ["// " + ("y" * 70)] * 700
+    primary_lines[9] = "private $option_name = 'demo_options'; // PRIMARY_CONFIG"
+    semantic_tokens = ["demo_route_one", "demo_route_two", "demo_route_three"]
+    for line_number, token in zip((100, 250, 400), semantic_tokens, strict=True):
+        primary_lines[line_number - 1] = f"function {token}() {{}}"
+    primary_lines[649] = "$wpdb->query($sql); // PRIMARY_SINK"
+    (tmp_path / "main.php").write_text("\n".join(primary_lines))
+
+    hypothesis = _hyp(BugClass.IDOR)
+    hypothesis.entry_point = "wp_ajax_demo_route_one"
+    hypothesis.file = "main.php"
+    hypothesis.line = 650
+    hypothesis.sink_code = "$wpdb->query($sql);"
+    hypothesis.taint_path = [
+        "demo_route_two receives the object ID",
+        "demo_route_three dispatches the update",
+    ]
+
+    context = _build_setup_code_context(tmp_path, hypothesis, max_chars=5_000)
+
+    assert context is not None
+    assert len(context) <= 5_000
+    assert "PRIMARY_CONFIG" in context
+    assert "PRIMARY_SINK" in context
 
 
 @pytest.mark.asyncio
-async def test_atomic_setup_repair_retries_once_and_shares_followup_cap(
+async def test_atomic_setup_repair_does_not_consume_poc_requested_quota(
     monkeypatch, tmp_path
 ):
     plugin_root = tmp_path / "plugin"
@@ -331,17 +1337,22 @@ async def test_atomic_setup_repair_retries_once_and_shares_followup_cap(
         "wp_mkdir_p('/srv/site/uploads'); chmod('/srv/site/uploads', 0777);",
     ]
     safe = ["eval", "wp_mkdir_p('/srv/site/uploads');"]
+    poc_forbidden = [
+        "eval",
+        "wp_mkdir_p('/srv/site/poc-uploads'); chmod('/srv/site/poc-uploads', 0777);",
+    ]
 
     class RecordingWPCli:
         def __init__(self):
             self.calls = []
 
-        async def _exec_result(self, *args, user=None):
-            self.calls.append((args, user))
+        async def _exec_result(self, *args, user=None, wp_user=None):
+            self.calls.append((args, user, wp_user))
             return 0, "directory ready", ""
 
     class FakeSandbox:
         target_url = "http://sandbox.invalid"
+        config = SimpleNamespace(wp_admin_email="owner@example.test")
 
         def __init__(self):
             self.wp_cli = RecordingWPCli()
@@ -390,7 +1401,16 @@ async def test_atomic_setup_repair_retries_once_and_shares_followup_cap(
                 return SetupPlan(
                     rationale="Use only the safe operation.", commands=[safe]
                 )
-            raise AssertionError("shared setup followup cap was exceeded")
+            if len(self.followup_feedback) == 3:
+                return SetupPlan(
+                    rationale="Apply the source-grounded PoC prerequisite.",
+                    commands=[poc_forbidden],
+                )
+            if len(self.followup_feedback) == 4:
+                return SetupPlan(
+                    rationale="Do not bypass the setup safety guard.", commands=[]
+                )
+            raise AssertionError("a setup followup quota was exceeded")
 
     callback_results = []
 
@@ -407,6 +1427,7 @@ async def test_atomic_setup_repair_retries_once_and_shares_followup_cap(
     config.verify_max_iterations = 1
     developer = FakeDeveloper()
     sandbox = FakeSandbox()
+    runtime = object()
 
     finding = await verify_stage._verify_one(
         _hyp(BugClass.ARBITRARY_FILE_WRITE),
@@ -414,26 +1435,222 @@ async def test_atomic_setup_repair_retries_once_and_shares_followup_cap(
         str(tmp_path / "plugin.zip"),
         "plugin",
         config,
-        object(),
+        runtime,
         poc_dir,
         developer=developer,
         persistent_sb=sandbox,
     )
 
     assert finding is None
-    assert len(developer.followup_feedback) == 2
+    assert len(developer.followup_feedback) == 4
     assert "BLOCKED BEFORE EXECUTION" in developer.followup_feedback[0]
     assert "LATEST SETUP ROUND" in developer.followup_feedback[1]
     assert "CUMULATIVE SETUP HISTORY" in developer.followup_feedback[1]
-    assert sandbox.wp_cli.calls == [(tuple(safe), "www-data")]
-    assert callback_results == [
-        "[request_additional_setup] setup followup limit reached (2/2)"
-    ]
+    assert sandbox.wp_cli.calls == [(tuple(safe), "www-data", "owner@example.test")]
+    assert len(callback_results) == 1
+    assert callback_results[0].startswith(
+        "[request_additional_setup] setup remains incomplete;"
+    )
     checkpoint = json.loads((poc_dir / "setup_results.json").read_text())
-    assert checkpoint["followups_used"] == 2
-    assert len(checkpoint["results"]) == 3
+    assert checkpoint["followups_used"] == 4
+    assert checkpoint["followup_cap"] == 4
+    assert checkpoint["automatic_followups_used"] == 2
+    assert checkpoint["automatic_followup_cap"] == 2
+    assert checkpoint["poc_requested_followups_used"] == 2
+    assert checkpoint["poc_requested_followup_cap"] == 2
+    assert len(checkpoint["results"]) == 4
     assert [item["blocked_before_execution"] for item in checkpoint["results"]] == [
         True,
         True,
+        False,
+        True,
+    ]
+    assert checkpoint["results"][-1]["executed"] is False
+
+
+@pytest.mark.asyncio
+async def test_blocked_lifecycle_repairs_cannot_starve_poc_requested_setup(
+    monkeypatch, tmp_path
+):
+    plugin_root = tmp_path / "plugin"
+    plugin_root.mkdir()
+    (plugin_root / "x.php").write_text("<?php\ncopy($source, $destination);\n")
+    poc_dir = tmp_path / "verification"
+    initial_lifecycle = ["plugin", "deactivate", "plugin"]
+    first_repair = ["plugin", "activate", "plugin"]
+    second_repair = ["--user=1", "plugin", "deactivate", "plugin"]
+    poc_initial = ["option", "update", "demo_runtime_ready", "1"]
+    poc_corrective = ["option", "update", "demo_runtime_postcondition", "1"]
+
+    class RecordingWPCli:
+        def __init__(self):
+            self.calls = []
+
+        async def _exec_result(self, *args, user=None, wp_user=None):
+            self.calls.append((args, user, wp_user))
+            if args == tuple(poc_initial):
+                return 0, '{"foreign_id":41,"control_id":42}', ""
+            if args == tuple(poc_corrective):
+                return 0, '{"observer_id":7,"postcondition":"ready"}', ""
+            return 0, "updated", ""
+
+    class FakeSandbox:
+        target_url = "http://sandbox.invalid"
+        config = SimpleNamespace(wp_admin_email="owner@example.test")
+
+        def __init__(self):
+            self.wp_cli = RecordingWPCli()
+            self.snapshot_count = 0
+
+        def baseline_user_accounts(self):
+            return [
+                {
+                    "login": "subscriber_user",
+                    "password": "password",
+                    "role": "subscriber",
+                }
+            ]
+
+        async def snapshot(self):
+            self.snapshot_count += 1
+            path = tmp_path / f"lifecycle-snapshot-{self.snapshot_count}"
+            path.mkdir()
+            return path
+
+        async def restore(self, _snapshot):
+            return None
+
+        async def run_poc(self, *_args, **_kwargs):
+            return SandboxRunResult(
+                success=False,
+                output="",
+                elapsed=0,
+                response="not confirmed",
+            )
+
+    class FakeDeveloper:
+        def __init__(self):
+            self.followup_calls = []
+
+        async def propose_setup(self, *_args, **_kwargs):
+            return SetupPlan(
+                rationale="Incorrectly cycle the managed plugin.",
+                commands=[initial_lifecycle],
+            )
+
+        async def propose_setup_followup(self, **kwargs):
+            self.followup_calls.append(kwargs)
+            call_number = len(self.followup_calls)
+            if call_number == 1:
+                return SetupPlan(
+                    rationale="Incorrect lifecycle retry.", commands=[first_repair]
+                )
+            if call_number == 2:
+                return SetupPlan(
+                    rationale="Incorrect identity and lifecycle retry.",
+                    commands=[second_repair],
+                )
+            if call_number == 3:
+                return SetupPlan(
+                    rationale="Create the source-grounded normal prerequisite.",
+                    commands=[poc_initial],
+                )
+            if call_number == 4:
+                return SetupPlan(
+                    rationale="Correct the source-grounded frontend postcondition.",
+                    commands=[poc_corrective],
+                )
+            raise AssertionError("a setup followup quota was exceeded")
+
+    callback_results = []
+    write_setup_summaries = []
+
+    class FakePoCAuthor:
+        def __init__(self, *_args, setup_callback=None, **_kwargs):
+            self.setup_callback = setup_callback
+            self.write_count = 0
+
+        async def write(self, **kwargs):
+            self.write_count += 1
+            write_setup_summaries.append(
+                kwargs["extra_context"].get("setup_summary", "")
+            )
+            descriptions = {
+                1: "create the source-grounded normal state",
+                2: "correct the failed frontend postcondition",
+                3: "request a third PoC setup round",
+            }
+            callback_results.append(
+                await self.setup_callback(descriptions[self.write_count])
+            )
+            return "from pathlib import Path\n"
+
+    monkeypatch.setattr(verify_stage, "PoCAuthorAgent", FakePoCAuthor)
+    config = PipelineConfig.from_yaml("pipelines/test.yaml")
+    config.verify_max_iterations = 3
+    developer = FakeDeveloper()
+    sandbox = FakeSandbox()
+    runtime = object()
+
+    finding = await verify_stage._verify_one(
+        _hyp(BugClass.ARBITRARY_FILE_WRITE),
+        str(plugin_root),
+        str(tmp_path / "plugin.zip"),
+        "plugin",
+        config,
+        runtime,
+        poc_dir,
+        developer=developer,
+        persistent_sb=sandbox,
+    )
+
+    assert finding is None
+    assert len(developer.followup_calls) == 4
+    assert all(call["runtime"] is runtime for call in developer.followup_calls)
+    assert all(
+        call["plugin_root"] == str(plugin_root)
+        for call in developer.followup_calls
+    )
+    assert (
+        "PoC author requested additional setup"
+        in developer.followup_calls[2]["schema_diagnostics"]
+    )
+    assert (
+        "failed frontend postcondition"
+        in developer.followup_calls[3]["schema_diagnostics"]
+    )
+    assert sandbox.wp_cli.calls == [
+        (tuple(poc_initial), "www-data", "owner@example.test"),
+        (tuple(poc_corrective), "www-data", "owner@example.test"),
+    ]
+    assert callback_results[0].startswith(
+        "[request_additional_setup] applied 1 permitted commands."
+    )
+    assert callback_results[1].startswith(
+        "[request_additional_setup] applied 1 permitted commands."
+    )
+    assert callback_results[2] == (
+        "[request_additional_setup] PoC-requested setup followup limit reached (2/2)"
+    )
+    assert '"foreign_id":41' not in write_setup_summaries[0]
+    assert '"foreign_id":41' in write_setup_summaries[1]
+    assert '"foreign_id":41' in write_setup_summaries[2]
+    assert '"observer_id":7' in write_setup_summaries[2]
+    assert "ordered oldest to newest" in write_setup_summaries[2]
+    assert "newer self-verified result as canonical" in write_setup_summaries[2]
+    assert "FAILED or partial commands are not evidence" in write_setup_summaries[2]
+
+    checkpoint = json.loads((poc_dir / "setup_results.json").read_text())
+    assert checkpoint["followups_used"] == 4
+    assert checkpoint["followup_cap"] == 4
+    assert checkpoint["automatic_followups_used"] == 2
+    assert checkpoint["automatic_followup_cap"] == 2
+    assert checkpoint["poc_requested_followups_used"] == 2
+    assert checkpoint["poc_requested_followup_cap"] == 2
+    assert [item["blocked_before_execution"] for item in checkpoint["results"]] == [
+        True,
+        True,
+        True,
+        False,
         False,
     ]

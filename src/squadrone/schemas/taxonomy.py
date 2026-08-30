@@ -38,6 +38,11 @@ PATCHSTACK_POLICIES = frozenset(
     }
 )
 
+# Canonical CWEs outside the reviewed registry retain their exact identifier and
+# receive one conservative authoring fallback for manual review. They deliberately
+# do not inherit an automatic oracle or disclosure policy.
+OPEN_CWE_POC_TEMPLATE = "generic_open_cwe.py.j2"
+
 
 class BugClass(str, Enum):
     MISSING_CAP_CHECK = "CWE-862"
@@ -325,10 +330,10 @@ _KNOWN_CWE_REGISTRY: dict[BugClass, KnownCWEProfile] = {
         "authorization_workflow",
         "insecure_direct_object_reference",
         "authorization_workflows",
-        surfaces=("entry_point", "object_write"),
+        surfaces=("entry_point", "object_write", "sql_object_access"),
         owasp="A01:2021-Broken Access Control",
         template="idor.py.j2",
-        oracles=("cross_object_access", "response_marker"),
+        oracles=("cross_object_access",),
         patchstack="significant_object",
         delivery="conditional",
     ),

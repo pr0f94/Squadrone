@@ -35,7 +35,14 @@ def _configure_logging(verbose: bool = False) -> None:
         logging.getLogger().setLevel(level)
         for handler in logging.getLogger().handlers:
             handler.setLevel(level)
-        for noisy in ("httpx", "httpcore", "litellm", "LiteLLM", "aiosqlite", "asyncio"):
+        for noisy in (
+            "httpx",
+            "httpcore",
+            "litellm",
+            "LiteLLM",
+            "aiosqlite",
+            "asyncio",
+        ):
             logging.getLogger(noisy).setLevel(logging.WARNING)
         return  # already configured (e.g., when used as a library)
     if "WPVH_LOG_LEVEL" in os.environ:
@@ -57,7 +64,10 @@ def _configure_logging(verbose: bool = False) -> None:
     for noisy in ("httpx", "httpcore", "litellm", "LiteLLM", "aiosqlite", "asyncio"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
-app = typer.Typer(help="Squadrone — multi-agent WordPress plugin vulnerability research tool")
+
+app = typer.Typer(
+    help="Squadrone — multi-agent WordPress plugin vulnerability research tool"
+)
 runs_app = typer.Typer(help="Manage scan runs")
 findings_app = typer.Typer(help="Inspect findings")
 manual_app = typer.Typer(help="Inspect and manage the manual review queue")
@@ -122,8 +132,20 @@ def _stage_done_summary(stage: str, info: dict[str, Any]) -> str:
         "intake": ("version", "files", "lines"),
         "recon": ("entry_points", "sinks"),
         "hypothesis": ("count",),
-        "triage": ("accepted", "rejected", "merged", "deferred", "manual_review_candidates"),
-        "manual_queue": ("candidates", "manual_queued", "already_queued", "unavailable", "reason"),
+        "triage": (
+            "accepted",
+            "rejected",
+            "merged",
+            "deferred",
+            "manual_review_candidates",
+        ),
+        "manual_queue": (
+            "candidates",
+            "manual_queued",
+            "already_queued",
+            "unavailable",
+            "reason",
+        ),
         "verify": ("findings", "manual_queued", "already_queued"),
         "dedup": ("novel", "possibly_known", "known_dupe"),
         "report": ("reports",),
@@ -194,15 +216,28 @@ def _print_scan_result(result: Any) -> None:
     stage_tsv = _run_dir(result.run_id) / "cost_per_stage.tsv"
     if stage_tsv.exists():
         stage_table = Table(title="Cost per stage")
-        for col in ("stage", "calls", "cost", "input", "output", "cache_read", "hit_rate"):
+        for col in (
+            "stage",
+            "calls",
+            "cost",
+            "input",
+            "output",
+            "cache_read",
+            "hit_rate",
+        ):
             stage_table.add_column(col)
         for line in stage_tsv.read_text().splitlines()[1:]:
             cols = line.split("\t")
             if len(cols) >= 8:
                 stage, calls, cost, inp, out, cache_read, _cache_write, hit = cols[:8]
                 stage_table.add_row(
-                    stage, calls, f"${float(cost):.4f}",
-                    inp, out, cache_read, f"{float(hit) * 100:.1f}%",
+                    stage,
+                    calls,
+                    f"${float(cost):.4f}",
+                    inp,
+                    out,
+                    cache_read,
+                    f"{float(hit) * 100:.1f}%",
                 )
         console.print(stage_table)
 
@@ -244,20 +279,30 @@ async def _run_scan_cli(
             console.print(f"\n{prefix}[bold cyan]▶ {label}[/]{detail}")
             console.print(f"[dim]{description}[/]")
             if verbose and run_id_seen:
-                console.print(f"[dim]Artifacts: plugins/{plugin_slug}/runs/{run_id_seen}/[/]")
+                console.print(
+                    f"[dim]Artifacts: plugins/{plugin_slug}/runs/{run_id_seen}/[/]"
+                )
         elif status == "done":
             elapsed = time.monotonic() - stage_started_at.get(stage, time.monotonic())
             summary = _stage_done_summary(stage, info)
             suffix = f" · {summary}" if summary else ""
-            console.print(f"{prefix}[green]✓ {label} complete[/] [dim]in {_fmt_elapsed(elapsed)}[/]{suffix}")
+            console.print(
+                f"{prefix}[green]✓ {label} complete[/] [dim]in {_fmt_elapsed(elapsed)}[/]{suffix}"
+            )
         elif status == "skipped":
             extras = _stage_done_summary(stage, info)
             suffix = f" · {extras}" if extras else ""
-            console.print(f"{prefix}[dim]↺ {label} loaded from existing artifacts{suffix}[/]")
+            console.print(
+                f"{prefix}[dim]↺ {label} loaded from existing artifacts{suffix}[/]"
+            )
         elif status == "budget_exceeded":
-            console.print(f"{prefix}[yellow]⚠ budget exceeded — {info.get('message','')}[/]")
+            console.print(
+                f"{prefix}[yellow]⚠ budget exceeded — {info.get('message', '')}[/]"
+            )
         elif status == "failed":
-            console.print(f"{prefix}[red]✗ pipeline failed — {info.get('message','')}[/]")
+            console.print(
+                f"{prefix}[red]✗ pipeline failed — {info.get('message', '')}[/]"
+            )
 
     result = await run_scan(
         plugin_slug=plugin_slug,
@@ -298,7 +343,9 @@ def _load_manual_queue() -> list[dict[str, Any]]:
         try:
             entry = json.loads(line)
         except json.JSONDecodeError as exc:
-            raise typer.BadParameter(f"manual queue has invalid JSON on line {line_no}: {exc}") from exc
+            raise typer.BadParameter(
+                f"manual queue has invalid JSON on line {line_no}: {exc}"
+            ) from exc
         entry["_line_no"] = line_no
         entries.append(entry)
     return entries
@@ -315,7 +362,9 @@ def _manual_plugin_slug(entry: dict[str, Any]) -> str:
 
 
 def _manual_hypothesis_id(entry: dict[str, Any]) -> str:
-    return str(entry.get("hypothesis_id") or entry.get("hypothesis", {}).get("id") or "-")
+    return str(
+        entry.get("hypothesis_id") or entry.get("hypothesis", {}).get("id") or "-"
+    )
 
 
 def _manual_role(entry: dict[str, Any]) -> str:
@@ -363,7 +412,9 @@ def _write_manual_queue(entries: list[dict[str, Any]]) -> None:
         cleaned = dict(entry)
         cleaned.pop("_line_no", None)
         clean_entries.append(cleaned)
-    MANUAL_QUEUE_PATH.write_text("\n".join(json.dumps(e, sort_keys=True) for e in clean_entries) + "\n")
+    MANUAL_QUEUE_PATH.write_text(
+        "\n".join(json.dumps(e, sort_keys=True) for e in clean_entries) + "\n"
+    )
 
 
 @manual_app.command("list")
@@ -413,16 +464,24 @@ def manual_remove(
     def matches(idx: int, entry: dict[str, Any]) -> bool:
         hyp_id = _manual_hypothesis_id(entry)
         plugin = _manual_plugin_slug(entry)
-        return selector == str(idx) or selector == hyp_id or selector == f"{plugin}:{hyp_id}"
+        return (
+            selector == str(idx)
+            or selector == hyp_id
+            or selector == f"{plugin}:{hyp_id}"
+        )
 
-    remaining = [entry for idx, entry in enumerate(entries, start=1) if not matches(idx, entry)]
+    remaining = [
+        entry for idx, entry in enumerate(entries, start=1) if not matches(idx, entry)
+    ]
     removed = len(entries) - len(remaining)
     if removed == 0:
         console.print(f"[red]No manual queue entry matched {selector!r}.[/]")
         raise typer.Exit(code=1)
 
     _write_manual_queue(remaining)
-    console.print(f"[green]Removed {removed} manual queue entr{'y' if removed == 1 else 'ies'}.[/]")
+    console.print(
+        f"[green]Removed {removed} manual queue entr{'y' if removed == 1 else 'ies'}.[/]"
+    )
     console.print(f"[dim]{len(remaining)} remaining.[/]")
 
 
@@ -432,49 +491,70 @@ def manual_clear() -> None:
     _configure_logging()
     count = len(_load_manual_queue())
     _write_manual_queue([])
-    console.print(f"[green]Cleared manual review queue.[/] [dim]removed {count} entr{'y' if count == 1 else 'ies'}[/]")
+    console.print(
+        f"[green]Cleared manual review queue.[/] [dim]removed {count} entr{'y' if count == 1 else 'ies'}[/]"
+    )
 
 
 @app.command()
 def scan(
     plugin_slug: str = typer.Argument(..., help="WordPress plugin slug"),
-    config: str = typer.Option("pipelines/default.yaml", "--config", help="Pipeline config YAML path"),
-    budget: float | None = typer.Option(None, "--budget", help="Override cost ceiling (USD)"),
-    version: str | None = typer.Option(None, "--version", help="Pin a specific plugin version (e.g. for re-scanning a historical release). Defaults to the latest version on wordpress.org."),
+    config: str = typer.Option(
+        "pipelines/default.yaml", "--config", help="Pipeline config YAML path"
+    ),
+    budget: float | None = typer.Option(
+        None, "--budget", help="Override cost ceiling (USD)"
+    ),
+    version: str | None = typer.Option(
+        None,
+        "--version",
+        help="Pin a specific plugin version (e.g. for re-scanning a historical release). Defaults to the latest version on wordpress.org.",
+    ),
     resume: str | None = typer.Option(
-        None, "--resume",
+        None,
+        "--resume",
         help="Resume an existing run by ID — auto-detects the latest completed stage from disk artifacts and re-runs from the next stage onwards",
     ),
     resume_from: str | None = typer.Option(
-        None, "--from",
+        None,
+        "--from",
         help="Force re-run from a specific stage (requires --resume). One of: intake, recon, hypothesis, triage, verify, dedup, report.",
     ),
     verify_only: bool = typer.Option(
         False,
         "--verify-only",
-        help="Stop successfully after verification; skip vulnerability DB dedup and report generation.",
+        help=(
+            "Verify source-valid candidates even without an automatic disclosure route; "
+            "skip vulnerability DB dedup and report generation."
+        ),
     ),
     verbose: bool = typer.Option(
-        False, "--verbose", "-v",
+        False,
+        "--verbose",
+        "-v",
         help="Show detailed INFO logs from stages, agents, sandbox setup, and LLM calls. Default output stays concise.",
     ),
 ) -> None:
     """Scan a single plugin for vulnerabilities."""
     _configure_logging(verbose=verbose)
-    result = asyncio.run(_run_scan_cli(
-        plugin_slug=plugin_slug,
-        config=config,
-        budget=budget,
-        version=version,
-        resume=resume,
-        resume_from=resume_from,
-        verbose=verbose,
-        verify_only=verify_only,
-    ))
+    result = asyncio.run(
+        _run_scan_cli(
+            plugin_slug=plugin_slug,
+            config=config,
+            budget=budget,
+            version=version,
+            resume=resume,
+            resume_from=resume_from,
+            verbose=verbose,
+            verify_only=verify_only,
+        )
+    )
 
     if result.status != "complete":
-        console.print(f"[yellow]Run ended with status [b]{result.status}[/b]; "
-                      f"inspect plugins/{result.plugin_slug}/runs/{result.run_id}/ for details.[/]")
+        console.print(
+            f"[yellow]Run ended with status [b]{result.status}[/b]; "
+            f"inspect plugins/{result.plugin_slug}/runs/{result.run_id}/ for details.[/]"
+        )
         raise typer.Exit(code=1)
 
 
@@ -498,30 +578,48 @@ def _read_plugins_file(path: str) -> list[str]:
 
 @app.command("scan-batch")
 def scan_batch(
-    plugins_file: str = typer.Argument(..., help="File containing plugin slugs (one per line)"),
-    concurrency: int = typer.Option(1, "--concurrency", min=1, help="Number of plugins to scan in parallel"),
-    config: str = typer.Option("pipelines/default.yaml", "--config", help="Pipeline config YAML path"),
-    budget: float | None = typer.Option(None, "--budget", help="Per-plugin cost ceiling override (USD)"),
-    version: str | None = typer.Option(None, "--version", help="Pin the same plugin version for every slug in the batch"),
+    plugins_file: str = typer.Argument(
+        ..., help="File containing plugin slugs (one per line)"
+    ),
+    concurrency: int = typer.Option(
+        1, "--concurrency", min=1, help="Number of plugins to scan in parallel"
+    ),
+    config: str = typer.Option(
+        "pipelines/default.yaml", "--config", help="Pipeline config YAML path"
+    ),
+    budget: float | None = typer.Option(
+        None, "--budget", help="Per-plugin cost ceiling override (USD)"
+    ),
+    version: str | None = typer.Option(
+        None,
+        "--version",
+        help="Pin the same plugin version for every slug in the batch",
+    ),
     verbose: bool = typer.Option(
-        False, "--verbose", "-v",
+        False,
+        "--verbose",
+        "-v",
         help="Show detailed INFO logs from stages, agents, sandbox setup, and LLM calls. Default output stays concise.",
     ),
 ) -> None:
     """Scan multiple plugins from a newline-delimited file."""
     _configure_logging(verbose=verbose)
     plugin_slugs = _read_plugins_file(plugins_file)
-    console.print(Panel(
-        "\n".join([
-            f"[b]Plugins[/b]      {len(plugin_slugs)}",
-            f"[b]Config[/b]       {config}",
-            f"[b]Budget[/b]       {f'${budget:.2f} per plugin' if budget is not None else 'from config'}",
-            f"[b]Concurrency[/b]  {concurrency}",
-            f"[b]Version[/b]      {version or 'latest'}",
-        ]),
-        title="Squadrone Batch Scan",
-        border_style="cyan",
-    ))
+    console.print(
+        Panel(
+            "\n".join(
+                [
+                    f"[b]Plugins[/b]      {len(plugin_slugs)}",
+                    f"[b]Config[/b]       {config}",
+                    f"[b]Budget[/b]       {f'${budget:.2f} per plugin' if budget is not None else 'from config'}",
+                    f"[b]Concurrency[/b]  {concurrency}",
+                    f"[b]Version[/b]      {version or 'latest'}",
+                ]
+            ),
+            title="Squadrone Batch Scan",
+            border_style="cyan",
+        )
+    )
 
     async def run_batch() -> list[tuple[str, str, str | None]]:
         semaphore = asyncio.Semaphore(concurrency)
@@ -553,7 +651,9 @@ def scan_batch(
                         f"inspect plugins/{result.plugin_slug}/runs/{result.run_id}/ for details.[/]"
                     )
 
-        await asyncio.gather(*(run_one(index, slug) for index, slug in enumerate(plugin_slugs, start=1)))
+        await asyncio.gather(
+            *(run_one(index, slug) for index, slug in enumerate(plugin_slugs, start=1))
+        )
         return outcomes
 
     outcomes = asyncio.run(run_batch())
@@ -575,20 +675,31 @@ def scan_batch(
 @app.command(rich_help_panel="Advanced")
 def benchmark(
     corpus: str = typer.Argument(..., help="Path to benchmark corpus JSON"),
-    split: str = typer.Option("train", "--split", help="Corpus split to evaluate (e.g. train, test, holdout)"),
-    config: str = typer.Option("pipelines/default.yaml", "--config", help="Pipeline config YAML path"),
-    budget: float | None = typer.Option(None, "--budget", help="Per-scan budget override (USD)"),
+    split: str = typer.Option(
+        "train", "--split", help="Corpus split to evaluate (e.g. train, test, holdout)"
+    ),
+    config: str = typer.Option(
+        "pipelines/default.yaml", "--config", help="Pipeline config YAML path"
+    ),
+    budget: float | None = typer.Option(
+        None, "--budget", help="Per-scan budget override (USD)"
+    ),
 ) -> None:
     """Run the benchmark harness over a corpus."""
     _configure_logging()
     import sys
+
     sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "benchmarks"))
     from runner import run_benchmark  # type: ignore
 
-    result = asyncio.run(run_benchmark(
-        corpus_path=corpus, split=split, config_path=config,
-        budget_override=budget,
-    ))
+    result = asyncio.run(
+        run_benchmark(
+            corpus_path=corpus,
+            split=split,
+            config_path=config,
+            budget_override=budget,
+        )
+    )
 
     table = Table(title=f"Benchmark — {corpus} (split={split})")
     table.add_column("metric")
@@ -600,8 +711,12 @@ def benchmark(
     table.add_row("hypothesis recall@10", f"{result.hypothesis_recall_at_10:.2%}")
     table.add_row("verified recall", f"{result.verified_recall:.2%}")
     table.add_row("target confirmation", f"{result.target_confirmation_rate:.2%}")
-    table.add_row("fixed-version target FP", f"{result.fixed_target_false_positive_rate:.2%}")
-    table.add_row("paired verified precision", f"{result.paired_verified_precision:.2%}")
+    table.add_row(
+        "fixed-version target FP", f"{result.fixed_target_false_positive_rate:.2%}"
+    )
+    table.add_row(
+        "paired verified precision", f"{result.paired_verified_precision:.2%}"
+    )
     table.add_row("cost / confirmed target", f"${result.cost_per_confirmed_target:.4f}")
     table.add_row("total cost", f"${result.total_cost_usd:.4f}")
     console.print(table)
@@ -633,7 +748,9 @@ def benchmark(
     detail.add_column("cost")
     for e in result.variants:
         detail.add_row(
-            e.cve_id, e.slug, e.version,
+            e.cve_id,
+            e.slug,
+            e.version,
             "vulnerable" if e.expected_vulnerable else "fixed",
             e.status,
             str(e.candidate_rank) if e.candidate_rank else "—",
@@ -673,43 +790,66 @@ def review(run_id: str = typer.Argument(..., help="Run ID to review")) -> None:
         f = findings[idx]
         prior = decisions.get(f.id, {})
         console.clear()
-        console.rule(f"[b]Finding {idx+1}/{len(findings)} — {f.id}[/b]")
+        console.rule(f"[b]Finding {idx + 1}/{len(findings)} — {f.id}[/b]")
         console.print(
             f"[b]vulnerability:[/b] {f.hypothesis.vulnerability_type} "
             f"({f.hypothesis.root_cause_cwe})"
         )
         console.print(f"[b]confidence:[/b] {f.hypothesis.confidence.value}")
-        console.print(f"[b]entry:[/b] {f.hypothesis.entry_point}  [b]sink:[/b] {f.hypothesis.sink}")
+        console.print(
+            f"[b]entry:[/b] {f.hypothesis.entry_point}  [b]sink:[/b] {f.hypothesis.sink}"
+        )
         console.print(f"[b]file:[/b] {f.hypothesis.file}:{f.hypothesis.line}")
         console.print(f"[b]reasoning:[/b] {f.hypothesis.reasoning}")
         console.print(f"[b]preconditions:[/b] {f.hypothesis.preconditions}")
-        console.print(f"[b]poc_status:[/b] {f.poc_status.value}  [b]dedup:[/b] {f.dedup_status.value}")
+        console.print(
+            f"[b]poc_status:[/b] {f.poc_status.value}  [b]dedup:[/b] {f.dedup_status.value}"
+        )
         console.print(f"[b]evidence:[/b] {f.evidence}")
         if f.dedup_matches:
             console.print(f"[b]dedup_matches ({len(f.dedup_matches)}):[/b]")
             for m in f.dedup_matches[:5]:
-                console.print(f"  - {m.get('source','?')} {m.get('cve_id','?')} {str(m.get('title',''))[:80]}")
+                console.print(
+                    f"  - {m.get('source', '?')} {m.get('cve_id', '?')} {str(m.get('title', ''))[:80]}"
+                )
         if Path(f.poc_script_path).exists():
-            console.print(Panel(
-                Syntax(Path(f.poc_script_path).read_text()[:4000], "python", line_numbers=True),
-                title=f"PoC: {f.poc_script_path}",
-            ))
+            console.print(
+                Panel(
+                    Syntax(
+                        Path(f.poc_script_path).read_text()[:4000],
+                        "python",
+                        line_numbers=True,
+                    ),
+                    title=f"PoC: {f.poc_script_path}",
+                )
+            )
         # Reports are now per-program (report_<id>_<program>.md); show all that exist.
         for report_path in sorted((_run_dir(run_id)).glob(f"report_{f.id}*.md")):
-            console.print(Panel(report_path.read_text()[:2000], title=f"Draft report: {report_path}"))
+            console.print(
+                Panel(
+                    report_path.read_text()[:2000], title=f"Draft report: {report_path}"
+                )
+            )
 
         if prior:
-            console.print(f"\n[dim]Prior decision: {prior.get('decision')} @ {prior.get('at','')}[/]")
+            console.print(
+                f"\n[dim]Prior decision: {prior.get('decision')} @ {prior.get('at', '')}[/]"
+            )
 
         choice = Prompt.ask(
             "\n[n]ext / [p]rev / [v]alid / [i]nvalid / needs-[m]ore / [q]uit",
-            choices=["n", "p", "v", "i", "m", "q"], default="n",
+            choices=["n", "p", "v", "i", "m", "q"],
+            default="n",
         )
         if choice == "q":
             break
         if choice in ("v", "i", "m"):
             decisions[f.id] = {
-                "decision": {"v": "valid", "i": "invalid", "m": "needs_more_investigation"}[choice],
+                "decision": {
+                    "v": "valid",
+                    "i": "invalid",
+                    "m": "needs_more_investigation",
+                }[choice],
                 "at": datetime.now(timezone.utc).isoformat(),
             }
             atomic_write_json(review_path, decisions)
@@ -734,9 +874,19 @@ class DiscloseTarget(str, Enum):
 @app.command(rich_help_panel="Advanced")
 def disclose(
     finding_id: str = typer.Argument(...),
-    to: DiscloseTarget = typer.Option(..., "--to", help="Submission target", case_sensitive=False),
-    notes: str | None = typer.Option(None, "--notes", help="Free-text note recorded with the disclosure (e.g. submission timestamp, ticket ID, reviewer feedback)"),
-    date: str | None = typer.Option(None, "--date", help="Submission date (YYYY-MM-DD or ISO 8601). Defaults to now. Use for backfilling historical submissions."),
+    to: DiscloseTarget = typer.Option(
+        ..., "--to", help="Submission target", case_sensitive=False
+    ),
+    notes: str | None = typer.Option(
+        None,
+        "--notes",
+        help="Free-text note recorded with the disclosure (e.g. submission timestamp, ticket ID, reviewer feedback)",
+    ),
+    date: str | None = typer.Option(
+        None,
+        "--date",
+        help="Submission date (YYYY-MM-DD or ISO 8601). Defaults to now. Use for backfilling historical submissions.",
+    ),
 ) -> None:
     """Mark a finding as disclosed."""
     from .orchestrator import DB_PATH
@@ -745,7 +895,9 @@ def disclose(
         try:
             submitted_at = datetime.fromisoformat(date).isoformat()
         except ValueError:
-            console.print(f"[red]Invalid --date {date!r}: expected YYYY-MM-DD or ISO 8601.[/]")
+            console.print(
+                f"[red]Invalid --date {date!r}: expected YYYY-MM-DD or ISO 8601.[/]"
+            )
             raise typer.Exit(code=2)
     else:
         submitted_at = datetime.now(timezone.utc).isoformat()
@@ -754,7 +906,8 @@ def disclose(
         async with connect_sqlite(DB_PATH) as db:
             async with db.execute(
                 "SELECT bug_class, cwe, confidence, poc_status, dedup_status, plugin_slug, run_id "
-                "FROM findings WHERE finding_id=?", (finding_id,)
+                "FROM findings WHERE finding_id=?",
+                (finding_id,),
             ) as cur:
                 row = await cur.fetchone()
             if row is None:
@@ -819,7 +972,8 @@ def findings_show(finding_id: str = typer.Argument(...)) -> None:
     async def _query():
         async with connect_sqlite(DB_PATH) as db:
             async with db.execute(
-                "SELECT run_id, plugin_slug FROM findings WHERE finding_id=?", (finding_id,)
+                "SELECT run_id, plugin_slug FROM findings WHERE finding_id=?",
+                (finding_id,),
             ) as cur:
                 return await cur.fetchone()
 
@@ -851,7 +1005,9 @@ def findings_show(finding_id: str = typer.Argument(...)) -> None:
         for p in report_paths:
             console.print(f"[b]Report:[/b] {p}")
     else:
-        console.print(f"[b]Report:[/b] (none — no per-program reports written for {found.id})")
+        console.print(
+            f"[b]Report:[/b] (none — no per-program reports written for {found.id})"
+        )
 
 
 if __name__ == "__main__":

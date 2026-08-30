@@ -1,0 +1,31 @@
+import requests
+
+from poc_result import emit_result
+from wp_login import wp_login
+
+
+TARGET = {{ target_url | tojson }}
+BUG_CLASS = {{ bug_class | tojson }}
+METHOD = {{ request_method | default("") | tojson }}
+ROUTE = {{ request_route | default("") | tojson }}
+DISPATCH = {{ request_dispatch | default({}) | tojson }}
+USERNAME = {{ test_username | default("") | tojson }}
+PASSWORD = {{ test_password | default("") | tojson }}
+ATTACKER_ROLE = {{ attacker_role | default("unknown") | tojson }}
+
+# Generic open-CWE scaffold. Replace this fail-closed observation with the
+# source-grounded request, a comparable negative control, and one existing
+# structured oracle that directly measures the hypothesis's CIA effect. Do not
+# infer the exploit shape or oracle merely from BUG_CLASS.
+session = requests.Session()
+endpoint = f"{TARGET}{ROUTE}" if ROUTE else TARGET
+
+emit_result(
+    verdict="not_vulnerable",
+    oracle="response_marker",
+    attacker_role=ATTACKER_ROLE,
+    request={"method": METHOD or "GET", "url": endpoint},
+    attack={"observed": False, "marker": "", "marker_present": False},
+    control={"observed": False, "marker_present": False},
+    impact=f"No independently measured {BUG_CLASS} security effect.",
+)

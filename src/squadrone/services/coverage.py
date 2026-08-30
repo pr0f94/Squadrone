@@ -57,6 +57,30 @@ _NON_PRODUCTION_PARTS = {
 _DEPENDENCY_PARTS = {"vendor"}
 
 _REVIEWABLE_SUPPORT = {"active", "partial", "review_only"}
+_SURFACE_SNIPPET_MAX_CHARS = 4_000
+_BARE_PHP_VARIABLE_RE = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*")
+_SQL_OPERATION_RE = re.compile(
+    r"\b(?P<operation>SELECT|UPDATE|DELETE|INSERT|REPLACE)\b",
+    re.IGNORECASE,
+)
+_SQL_AGGREGATE_RE = re.compile(r"\b(?:COUNT|SUM|AVG|MIN|MAX)\s*\(", re.IGNORECASE)
+_SQL_IDENTITY_PREDICATE_RE = re.compile(
+    r"(?<![A-Za-z0-9_])"
+    r"(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?"
+    r"`?(?:id|[A-Za-z_][A-Za-z0-9_]*_id)`?\s*"
+    r"(?P<operator>=|IN\s*\()",
+    re.IGNORECASE,
+)
+_SQL_PLACEHOLDER_RE = re.compile(r"%(?:(?P<position>[1-9][0-9]*)\$)?[disfF]")
+_SQL_CLAUSE_BOUNDARY_RE = re.compile(
+    r"\b(?:AND|OR|ORDER\s+BY|GROUP\s+BY|HAVING|LIMIT|UNION)\b",
+    re.IGNORECASE,
+)
+_PHP_FUNCTION_RE = re.compile(r"\bfunction\b", re.IGNORECASE)
+_CURRENT_USER_ID_RE = re.compile(
+    r"(?:(?i:get_current_user_id)\s*\(\s*\)|"
+    r"(?i:wp_get_current_user)\s*\(\s*\)\s*->\s*ID)"
+)
 
 
 def _review_areas_for_surface(
@@ -490,6 +514,535 @@ def _code_files(plugin_dir: Path) -> tuple[list[str], list[str]]:
     return production, dependencies
 
 
+def _php_call_snippet(
+    source: str,
+    masked_source: str,
+    match_start: int,
+    match_end: int,
+) -> str:
+    """Return one bounded, balanced PHP call starting at a surface match."""
+    opening = masked_source.find("(", match_start, match_end)
+    if opening < 0:
+        return ""
+
+    limit = min(len(source), match_start + _SURFACE_SNIPPET_MAX_CHARS)
+    depth = 0
+    closing = -1
+    for index in range(opening, limit):
+        char = masked_source[index]
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                closing = index + 1
+                break
+    end = closing if closing >= 0 else limit
+    return source[match_start:end].strip()
+
+
+def _php_call_arguments(snippet: str, function_name: str) -> list[str] | None:
+    """Return the top-level arguments of one complete PHP call."""
+    snippet = _mask_non_code(snippet, mask_strings=False)
+    match = re.search(
+        rf"(?<![A-Za-z0-9_]){re.escape(function_name)}\s*\(",
+        snippet,
+        re.IGNORECASE,
+    )
+    if match is None:
+        return None
+
+    opening = snippet.find("(", match.start())
+    stack = ["("]
+    pairs = {")": "(", "]": "[", "}": "{"}
+    arguments: list[str] = []
+    argument_start = opening + 1
+    quote = ""
+    escaped = False
+    for index in range(opening + 1, len(snippet)):
+        char = snippet[index]
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+            continue
+        if char in {"'", '"', "`"}:
+            quote = char
+            continue
+        if char in "([{":
+            stack.append(char)
+            continue
+        if char in ")]}":
+            if not stack or stack[-1] != pairs[char]:
+                return None
+            if len(stack) == 1:
+                argument = snippet[argument_start:index].strip()
+                if argument:
+                    arguments.append(argument)
+                return arguments
+            stack.pop()
+            continue
+        if char == "," and len(stack) == 1:
+            arguments.append(snippet[argument_start:index].strip())
+            argument_start = index + 1
+    return None
+
+
+def _php_function_ranges(masked_source: str) -> list[tuple[int, int]]:
+    """Return balanced named/anonymous function body ranges."""
+    ranges: list[tuple[int, int]] = []
+    for function_match in _PHP_FUNCTION_RE.finditer(masked_source):
+        paren_depth = 0
+        bracket_depth = 0
+        body_start = -1
+        for index in range(function_match.end(), len(masked_source)):
+            char = masked_source[index]
+            if char == "(":
+                paren_depth += 1
+            elif char == ")":
+                paren_depth = max(0, paren_depth - 1)
+            elif char == "[":
+                bracket_depth += 1
+            elif char == "]":
+                bracket_depth = max(0, bracket_depth - 1)
+            elif char == ";" and paren_depth == bracket_depth == 0:
+                break
+            elif char == "{" and paren_depth == bracket_depth == 0:
+                body_start = index
+                break
+        if body_start < 0:
+            continue
+
+        depth = 0
+        for index in range(body_start, len(masked_source)):
+            char = masked_source[index]
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    ranges.append((body_start, index + 1))
+                    break
+    return ranges
+
+
+def _php_function_scope(
+    function_ranges: list[tuple[int, int]],
+    offset: int,
+) -> tuple[int, int] | None:
+    """Return the innermost PHP function containing an offset."""
+    containing = [
+        function_range
+        for function_range in function_ranges
+        if function_range[0] < offset < function_range[1]
+    ]
+    return max(containing, key=lambda function_range: function_range[0], default=None)
+
+
+def _php_assignment_end(masked_source: str, start: int, limit: int) -> int:
+    """Find a top-level semicolon terminating an assignment expression."""
+    stack: list[str] = []
+    pairs = {")": "(", "]": "[", "}": "{"}
+    for index in range(start, limit):
+        char = masked_source[index]
+        if char in "([{":
+            stack.append(char)
+        elif char in ")]}":
+            if stack and stack[-1] == pairs[char]:
+                stack.pop()
+        elif char == ";" and not stack:
+            return index
+    return -1
+
+
+def _php_brace_depth(masked_source: str, offset: int) -> int:
+    """Return lexical brace depth at an executable PHP offset."""
+    return masked_source.count("{", 0, offset) - masked_source.count("}", 0, offset)
+
+
+def _reaching_same_function_assignments(
+    source: str,
+    masked_source: str,
+    function_ranges: list[tuple[int, int]],
+    variable: str,
+    before: int,
+) -> list[str]:
+    """Approximate branch-aware reaching definitions in one PHP function."""
+    sink_scope = _php_function_scope(function_ranges, before)
+    sink_depth = _php_brace_depth(masked_source, before)
+    assignment_re = re.compile(rf"{re.escape(variable)}\s*=(?!=|>)")
+    matches = list(assignment_re.finditer(masked_source, 0, before))
+    assignments: list[tuple[int, str]] = []
+    for match in matches:
+        if _php_function_scope(function_ranges, match.start()) != sink_scope:
+            continue
+        expression_start = match.end()
+        expression_end = _php_assignment_end(
+            masked_source,
+            expression_start,
+            before,
+        )
+        if expression_end < 0:
+            continue
+        assignments.append(
+            (
+                _php_brace_depth(masked_source, match.start()),
+                source[expression_start:expression_end].strip(),
+            )
+        )
+
+    # A definition at the sink's own (or an outer) lexical depth dominates all
+    # earlier definitions. Assignments nested after that reset may be mutually
+    # exclusive branch definitions that still reach a sink outside the branch.
+    reset_index = next(
+        (
+            index
+            for index in range(len(assignments) - 1, -1, -1)
+            if assignments[index][0] <= sink_depth
+        ),
+        None,
+    )
+    if reset_index is None:
+        return [expression for _, expression in assignments]
+    reset_expression = assignments[reset_index][1]
+    return [
+        reset_expression,
+        *[
+            expression
+            for depth, expression in assignments[reset_index + 1 :]
+            if depth > sink_depth
+        ],
+    ]
+
+
+def _is_fixed_php_scalar(expression: str) -> bool:
+    """Whether an expression is provably a fixed scalar literal."""
+    expression = expression.strip()
+    if re.fullmatch(
+        r"[+-]?(?:0[xX][0-9A-Fa-f]+|(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)",
+        expression,
+    ):
+        return True
+    if expression.lower() in {"true", "false", "null"}:
+        return True
+    if re.fullmatch(r"'(?:\\.|[^'\\])*'", expression, re.DOTALL):
+        return True
+    if re.fullmatch(r'"(?:\\.|[^"\\])*"', expression, re.DOTALL):
+        return "$" not in expression
+    return False
+
+
+def _is_current_user_identity(expression: str) -> bool:
+    """Whether a selector is constrained to WordPress's current user id."""
+    return _CURRENT_USER_ID_RE.fullmatch(expression.strip()) is not None
+
+
+def _has_untrusted_php_variable(expression: str) -> bool:
+    """Whether an expression contains a variable beyond the current-user id."""
+    without_current_user = _CURRENT_USER_ID_RE.sub("", expression)
+    return _BARE_PHP_VARIABLE_RE.search(without_current_user) is not None
+
+
+def _php_array_entries(expression: str) -> list[str] | None:
+    """Return entries from one complete inline PHP array."""
+    expression = expression.strip()
+    if re.match(r"array\s*\(", expression, re.IGNORECASE):
+        if not expression.endswith(")"):
+            return None
+        return _php_call_arguments(expression, "array")
+    if not (expression.startswith("[") and expression.endswith("]")):
+        return None
+    return _php_call_arguments(
+        f"__squadrone_array({expression[1:-1]})",
+        "__squadrone_array",
+    )
+
+
+def _php_array_pair(entry: str) -> tuple[str, str] | None:
+    """Split a top-level associative-array entry around its arrow."""
+    stack: list[str] = []
+    pairs = {")": "(", "]": "[", "}": "{"}
+    quote = ""
+    escaped = False
+    for index, char in enumerate(entry):
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+            continue
+        if char in {"'", '"', "`"}:
+            quote = char
+            continue
+        if char in "([{":
+            stack.append(char)
+            continue
+        if char in ")]}":
+            if stack and stack[-1] == pairs[char]:
+                stack.pop()
+            continue
+        if char == "=" and not stack and entry[index : index + 2] == "=>":
+            return entry[:index].strip(), entry[index + 2 :].strip()
+    return None
+
+
+def _identity_key(expression: str) -> bool:
+    """Whether a fixed SQL/map key denotes a likely row identity."""
+    expression = expression.strip()
+    if (
+        len(expression) >= 2
+        and expression[0] == expression[-1]
+        and expression[0]
+        in {
+            "'",
+            '"',
+        }
+    ):
+        expression = expression[1:-1]
+    return (
+        re.fullmatch(r"(?:id|[A-Za-z_][A-Za-z0-9_]*_id)", expression, re.I) is not None
+    )
+
+
+def _inline_where_map_has_dynamic_identity(expression: str) -> bool:
+    entries = _php_array_entries(expression)
+    if entries is None:
+        return False
+    for entry in entries:
+        pair = _php_array_pair(entry)
+        if pair is None:
+            continue
+        key, value = pair
+        if (
+            _identity_key(key)
+            and not _is_fixed_php_scalar(value)
+            and not _is_current_user_identity(value)
+        ):
+            return True
+    return False
+
+
+def _prepare_bound_values(arguments: list[str]) -> list[str]:
+    """Normalize the variadic and legacy array forms of wpdb::prepare."""
+    if len(arguments) != 1:
+        return arguments
+    entries = _php_array_entries(arguments[0])
+    return entries if entries is not None else arguments
+
+
+def _placeholder_value(
+    query_expression: str,
+    placeholder: re.Match[str],
+    bound_values: list[str],
+) -> str | None:
+    explicit_position = placeholder.group("position")
+    if explicit_position is not None:
+        value_index = int(explicit_position) - 1
+    else:
+        value_index = (
+            len(
+                list(
+                    _SQL_PLACEHOLDER_RE.finditer(query_expression, 0, placeholder.end())
+                )
+            )
+            - 1
+        )
+    if 0 <= value_index < len(bound_values):
+        return bound_values[value_index]
+    return None
+
+
+def _select_projection_is_pure_aggregate(
+    query_expression: str,
+    operation_end: int,
+) -> bool:
+    from_match = re.search(r"\bFROM\b", query_expression[operation_end:], re.IGNORECASE)
+    if from_match is None:
+        return False
+    projection = query_expression[operation_end : operation_end + from_match.start()]
+    aggregate = _SQL_AGGREGATE_RE.search(projection)
+    if aggregate is None:
+        return False
+
+    remainder = list(projection)
+    search_from = 0
+    while aggregate is not None:
+        opening = projection.find("(", aggregate.start(), aggregate.end())
+        depth = 0
+        closing = -1
+        for index in range(opening, len(projection)):
+            if projection[index] == "(":
+                depth += 1
+            elif projection[index] == ")":
+                depth -= 1
+                if depth == 0:
+                    closing = index + 1
+                    break
+        if closing < 0:
+            return False
+        remainder[aggregate.start() : closing] = " " * (closing - aggregate.start())
+        search_from = closing
+        aggregate = _SQL_AGGREGATE_RE.search(projection, search_from)
+
+    non_aggregate = "".join(remainder)
+    non_aggregate = re.sub(
+        r"\b(?:ALL|DISTINCT|SQL_CALC_FOUND_ROWS)\b",
+        "",
+        non_aggregate,
+        flags=re.I,
+    )
+    non_aggregate = re.sub(
+        r"\bAS\s+`?[A-Za-z_][A-Za-z0-9_]*`?",
+        "",
+        non_aggregate,
+        flags=re.I,
+    )
+    return re.search(r"[A-Za-z0-9_$]", non_aggregate) is None
+
+
+def _sql_expression_has_dynamic_identity(expression: str) -> bool:
+    """Identify dynamic row-specific SELECT/UPDATE/DELETE expressions."""
+    prepare_arguments = _php_call_arguments(expression, "prepare")
+    if prepare_arguments:
+        query_expression = prepare_arguments[0]
+        bound_values = _prepare_bound_values(prepare_arguments[1:])
+    else:
+        query_expression = expression
+        bound_values = []
+
+    operation = _SQL_OPERATION_RE.search(query_expression)
+    if operation is None or operation.group("operation").upper() not in {
+        "SELECT",
+        "UPDATE",
+        "DELETE",
+    }:
+        return False
+    if operation.group(
+        "operation"
+    ).upper() == "SELECT" and _select_projection_is_pure_aggregate(
+        query_expression,
+        operation.end(),
+    ):
+        return False
+
+    for identity in _SQL_IDENTITY_PREDICATE_RE.finditer(
+        query_expression,
+        operation.end(),
+    ):
+        rhs = query_expression[identity.end() :]
+        if identity.group("operator").upper().startswith("IN"):
+            closing = rhs.find(")")
+            placeholder_region = rhs if closing < 0 else rhs[:closing]
+            relative_placeholders = list(
+                _SQL_PLACEHOLDER_RE.finditer(placeholder_region)
+            )
+        else:
+            first_placeholder = re.match(
+                rf"\s*['\"]?\s*(?P<value>{_SQL_PLACEHOLDER_RE.pattern})",
+                rhs,
+            )
+            relative_placeholders = (
+                list(
+                    _SQL_PLACEHOLDER_RE.finditer(
+                        rhs,
+                        0,
+                        first_placeholder.end(),
+                    )
+                )
+                if first_placeholder is not None
+                else []
+            )
+        if relative_placeholders and bound_values:
+            for relative_placeholder in relative_placeholders:
+                absolute_placeholder = _SQL_PLACEHOLDER_RE.search(
+                    query_expression,
+                    identity.end() + relative_placeholder.start(),
+                    identity.end() + relative_placeholder.end(),
+                )
+                if absolute_placeholder is None:
+                    continue
+                value = _placeholder_value(
+                    query_expression,
+                    absolute_placeholder,
+                    bound_values,
+                )
+                if (
+                    value is not None
+                    and not _is_fixed_php_scalar(value)
+                    and not _is_current_user_identity(value)
+                ):
+                    return True
+            continue
+
+        boundary = _SQL_CLAUSE_BOUNDARY_RE.search(rhs)
+        selector_expression = rhs[: boundary.start()] if boundary else rhs
+        if _has_untrusted_php_variable(selector_expression):
+            return True
+    return False
+
+
+def _sql_object_access_review(
+    *,
+    surface_type: str,
+    function_name: str,
+    snippet: str,
+    source: str,
+    masked_source: str,
+    function_ranges: list[tuple[int, int]],
+    match_start: int,
+) -> bool:
+    """Whether one SQL surface merits a row-authorization review."""
+    arguments = _php_call_arguments(snippet, function_name)
+    if arguments is None:
+        return False
+
+    if surface_type == "sql_write":
+        function_name = function_name.lower()
+        if function_name not in {"update", "delete"}:
+            return False
+        where_index = 2 if function_name == "update" else 1
+        if len(arguments) <= where_index:
+            return False
+        where_expression = arguments[where_index].strip()
+        if _BARE_PHP_VARIABLE_RE.fullmatch(where_expression):
+            where_expressions = _reaching_same_function_assignments(
+                source,
+                masked_source,
+                function_ranges,
+                where_expression,
+                match_start,
+            )
+        else:
+            where_expressions = [where_expression]
+        return any(
+            _inline_where_map_has_dynamic_identity(candidate)
+            for candidate in where_expressions
+        )
+
+    if surface_type != "sql_query" or not arguments:
+        return False
+    query_expression = arguments[0].strip()
+    if _BARE_PHP_VARIABLE_RE.fullmatch(query_expression):
+        query_expressions = _reaching_same_function_assignments(
+            source,
+            masked_source,
+            function_ranges,
+            query_expression,
+            match_start,
+        )
+    else:
+        query_expressions = [query_expression]
+    return any(
+        _sql_expression_has_dynamic_identity(candidate)
+        for candidate in query_expressions
+    )
+
+
 def _surface_items(
     plugin_dir: Path, production_files: list[str]
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -502,7 +1055,6 @@ def _surface_items(
             source = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        lines = source.splitlines()
         patterns = (
             _PHP_SURFACES
             if path.suffix.lower() in {".php", ".phtml", ".inc"}
@@ -513,9 +1065,15 @@ def _surface_items(
             if patterns is _PHP_SURFACES
             else source
         )
-        scan_lines = scan_source.splitlines()
+        function_ranges = (
+            _php_function_ranges(scan_source) if patterns is _PHP_SURFACES else []
+        )
+        lines = source.splitlines(keepends=True)
+        scan_lines = scan_source.splitlines(keepends=True)
+        line_start = 0
         for line_no, (line, scan_line) in enumerate(zip(lines, scan_lines), 1):
             if not scan_line.strip():
+                line_start += len(line)
                 continue
             for surface_type, pattern, areas, kind in patterns:
                 match = pattern.search(scan_line)
@@ -527,18 +1085,45 @@ def _surface_items(
                 if key in seen:
                     continue
                 seen.add(key)
+                fallback_snippet = line[
+                    max(0, match.start() - 200) : match.end() + 300
+                ].strip()
+                if patterns is _PHP_SURFACES and "(" in match.group(0):
+                    snippet = (
+                        _php_call_snippet(
+                            source,
+                            scan_source,
+                            line_start + match.start(),
+                            line_start + match.end(),
+                        )
+                        or fallback_snippet
+                    )
+                else:
+                    snippet = fallback_snippet
+                item_areas = list(areas)
+                if patterns is _PHP_SURFACES and _sql_object_access_review(
+                    surface_type=surface_type,
+                    function_name=name,
+                    snippet=snippet,
+                    source=source,
+                    masked_source=scan_source,
+                    function_ranges=function_ranges,
+                    match_start=line_start + match.start(),
+                ):
+                    item_areas = _review_areas_for_surface(
+                        "sql_object_access",
+                        item_areas,
+                    )
                 raw_items.append(
                     {
                         "kind": kind,
-                        "review_areas": areas,
+                        "review_areas": item_areas,
                         "type": surface_type,
                         "name": name,
                         "file": rel,
                         "line": line_no,
                         "column": match.start() + 1,
-                        "snippet": line[
-                            max(0, match.start() - 200) : match.end() + 300
-                        ].strip(),
+                        "snippet": snippet,
                     }
                 )
                 if kind == "sink":
@@ -552,6 +1137,7 @@ def _surface_items(
                             "source": "deterministic",
                         }
                     )
+            line_start += len(line)
     return raw_items, static_sinks
 
 

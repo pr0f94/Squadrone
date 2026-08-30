@@ -12,6 +12,7 @@ from pydantic import BeforeValidator, Field, model_validator
 from ._base import JSONFileMixin
 from .recon import CoverageDisposition
 from .taxonomy import BugClass, get_known_cwe_profile
+from ..services.roles import UNKNOWN_ATTACKER_ROLE, normalize_attacker_role
 
 
 class Confidence(str, Enum):
@@ -279,6 +280,14 @@ class Hypothesis(JSONFileMixin):
     def _fill_taxonomy(self) -> "Hypothesis":
         # These fields are derived taxonomy, not model-authored metadata.  Always
         # replace supplied values so artifacts cannot disagree with bug_class.
+        # Classification itself is preserved while loading an artifact. New
+        # model-authored candidates are normalized explicitly by the hypothesis
+        # stage so historical findings never change meaning on deserialization.
+        self.refresh_derived_taxonomy()
+        return self
+
+    def refresh_derived_taxonomy(self) -> None:
+        """Synchronize fields that are mechanically derived from bug_class."""
         profile = get_known_cwe_profile(self.bug_class)
         self.root_cause_cwe = (
             profile.root_cwe if profile is not None else self.bug_class.value
@@ -290,7 +299,24 @@ class Hypothesis(JSONFileMixin):
             impact = str((self.evidence_summary or {}).get("impact") or "")
             if impact:
                 self.security_outcome.description = impact
-        return self
+
+
+def canonicalize_new_candidate_taxonomy(
+    hypothesis: Hypothesis,
+) -> tuple[BugClass, BugClass] | None:
+    """Normalize a newly generated candidate without rewriting loaded history."""
+    attacker_role = normalize_attacker_role(
+        (hypothesis.evidence_summary or {}).get("attacker_role")
+    )
+    previous = hypothesis.bug_class
+    if (
+        previous == BugClass.MISSING_AUTH_CRITICAL_FUNCTION
+        and attacker_role not in {"unauthenticated", UNKNOWN_ATTACKER_ROLE}
+    ):
+        hypothesis.bug_class = BugClass.MISSING_CAP_CHECK
+        hypothesis.refresh_derived_taxonomy()
+        return previous, hypothesis.bug_class
+    return None
 
 
 class HypothesesArtifact(JSONFileMixin):
@@ -307,6 +333,24 @@ class SpecialistReviewArtifact(JSONFileMixin):
     input_fingerprint: str = ""
 
 
+class SourceAnchor(JSONFileMixin):
+    """One exact source location for a hypothesis's dangerous operation."""
+
+    file: str
+    line: int = Field(ge=1)
+    sink: str
+    sink_code: str
+
+
+class SourceAnchorRepair(JSONFileMixin):
+    """Auditable critic correction of a sink anchor without changing the claim."""
+
+    hypothesis_id: str
+    original: SourceAnchor
+    corrected: SourceAnchor
+    reason: str
+
+
 class TriagedArtifact(JSONFileMixin):
     plugin_slug: str
     accepted: list[Hypothesis]
@@ -314,3 +358,7 @@ class TriagedArtifact(JSONFileMixin):
     merged: list[dict]
     manual_review: list[dict] = Field(default_factory=list)
     deferred: list[dict] = Field(default_factory=list)
+    source_anchor_repairs: list[SourceAnchorRepair] = Field(default_factory=list)
+    # Historical artifacts predate local-only verification and always enforced
+    # delivery scope, so True is the backward-compatible resume interpretation.
+    submission_scope_enforced: bool = True

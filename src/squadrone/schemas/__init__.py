@@ -15,6 +15,8 @@ from .hypothesis import (
     HypothesesArtifact,
     SpecialistReviewArtifact,
     SecurityOutcome,
+    SourceAnchor,
+    SourceAnchorRepair,
     root_cause_cwe_for,
     TriagedArtifact,
 )
@@ -58,6 +60,8 @@ __all__ = [
     "SecurityOutcome",
     "Sink",
     "SpecialistReviewArtifact",
+    "SourceAnchor",
+    "SourceAnchorRepair",
     "StaticCallEdge",
     "StaticCallback",
     "TriagedArtifact",

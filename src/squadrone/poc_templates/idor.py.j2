@@ -1,53 +1,201 @@
 import requests
-from wp_login import wp_login
+
 from poc_result import emit_result
+from wp_login import wp_login
+
 
 TARGET = "{{ target_url }}"
-ACTION = "{{ ajax_action }}"
+METHOD = {{ request_method | default("") | tojson }}
+ROUTE = {{ request_route | default("") | tojson }}
+DISPATCH = {{ request_dispatch | default({}) | tojson }}
+ENDPOINT = f"{TARGET}{ROUTE}" if ROUTE else ""
 PARAM = "{{ injectable_param }}"
 USERNAME = "{{ test_username }}"
 PASSWORD = "{{ test_password }}"
 ATTACKER_ROLE = "{{ attacker_role }}"
 
+# Fail-closed skeleton: replace these placeholders with exact IDs and
+# deterministic markers from one authoritative provisioning path. For a write,
+# an owner/admin session must measure BEFORE and AFTER; the attacker session is
+# not an independent observer of the foreign object.
+ACCESS_TYPE = "read"
+CONTROL_BASIS = "attacker_owned"
+OBJECT_PROVENANCE = ""
+ATTACKER_USER_ID = ""
+OWNER_USER_ID = ""
+ATTACK_OBJECT_ID = ""
+CONTROL_OBJECT_ID = ""
+ATTACK_MARKER = ""
+CONTROL_MARKER = ""
+PROTECTION_VISIBLE_MARKER = ""
+WRITE_EFFECT = "modify"
+ATTACK_BASELINE_MARKER = ""
+CONTROL_BASELINE_MARKER = ""
+ATTACK_OBSERVER_USER_ID = ""
+CONTROL_OBSERVER_USER_ID = ""
+ATTACK_OBSERVER_ROLE = ""
+CONTROL_OBSERVER_ROLE = ""
+REQUEST_FINGERPRINT = {
+    "method": METHOD,
+    "route": ROUTE,
+    "object_parameter": PARAM,
+    "object_type": "",
+    "object_location": "form",
+    "dispatch": DISPATCH,
+    "object_value_template": "",
+    "marker_field": "",
+    "owner_field": "",
+    "csrf_fields": [],
+}
+# Choose exactly one protection shape. An owner-filtered collection is
+# deliberately objectless: never add object_parameter, object_type, or
+# object_location to this dictionary. Its request values must not contain a
+# SQUADRONE_ proof sentinel, including in a search/filter parameter.
+OWNER_FILTERED_COLLECTION_PROTECTION_REQUEST_FINGERPRINT = {
+    "scope": "owner_filtered_collection",
+    "method": "GET",
+    "route": "",
+    "dispatch": {},
+    "csrf_fields": [],
+}
+# An object-bound denial must include all three object-selection fields and the
+# real request must select ATTACK_OBJECT_ID and return 401, 403, or 404.
+OBJECT_BOUND_PROTECTION_REQUEST_FINGERPRINT = {
+    "scope": "object",
+    "method": "GET",
+    "route": "",
+    "object_parameter": PARAM,
+    "object_type": "",
+    "object_location": "query",
+    "dispatch": {},
+    "csrf_fields": [],
+}
+PROTECTION_REQUEST_FINGERPRINT = (
+    OWNER_FILTERED_COLLECTION_PROTECTION_REQUEST_FINGERPRINT
+)
+OWNER_REQUEST_FINGERPRINT = {
+    "method": "GET",
+    "route": "",
+    "object_parameter": PARAM,
+    "object_type": "",
+    "object_location": "query",
+    "dispatch": {},
+}
+OBSERVER_REQUEST_FINGERPRINT = {
+    "method": "GET",
+    "route": "",
+    "object_parameter": PARAM,
+    "object_type": "",
+    "object_location": "query",
+    "dispatch": {},
+}
+
 session = requests.Session()
+login_ok = True
 if ATTACKER_ROLE.lower() not in {"unauthenticated", "anonymous", "guest"}:
     login = wp_login(session, TARGET, USERNAME, PASSWORD)
-    if not login.success:
-        emit_result(
-            verdict="not_vulnerable", oracle="cross_object_access", attacker_role=ATTACKER_ROLE,
-            request={"method": "POST", "url": f"{TARGET}/wp-admin/admin-ajax.php"},
-            attack={"observed": False, "attacker_user_id": "unknown", "owner_user_id": "unknown", "secret_present": False},
-            control={"observed": True, "secret_present": False},
-            impact="Authentication failed before the authorization boundary could be tested.",
-        )
-        raise SystemExit(0)
+    login_ok = login.success
 
-candidate_ids = ["1", "2", "3", "10", "100"]
-hits = []
-for object_id in candidate_ids:
-    resp = session.post(
-        f"{TARGET}/wp-admin/admin-ajax.php",
-        data={"action": ACTION, PARAM: object_id, {{ extra_params }}},
-        timeout=20,
-    )
-    body = resp.text[:500]
-    if resp.status_code == 200 and not any(marker in body.lower() for marker in ("forbidden", "unauthorized", "not allowed", "-1")):
-        hits.append((object_id, resp.status_code, body))
+# Never infer object access from guessed IDs or HTTP 200. Populate these only
+# from exact marker/state measurements made through the real entry point.
+attack_marker_present = False
+control_marker_present = False
+attack_marker_in_control = False
+legitimate_control_access_succeeded = False
+attack_observed_value = ""
+control_observed_value = ""
 
-# Generic IDs and HTTP 200 are reachability only. The PoC author must replace
-# these placeholders with two setup-created users/objects and a private marker.
-secret_marker = ""
-attacker_user_id = ""
-owner_user_id = ""
-secret_present = bool(secret_marker and any(secret_marker in body for _, _, body in hits))
-observed = bool(attacker_user_id and owner_user_id and attacker_user_id != owner_user_id and secret_present)
+# Write-capable fail-closed measurements. Populate BEFORE/AFTER only from the
+# claimed owner's object-bound observer requests. write_marker_present_before
+# and write_marker_present_after always test the arm's write marker, never its
+# benign baseline_marker: modify is False -> True; delete is True -> False.
+attack_before = ""
+attack_after = ""
+control_before = ""
+control_after = ""
+attack_write_measurements = {
+    "write_effect": WRITE_EFFECT,
+    "baseline_marker": ATTACK_BASELINE_MARKER,
+    "before": attack_before,
+    "after": attack_after,
+    "write_marker_present_before": bool(
+        ATTACK_MARKER and ATTACK_MARKER in attack_before
+    ),
+    "write_marker_present_after": bool(
+        ATTACK_MARKER and ATTACK_MARKER in attack_after
+    ),
+    "observer_user_id": ATTACK_OBSERVER_USER_ID,
+    "observer_role": ATTACK_OBSERVER_ROLE,
+    "observer_request_fingerprint": OBSERVER_REQUEST_FINGERPRINT,
+}
+control_write_measurements = {
+    "write_effect": WRITE_EFFECT,
+    "baseline_marker": CONTROL_BASELINE_MARKER,
+    "before": control_before,
+    "after": control_after,
+    "write_marker_present_before": bool(
+        CONTROL_MARKER and CONTROL_MARKER in control_before
+    ),
+    "write_marker_present_after": bool(
+        CONTROL_MARKER and CONTROL_MARKER in control_after
+    ),
+    "observer_user_id": CONTROL_OBSERVER_USER_ID,
+    "observer_role": CONTROL_OBSERVER_ROLE,
+    "observer_request_fingerprint": OBSERVER_REQUEST_FINGERPRINT,
+}
+
 emit_result(
-    verdict="vulnerable" if observed else "not_vulnerable",
+    verdict="not_vulnerable",
     oracle="cross_object_access",
     attacker_role=ATTACKER_ROLE,
-    request={"method": "POST", "url": f"{TARGET}/wp-admin/admin-ajax.php"},
-    attack={"observed": observed, "attacker_user_id": attacker_user_id, "owner_user_id": owner_user_id, "secret_present": secret_present},
-    control={"observed": False if observed else True, "secret_present": False},
-    confidentiality="high" if observed else "none",
-    impact="The attacker read a private marker owned by a different user." if observed else "Cross-user access to private data was not demonstrated.",
+    request={"method": METHOD, "url": ENDPOINT},
+    attack={
+        "observed": False,
+        "access_type": ACCESS_TYPE,
+        "attacker_user_id": ATTACKER_USER_ID,
+        "owner_user_id": OWNER_USER_ID,
+        "object_id": ATTACK_OBJECT_ID,
+        "object_provenance": OBJECT_PROVENANCE,
+        "request_fingerprint": REQUEST_FINGERPRINT,
+        "identity_verified": login_ok,
+        "owner_verified": False,
+        "authorization_expected": False,
+        "protection_basis": "",
+        "protection_observed": False,
+        "protection_visible_marker": PROTECTION_VISIBLE_MARKER,
+        "protection_request_fingerprint": PROTECTION_REQUEST_FINGERPRINT,
+        "owner_request_fingerprint": OWNER_REQUEST_FINGERPRINT,
+        "marker": ATTACK_MARKER,
+        "marker_present": attack_marker_present,
+        "observed_value": attack_observed_value,
+        "secret_present": attack_marker_present,
+        **(attack_write_measurements if ACCESS_TYPE == "write" else {}),
+    },
+    control={
+        "observed": False,
+        "access_type": ACCESS_TYPE,
+        "control_basis": CONTROL_BASIS,
+        "attacker_user_id": ATTACKER_USER_ID,
+        "owner_user_id": ATTACKER_USER_ID,
+        "object_id": CONTROL_OBJECT_ID,
+        "object_provenance": OBJECT_PROVENANCE,
+        "request_fingerprint": REQUEST_FINGERPRINT,
+        "identity_verified": login_ok,
+        "owner_verified": False,
+        "authorization_expected": True,
+        "marker": CONTROL_MARKER,
+        "marker_present": control_marker_present,
+        "observed_value": control_observed_value,
+        "attack_marker_present": attack_marker_in_control,
+        "secret_present": attack_marker_in_control,
+        "legitimate_access_succeeded": legitimate_control_access_succeeded,
+        **(control_write_measurements if ACCESS_TYPE == "write" else {}),
+    },
+    confidentiality="none",
+    integrity="none",
+    availability="none",
+    impact=(
+        "Cross-object access was not demonstrated; exact identities, objects, "
+        "markers, and independent state measurements are still required."
+    ),
 )

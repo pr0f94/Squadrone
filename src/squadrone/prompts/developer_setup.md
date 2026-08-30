@@ -5,9 +5,12 @@ You are NOT writing the exploit. You are setting the stage so the exploit can fi
 ### Sandbox baseline (already done before you run)
 
 - WordPress 6.x installed at the target URL
-- `admin` / `password` administrator account exists
-- `subscriber_user` / `password` (subscriber role) and `editor_user` / `password` (editor role) exist
-- The target plugin has been installed and activated — its activation hook has fired, its options table rows exist
+- A configured administrator and any available test-role accounts have been
+  reconciled by the sandbox. Setup does not need their credentials; never assume,
+  invent, reset, or print a test-account password.
+- The target plugin has been installed and activated with the configured WordPress
+  administrator identity (while files remain owned by the managed web-service OS
+  user) — its activation hook has already fired
 - Permalinks default (`?p=` / plain) — no rewrite rules
 
 Anything beyond that is your responsibility.
@@ -56,36 +59,78 @@ includes `chmod`, `chown`, `chgrp`, `umask`, `wp_chmod`, equivalent WordPress or
 filesystem APIs, and indirect permission-mutation techniques.
 
 If source-grounded reachability requires a legitimate runtime directory, issue a
-clean `wp eval` command that calls `wp_mkdir_p($path)` alone. Let the managed web
-user and normal defaults determine ownership and mode. Do not combine directory
-creation with any permission or ownership operation.
+clean `wp eval` command with `wp_mkdir_p($path)` alone as its state-changing
+operation. Let the managed web user and normal defaults determine ownership and
+mode. Then verify the directory postcondition and emit the structured result
+required below. Do not combine directory creation with any permission or ownership
+operation.
 
 Setup commands are safety-checked atomically. If one command mixes an allowed
 operation with a prohibited one, the whole command is blocked and none of it is
 executed. Reissue the allowed operation as a clean, self-contained command without
 the prohibited operation.
 
-### Critical: WP-CLI runs without a logged-in user
+### Critical: setup runs as the configured WordPress administrator
 
-Although WP-CLI runs as the managed web-server operating-system user, `wp eval`
-executes with **no WordPress current user** (user ID 0). Most plugins gate their
-model `save()` / `update()` / `delete()` methods behind capability checks
-(`current_user_can('edit_X')`, `can_manage()`, etc.) — these silently return
-`false` in CLI context, with no exception thrown and no error logged. The data you
-tried to seed simply never gets written, and the next stage's PoC has nothing to
-attack.
+The runner executes every setup command as the managed web-server operating-system
+user while selecting the configured WordPress administrator. Plugin model methods
+therefore see an authenticated administrator and may perform their normal capability
+checks. Do not include a WP-CLI `--user` selector and do not call
+`wp_set_current_user(...)`; identity is managed by the runner rather than by generated
+setup code.
 
-**Always prefix `wp eval` calls that invoke plugin model methods with `wp_set_current_user(1);`** to assume the admin user. Example:
+The runner also owns the target plugin's lifecycle. The plugin is already installed
+and activated with that administrator identity before setup begins. Never propose
+`wp plugin install`, `activate`, `deactivate`, `delete`, `update`, or `toggle`, and do
+not call the equivalent PHP lifecycle APIs. If activation did not complete, that is
+an invalid sandbox baseline rather than a state for setup commands to repair.
 
-```
-wp eval "wp_set_current_user(1); $event = new EM_Event(); $event->event_name = 'Test'; ...; $event->save();"
-```
+### Critical: every `wp eval` must prove its semantic postconditions
 
-This is needed for almost every plugin that has its own data model. Skip it only when you're calling pure WordPress core APIs (`wp_insert_post`, `update_option`, etc.) or when the hypothesis specifically requires testing what an unprivileged user can do at seed time.
+Every `wp eval` command must be one self-verifying program. A zero PHP exit status,
+a truthy model-method return, an affected-row count, or an emitted ID alone proves
+only that an operation ran; it does not prove that the required state exists.
+
+- Prefer source-grounded WordPress Core or plugin APIs for creation, mutation, and
+  the authoritative re-read. Do not bypass an available higher-level API with a raw
+  database write.
+- After all mutations, re-read the resulting state and assert the semantic
+  postconditions needed by the PoC. As applicable, prove that every object ID is a
+  positive nonzero integer, IDs for distinct objects are unique, ownership or
+  authorship is correct, and every relevant persisted value equals the intended
+  benign value.
+- If a call returns `false` or `WP_Error`, an ID is missing or invalid, objects are
+  not distinct, `$wpdb->last_error` is non-empty, or any re-read value, ownership,
+  or other semantic postcondition is wrong, fail with a stable, specific label such
+  as `WP_CLI::error('setup postcondition failed: foreign owner')`. Never include a
+  secret or an unbounded persisted value in the label, and never print a success
+  result after a failed assertion. Reusing only the opaque text `setup postcondition
+  failed` prevents safe followup repair.
+- Plugin APIs and database schemas may normalize input values, including booleans,
+  statuses, empty strings, dates, and times. Inspect the source-defined write path,
+  schema, or an authoritative re-read and compare proof-relevant fields against
+  their canonical persisted forms. Do not require byte-for-byte equality for every
+  incidental input field when those fields are irrelevant to reachability.
+- On success, make the final explicit output a single structured JSON object via
+  `WP_CLI::log(wp_json_encode($result))`. Include the verified IDs, ownership, and
+  relevant persisted values (or equivalent evidence for non-record state) so the
+  runner can distinguish established state from an unverified attempt.
+
+Raw database writes are a last resort. Use one only when no source-grounded Core or
+plugin write API exists and every table and column is grounded in the supplied
+source. For each `$wpdb->insert`, `$wpdb->update`, `$wpdb->replace`, or write through
+`$wpdb->query`, check both its return value and `$wpdb->last_error` immediately,
+then re-read the exact affected rows. Assert positive nonzero IDs, uniqueness where
+multiple objects were seeded, correct ownership, and exact persisted values before
+emitting the final JSON. Neither `$wpdb->insert_id` nor an affected-row count is a
+semantic postcondition by itself.
 
 ### Output format
 
-Each command becomes `wp --allow-root <args...>` inside the sandbox container. Do not include the `wp` prefix or `--allow-root`. Each command must be self-contained — no shell variables, no pipes, no redirects. For multi-statement PHP, use `wp eval "<single quoted PHP statement>"`.
+The runner adds the `wp` prefix and both managed identities inside the sandbox
+container. Do not include `wp`, `--allow-root`, or `--user`. Each command must be
+self-contained — no shell variables, pipes, or redirects. For multi-statement PHP,
+use `wp eval "<single quoted PHP statement>"`.
 
 If no setup is needed (the hypothesis is reachable in a vanilla install), return an empty `commands` list.
 

@@ -184,10 +184,40 @@ success word:
 | `response_marker` | Unique private marker in attack and absent from control |
 | `state_change` | Different before/after state only for attack |
 | `authorization` | Protected effect allowed for attack and denied for control |
-| `cross_object_access` | Distinct attacker/owner and private marker only in attack |
+| `cross_object_access` | Runner-traced HTTP requests with server-signed WordPress identities; measured protection path; bound objects, provenance, dispatch, and matching parameter shapes; separate markers and a legitimate control; trusted before/after evidence for writes |
 | `callback` | Attack-only callback carrying a unique sensitive marker |
 | `browser_execution` | JavaScript execution for attack and not control |
 | `file_effect` | Observed path plus SHA-256 marker, absent for control |
+
+The cross-object HTTP proof path is supervised by a parent-owned, exact-origin proxy.
+The child receives only the proxy address; request nonces, trace salts, and the
+sandbox receipt secret remain in the parent. For cross-object claims, every
+proof request is bound to its exact method, target, body digest, server-signed
+WordPress identity, parsed parameter shape, and an uninterrupted
+protection/before/attack/after/control sequence. Opaque bodies, hidden routing
+overrides, raw marker reflection, failed forwarding, and incomplete capture all
+fail closed.
+
+SSRF response proofs use the same parent proxy with one of two verifier-owned
+oracles. Network-fetch claims use a short-lived HTTP service outside the
+WordPress container: its private marker, generation, and hit ledger never enter
+the plugin trust domain, and each inner hit must fall inside its matching outer
+request. Local-resource scheme-bypass claims instead use an opaque canary file
+outside the web root, supplied through an exact read-only bind mount. The parent
+withholds the fresh marker, attests the mount and immutable file before and after
+execution, confines the opaque path capability to the two destination fields,
+and restarts WordPress request workers before clean-state confirmation. In both
+modes the cited method, route, dispatch, destination field, request values,
+headers, actor boundary, and confirmation are bound exactly. Alternate
+self-reported SSRF oracles fail closed.
+
+Trace-bound HTTP PoCs additionally run in a bounded macOS Seatbelt profile. It can
+read only the copied PoC bundle and derived Python/runtime dependencies, write
+only inside the bundle, and connect only to the parent proxy port. The profile
+denies host credential paths, process inspection/spawning, Unix sockets, and
+all other TCP destinations. Browser and inbound-callback oracles retain their
+compatibility execution path until dedicated capability profiles are added;
+they are never accepted as cross-object evidence.
 
 Before each attempt, Squadrone snapshots the full database and `wp-content`.
 After an oracle passes, it strictly restores that state and runs the exact same
@@ -265,6 +295,10 @@ possible, and malformed finding rows are quarantined during resume.
   resolve every dynamic PHP pattern. The Surveyor must validate and augment it.
 - Generated PoCs remain test programs, not mathematical proof. Their source and
   measured output must still be reviewed before disclosure.
+- Strict OS isolation currently requires macOS Seatbelt and covers the
+  requests-based cross-object and SSRF proof capabilities. Browser and
+  inbound-callback oracles need separate OS-isolated brokers before they can use
+  that profile.
 - Program rules and asset thresholds change. Scope references include their
   checked date and must be refreshed when official rules change.
 - A corpus labeled for one CVE cannot determine whether an unrelated finding is

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from squadrone.schemas import EntryPoint, ReconArtifact
+from squadrone.agents._specialist_base import _requires_dynamic_key_trace
 from squadrone.services.coverage import (
     build_coverage_artifact,
     merge_deterministic_coverage,
@@ -92,6 +93,259 @@ def test_registry_routes_authorization_storage_surfaces_without_losing_xss(tmp_p
     for item in storage_items.values():
         assert "authorization_workflows" in item.review_areas
         assert "xss_lifecycle" in item.review_areas
+
+
+def test_dynamic_sql_identity_crud_routes_to_authorization_without_broad_sql_routing(
+    tmp_path,
+):
+    (tmp_path / "plugin.php").write_text(
+        "<?php\n"
+        "function inspect_records($record_id, $status) {\n"
+        "  global $wpdb;\n"
+        "  $wpdb->get_row($wpdb->prepare(\n"
+        "    'SELECT * FROM records WHERE record_id=%d', $record_id\n"
+        "  ));\n"
+        "  $wpdb->get_results('SELECT * FROM records WHERE record_id=' . $record_id);\n"
+        "  $wpdb->get_var($wpdb->prepare(\n"
+        "    'SELECT COUNT(*) AS total FROM records WHERE record_id=%d', $record_id\n"
+        "  ));\n"
+        "  $wpdb->get_results($wpdb->prepare(\n"
+        "    'SELECT * FROM records WHERE record_id=%d', 7\n"
+        "  ));\n"
+        "  $wpdb->get_results($wpdb->prepare(\n"
+        "    'SELECT * FROM records WHERE status=%s', $status\n"
+        "  ));\n"
+        "  $wpdb->query($wpdb->prepare(\n"
+        "    'INSERT INTO records SET record_id=%d', $record_id\n"
+        "  ));\n"
+        "}\n"
+    )
+
+    artifact, _, _ = build_coverage_artifact(tmp_path)
+
+    sql_items = [item for item in artifact.items if item.type == "sql_query"]
+    routed = ["authorization_workflows" in item.review_areas for item in sql_items]
+    assert routed == [True, True, False, False, False, False]
+    assert all("injection_files" in item.review_areas for item in sql_items)
+
+
+def test_bare_sql_variables_resolve_assignments_in_the_same_function(
+    tmp_path,
+):
+    (tmp_path / "plugin.php").write_text(
+        "<?php\n"
+        "function persist_record($title) {\n"
+        "  global $wpdb;\n"
+        "  if (!current_user_can('edit_posts')) { return; }\n"
+        "  $record_id = absint($_POST['record_id']);\n"
+        "  $sql = $wpdb->prepare(\n"
+        "    'INSERT INTO records SET record_id=%d',\n"
+        "    $record_id\n"
+        "  );\n"
+        "  $wpdb->get_results($sql);\n"
+        "  $sql = $wpdb->prepare(\n"
+        "    'UPDATE records SET title=%s WHERE record_id=%d',\n"
+        "    $title,\n"
+        "    $record_id\n"
+        "  );\n"
+        "  $wpdb->get_results($sql);\n"
+        "}\n"
+        "function execute_unresolved_query() {\n"
+        "  global $wpdb;\n"
+        "  $wpdb->get_results($sql);\n"
+        "}\n"
+    )
+
+    artifact, _, _ = build_coverage_artifact(tmp_path)
+
+    sql_items = [item for item in artifact.items if item.type == "sql_query"]
+    routed = ["authorization_workflows" in item.review_areas for item in sql_items]
+    assert routed == [False, True, False]
+    assert all(item.snippet == "$wpdb->get_results($sql)" for item in sql_items)
+
+
+def test_bare_sql_and_where_variables_consider_all_branch_assignments(tmp_path):
+    (tmp_path / "plugin.php").write_text(
+        "<?php\n"
+        "function branch_on_record($record_id, $status, $by_id) {\n"
+        "  global $wpdb;\n"
+        "  if ($by_id) {\n"
+        "    $sql = $wpdb->prepare(\n"
+        "      'SELECT * FROM records WHERE record_id=%d', $record_id\n"
+        "    );\n"
+        "  } else {\n"
+        "    $sql = $wpdb->prepare(\n"
+        "      'SELECT * FROM records WHERE status=%s', $status\n"
+        "    );\n"
+        "  }\n"
+        "  $wpdb->get_results($sql);\n"
+        "  if ($by_id) {\n"
+        "    $where = ['record_id' => $record_id];\n"
+        "  } else {\n"
+        "    $where = ['status' => $status];\n"
+        "  }\n"
+        "  $wpdb->delete('records', $where);\n"
+        "}\n"
+    )
+
+    artifact, _, _ = build_coverage_artifact(tmp_path)
+
+    sql_items = [
+        item for item in artifact.items if item.type in {"sql_query", "sql_write"}
+    ]
+    assert len(sql_items) == 2
+    assert all("authorization_workflows" in item.review_areas for item in sql_items)
+
+
+def test_sequential_sql_and_where_reuse_resets_earlier_identity_assignments(tmp_path):
+    (tmp_path / "plugin.php").write_text(
+        "<?php\n"
+        "function reuse_query_variables($record_id, $status) {\n"
+        "  global $wpdb;\n"
+        "  $sql = $wpdb->prepare(\n"
+        "    'SELECT * FROM records WHERE record_id=%d', $record_id\n"
+        "  );\n"
+        "  $wpdb->get_results($sql);\n"
+        "  $sql = $wpdb->prepare(\n"
+        "    'SELECT * FROM records WHERE status=%s', $status\n"
+        "  );\n"
+        "  $wpdb->get_results($sql);\n"
+        "  $where = ['record_id' => $record_id];\n"
+        "  $wpdb->delete('records', $where);\n"
+        "  $where = ['record_id' => 7];\n"
+        "  $wpdb->delete('records', $where);\n"
+        "}\n"
+    )
+
+    artifact, _, _ = build_coverage_artifact(tmp_path)
+
+    sql_items = [
+        item for item in artifact.items if item.type in {"sql_query", "sql_write"}
+    ]
+    routed = ["authorization_workflows" in item.review_areas for item in sql_items]
+    assert routed == [True, False, True, False]
+
+
+def test_sql_identity_routing_handles_bulk_aggregate_and_safe_identity_shapes(
+    tmp_path,
+):
+    (tmp_path / "plugin.php").write_text(
+        "<?php\n"
+        "function inspect_identity_shapes($record_id, $record_ids, $user_id, $user_ID, $migration_row) {\n"
+        "  global $wpdb;\n"
+        "  $wpdb->get_results($wpdb->prepare(\n"
+        "    'SELECT record_id, COUNT(*) AS total FROM records WHERE record_id=%d', $record_id\n"
+        "  ));\n"
+        "  $wpdb->get_results($wpdb->prepare(\n"
+        "    'SELECT * FROM records WHERE record_id IN (%d, %d)', 7, $record_ids[0]\n"
+        "  ));\n"
+        "  $wpdb->get_results('SELECT * FROM records WHERE record_id IN (1, 2)');\n"
+        "  $wpdb->get_results($wpdb->prepare(\n"
+        "    'SELECT * FROM records WHERE user_id=%d', $user_id\n"
+        "  ));\n"
+        "  $wpdb->get_results($wpdb->prepare(\n"
+        "    'SELECT * FROM records WHERE user_id=%d', $user_ID\n"
+        "  ));\n"
+        "  $wpdb->get_results($wpdb->prepare(\n"
+        "    'SELECT * FROM records WHERE user_id=%d', get_current_user_id()\n"
+        "  ));\n"
+        "  $wpdb->get_results($wpdb->prepare(\n"
+        "    'DELETE FROM records WHERE record_id=%d', $migration_row->record_id\n"
+        "  ));\n"
+        "}\n"
+    )
+
+    artifact, _, _ = build_coverage_artifact(tmp_path)
+
+    sql_items = [item for item in artifact.items if item.type == "sql_query"]
+    routed = ["authorization_workflows" in item.review_areas for item in sql_items]
+    # Unknown internal identifiers and unproven variables remain conservative
+    # candidates; the specialist proves reachability. A fixed list and a direct
+    # WordPress current-user call cannot select a different object.
+    assert routed == [True, True, False, True, True, False, True]
+
+
+def test_sql_object_access_area_does_not_leak_to_adjacent_safe_items(tmp_path):
+    (tmp_path / "plugin.php").write_text(
+        "<?php\n"
+        "function inspect_one_record($record_id) {\n"
+        "  global $wpdb;\n"
+        "  $wpdb->get_row('SELECT * FROM records WHERE record_id=1');\n"
+        "  $wpdb->get_row($wpdb->prepare(\n"
+        "    'SELECT * FROM records WHERE record_id=%d', $record_id\n"
+        "  ));\n"
+        "  $wpdb->get_row('SELECT * FROM records WHERE record_id=2');\n"
+        "}\n"
+    )
+
+    artifact, _, _ = build_coverage_artifact(tmp_path)
+
+    sql_items = [item for item in artifact.items if item.type == "sql_query"]
+    routed = ["authorization_workflows" in item.review_areas for item in sql_items]
+    assert routed == [False, True, False]
+    assert all("injection_files" in item.review_areas for item in sql_items)
+
+
+def test_wpdb_update_and_delete_route_only_dynamic_identity_where_maps(tmp_path):
+    (tmp_path / "plugin.php").write_text(
+        "<?php\n"
+        "function mutate_records($record_id, $title) {\n"
+        "  global $wpdb;\n"
+        "  $wpdb->update(\n"
+        "    'records', ['title' => $title], ['record_id' => $record_id]\n"
+        "  );\n"
+        "  $wpdb->delete('records', ['record_id' => 7]);\n"
+        "  $where = ['record_id' => $record_id];\n"
+        "  $wpdb->delete('records', $where);\n"
+        "  $wpdb->insert('records', ['record_id' => $record_id]);\n"
+        "}\n"
+    )
+
+    artifact, _, _ = build_coverage_artifact(tmp_path)
+
+    sql_writes = [item for item in artifact.items if item.type == "sql_write"]
+    routed = ["authorization_workflows" in item.review_areas for item in sql_writes]
+    assert routed == [True, False, True, False]
+    assert all("injection_files" in item.review_areas for item in sql_writes)
+    assert all("xss_lifecycle" in item.review_areas for item in sql_writes)
+
+
+def test_multiline_fixed_write_calls_keep_complete_snippets_and_ordinary_batches(
+    tmp_path,
+):
+    (tmp_path / "plugin.php").write_text(
+        "<?php\n"
+        "update_user_meta(\n"
+        "    $user_id,\n"
+        "    // This literal remains a fixed field despite layout and comments.\n"
+        "    'display_name',\n"
+        "    $display_name,\n"
+        ");\n"
+        "wp_update_user([\n"
+        "    'ID' => $user_id,\n"
+        "    'user_url' => $url,\n"
+        "]);\n"
+    )
+
+    artifact, _, _ = build_coverage_artifact(tmp_path)
+
+    writes = [item for item in artifact.items if item.kind == "storage_write"]
+    assert {item.name for item in writes} == {"update_user_meta", "wp_update_user"}
+    assert all("\n" in item.snippet and item.snippet.endswith(")") for item in writes)
+    assert all(not _requires_dynamic_key_trace([item]) for item in writes)
+
+
+def test_non_call_php_surface_keeps_the_full_source_line(tmp_path):
+    (tmp_path / "plugin.php").write_text(
+        "<?php\n$path = $_GET['path']; require_once $path;\n"
+    )
+
+    artifact, _, _ = build_coverage_artifact(tmp_path)
+
+    dynamic_include = next(
+        item for item in artifact.items if item.type == "dynamic_include"
+    )
+    assert dynamic_include.snippet == "$path = $_GET['path']; require_once $path;"
 
 
 def test_weak_crypto_and_randomness_primitives_are_reviewed_only_when_executable(

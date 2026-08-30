@@ -88,8 +88,10 @@ async def run(
 
     if release is not None:
         await svn.export_release(plugin_slug, release, str(plugin_dir))
+        source_url = release.download_url
     else:
-        await svn.export(plugin_slug, version, str(plugin_dir))
+        exported = await svn.export_pinned_release(plugin_slug, version, str(plugin_dir))
+        source_url = exported.source_url
     _maybe_unpack_zip_tag(plugin_dir, plugin_slug)
     file_count, total_lines = _count_files(plugin_dir)
 
@@ -100,11 +102,7 @@ async def run(
         source_path=str(plugin_dir),
         file_count=file_count,
         total_lines=total_lines,
-        source_url=(
-            release.download_url
-            if release is not None
-            else f"https://plugins.svn.wordpress.org/{plugin_slug}/tags/{version}"
-        ),
+        source_url=source_url,
         scanned_at=datetime.now(timezone.utc),
         is_plugin_closed=is_closed,
     )

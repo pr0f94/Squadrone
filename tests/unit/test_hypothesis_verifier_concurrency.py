@@ -80,13 +80,32 @@ async def test_unreadable_citation_is_dropped_without_calling_model(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_sink_quote_at_wrong_line_is_dropped_without_line_drift_recovery(tmp_path):
+async def test_unique_adjacent_sink_quote_is_relocated_before_source_verification(
+    tmp_path,
+):
     (tmp_path / "demo.php").write_text(
-        "<?php\n"
-        "safe_call();\n"
-        "$wpdb->query($_GET['id']);\n"
+        "<?php\nsafe_call();\n$wpdb->query($_GET['id']);\n"
     )
-    verifier = HypothesisVerifier(runtime=object(), model="unused")  # type: ignore[arg-type]
+
+    class Runtime:
+        def __init__(self) -> None:
+            self.user_prompt = ""
+
+        async def run(self, **kwargs):
+            self.user_prompt = kwargs["messages"][-1]["content"]
+            return type(
+                "Result",
+                (),
+                {
+                    "output": VerifierVerdict(
+                        verdict="keep",
+                        reason="the normalized citation matches the exact sink",
+                    ),
+                },
+            )()
+
+    runtime = Runtime()
+    verifier = HypothesisVerifier(runtime=runtime, model="test")  # type: ignore[arg-type]
     hypothesis = Hypothesis(
         id="h-drift",
         specialist="injection_files",
@@ -105,8 +124,94 @@ async def test_sink_quote_at_wrong_line_is_dropped_without_line_drift_recovery(t
 
     verdict = await verifier.verify(hypothesis, str(tmp_path))
 
+    assert verdict.verdict == "keep"
+    assert hypothesis.line == 3
+    assert "around line 3" in runtime.user_prompt
+    assert "normalized from demo.php:2 to demo.php:3" in (verdict.citation or "")
+
+
+@pytest.mark.asyncio
+async def test_sink_quote_outside_bounded_line_drift_is_dropped(tmp_path):
+    (tmp_path / "demo.php").write_text(
+        "<?php\n" + "safe_call();\n" * 15 + "$wpdb->query($_GET['id']);\n"
+    )
+    verifier = HypothesisVerifier(runtime=object(), model="unused")  # type: ignore[arg-type]
+    hypothesis = Hypothesis(
+        id="h-far-drift",
+        specialist="injection_files",
+        bug_class=BugClass.SQLI,
+        entry_point="wp_ajax_nopriv_demo",
+        file="demo.php",
+        line=1,
+        sink="$wpdb->query",
+        sink_code="$wpdb->query($_GET['id']);",
+        taint_path=["$_GET['id']", "$wpdb->query"],
+        reasoning="Unauthenticated SQL injection.",
+        confidence=Confidence.HIGH,
+        preconditions="unauthenticated",
+        affected_versions="current",
+    )
+
+    verdict = await verifier.verify(hypothesis, str(tmp_path))
+
     assert verdict.verdict == "drop"
-    assert "does not begin" in verdict.reason
+    assert "within ±15 lines" in verdict.reason
+
+
+@pytest.mark.asyncio
+async def test_relocation_does_not_use_fuzzy_whitespace_matching(tmp_path):
+    (tmp_path / "demo.php").write_text(
+        "<?php\nsafe_call();\n$wpdb->query(  $_GET['id']  );\n"
+    )
+    verifier = HypothesisVerifier(runtime=object(), model="unused")  # type: ignore[arg-type]
+    hypothesis = Hypothesis(
+        id="h-fuzzy-drift",
+        specialist="injection_files",
+        bug_class=BugClass.SQLI,
+        entry_point="wp_ajax_nopriv_demo",
+        file="demo.php",
+        line=2,
+        sink="$wpdb->query",
+        sink_code="$wpdb->query( $_GET['id'] );",
+        taint_path=["$_GET['id']", "$wpdb->query"],
+        reasoning="Unauthenticated SQL injection.",
+        confidence=Confidence.HIGH,
+        preconditions="unauthenticated",
+        affected_versions="current",
+    )
+
+    verdict = await verifier.verify(hypothesis, str(tmp_path))
+
+    assert verdict.verdict == "drop"
+    assert "within ±15 lines" in verdict.reason
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_nearby_sink_quotes_are_dropped(tmp_path):
+    (tmp_path / "demo.php").write_text(
+        "<?php\n$wpdb->query($_GET['id']);\nsafe_call();\n$wpdb->query($_GET['id']);\n"
+    )
+    verifier = HypothesisVerifier(runtime=object(), model="unused")  # type: ignore[arg-type]
+    hypothesis = Hypothesis(
+        id="h-ambiguous-drift",
+        specialist="injection_files",
+        bug_class=BugClass.SQLI,
+        entry_point="wp_ajax_nopriv_demo",
+        file="demo.php",
+        line=3,
+        sink="$wpdb->query",
+        sink_code="$wpdb->query($_GET['id']);",
+        taint_path=["$_GET['id']", "$wpdb->query"],
+        reasoning="Unauthenticated SQL injection.",
+        confidence=Confidence.HIGH,
+        preconditions="unauthenticated",
+        affected_versions="current",
+    )
+
+    verdict = await verifier.verify(hypothesis, str(tmp_path))
+
+    assert verdict.verdict == "drop"
+    assert "multiple nearby matches" in verdict.reason
 
 
 @pytest.mark.asyncio
@@ -119,12 +224,16 @@ async def test_exact_sink_quote_reaches_source_verifier(tmp_path):
 
         async def run(self, **kwargs):
             self.called = True
-            return type("Result", (), {
-                "output": VerifierVerdict(
-                    verdict="keep",
-                    reason="citation matches and no local contradiction is visible",
-                ),
-            })()
+            return type(
+                "Result",
+                (),
+                {
+                    "output": VerifierVerdict(
+                        verdict="keep",
+                        reason="citation matches and no local contradiction is visible",
+                    ),
+                },
+            )()
 
     runtime = Runtime()
     verifier = HypothesisVerifier(runtime=runtime, model="test")  # type: ignore[arg-type]

@@ -8,8 +8,11 @@ Return `drop` only when the supplied source proves one of these facts:
 2. The cited expression is a different operation from the claimed root cause.
 3. A visible guard, constant value, sanitizer, or safe API conclusively defeats
    the exact claim.
-4. The source conclusively shows own-object, public-data, or no-security-impact
-   behavior that directly contradicts the hypothesis.
+4. The source conclusively shows public-data or no-security-impact behavior that
+   directly contradicts the hypothesis. An own or newly created target alone
+   does not disprove mass assignment when the field/key is attacker-controlled;
+   drop only when the visible code constrains it to intended non-sensitive
+   fields or otherwise defeats the claimed protected attribute write.
 
 Do not reconstruct a whole vulnerability from this local window. Do not drop
 because a caller, helper, runtime value, configuration fact, or impact is not

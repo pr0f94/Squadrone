@@ -8,6 +8,11 @@ attacker role, storage transformation where applicable, victim path, exact
 HTML/JavaScript context, and context-appropriate escaping. Inspect built/dist
 JavaScript for DOM sinks and data consumers.
 
+When several independent or source-local line windows are already known,
+prefer one `read_plugin_ranges` call (up to eight bounded ranges) over separate
+`read_plugin_file` calls. This only reduces tool turns: inspect the same complete
+paths and obtain every line used as evidence.
+
 Stored XSS requires attacker input to survive the legitimate write path and
 execute on a natural victim page. Reflected XSS requires a victim-reachable URL
 and JavaScript execution. Reflection, HTML/CSS injection, self-XSS, values only

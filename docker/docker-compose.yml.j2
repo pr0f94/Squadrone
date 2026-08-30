@@ -17,6 +17,10 @@ services:
     depends_on:
       db:
         condition: service_healthy
+{% if enable_http_ssrf %}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+{% endif %}
     ports:
       - "{{ port }}:80"
     environment:
@@ -38,6 +42,9 @@ services:
     volumes:
       - wp_data:/var/www/html
       - ./wp-init.sh:/docker-entrypoint.d/99-wp-init.sh
+{% if enable_local_resource_ssrf %}
+      - "{{ ssrf_local_host_dir }}:/var/lib/squadrone/ssrf:ro"
+{% endif %}
 
 volumes:
   wp_data:

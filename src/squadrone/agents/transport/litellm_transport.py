@@ -375,13 +375,64 @@ class LiteLLMTransport:
         tool_handlers: Optional[dict],
         force_finalise_after: Optional[int],
         max_tokens: int,
+        force_finalise_allowed_tools: Optional[set[str]] = None,
     ) -> AgentResult:
         msgs = [dict(m) for m in messages]
         usage_acc: dict = {}
         dev_calls = [0]
         call_history: dict = {}
+        finalisation_allowed_tools = (
+            frozenset(force_finalise_allowed_tools)
+            if force_finalise_allowed_tools is not None
+            else None
+        )
+        finalisation_tool_used = False
 
-        async def _one_call(call_msgs: list[dict]) -> dict:
+        def _tool_name(tool: dict) -> str:
+            function = tool.get("function") or {}
+            return str(function.get("name") or "")
+
+        def _tools_for_next_call(forced: bool) -> Optional[list[dict]]:
+            if not forced or finalisation_allowed_tools is None:
+                return tools
+            if finalisation_tool_used:
+                return []
+            return [
+                tool
+                for tool in (tools or [])
+                if _tool_name(tool) in finalisation_allowed_tools
+            ]
+
+        def _force_finalise_message(total_calls: int) -> str:
+            common = (
+                "Do not invent uncertain source facts; omit an unproven candidate "
+                "or use the schema's unreviewed disposition where available."
+            )
+            if finalisation_allowed_tools is None:
+                return (
+                    f"You have made {total_calls} tool calls — that is enough investigation. "
+                    "Stop calling tools and produce your final output now using what you already know. "
+                    f"Do not call any more tools. {common}"
+                )
+            if finalisation_tool_used or not finalisation_allowed_tools:
+                return (
+                    f"You have made {total_calls} tool calls — that is enough investigation. "
+                    "All tool allowances are exhausted. Produce your final output now; do not call "
+                    f"any more tools. {common}"
+                )
+            allowed = ", ".join(
+                f"`{name}`" for name in sorted(finalisation_allowed_tools)
+            )
+            return (
+                f"You have made {total_calls} tool calls — ordinary investigation must stop. "
+                f"You may make at most one finalisation tool call, using only {allowed}, if it is "
+                "needed before final output. All other tools are unavailable. After that tool result, "
+                f"produce your final output without another tool call. {common}"
+            )
+
+        async def _one_call(
+            call_msgs: list[dict], call_tools: Optional[list[dict]]
+        ) -> dict:
             trimmed_msgs, dropped = _trim_history_for_budget(call_msgs)
             if dropped:
                 runtime._trace(
@@ -401,14 +452,14 @@ class LiteLLMTransport:
                 {
                     "model": model,
                     "messages": trimmed_msgs,
-                    "tools": tools,
+                    "tools": call_tools,
                     "llm_options": llm_options,
                 },
             )
             resp = await call_llm(
                 model=model,
                 messages=cached_msgs,
-                tools=tools,
+                tools=call_tools,
                 max_tokens=max_tokens,
                 budget_tracker=runtime.budget_tracker,
                 agent_name=agent_name,
@@ -431,7 +482,7 @@ class LiteLLMTransport:
         total_tool_calls = 0
         forced = False
         for iteration in range(1, max_iterations + 1):
-            resp = await _one_call(msgs)
+            resp = await _one_call(msgs, _tools_for_next_call(forced))
             choice = (resp.get("choices") or [{}])[0]
             message = choice.get("message") or {}
             content = message.get("content") or ""
@@ -445,6 +496,8 @@ class LiteLLMTransport:
                         "tool_calls": tool_calls,
                     }
                 )
+                blocked_during_finalisation = False
+                dispatched_finalisation_tool = False
                 for tc in tool_calls:
                     fn = tc.get("function", {}) or {}
                     name = fn.get("name", "")
@@ -457,14 +510,51 @@ class LiteLLMTransport:
                         )
                     except json.JSONDecodeError:
                         args = {}
-                    result = await runtime._dispatch_tool(
-                        agent_name,
-                        name,
-                        args,
-                        dev_calls,
-                        extra_handlers=tool_handlers,
-                        call_history=call_history,
+                    finalisation_phase = (
+                        finalisation_allowed_tools is not None
+                        and force_finalise_after is not None
+                        and (forced or total_tool_calls >= force_finalise_after)
                     )
+                    if finalisation_phase and (
+                        finalisation_tool_used or name not in finalisation_allowed_tools
+                    ):
+                        blocked_during_finalisation = True
+                        remaining = (
+                            "none"
+                            if finalisation_tool_used
+                            else ", ".join(sorted(finalisation_allowed_tools)) or "none"
+                        )
+                        result = (
+                            f"[runtime] tool {name!r} is unavailable during forced "
+                            f"finalisation; remaining allowed tool: {remaining}."
+                        )
+                        runtime._trace(
+                            agent_name,
+                            "finalisation_tool_blocked",
+                            {
+                                "tool": name,
+                                "args": args,
+                                "allowed_tools": sorted(finalisation_allowed_tools),
+                                "finalisation_tool_used": finalisation_tool_used,
+                            },
+                        )
+                    else:
+                        result = await runtime._dispatch_tool(
+                            agent_name,
+                            name,
+                            args,
+                            dev_calls,
+                            extra_handlers=tool_handlers,
+                            call_history=call_history,
+                        )
+                        if finalisation_phase:
+                            finalisation_tool_used = True
+                            dispatched_finalisation_tool = True
+                            runtime._trace(
+                                agent_name,
+                                "finalisation_tool_dispatched",
+                                {"tool": name, "args": args},
+                            )
                     msgs.append(
                         {
                             "role": "tool",
@@ -474,28 +564,50 @@ class LiteLLMTransport:
                     )
                     total_tool_calls += 1
 
-                if (
+                newly_forced = (
                     not forced
                     and force_finalise_after is not None
                     and total_tool_calls >= force_finalise_after
-                ):
+                )
+                if newly_forced:
                     msgs.append(
                         {
                             "role": "user",
-                            "content": (
-                                f"You have made {total_tool_calls} tool calls — that is enough investigation. "
-                                "Stop calling tools and produce your final output now using what you already know. "
-                                "Do not call any more tools. Do not invent uncertain source facts; omit an unproven "
-                                "candidate or use the schema's unreviewed disposition where available."
-                            ),
+                            "content": _force_finalise_message(total_tool_calls),
                         }
                     )
                     runtime._trace(
                         agent_name,
                         "force_finalise",
-                        {"after_tool_calls": total_tool_calls},
+                        {
+                            "after_tool_calls": total_tool_calls,
+                            "allowed_tools": (
+                                sorted(finalisation_allowed_tools)
+                                if finalisation_allowed_tools is not None
+                                else None
+                            ),
+                            "finalisation_tool_used": finalisation_tool_used,
+                        },
                     )
                     forced = True
+                elif forced and finalisation_allowed_tools is not None:
+                    if dispatched_finalisation_tool:
+                        msgs.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "The permitted finalisation tool result is now available. "
+                                    "Produce your final output now. No further tool calls are permitted."
+                                ),
+                            }
+                        )
+                    elif blocked_during_finalisation:
+                        msgs.append(
+                            {
+                                "role": "user",
+                                "content": _force_finalise_message(total_tool_calls),
+                            }
+                        )
                 continue
 
             final_content = content
@@ -669,7 +781,7 @@ class LiteLLMTransport:
             msgs.append({"role": "assistant", "content": final_content})
             msgs.append({"role": "user", "content": err})
             runtime._trace(agent_name, "retry", {"reason": err[:500]})
-            resp = await _one_call(msgs)
+            resp = await _one_call(msgs, _tools_for_next_call(forced))
             choice = (resp.get("choices") or [{}])[0]
             final_content = (choice.get("message") or {}).get("content") or ""
 

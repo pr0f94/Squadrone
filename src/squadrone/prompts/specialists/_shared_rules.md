@@ -27,6 +27,13 @@ cite its real `file` and `line` from a recent `read_plugin_file` result. Read th
 complete callback and every plugin helper on the claimed path. A 15-line window
 is not enough to assert that a guard or sanitizer is absent.
 
+Source presence is not branch reachability. When a helper contains conditional,
+fallback, or mutually exclusive dangerous operations, trace the actual source
+through the branch condition and cite the operation that this input executes.
+Do not anchor a hypothesis to a nearby sibling branch merely because it has the
+same sink class. When two operations are genuine fallbacks on the same reachable
+condition, quote the complete source expression containing both.
+
 Trace both directions:
 
 1. From each external handler forward to a guard, sanitizer, sensitive
@@ -83,7 +90,14 @@ control, granting an extra capability, modifying source, enabling debug behavior
 or installing another component is not a valid prerequisite. Absence of a WAF
 is normal and is not a precondition.
 
-Do not emit admin-only behavior, self/own-object behavior, cosmetic changes,
+Object authorization and attribute authorization are separate questions. Object
+ownership does not grant authority over every attribute. For a generic write
+whose field/key name is request-controlled, trace the name as well as the value
+and prove a server-side allowed-key set excludes protected attributes before
+marking a current or newly created object safe.
+
+Do not emit admin-only behavior, self/own-object behavior that cannot change a
+protected attribute or cross a broader security boundary, cosmetic changes,
 public counters, open redirects, HTML/CSS-only injection, generic HTTP 200
 responses, or primitives with no demonstrated CIA consequence.
 

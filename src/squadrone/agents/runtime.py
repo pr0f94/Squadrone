@@ -49,12 +49,15 @@ class AgentRuntime:
         self.budget_tracker = budget_tracker
         self.llm_options = dict(llm_options or {})
         self.role_reasoning = {
-            role: effort for role, effort in (role_reasoning or {}).items()
+            role: effort
+            for role, effort in (role_reasoning or {}).items()
             if effort is not None
         }
 
     @staticmethod
     def _role_for_agent(agent_name: str) -> str:
+        if agent_name.startswith("developer.propose_setup_followup"):
+            return "developer_followup"
         base = agent_name.split(".", 1)[0]
         if base in {
             "authentication",
@@ -96,9 +99,15 @@ class AgentRuntime:
             dedup_key = (tool_name, args_canon)
             if dedup_key in call_history:
                 prior = call_history[dedup_key]
-                self._trace(agent_name, "tool_call", {
-                    "tool": tool_name, "args": arguments, "deduped": True,
-                })
+                self._trace(
+                    agent_name,
+                    "tool_call",
+                    {
+                        "tool": tool_name,
+                        "args": arguments,
+                        "deduped": True,
+                    },
+                )
                 return (
                     f"[runtime] DUPLICATE: you already called {tool_name} with these arguments "
                     f"in this session. The earlier result was {len(prior)} chars long; refer to "
@@ -113,13 +122,21 @@ class AgentRuntime:
                 if hasattr(result, "__await__"):
                     result = await result
                 result_str = str(result)
-                self._trace(agent_name, "tool_call", {"tool": tool_name, "args": arguments, "result": result_str})
+                self._trace(
+                    agent_name,
+                    "tool_call",
+                    {"tool": tool_name, "args": arguments, "result": result_str},
+                )
                 if dedup_key is not None and call_history is not None:
                     call_history[dedup_key] = result_str
                 return result_str
             except Exception as e:
                 msg = f"[runtime] tool {tool_name} raised: {e}"
-                self._trace(agent_name, "tool_call", {"tool": tool_name, "args": arguments, "error": str(e)})
+                self._trace(
+                    agent_name,
+                    "tool_call",
+                    {"tool": tool_name, "args": arguments, "error": str(e)},
+                )
                 return msg
         if tool_name == "consult_developer":
             if dev_calls[0] >= self.developer_calls_per_agent:
@@ -135,13 +152,17 @@ class AgentRuntime:
                 code_snippet=arguments.get("code_snippet", ""),
                 context=arguments.get("context"),
             )
-            self._trace(agent_name, "developer_call", {
-                "n": dev_calls[0],
-                "question": arguments.get("question", ""),
-                "code_snippet": arguments.get("code_snippet", ""),
-                "context": arguments.get("context") or "",
-                "answer": answer,
-            })
+            self._trace(
+                agent_name,
+                "developer_call",
+                {
+                    "n": dev_calls[0],
+                    "question": arguments.get("question", ""),
+                    "code_snippet": arguments.get("code_snippet", ""),
+                    "context": arguments.get("context") or "",
+                    "answer": answer,
+                },
+            )
             if dedup_key is not None and call_history is not None:
                 call_history[dedup_key] = answer
             return answer
@@ -158,6 +179,7 @@ class AgentRuntime:
         tool_handlers: Optional[dict] = None,
         force_finalise_after: Optional[int] = None,
         max_tokens: int = 16384,
+        force_finalise_allowed_tools: Optional[set[str]] = None,
     ) -> AgentResult:
         return await LiteLLMTransport().run_agent(
             runtime=self,
@@ -170,4 +192,5 @@ class AgentRuntime:
             tool_handlers=tool_handlers,
             force_finalise_after=force_finalise_after,
             max_tokens=max_tokens,
+            force_finalise_allowed_tools=force_finalise_allowed_tools,
         )

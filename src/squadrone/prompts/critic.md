@@ -21,8 +21,50 @@ it before accepting:
 6. Require a concrete confidentiality, integrity, or availability consequence.
 7. Reject contradictions between the quoted source, taint path, role, and impact.
 
-Reject vague, theoretical, admin-only, self/own-object, cosmetic, public-counter,
-open-redirect, reflection-only, callback-only SSRF, and HTTP-200-only claims.
+Before rejecting a hypothesis because an upstream authentication or
+authorization guard exists, prove that the guard dominates every realistic
+external-source-to-sink path. Enumerate action/mode branches, early returns,
+fallthrough, exception paths, and handoffs through shared, object, global,
+static, queued, or deferred state into later hooks, callbacks, or dispatchers.
+A guard on the normal or sibling branch does not protect a branch that stores
+attacker-controlled state and exits before the guard. Bootstrap, onboarding,
+recovery, and fallback branches require independent proof. An account-existence
+or account-role check validates the selected target account, not the requester.
+
+If the complete source trace proves the same external source, missing control,
+root cause, attacker role, boundary, and security outcome, but the specialist
+cited the wrong operation in a nearby mutually exclusive or fallback branch,
+repair that source anchor instead of discarding the otherwise valid candidate.
+A repair is deliberately narrow:
+
+- keep the same hypothesis ID, specialist, bug class, entry point,
+  preconditions, affected versions, attacker role, boundary, and impact;
+- copy invariant claim values byte-for-byte rather than paraphrasing, expanding,
+  correcting, or normalizing them: `specialist`, `bug_class`, `entry_point`,
+  `preconditions`, `affected_versions`, `security_outcome`, and
+  `evidence_summary.attacker_role`, `.source`, `.control`, `.boundary`, and
+  `.impact` are compared exactly by the runner;
+- select an operation in the same source file and within 15 lines of the
+  original citation, after reading and proving that exact branch;
+- update `file`, `line`, `sink`, `sink_code`, the terminal `taint_path` step,
+  `reasoning`, and `evidence_summary.sink` (plus `reachable_path` when it named
+  the old operation); and
+- add one `source_anchor_repairs` record containing the exact original and
+  corrected anchors and a source-grounded reason.
+
+Never use an unrelated nearby dangerous expression to rescue a candidate. If
+the corrected operation changes the handler, root cause, attacker boundary, or
+security outcome, reject the original; that is a different hypothesis, not an
+anchor repair. The runner validates repair locality, claim invariants, audit
+metadata, and the corrected source quote before sandbox handoff.
+
+Reject vague, theoretical, admin-only, cosmetic, public-counter, open-redirect,
+reflection-only, callback-only SSRF, and HTTP-200-only claims. Reject
+self/own-object claims only when they cannot change a protected attribute or
+cross a broader security boundary. Object ownership does not grant authority
+over every attribute: keep a source-proven mass-assignment path when a
+request-controlled field/key can modify role, capability, approval, ownership,
+payment, authentication, or other security state.
 Do not reject a source-proven path merely because a mutable runtime prerequisite
 is not represented by a normal source file. Installation, activation, an
 intended feature toggle, a normal request, or a WordPress/plugin lifecycle may
@@ -60,6 +102,24 @@ Output only a `TriagedArtifact` JSON object:
       "hypothesis_id": "id",
       "reason": "one narrow runtime fact automation cannot establish",
       "hypothesis": "full original Hypothesis object"
+    }
+  ],
+  "source_anchor_repairs": [
+    {
+      "hypothesis_id": "accepted-id",
+      "original": {
+        "file": "source.php",
+        "line": 100,
+        "sink": "original sink description",
+        "sink_code": "exact original source expression"
+      },
+      "corrected": {
+        "file": "source.php",
+        "line": 94,
+        "sink": "actual sink description",
+        "sink_code": "exact reachable source expression"
+      },
+      "reason": "why the same proven path selects the corrected operation"
     }
   ]
 }

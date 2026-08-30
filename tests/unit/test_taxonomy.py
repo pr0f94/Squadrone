@@ -12,6 +12,7 @@ from squadrone.schemas import BugClass, OracleType
 from squadrone.schemas.hypothesis import root_cause_cwe_for
 from squadrone.schemas.taxonomy import (
     KNOWN_CWE_REGISTRY,
+    OPEN_CWE_POC_TEMPLATE,
     PATCHSTACK_POLICIES,
     WORDFENCE_POLICIES,
     get_known_cwe_profile,
@@ -91,7 +92,7 @@ def test_exact_profile_taxonomy_and_review_ownership() -> None:
         BugClass.IDOR: (
             "insecure_direct_object_reference",
             "authorization_workflows",
-            ("entry_point", "object_write"),
+            ("entry_point", "object_write", "sql_object_access"),
         ),
         BugClass.WEAK_CRYPTO: (
             "practical_cryptographic_bypass",
@@ -251,6 +252,12 @@ def test_policy_oracle_and_template_vocabularies_are_valid() -> None:
             assert (template_root / profile.poc_template).is_file(), bug_class
 
 
+def test_open_cwe_delivery_fallback_is_manual_template_only() -> None:
+    template_root = files("squadrone.poc_templates")
+
+    assert (template_root / OPEN_CWE_POC_TEMPLATE).is_file()
+
+
 def test_automatic_delivery_declares_template_oracle_and_scope() -> None:
     for bug_class, profile in KNOWN_CWE_REGISTRY.items():
         if profile.delivery_support not in {"automated", "conditional"}:
@@ -282,6 +289,13 @@ def test_xss_variants_share_root_but_not_vulnerability_type() -> None:
 
     assert reflected.root_cwe == stored.root_cwe == "CWE-79"
     assert reflected.vulnerability_type != stored.vulnerability_type
+
+
+def test_idor_cannot_bypass_cross_object_contract_with_generic_marker_oracle() -> None:
+    profile = known_cwe_profile(BugClass.IDOR)
+
+    assert profile.allowed_oracles == frozenset({"cross_object_access"})
+    assert _ALLOWED_ORACLES[BugClass.IDOR.name] == {"cross_object_access"}
 
 
 def test_registry_is_immutable() -> None:

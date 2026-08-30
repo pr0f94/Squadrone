@@ -65,6 +65,22 @@ calls. The list below is a defensive reference, not exhaustive.
 - `$wpdb->insert/update/delete` with `format` arrays is parameterised.
 - `dbDelta` is for schema migrations, not user data — not an SQLi sink.
 
+## User metadata and protected attributes
+
+- `update_user_meta($user_id, $key, $value)` performs the requested metadata
+  write; it does not authorize an attacker-controlled `$key`. Trace the key and
+  value independently back to the request and require a server-side allowed-key
+  set before treating a generic write as safe.
+- WordPress role/capability state is stored in a table-prefix-specific
+  capabilities user-meta key (commonly `wp_capabilities`). PHP bracket-shaped
+  request fields can supply an array value. Writing that protected attribute on
+  a current or newly created account can elevate the account; it is not a
+  harmless own-object update.
+- Validation of a dedicated field such as `role` does not constrain a separate
+  request-controlled metadata key. Verify that filtering is applied on the
+  exact path to the dynamic write, rather than merely finding a denylist or
+  cleaner used by another caller.
+
 ## Object injection / unserialize
 
 - `maybe_unserialize($x)` runs `unserialize` only if `is_serialized($x)` returns true.

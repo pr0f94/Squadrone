@@ -16,17 +16,77 @@ The hypothesis `preconditions` are reachability requirements, not observations o
 the current sandbox. They still need execution evidence or a fresh, source-grounded
 command.
 
+Every setup command runs as the managed web-server operating-system user with the
+configured WordPress administrator selected. Do not assume setup or activation ran
+in an anonymous WordPress context. Do not include a WP-CLI `--user` selector or call
+`wp_set_current_user(...)`; the runner owns identity.
+
+The runner also owns the target plugin's lifecycle, and its activation hook has
+already run with the configured administrator identity. Never propose `wp plugin
+install`, `activate`, `deactivate`, `delete`, `update`, or `toggle`, and do not call
+the equivalent PHP lifecycle APIs. An activation failure is an invalid sandbox
+baseline, not a repair for this setup stage.
+
 Every plugin-specific option key, table, column, post type, status, hook, class,
 method, and setting value in a followup command must appear verbatim in the supplied
 source context or schema diagnostics. Do not guess identifiers from feature labels,
 the hypothesis prose, prior proposed commands, or familiarity with another plugin.
 
+When bounded read-only plugin-source tools are available, their returned source is
+part of the supplied source context. Use them only when the initial slice or schema
+diagnostics do not establish a helper signature, validation rule, schema default,
+or canonical persisted value needed for a repair. These tools cannot inspect the
+sandbox or database and cannot mutate files; do not infer runtime state from source.
+
+### Critical: every `wp eval` must prove its semantic postconditions
+
+Every `wp eval` command must be one self-verifying program. A zero PHP exit status,
+a truthy model-method return, an affected-row count, or an emitted ID alone proves
+only that an operation ran; it does not prove that the repaired state exists.
+
+- Prefer source-grounded WordPress Core or plugin APIs for creation, mutation, and
+  the authoritative re-read. Do not bypass an available higher-level API with a raw
+  database write.
+- After all mutations, re-read the resulting state and assert the semantic
+  postconditions needed by the PoC. As applicable, prove that every object ID is a
+  positive nonzero integer, IDs for distinct objects are unique, ownership or
+  authorship is correct, and every relevant persisted value equals the intended
+  benign value.
+- If a call returns `false` or `WP_Error`, an ID is missing or invalid, objects are
+  not distinct, `$wpdb->last_error` is non-empty, or any re-read value, ownership,
+  or other semantic postcondition is wrong, fail with a stable, specific label such
+  as `WP_CLI::error('setup postcondition failed: foreign owner')`. Never include a
+  secret or an unbounded persisted value in the label, and never print a success
+  result after a failed assertion. Reusing only the opaque text `setup postcondition
+  failed` prevents safe followup repair.
+- Plugin APIs and database schemas may normalize input values, including booleans,
+  statuses, empty strings, dates, and times. Use the supplied source/schema and the
+  authoritative prior output to compare proof-relevant fields against canonical
+  persisted forms. Do not repeat an all-fields equality assertion after feedback
+  shows that an incidental field was normalized.
+- On success, make the final explicit output a single structured JSON object via
+  `WP_CLI::log(wp_json_encode($result))`. Include the verified IDs, ownership, and
+  relevant persisted values (or equivalent evidence for non-record state) so the
+  runner can distinguish established state from an unverified attempt.
+
+Raw database writes are a last resort. Use one only when no source-grounded Core or
+plugin write API exists and every table and column is grounded in the supplied
+source or schema diagnostics. For each `$wpdb->insert`, `$wpdb->update`,
+`$wpdb->replace`, or write through `$wpdb->query`, check both its return value and
+`$wpdb->last_error` immediately, then re-read the exact affected rows. Assert
+positive nonzero IDs, uniqueness where multiple objects were seeded, correct
+ownership, and exact persisted values before emitting the final JSON. Neither
+`$wpdb->insert_id` nor an affected-row count is a semantic postcondition by itself.
+
 ### How to decide
 
 **Setup-shaped failure signs** (return commands):
 
-- "Unknown column" / "Unknown table" / SQL errors in the prior setup output → schema differs from what was assumed; re-issue inserts using actual columns from SCHEMA DIAGNOSTICS, OR switch to a higher-level helper (`wp post create`, `wp option update`, or the plugin's own `wp eval` API like `Ninja_Forms()->form()->import_form()`)
-- A prior `wp eval` that called a plugin model `save()` / `update()` returned `bool(false)` with no error message and no row was created → almost always the plugin's `save()` short-circuits on a capability check that fails because `wp eval` runs with **no current user (ID 0)**. **Re-issue the seed call prefixed with `wp_set_current_user(1);`** so the plugin sees an admin caller. Example: `wp eval "wp_set_current_user(1); $e = new EM_Event(); $e->event_name='X'; ...; $e->save();"`. This unblocks roughly every plugin that has its own data model.
+- "Unknown column" / "Unknown table" / SQL errors in the prior setup output → schema differs from what was assumed; re-issue inserts using actual columns from SCHEMA DIAGNOSTICS, OR switch to a source-grounded Core or plugin data-model API
+- A prior `wp eval` that called a plugin model `save()` / `update()` returned
+  `bool(false)` with no row created → setup already had administrator capabilities,
+  so inspect the source-grounded model validation and prerequisite state. Do not
+  retry plugin activation or change the managed identity.
 - PoC stdout shows "no posts of type X", "form_id not found", "endpoint returned 404", "field not present" → the prerequisite record never got created
 - PoC stdout shows the page returned "no items" / "list is empty" / a redirect to a setup page → the plugin isn't in the configured state the bug needs
 
@@ -44,9 +104,11 @@ includes `chmod`, `chown`, `chgrp`, `umask`, `wp_chmod`, equivalent WordPress or
 filesystem APIs, and indirect permission-mutation techniques.
 
 If a source-grounded prerequisite is a legitimate runtime directory, reissue a
-clean `wp eval` command that calls `wp_mkdir_p($path)` alone. Let the managed web
-user and normal defaults determine ownership and mode. Do not combine directory
-creation with any permission or ownership operation.
+clean `wp eval` command with `wp_mkdir_p($path)` alone as its state-changing
+operation. Let the managed web user and normal defaults determine ownership and
+mode. Then verify the directory postcondition and emit the structured result
+required above. Do not combine directory creation with any permission or ownership
+operation.
 
 Setup commands are safety-checked atomically. If one command mixes an allowed
 operation with a prohibited one, the whole command is blocked and none of it is
@@ -82,15 +144,17 @@ When in doubt between setup vs exploit_shape, return empty. False-positive setup
 
 ### Use source-grounded higher-level helpers
 
-If authoritative feedback shows that raw `wpdb->insert` SQL ran and errored,
-prefer a plugin data-model helper that appears explicitly in the supplied source
-context. Core helpers such as `wp post create` are also acceptable when their
-post type and values are source-grounded. Do not invent a plugin helper from prior
-knowledge merely to bypass a schema mismatch.
+If authoritative feedback shows that a raw database write ran and errored, prefer a
+Core or plugin data-model helper that appears explicitly in the supplied source
+context. Core helpers such as `wp post create` are acceptable when their post type
+and values are source-grounded. Do not invent a plugin helper from prior knowledge
+merely to bypass a schema mismatch.
 
 ### Output format
 
-Same JSON shape as the original setup prompt. Each command becomes `wp --allow-root <args...>`. No `wp` prefix, no `--allow-root`, no shell pipes/variables. For multi-statement PHP, use `wp eval "<php>"`.
+Same JSON shape as the original setup prompt. The runner adds the `wp` prefix and
+both managed identities. Do not include `wp`, `--allow-root`, or `--user`, and do not
+use shell pipes or variables. For multi-statement PHP, use `wp eval "<php>"`.
 
 ```
 {

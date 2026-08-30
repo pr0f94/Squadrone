@@ -10,16 +10,39 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Literal, Optional
+from pathlib import Path
+from typing import Literal, Optional, TYPE_CHECKING
 
 from pydantic import BaseModel
 
 from ..schemas.hypothesis import Hypothesis
+from ..schemas.taxonomy import get_known_cwe_profile
 from ..services.llm import call_llm_oneshot
+from .plugin_tools import PluginToolHandlers
 from .prompts_io import load_prompt
 from .runtime import _strip_fences
 
+if TYPE_CHECKING:
+    from .runtime import AgentRuntime
+
 logger = logging.getLogger(__name__)
+
+_CROSS_OBJECT_SETUP_GUIDANCE = """For a cross-object modification proof, trusted
+setup must create both distinct legitimate baseline objects: one owned by the
+protected/foreign actor and one owned by the authorized control actor. Give each
+object a distinct strong benign `SQUADRONE_` baseline marker in the source-grounded
+field the later owner observer can read. Re-read them, then return their exact IDs,
+owners, marker fields, and canonical persisted markers in the final JSON. The
+traced PoC cannot create these baselines itself: any extra sentinel-bearing target
+request outside the declared attack/control mutation arms is rejected."""
+
+
+def _setup_family_guidance(hypothesis: Hypothesis) -> str | None:
+    """Return verifier-contract guidance only for the relevant CWE family."""
+    profile = get_known_cwe_profile(hypothesis.bug_class)
+    if profile is None or "cross_object_access" not in profile.allowed_oracles:
+        return None
+    return _CROSS_OBJECT_SETUP_GUIDANCE
 
 
 class SetupPlan(BaseModel):
@@ -255,6 +278,11 @@ class DeveloperAgent:
         if plugin_slug:
             user_parts.append(f"PLUGIN_SLUG: {plugin_slug}")
         user_parts.append(f"HYPOTHESIS:\n{hypothesis.model_dump_json(indent=2)}")
+        family_guidance = _setup_family_guidance(hypothesis)
+        if family_guidance:
+            user_parts.append(
+                f"FAMILY-SPECIFIC SETUP REQUIREMENTS:\n{family_guidance}"
+            )
         if code_slice:
             # Cap to keep token cost bounded; the developer just needs to see entry-point context.
             snippet = (
@@ -309,6 +337,8 @@ class DeveloperAgent:
         schema_diagnostics: str = "",
         code_slice: Optional[str] = None,
         setup_execution_feedback: Optional[str] = None,
+        runtime: Optional["AgentRuntime"] = None,
+        plugin_root: str | Path | None = None,
     ) -> SetupPlan:
         """After a failed PoC iteration, ask the developer if the failure was setup-shaped.
 
@@ -332,6 +362,11 @@ class DeveloperAgent:
             f"PoC STDERR (truncated):\n{(last_stderr or '')[:1500]}",
             f"WP DEBUG.LOG (truncated):\n{(last_error_log or '')[:1500]}",
         ]
+        family_guidance = _setup_family_guidance(hypothesis)
+        if family_guidance:
+            parts.append(
+                f"FAMILY-SPECIFIC SETUP REQUIREMENTS:\n{family_guidance}"
+            )
         if setup_execution_feedback:
             parts.append(
                 "AUTHORITATIVE SETUP EXECUTION FEEDBACK:\n"
@@ -352,11 +387,39 @@ class DeveloperAgent:
             {"role": "system", "content": self.setup_followup_prompt},
             {"role": "user", "content": "\n\n".join(parts)},
         ]
-        parsed = await self._call_setup_json(
-            model=self.followup_model,
-            messages=messages,
-            agent_name="developer.propose_setup_followup",
-        )
+        parsed: dict | None
+        if runtime is not None and plugin_root is not None:
+            plugin_tools = PluginToolHandlers(plugin_root)
+            result = await runtime.run(
+                agent_name="developer.propose_setup_followup",
+                model=self.followup_model,
+                messages=messages,
+                tools=plugin_tools.tool_definitions(),
+                tool_handlers=plugin_tools.tool_handlers(),
+                max_iterations=6,
+                output_schema=SetupPlan,
+                force_finalise_after=3,
+                force_finalise_allowed_tools=set(),
+                max_tokens=4096,
+            )
+            if isinstance(result.output, SetupPlan):
+                plan = result.output
+                logger.info(
+                    "propose_setup_followup [%s] iter %d: class=%s %s — %d commands",
+                    hypothesis.id,
+                    last_iteration,
+                    plan.failure_class or "(unset)",
+                    plan.rationale[:200],
+                    len(plan.commands),
+                )
+                return plan
+            parsed = _parse_json_resilient(str(result.output))
+        else:
+            parsed = await self._call_setup_json(
+                model=self.followup_model,
+                messages=messages,
+                agent_name="developer.propose_setup_followup",
+            )
         if parsed is None:
             return SetupPlan()
         commands_raw = parsed.get("commands") or []

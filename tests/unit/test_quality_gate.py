@@ -5,6 +5,7 @@ import pytest
 from squadrone.agents.reporter import ReporterAgent
 from squadrone.schemas import (
     BugClass,
+    CIAImpact,
     Confidence,
     DedupStatus,
     Finding,
@@ -18,8 +19,10 @@ from squadrone.schemas.config import PipelineConfig
 from squadrone.services.budget import BudgetTracker
 from squadrone.services.quality_gate import (
     apply_quality_gate,
+    grade_finding_for_report,
     grade_hypothesis,
     infer_attacker_role,
+    reconcile_verified_impact,
     recompute_severity,
     severity_from_finding,
 )
@@ -168,15 +171,180 @@ def test_quality_gate_rejects_missing_concrete_cia_impact():
     assert "cosmetic_or_no_security_impact" in grade.rules
 
 
-def test_quality_gate_rejects_missing_security_boundary():
+@pytest.mark.parametrize(
+    "boundary",
+    ["", "  ", "unknown", "not applicable", "security boundary"],
+)
+def test_quality_gate_rejects_missing_or_placeholder_security_boundary(boundary):
     evidence = dict(_hypothesis().evidence_summary)
-    evidence["boundary"] = ""
+    evidence["boundary"] = boundary
     hypothesis = _hypothesis(evidence_summary=evidence)
 
     grade = grade_hypothesis(hypothesis)
 
     assert grade.accepted is False
     assert "missing_security_boundary" in grade.rules
+
+
+def test_quality_gate_accepts_descriptive_boundary_outside_closed_cwe_vocabulary():
+    evidence = dict(_hypothesis().evidence_summary)
+    evidence.update(
+        {
+            "boundary": (
+                "A request crosses from one tenant workspace into a separate "
+                "tenant workspace."
+            ),
+            "impact": "Records from a separate tenant become readable.",
+        }
+    )
+    hypothesis = _hypothesis(
+        security_outcome=SecurityOutcome(
+            confidentiality="high",
+            description="Records from a separate tenant become readable.",
+        ),
+        evidence_summary=evidence,
+    )
+
+    grade = grade_hypothesis(hypothesis)
+
+    assert grade.accepted is True
+    assert grade.evidence["has_security_boundary"] is True
+
+
+def test_quality_gate_accepts_structured_ssrf_impact_without_keyword_allowlist():
+    evidence = dict(_hypothesis().evidence_summary)
+    evidence.update(
+        {
+            "attacker_role": "subscriber",
+            "source": "REST query parameter get_content_url",
+            "control": "No destination restriction is applied",
+            "sink": "wp_remote_get($get_content_url)",
+            "reachable_path": "REST route -> get_remote_content -> wp_remote_get",
+            "boundary": (
+                "An ordinary web user crosses from browser-visible resources into "
+                "services reachable only from the application execution environment."
+            ),
+            "impact": (
+                "The caller reads valid JSON returned by a service unavailable through "
+                "the caller's own network path."
+            ),
+            "counterevidence": "The URL is syntax-validated but destinations are unrestricted",
+            "proof_gaps": "runtime reachability confirmation only",
+        }
+    )
+    hypothesis = _hypothesis(
+        bug_class=BugClass.SSRF,
+        entry_point="GET /wp-json/demo/v1/fetch",
+        sink="wp_remote_get",
+        sink_code="wp_remote_get($request->get_param('get_content_url'))",
+        taint_path=["REST get_content_url", "get_remote_content", "wp_remote_get"],
+        preconditions="authenticated Subscriber",
+        security_outcome=SecurityOutcome(
+            confidentiality="low",
+            description=evidence["impact"],
+        ),
+        evidence_summary=evidence,
+    )
+
+    grade = grade_hypothesis(hypothesis)
+
+    assert grade.accepted is True
+    assert grade.evidence["impact_dimensions"]["confidentiality"] == "low"
+
+
+def test_quality_gate_rejects_attacker_controlled_callback_as_security_boundary():
+    evidence = dict(_hypothesis().evidence_summary)
+    evidence.update(
+        {
+            "source": "REST query parameter target_url",
+            "sink": "wp_remote_get($target_url)",
+            "reachable_path": "REST route -> callback -> wp_remote_get",
+            "boundary": "The server requests an attacker-controlled callback endpoint.",
+            "impact": "The callback confirms that the server made an outbound request.",
+        }
+    )
+    hypothesis = _hypothesis(
+        bug_class=BugClass.SSRF,
+        entry_point="GET /wp-json/demo/v1/callback",
+        sink="wp_remote_get",
+        sink_code="wp_remote_get($request->get_param('target_url'))",
+        taint_path=["REST target_url", "callback", "wp_remote_get"],
+        security_outcome=SecurityOutcome(
+            confidentiality="low",
+            description=evidence["impact"],
+        ),
+        evidence_summary=evidence,
+    )
+
+    grade = grade_hypothesis(hypothesis)
+
+    assert grade.accepted is False
+    assert "missing_security_boundary" in grade.rules
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "A registered user edits only their own profile.",
+        "The caller changes an object that the caller owns.",
+        "A registered user edits their profile.",
+        "The request updates an account owned by the same caller.",
+        "The newly created account belongs to the registrant.",
+        "The caller changes their own object without authorization.",
+        "Request input reaches the selected record.",
+    ],
+)
+def test_quality_gate_rejects_own_object_or_flow_as_security_boundary(boundary):
+    evidence = dict(_hypothesis().evidence_summary)
+    evidence["boundary"] = boundary
+
+    grade = grade_hypothesis(_hypothesis(evidence_summary=evidence))
+
+    assert grade.accepted is False
+    assert grade.evidence["has_security_boundary"] is False
+    assert "missing_security_boundary" in grade.rules
+
+
+def test_quality_gate_accepts_protected_attribute_boundary_on_own_object():
+    hypothesis = _hypothesis(
+        bug_class=BugClass.MASS_ASSIGNMENT,
+        sink="attacker-selected user metadata write",
+        sink_code="update_user_meta($user_id, $key, $value);",
+        taint_path=[
+            "$_POST['account_fields']",
+            "update_profile",
+            "update_user_meta",
+        ],
+        reasoning=(
+            "A public registration path accepts an attacker-selected protected "
+            "attribute without an allowed-key check."
+        ),
+        security_outcome=SecurityOutcome(
+            integrity="high",
+            description="The registrant gains administrative capabilities.",
+        ),
+        evidence_summary={
+            "attacker_role": "unauthenticated",
+            "source": "$_POST['account_fields']",
+            "control": "no allowed-key check for protected attributes",
+            "sink": "update_user_meta($user_id, $key, $value)",
+            "reachable_path": (
+                "public_registration -> update_profile -> update_user_meta"
+            ),
+            "boundary": (
+                "An anonymous registrant assigns the administrator role and "
+                "protected capabilities to their own newly created account."
+            ),
+            "impact": "The registrant gains administrative capabilities.",
+            "counterevidence": "ordinary profile fields are intended to be writable",
+            "proof_gaps": "runtime confirmation only",
+        },
+    )
+
+    grade = grade_hypothesis(hypothesis)
+
+    assert grade.accepted is True
+    assert grade.evidence["has_security_boundary"] is True
 
 
 def test_quality_gate_recognizes_public_upload_execution_impact():
@@ -210,6 +378,46 @@ def test_quality_gate_recognizes_public_upload_execution_impact():
     assert grade.accepted is True
     assert grade.evidence["has_security_boundary"] is True
     assert grade.evidence["impact_dimensions"]["integrity"] == "low"
+
+
+def test_quality_gate_recognizes_browser_origin_as_xss_security_boundary():
+    hypothesis = _hypothesis(
+        bug_class=BugClass.XSS_REFLECTED,
+        entry_point="wp_ajax_nopriv_render",
+        sink="unescaped validation error in an HTML response",
+        sink_code="echo '<p>' . $error . '</p>';",
+        taint_path=["$_GET['value']", "validate", "echo HTML"],
+        reasoning=(
+            "An unauthenticated request injects script into a top-level HTML response."
+        ),
+        security_outcome=SecurityOutcome(
+            confidentiality="high",
+            integrity="high",
+            description=(
+                "Attacker-supplied JavaScript executes in the victim's site origin and "
+                "can read same-origin data or perform authenticated actions."
+            ),
+        ),
+        evidence_summary={
+            "attacker_role": "unauthenticated",
+            "source": "$_GET['value']",
+            "control": "validation error retains the unescaped request value",
+            "sink": "echo HTML",
+            "reachable_path": "wp_ajax_nopriv_render -> validate -> echo HTML",
+            "boundary": (
+                "Unauthenticated request data reaches executable HTML in a victim's "
+                "site origin."
+            ),
+            "impact": "Script runs with the victim's same-origin browser authority.",
+            "counterevidence": "none",
+            "proof_gaps": "browser execution only",
+        },
+    )
+
+    grade = grade_hypothesis(hypothesis)
+
+    assert grade.accepted is True
+    assert grade.evidence["has_security_boundary"] is True
 
 
 def test_quality_gate_records_narrow_runtime_gap_as_warning():
@@ -307,6 +515,55 @@ def test_confirmed_finding_gets_cvss31_score_and_vector():
 
     assert severity["cvss_vector"] == "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
     assert severity["cvss_estimate"] == 9.8
+
+
+def test_confirmed_impact_replaces_broader_source_only_cia_claim():
+    finding = _confirmed_finding()
+    finding.hypothesis.security_outcome = SecurityOutcome(
+        integrity="high",
+        availability="low",
+        description="Source review predicted modification and disruption.",
+    )
+    observation = finding.evidence["confirmation_run"]["observation"]
+    observation["impact"] = {
+        "confidentiality": "none",
+        "integrity": "high",
+        "availability": "none",
+        "description": "Clean replay measured modification only.",
+    }
+
+    verified = reconcile_verified_impact(finding)
+    severity = severity_from_finding(finding)
+
+    assert verified == CIAImpact(
+        integrity="high",
+        description="Clean replay measured modification only.",
+    )
+    assert finding.verified_impact == verified
+    assert finding.hypothesis.security_outcome.availability == "none"
+    assert finding.hypothesis.security_outcome.description == verified.description
+    assert severity["impact_dimensions"]["availability"] == "none"
+    assert severity["cvss_vector"].endswith("/C:N/I:H/A:N")
+
+
+def test_report_gate_rejects_explicit_impact_that_conflicts_with_confirmation():
+    finding = _confirmed_finding()
+    finding.verified_impact = CIAImpact(
+        integrity="high",
+        availability="low",
+        description="Claimed disruption.",
+    )
+    finding.evidence["confirmation_run"]["observation"]["impact"] = {
+        "confidentiality": "none",
+        "integrity": "high",
+        "availability": "none",
+        "description": "Measured modification only.",
+    }
+
+    grade = grade_finding_for_report(finding)
+
+    assert grade.accepted is False
+    assert "verified_impact_mismatch" in grade.rules
 
 
 def test_confirmed_severity_uses_canonical_descriptive_attacker_role():

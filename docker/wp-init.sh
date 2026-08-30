@@ -25,13 +25,9 @@ if ! command -v wp >/dev/null 2>&1; then
     chmod +x /usr/local/bin/wp
 fi
 
-# Wait for db
-for _ in $(seq 1 30); do
-    if wp --allow-root --path="$WP_PATH" db check >/dev/null 2>&1; then
-        break
-    fi
-    sleep 2
-done
+# docker-compose starts this service only after MariaDB's healthcheck passes.
+# Avoid `wp db check`: it requires the external `mysqlcheck` executable, which
+# is not part of the official WordPress image.
 
 if wp --allow-root --path="$WP_PATH" core is-installed >/dev/null 2>&1; then
     echo "[wp-init] core already installed — skipping"

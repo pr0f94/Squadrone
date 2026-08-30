@@ -30,6 +30,27 @@ class PluginRelease:
     download_url: str
 
 
+@dataclass(frozen=True)
+class PluginExport:
+    path: str
+    source_url: str
+
+
+def _versioned_download_url(slug: str, version: str) -> str:
+    return f"https://downloads.wordpress.org/plugin/{slug}.{version}.zip"
+
+
+def _svn_target_missing(stderr: str) -> bool:
+    """Recognize missing repository paths without masking operational failures."""
+    error = stderr.lower()
+    if "e160013" in error or "w160013" in error:
+        return True
+    return "e170000" in error and any(
+        marker in error
+        for marker in ("doesn't exist", "non-existent", "path not found", "target not found")
+    )
+
+
 class SVNClient:
     """Async client for the wordpress.org plugin SVN repository."""
 
@@ -87,6 +108,15 @@ class SVNClient:
         return str(dest_path)
 
     async def export(self, slug: str, version: str, dest: str) -> str:
+        result = await self.export_pinned_release(slug, version, dest)
+        return result.path
+
+    async def export_pinned_release(
+        self,
+        slug: str,
+        version: str,
+        dest: str,
+    ) -> PluginExport:
         url = f"{_SVN_BASE}/{slug}/tags/{version}"
         dest_path = Path(dest)
         dest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -100,20 +130,30 @@ class SVNClient:
         except FileNotFoundError:
             logger.warning("svn executable not found; falling back to plugin zip download")
             await self._export_zip(slug, version, dest_path)
-            return str(dest_path)
+            return PluginExport(
+                path=str(dest_path),
+                source_url=_versioned_download_url(slug, version),
+            )
 
-        stdout, stderr = await proc.communicate()
+        _stdout, stderr = await proc.communicate()
         if proc.returncode != 0:
             err = stderr.decode("utf-8", errors="replace")
-            if "non-existent" in err.lower() or "404" in err:
-                raise PluginNotFoundError(
-                    f"plugin {slug!r} version {version!r} not found: {err.strip()}"
+            if _svn_target_missing(err):
+                logger.warning(
+                    "SVN tag missing for %s %s; falling back to versioned plugin zip",
+                    slug,
+                    version,
+                )
+                await self._export_zip(slug, version, dest_path)
+                return PluginExport(
+                    path=str(dest_path),
+                    source_url=_versioned_download_url(slug, version),
                 )
             raise RuntimeError(f"svn export failed: {err.strip()}")
-        return str(dest_path)
+        return PluginExport(path=str(dest_path), source_url=url)
 
     async def _export_zip(self, slug: str, version: str, dest_path: Path) -> None:
-        url = f"https://downloads.wordpress.org/plugin/{slug}.{version}.zip"
+        url = _versioned_download_url(slug, version)
         await self._download_and_extract(slug, url, dest_path, version=version)
 
     async def _download_and_extract(
@@ -135,17 +175,23 @@ class SVNClient:
 
         with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
             members = zf.infolist()
-            top_dirs = {
-                name.split("/", 1)[0]
-                for name in (m.filename for m in members)
-                if name and not name.startswith("/") and "/" in name
-            }
-            if len(top_dirs) != 1:
+            if not members:
                 raise RuntimeError(f"unexpected plugin zip layout for {slug!r}")
-            top_dir = next(iter(top_dirs))
+            has_plugin_file = False
+            for member in members:
+                member_path = Path(member.filename)
+                if member_path.is_absolute() or ".." in member_path.parts:
+                    raise RuntimeError(f"unsafe path in plugin zip for {slug!r}")
+                if not member_path.parts or member_path.parts[0] != slug:
+                    raise RuntimeError(f"unexpected plugin zip layout for {slug!r}")
+                if len(member_path.parts) == 1:
+                    if not member.is_dir():
+                        raise RuntimeError(f"unexpected plugin zip layout for {slug!r}")
+                elif not member.is_dir():
+                    has_plugin_file = True
+            if not has_plugin_file:
+                raise RuntimeError(f"unexpected plugin zip layout for {slug!r}")
 
-            if dest_path.exists():
-                shutil.rmtree(dest_path)
             tmp_dest = dest_path.parent / f".{dest_path.name}.zip-extract"
             if tmp_dest.exists():
                 shutil.rmtree(tmp_dest)
@@ -153,13 +199,12 @@ class SVNClient:
 
             try:
                 for member in members:
-                    member_path = Path(member.filename)
-                    if member_path.is_absolute() or ".." in member_path.parts:
-                        raise RuntimeError(f"unsafe path in plugin zip for {slug!r}")
                     zf.extract(member, tmp_dest)
-                extracted = tmp_dest / top_dir
+                extracted = tmp_dest / slug
                 if not extracted.is_dir():
-                    raise RuntimeError(f"plugin zip for {slug!r} did not contain {top_dir}/")
+                    raise RuntimeError(f"plugin zip for {slug!r} did not contain {slug}/")
+                if dest_path.exists():
+                    shutil.rmtree(dest_path)
                 shutil.move(str(extracted), str(dest_path))
             finally:
                 shutil.rmtree(tmp_dest, ignore_errors=True)

