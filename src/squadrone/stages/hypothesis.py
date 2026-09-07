@@ -21,11 +21,12 @@ from ..agents._specialist_base import (
     _compact_recon,
     _requires_authentication_alternate_path_audit,
     _requires_dynamic_key_trace,
+    _requires_variable_php_include_trace,
     _specialist_iteration_limits,
 )
 from ..agents.prompts_io import load_prompt
 from ..agents.runtime import AgentRuntime
-from ..schemas.config import PipelineConfig
+from ..schemas.config import DEFAULT_HYPOTHESIS_REVIEW_AREAS, PipelineConfig
 from ..schemas.hypothesis import (
     canonicalize_new_candidate_taxonomy,
     HypothesesArtifact,
@@ -53,7 +54,7 @@ _REVIEW_BATCH_MAX_WINDOWS = 6
 _REVIEW_BATCH_WINDOW_LINES = 250
 _REVIEW_BATCH_ATTEMPTS = 2
 _REVIEW_CHECKPOINT_VERSION = 5
-_REVIEW_BATCH_POLICY_VERSION = 1
+_REVIEW_BATCH_POLICY_VERSION = 2
 _REVIEWABLE_SUPPORT = {"active", "partial", "review_only"}
 
 
@@ -209,10 +210,7 @@ def _build_bounded_review_batches(
         if (
             dense_same_file_max_items is not None
             and len(prospective_files) == 1
-            and (
-                max_windows is None
-                or len(prospective_windows) <= max_windows
-            )
+            and (max_windows is None or len(prospective_windows) <= max_windows)
         ):
             item_limit = dense_same_file_max_items
         if current and (
@@ -269,6 +267,39 @@ def _build_review_batches(
             [*ordinary_batches, *focused_batches],
             key=lambda batch: _target_sort_key(batch[0]),
         )
+
+    if reviewer == "injection_files":
+        variable_include_targets = [
+            target for target in targets if _requires_variable_php_include_trace(target)
+        ]
+        implicit_deserialization_targets = [
+            target for target in targets if target.type == "implicit_deserialization"
+        ]
+        focused_ids = {
+            target.id
+            for target in [
+                *variable_include_targets,
+                *implicit_deserialization_targets,
+            ]
+        }
+        ordinary_batches = _build_bounded_review_batches(
+            [target for target in targets if target.id not in focused_ids],
+            max_items=_review_batch_max_items(reviewer),
+            max_windows=_REVIEW_BATCH_MAX_WINDOWS,
+            dense_same_file_max_items=_REVIEW_BATCH_MAX_ITEMS_DENSE,
+        )
+        focused_batches = [
+            [target]
+            for target in [
+                *sorted(variable_include_targets, key=_target_sort_key),
+                *sorted(implicit_deserialization_targets, key=_target_sort_key),
+            ]
+        ]
+        # Review high-risk include operands and implicit metadata
+        # deserialization operations as singleton traces. This gives each one
+        # a complete caller/storage trace and checkpoints useful candidates
+        # before broad fixed-include/query review.
+        return [*focused_batches, *ordinary_batches]
 
     if reviewer != "authorization_workflows":
         return _build_bounded_review_batches(
@@ -344,6 +375,31 @@ def _reconcile_batch_coverage(
     return list(by_id.values()), unresolved, accepted_hypothesis_ids
 
 
+def _retry_progress_context(
+    result: SpecialistReviewArtifact,
+    unresolved: list[CoverageItem],
+    reviewer: ReviewArea,
+) -> list[dict[str, Any]]:
+    """Keep only bounded, non-authoritative progress for a retry."""
+    unresolved_ids = {target.id for target in unresolved}
+    context: list[dict[str, Any]] = []
+    for disposition in result.coverage:
+        if (
+            disposition.item_id not in unresolved_ids
+            or disposition.reviewer != reviewer
+        ):
+            continue
+        context.append(
+            {
+                "item_id": disposition.item_id,
+                "status": disposition.status,
+                "reason": disposition.reason[:2_000],
+                "evidence_locations": disposition.evidence_locations[:24],
+            }
+        )
+    return context
+
+
 def _canonicalize_batch_hypotheses(
     hypotheses: list[Hypothesis],
     reviewer: ReviewArea,
@@ -378,8 +434,15 @@ def _canonicalize_batch_hypotheses(
 logger = logging.getLogger(__name__)
 
 
-def _build_specialists(runtime: AgentRuntime, model: str) -> list[Any]:
-    return [
+def _build_specialists(
+    runtime: AgentRuntime,
+    model: str,
+    review_areas: list[ReviewArea] | None = None,
+) -> list[Any]:
+    selected = set(
+        DEFAULT_HYPOTHESIS_REVIEW_AREAS if review_areas is None else review_areas
+    )
+    specialists = [
         FocusedSpecialist(
             runtime,
             model,
@@ -405,6 +468,7 @@ def _build_specialists(runtime: AgentRuntime, model: str) -> list[Any]:
             prompt_path="specialists/authentication",
         ),
     ]
+    return [specialist for specialist in specialists if specialist.NAME in selected]
 
 
 def _build_code_slices(
@@ -449,7 +513,11 @@ async def run(
     run_id: str = "",
 ) -> HypothesesArtifact:
     model = config.models.specialists
-    specialists = _build_specialists(runtime, model)
+    specialists = _build_specialists(
+        runtime,
+        model,
+        config.hypothesis_review_areas,
+    )
 
     # Reviewers run sequentially to avoid rate-limit bursts. Each reviewer gets
     # fresh, source-local batches rather than the complete recon artifact, and
@@ -459,6 +527,11 @@ async def run(
     batch_root = spec_dir / "review_batches"
     merged: list[Hypothesis] = []
     coverage_dispositions: list[CoverageDisposition] = []
+    selected_item_types = (
+        set(config.hypothesis_review_item_types)
+        if config.hypothesis_review_item_types is not None
+        else None
+    )
     for spec in specialists:
         spec_path = spec_dir / f"hypotheses_{spec.NAME}.jsonl"
         coverage_path = spec_dir / f"coverage_{spec.NAME}.json"
@@ -466,6 +539,7 @@ async def run(
             item
             for item in (recon.coverage.items if recon.coverage else [])
             if spec.NAME in item.review_areas
+            and (selected_item_types is None or item.type in selected_item_types)
         ]
         batches = _build_review_batches(targets, spec.NAME)
         logger.info(
@@ -515,6 +589,7 @@ async def run(
             unresolved = list(batch_targets)
             batch_hypotheses: list[Hypothesis] = []
             batch_dispositions: dict[str, CoverageDisposition] = {}
+            retry_progress: list[dict[str, Any]] = []
             for attempt in range(1, _REVIEW_BATCH_ATTEMPTS + 1):
                 attempt_id = batch_id if attempt == 1 else f"{batch_id}-retry"
                 priority_files = sorted({item.file for item in unresolved})
@@ -528,12 +603,17 @@ async def run(
                     len(priority_files),
                 )
                 try:
+                    analyze_kwargs: dict[str, Any] = {
+                        "plugin_path": plugin_path,
+                        "priority_files": priority_files,
+                        "coverage_targets": unresolved,
+                        "batch_id": attempt_id,
+                    }
+                    if retry_progress:
+                        analyze_kwargs["prior_incomplete_review"] = retry_progress
                     result = await spec.analyze(
                         recon,
-                        plugin_path=plugin_path,
-                        priority_files=priority_files,
-                        coverage_targets=unresolved,
-                        batch_id=attempt_id,
+                        **analyze_kwargs,
                     )
                 except Exception as exc:
                     logger.warning(
@@ -599,6 +679,11 @@ async def run(
                 batch_hypotheses.extend(accepted_hypotheses)
                 if not unresolved:
                     break
+                retry_progress = _retry_progress_context(
+                    result,
+                    unresolved,
+                    spec.NAME,
+                )
 
             if unresolved:
                 unresolved_ids = ", ".join(item.id for item in unresolved)

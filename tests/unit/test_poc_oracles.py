@@ -2827,6 +2827,37 @@ def test_file_oracle_accepts_measured_file_sha256_alias():
     assert accepted is True, reason
 
 
+@pytest.mark.parametrize("dimension", ["confidentiality", "availability"])
+def test_file_oracle_rejects_unmeasured_non_integrity_impact(dimension):
+    impact = CIAImpact(integrity="high", description="A protected file was written.")
+    setattr(impact, dimension, "high")
+    observation = _observation(
+        oracle="file_effect",
+        attack={
+            "observed": True,
+            "before_exists": False,
+            "after_exists": True,
+            "path": "/wp-content/uploads/marker.php",
+            "after_sha256": "a" * 64,
+        },
+        control={
+            "observed": False,
+            "before_exists": False,
+            "after_exists": False,
+            "path": "/wp-content/uploads/control.php",
+        },
+        impact=impact,
+    )
+
+    accepted, reason = validate_poc_observation(
+        observation,
+        expected_bug_class="ARBITRARY_FILE_WRITE",
+    )
+
+    assert accepted is False
+    assert "file creation or overwrite integrity" in reason
+
+
 def test_file_oracle_rejects_identical_attack_and_control_paths():
     observation = _observation(
         oracle="file_effect",

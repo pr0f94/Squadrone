@@ -23,6 +23,8 @@ PatchstackPolicy = Literal[
     "significant_object",
     "sitewide_stored_xss",
 ]
+CriticAcceptanceMode = Literal["source_review", "manual_review_only"]
+CriticEvidenceJSONType = Literal["boolean", "string", "number"]
 
 WORDFENCE_POLICIES = frozenset(
     {"none", "direct", "qualifying_authorization", "usable_gadget"}
@@ -42,6 +44,84 @@ PATCHSTACK_POLICIES = frozenset(
 # receive one conservative authoring fallback for manual review. They deliberately
 # do not inherit an automatic oracle or disclosure policy.
 OPEN_CWE_POC_TEMPLATE = "generic_open_cwe.py.j2"
+
+
+@dataclass(frozen=True)
+class CriticEvidenceRequirement:
+    """One exact structured fact that a critic must establish from source."""
+
+    path: str
+    json_type: CriticEvidenceJSONType
+    required_value: bool | str | int | float
+    source_requirement: str
+
+
+@dataclass(frozen=True)
+class CriticEvidenceContract:
+    """Family/profile-owned acceptance rules supplied to the source critic."""
+
+    acceptance_mode: CriticAcceptanceMode
+    acceptance_requirements: tuple[str, ...] = ()
+    required_evidence: tuple[CriticEvidenceRequirement, ...] = ()
+    non_evidence: tuple[str, ...] = ()
+
+
+# Existing reviewed families retain the shared source-review behavior unless
+# their taxonomy profile declares additional, independently reviewed evidence.
+BASE_CRITIC_EVIDENCE_CONTRACT = CriticEvidenceContract(
+    acceptance_mode="source_review"
+)
+
+# An open CWE has no reviewed family semantics or automatic oracle. The critic
+# may still reject a disproven claim, but it must not silently accept one under
+# assumptions borrowed from a superficially similar known family.
+OPEN_CWE_CRITIC_EVIDENCE_CONTRACT = CriticEvidenceContract(
+    acceptance_mode="manual_review_only",
+    acceptance_requirements=(
+        "No reviewed family-specific evidence contract exists for this canonical "
+        "open CWE. Apply the shared source-validity checks, but route a surviving "
+        "candidate to manual_review instead of accepted.",
+    ),
+)
+
+_PHP_OBJECT_INJECTION_CRITIC_EVIDENCE_CONTRACT = CriticEvidenceContract(
+    acceptance_mode="source_review",
+    acceptance_requirements=(
+        "Independently review a shipped-source gadget chain: its class is loaded "
+        "or autoloadable, the required serialized property names and visibility "
+        "encoding survive every proven ingress transform with exact byte lengths, "
+        "and its magic method reaches the claimed concrete side effect.",
+        "An optional automated natural-gadget proof recipe is valid only for one "
+        "shipped object whose __wakeup or __destruct chain has complete exact "
+        "class, trigger, helper, and unlink source anchors. It must declare one "
+        "parent-supplied ephemeral file path, account for every unlink, and contain "
+        "no raw serialization, path, nested object, reference, callback, dynamic "
+        "helper, or other terminal side effect. Full direct-path promotion also "
+        "requires immutable source-bound property/iteration dataflow with no "
+        "aliases or by-reference helpers and no additional unreviewed magic hooks; "
+        "a local-path helper must "
+        "prove scheme rejection and same-argument local file existence, while a "
+        "prefix-only deletion remains lower-tier evidence.",
+    ),
+    required_evidence=(
+        CriticEvidenceRequirement(
+            path="evidence_summary.usable_gadget",
+            json_type="boolean",
+            required_value=True,
+            source_requirement=(
+                "The independently reviewed shipped-source chain establishes a "
+                "reachable usable gadget and concrete side effect."
+            ),
+        ),
+    ),
+    non_evidence=(
+        "Verifier-owned canaries do not establish a usable shipped gadget.",
+        "The mere occurrence of words such as 'gadget' or 'code execution' is not "
+        "affirmative gadget evidence.",
+        "Model-authored serialized bytes, filesystem paths, callback names, and "
+        "unreviewed helper calls are not safe natural-gadget recipes.",
+    ),
+)
 
 
 class BugClass(str, Enum):
@@ -110,6 +190,7 @@ class KnownCWEProfile:
     patchstack_policy: PatchstackPolicy
     analysis_support: str
     delivery_support: str
+    critic_evidence_contract: CriticEvidenceContract
     exclusion_reason: str = ""
     alternative_discovery: str = ""
 
@@ -129,6 +210,7 @@ def _profile(
     patchstack: str = "none",
     analysis: str = "active",
     delivery: str = "automated",
+    critic_evidence_contract: CriticEvidenceContract = BASE_CRITIC_EVIDENCE_CONTRACT,
     exclusion_reason: str = "",
     alternative_discovery: str = "",
 ) -> KnownCWEProfile:
@@ -150,6 +232,7 @@ def _profile(
         patchstack_policy=cast(PatchstackPolicy, patchstack),
         analysis_support=analysis,
         delivery_support=delivery,
+        critic_evidence_contract=critic_evidence_contract,
         exclusion_reason=exclusion_reason,
         alternative_discovery=alternative_discovery,
     )
@@ -270,15 +353,18 @@ _KNOWN_CWE_REGISTRY: dict[BugClass, KnownCWEProfile] = {
         "server_side_parser",
         "php_object_injection",
         "injection_files",
-        surfaces=("deserialization",),
+        surfaces=(
+            "deserialization",
+            "implicit_deserialization",
+        ),
         owasp="A08:2021-Software and Data Integrity Failures",
-        template="auth_bypass.py.j2",
-        template_fit="generic",
-        oracles=("file_effect", "response_marker", "state_change"),
+        template="php_object_instantiation.py.j2",
+        oracles=("object_instantiation",),
         wordfence="usable_gadget",
         patchstack="direct",
         analysis="partial",
         delivery="conditional",
+        critic_evidence_contract=_PHP_OBJECT_INJECTION_CRITIC_EVIDENCE_CONTRACT,
     ),
     BugClass.XSS_REFLECTED: _profile(
         "CWE-79",
@@ -490,3 +576,11 @@ def known_cwe_profile(bug_class: BugClass) -> KnownCWEProfile:
 def get_known_cwe_profile(bug_class: BugClass) -> KnownCWEProfile | None:
     """Return support metadata, or ``None`` for an open/unmapped CWE."""
     return KNOWN_CWE_REGISTRY.get(bug_class)
+
+
+def critic_evidence_contract_for(bug_class: BugClass) -> CriticEvidenceContract:
+    """Return a reviewed profile contract or the fail-closed open-CWE fallback."""
+    profile = get_known_cwe_profile(bug_class)
+    if profile is None:
+        return OPEN_CWE_CRITIC_EVIDENCE_CONTRACT
+    return profile.critic_evidence_contract

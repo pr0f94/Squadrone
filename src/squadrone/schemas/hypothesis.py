@@ -10,6 +10,7 @@ from typing import Annotated, Any, Literal
 from pydantic import BeforeValidator, Field, model_validator
 
 from ._base import JSONFileMixin
+from .php_object_gadget import PhpObjectGadgetRecipe
 from .recon import CoverageDisposition
 from .taxonomy import BugClass, get_known_cwe_profile
 from ..services.roles import UNKNOWN_ATTACKER_ROLE, normalize_attacker_role
@@ -168,6 +169,7 @@ class Hypothesis(JSONFileMixin):
     # may contain "wordfence", "patchstack", or both. Routing/report stages should respect this.
     bounty_programs: list[str] = Field(default_factory=list)
     evidence_summary: dict[str, Any] = Field(default_factory=dict)
+    php_object_gadget_recipe: PhpObjectGadgetRecipe | None = None
     quality_gate: dict[str, Any] = Field(default_factory=dict)
     derived_severity: dict[str, Any] = Field(default_factory=dict)
 
@@ -284,6 +286,16 @@ class Hypothesis(JSONFileMixin):
         # model-authored candidates are normalized explicitly by the hypothesis
         # stage so historical findings never change meaning on deserialization.
         self.refresh_derived_taxonomy()
+        if self.php_object_gadget_recipe is not None:
+            if self.bug_class != BugClass.PHP_OBJECT_INJECTION:
+                raise ValueError(
+                    "php_object_gadget_recipe is valid only for CWE-502 hypotheses"
+                )
+            if (self.evidence_summary or {}).get("usable_gadget") is not True:
+                raise ValueError(
+                    "php_object_gadget_recipe requires exact "
+                    "evidence_summary.usable_gadget=true"
+                )
         return self
 
     def refresh_derived_taxonomy(self) -> None:

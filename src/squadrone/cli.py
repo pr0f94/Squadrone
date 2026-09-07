@@ -760,6 +760,84 @@ def benchmark(
     console.print(detail)
 
 
+@app.command("regression", rich_help_panel="Advanced")
+def regression(
+    manifest: str = typer.Argument(
+        ...,
+        help="Path to a seeded historical-CVE regression manifest",
+    ),
+    budget: float = typer.Option(
+        ...,
+        "--budget",
+        min=0.01,
+        help="Required per-case cost ceiling (USD)",
+    ),
+    config: str = typer.Option(
+        "pipelines/default.yaml",
+        "--config",
+        help="Pipeline config YAML path",
+    ),
+    case_ids: list[str] | None = typer.Option(
+        None,
+        "--case",
+        help="Run only this case ID; repeat the option to select multiple cases",
+    ),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        "-v",
+        help="Show detailed INFO logs from regression stages",
+    ),
+) -> None:
+    """Re-run curated hypotheses through source review and verification."""
+    _configure_logging(verbose=verbose)
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "benchmarks"))
+    from regression_runner import run_regressions  # type: ignore
+
+    result = asyncio.run(
+        run_regressions(
+            manifest_path=manifest,
+            config_path=config,
+            budget_per_case_usd=budget,
+            case_ids=case_ids,
+        )
+    )
+
+    summary = Table(title=f"Seeded regression — {manifest}")
+    summary.add_column("CVE")
+    summary.add_column("plugin")
+    summary.add_column("version")
+    summary.add_column("mode")
+    summary.add_column("status")
+    summary.add_column("findings")
+    summary.add_column("cost")
+    summary.add_column("detail")
+    for case in result.cases:
+        summary.add_row(
+            case.cve_id,
+            case.plugin_slug,
+            case.version,
+            case.mode,
+            case.status,
+            str(case.finding_count),
+            f"${case.cost_usd:.4f}",
+            "; ".join(case.errors),
+        )
+    console.print(summary)
+    console.print(
+        f"[b]Passed[/b] {result.passed_count}/{result.case_count} · "
+        f"[b]Total cost[/b] ${result.total_cost_usd:.4f}"
+    )
+    for case in result.cases:
+        if case.errors:
+            console.print(f"[red]{case.case_id}[/]: " + "; ".join(case.errors))
+    console.print(f"[dim]Result: {result.result_path}[/]")
+    if result.failed_count:
+        raise typer.Exit(code=1)
+
+
 @app.command(rich_help_panel="Advanced")
 def review(run_id: str = typer.Argument(..., help="Run ID to review")) -> None:
     """Interactively review findings from a completed run."""

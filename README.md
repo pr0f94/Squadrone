@@ -125,6 +125,20 @@ cap, PoC iterations, sandbox images/timeouts, persistent sandbox reuse, failure
 state dumps, and optional screenshots. Most users only need to change models or
 budget.
 
+Focused discovery can limit source review to one or more areas; omit this field
+to retain all four reviewers in their fixed order:
+
+```yaml
+hypothesis_review_areas:
+  - injection_files
+hypothesis_review_item_types:
+  - deserialization
+```
+
+Valid areas are `authorization_workflows`, `injection_files`, `xss_lifecycle`,
+and `authentication`. The optional item-type list matches deterministic
+`CoverageItem.type` values exactly; omit it to review every item type.
+
 ## Usage
 
 ```sh
@@ -223,6 +237,42 @@ confirmed target. A hypothesis alone is never counted as a confirmed finding.
 
 ```sh
 .venv/bin/squadrone benchmark benchmarks/corpus.json --split train --budget 5
+```
+
+## Seeded Regression
+
+Seeded regressions test whether a previously source-grounded hypothesis still
+survives source verification and technical triage, then reproduces with both an
+attack run and a clean-state confirmation. This is intentionally separate from
+the paired benchmark above: it tests downstream integrity without treating
+rediscovery variance as a verifier failure.
+
+The manifest is a versioned JSON object with a `cases` array. Each case provides
+`case_id`, `cve_id`, `plugin_slug`, `version`, `mode`, one complete canonical
+`Hypothesis` under `hypothesis`, and an `expected` object. A `confirm` expectation
+requires `attribution`, `attacker_role`, `minimum_impact`, and one or more
+`allowed_oracles`. The attribution object records the exact final
+`hypothesis_id`, `bug_class`, `root_cause_cwe`, `file`, `line`, `sink`, and
+`sink_code`; it is separate from the seeded hypothesis so a source-anchor repair
+can itself be regression tested, including a corrected dangerous expression on
+the same source line. A `policy_reject` expectation instead lists the deterministic
+`rejection_rules` and may also provide exact attribution. `source_tree_sha256`
+is optional and pins the downloaded source tree when present.
+
+The budget is required and applies independently to every selected case. Cases
+run sequentially, so at most one verification sandbox is active. The harness
+does not run vulnerability-database feeds, deduplication, or reporting. Plugin
+source and run artifacts remain under ignored `plugins/`; suite results remain
+under ignored `benchmarks/results/`.
+
+```sh
+env -u WORDFENCE_API_KEY -u WPSCAN_API_KEY \
+  .venv/bin/squadrone regression benchmarks/regressions.json \
+  --config pipelines/openai.yaml --budget 100
+
+# Run one or more named cases from the same manifest
+.venv/bin/squadrone regression benchmarks/regressions.json --budget 100 \
+  --case duplicator-cve-2020-11738 --case getwid-cve-2023-1895
 ```
 
 ## Tests

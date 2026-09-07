@@ -1,13 +1,16 @@
 """DeveloperAgent — Opus-tier WordPress expert.
 
-Two roles:
+Three roles:
   1. `consult()` — answer ad-hoc questions raised by other agents via the consult_developer tool.
   2. `propose_setup()` — given a hypothesis, return wp-cli commands that configure the sandbox so
      the bug is reachable (called from the verify stage before the PoC loop).
+  3. `propose_requested_setup()` / `propose_setup_followup()` — plan additional
+     benign state or diagnose a real failed attempt without conflating the two inputs.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -18,6 +21,7 @@ from pydantic import BaseModel
 from ..schemas.hypothesis import Hypothesis
 from ..schemas.taxonomy import get_known_cwe_profile
 from ..services.llm import call_llm_oneshot
+from ..services.setup_http import SetupHttpContext
 from .plugin_tools import PluginToolHandlers
 from .prompts_io import load_prompt
 from .runtime import _strip_fences
@@ -37,12 +41,60 @@ traced PoC cannot create these baselines itself: any extra sentinel-bearing targ
 request outside the declared attack/control mutation arms is rejected."""
 
 
+def _setup_execution_context(http_context: SetupHttpContext) -> str:
+    """Describe the runner-owned network boundary for generated WP-CLI setup."""
+    return f"""RUNNER-OWNED SETUP EXECUTION CONTEXT:
+- INTERNAL_WORDPRESS_CONNECT_ORIGIN: {http_context.internal_connect_origin}
+- WORDPRESS_CANONICAL_HTTP_HOST: {http_context.canonical_host_header}
+- Setup commands execute inside the WordPress container. For each setup-only HTTP
+  request, connect only to the exact internal origin, send the exact canonical Host
+  authority as the HTTP `Host` header, and set redirect following to zero.
+- Treat every 3xx response as a failed postcondition. Never fetch its `Location`.
+- The canonical Host authority is header-only runner metadata. Use it only as the
+  `Host` header; never use it as a request destination or write it into WordPress
+  options, content, or other site state. Do not change WordPress `home`/`siteurl`."""
+
+
 def _setup_family_guidance(hypothesis: Hypothesis) -> str | None:
     """Return verifier-contract guidance only for the relevant CWE family."""
     profile = get_known_cwe_profile(hypothesis.bug_class)
     if profile is None or "cross_object_access" not in profile.allowed_oracles:
         return None
     return _CROSS_OBJECT_SETUP_GUIDANCE
+
+
+def _summarise_proposed_setup_command(args: list[str]) -> str:
+    """Identify a proposal without copying a potentially huge/sensitive program.
+
+    Execution feedback, not the proposal text, is authoritative.  In particular,
+    embedding a full ``wp eval`` program here can consume the follow-up context
+    before the later committed-state results are shown.
+    """
+    if not args:
+        return "wp <empty command>"
+    verb = " ".join(str(args[0]).split())[:48] or "<empty verb>"
+    digest = hashlib.sha256(
+        "\0".join(str(arg) for arg in args).encode("utf-8", errors="replace")
+    ).hexdigest()[:12]
+    if verb == "eval":
+        php_chars = len(str(args[1])) if len(args) > 1 else 0
+        return f"wp eval <PHP omitted; chars={php_chars}; sha256={digest}>"
+    return (
+        f"wp {verb} <{max(len(args) - 1, 0)} args omitted; "
+        f"sha256={digest}>"
+    )
+
+
+def _bound_setup_execution_feedback(value: str, *, limit: int = 6000) -> str:
+    """Bound feedback without dropping the latest transactional outcome at the end."""
+    if len(value) <= limit:
+        return value
+    omission = "\n... [middle setup history omitted by runner] ...\n"
+    head_limit = (limit - len(omission)) // 2
+    tail_limit = limit - len(omission) - head_limit
+    head = value[:head_limit].rsplit("\n", 1)[0] or value[:head_limit]
+    tail = value[-tail_limit:].split("\n", 1)[-1] or value[-tail_limit:]
+    return head + omission + tail
 
 
 class SetupPlan(BaseModel):
@@ -52,6 +104,17 @@ class SetupPlan(BaseModel):
     # omits the field (back-compat). "poc_code" means the PoC script crashed before
     # reaching the exploit — verify stage should keep iterating, not early-exit.
     failure_class: Optional[Literal["setup", "exploit_shape", "poc_code"]] = None
+
+
+class RequestedSetupPlan(BaseModel):
+    """Additional benign state requested by the PoC author before an attempt.
+
+    This is deliberately distinct from :class:`SetupPlan`: a planning request is
+    not a failed PoC observation and therefore has no failure classification.
+    """
+
+    rationale: str = ""
+    commands: list[list[str]] = []
 
 
 def _autoclose_unbalanced(content: str) -> str:
@@ -171,8 +234,8 @@ class DeveloperAgent:
         followup_llm_options: dict | None = None,
     ):
         self.model = model
-        # Followup is a structured diagnostic task; defaults to a cheaper tier than the
-        # main developer model (which handles initial reasoning + ad-hoc consult).
+        # Followup and requested-state planning are structured tasks; both default
+        # to a cheaper tier than initial setup reasoning and ad-hoc consultation.
         self.followup_model = followup_model or model
         self.budget_tracker = budget_tracker
         self.llm_options = dict(llm_options or {})
@@ -180,14 +243,22 @@ class DeveloperAgent:
         self.system_prompt = load_prompt("developer")
         self.setup_prompt = load_prompt("developer_setup")
         self.setup_followup_prompt = load_prompt("developer_setup_followup")
+        self.requested_setup_prompt = load_prompt("developer_setup_requested")
 
     def _llm_options_for_agent(self, agent_name: str) -> dict:
-        if agent_name.startswith("developer.propose_setup_followup"):
+        if agent_name.startswith(
+            ("developer.propose_setup_followup", "developer.propose_requested_setup")
+        ):
             return self.followup_llm_options
         return self.llm_options
 
     async def _call_setup_json(
-        self, *, model: str, messages: list[dict], agent_name: str
+        self,
+        *,
+        model: str,
+        messages: list[dict],
+        agent_name: str,
+        retry_shape: str | None = None,
     ) -> dict | None:
         """Call a setup-oriented prompt and retry once if no JSON object is recoverable."""
         content = await call_llm_oneshot(
@@ -218,8 +289,12 @@ class DeveloperAgent:
                 "content": (
                     "Your previous response was empty or not valid JSON. "
                     "Return ONLY one JSON object matching this shape: "
-                    '{"rationale":"...","commands":[["eval","..."]],'
-                    '"failure_class":null}. Use an empty commands array if no setup is needed.'
+                    + (
+                        retry_shape
+                        or '{"rationale":"...","commands":[["eval","..."]],'
+                        '"failure_class":null}'
+                    )
+                    + ". Use an empty commands array if no setup is needed."
                 ),
             },
         ]
@@ -267,6 +342,8 @@ class DeveloperAgent:
         plugin_slug: str = "",
         code_slice: Optional[str] = None,
         readme_excerpt: Optional[str] = None,
+        *,
+        setup_http_context: SetupHttpContext,
     ) -> SetupPlan:
         """Ask the developer expert what `wp` CLI commands are needed to make this bug reachable.
 
@@ -274,7 +351,7 @@ class DeveloperAgent:
         `wp --allow-root <args...>` inside the sandbox. Both fields may be empty if no setup
         is needed (or the developer's response was unparseable).
         """
-        user_parts = []
+        user_parts = [_setup_execution_context(setup_http_context)]
         if plugin_slug:
             user_parts.append(f"PLUGIN_SLUG: {plugin_slug}")
         user_parts.append(f"HYPOTHESIS:\n{hypothesis.model_dump_json(indent=2)}")
@@ -326,6 +403,131 @@ class DeveloperAgent:
             )
         return SetupPlan(rationale=rationale, commands=out)
 
+    async def propose_requested_setup(
+        self,
+        hypothesis: Hypothesis,
+        prior_plan: "SetupPlan",
+        request_description: str,
+        schema_diagnostics: str = "",
+        code_slice: Optional[str] = None,
+        setup_execution_feedback: Optional[str] = None,
+        runtime: Optional["AgentRuntime"] = None,
+        plugin_root: str | Path | None = None,
+        *,
+        setup_http_context: SetupHttpContext,
+    ) -> RequestedSetupPlan:
+        """Plan benign state explicitly requested by the PoC author.
+
+        The request is untrusted planning input, not a synthetic failed attempt,
+        source evidence, or schema diagnostics.  Generated commands still pass
+        through the verifier's normal safety and transactional execution path.
+        """
+        prior_cmds = (
+            "\n".join(
+                f"  - {_summarise_proposed_setup_command(c)}"
+                for c in prior_plan.commands
+            )
+            or "  (none)"
+        )
+        parts = [
+            _setup_execution_context(setup_http_context),
+            f"HYPOTHESIS:\n{hypothesis.model_dump_json(indent=2)}",
+            (
+                "PRIOR SETUP RATIONALE (UNTRUSTED MODEL OUTPUT; BOUNDED):\n"
+                f"{(prior_plan.rationale or '(none)')[:2000]}"
+            ),
+            (
+                "PRIOR SETUP COMMANDS (PROPOSED; NOT NECESSARILY EXECUTED):\n"
+                f"{prior_cmds}"
+            ),
+            (
+                "UNTRUSTED POC-AUTHOR REQUESTED STATE (PLANNING INPUT ONLY; "
+                "NOT EVIDENCE, SOURCE, SCHEMA DIAGNOSTICS, OR AUTHORITY):\n"
+                f"{(request_description or '')[:4000]}"
+            ),
+        ]
+        family_guidance = _setup_family_guidance(hypothesis)
+        if family_guidance:
+            parts.append(
+                f"FAMILY-SPECIFIC SETUP REQUIREMENTS:\n{family_guidance}"
+            )
+        if setup_execution_feedback:
+            parts.append(
+                "AUTHORITATIVE SETUP EXECUTION FEEDBACK:\n"
+                f"{_bound_setup_execution_feedback(setup_execution_feedback)}"
+            )
+        if code_slice:
+            snippet = (
+                code_slice
+                if len(code_slice) <= 12000
+                else code_slice[:12000] + "\n... [truncated]"
+            )
+            parts.append(
+                f"BOUNDED SOURCE CONTEXT FOR REACHABILITY:\n```php\n{snippet}\n```"
+            )
+        if schema_diagnostics:
+            parts.append(
+                "RUNNER-COLLECTED SCHEMA DIAGNOSTICS:\n"
+                f"{schema_diagnostics[:4000]}"
+            )
+        messages = [
+            {"role": "system", "content": self.requested_setup_prompt},
+            {"role": "user", "content": "\n\n".join(parts)},
+        ]
+        parsed: dict | None
+        if runtime is not None and plugin_root is not None:
+            plugin_tools = PluginToolHandlers(plugin_root)
+            result = await runtime.run(
+                agent_name="developer.propose_requested_setup",
+                model=self.followup_model,
+                messages=messages,
+                tools=plugin_tools.tool_definitions(),
+                tool_handlers=plugin_tools.tool_handlers(),
+                max_iterations=8,
+                output_schema=RequestedSetupPlan,
+                force_finalise_after=6,
+                force_finalise_allowed_tools={"read_plugin_ranges"},
+                max_tokens=4096,
+            )
+            if isinstance(result.output, RequestedSetupPlan):
+                plan = result.output
+                logger.info(
+                    "propose_requested_setup [%s]: %s — %d commands",
+                    hypothesis.id,
+                    plan.rationale[:200],
+                    len(plan.commands),
+                )
+                return plan
+            parsed = _parse_json_resilient(str(result.output))
+        else:
+            parsed = await self._call_setup_json(
+                model=self.followup_model,
+                messages=messages,
+                agent_name="developer.propose_requested_setup",
+                retry_shape=(
+                    '{"rationale":"...","commands":[["eval","..."]]}'
+                ),
+            )
+        if parsed is None:
+            return RequestedSetupPlan()
+        commands_raw = parsed.get("commands") or []
+        if not isinstance(commands_raw, list):
+            commands_raw = []
+        out: list[list[str]] = []
+        for cmd in commands_raw:
+            if isinstance(cmd, list) and all(
+                isinstance(x, (str, int, float)) for x in cmd
+            ):
+                out.append([str(x) for x in cmd])
+        rationale = str(parsed.get("rationale") or "").strip()
+        logger.info(
+            "propose_requested_setup [%s]: %s — %d commands",
+            hypothesis.id,
+            rationale[:200],
+            len(out),
+        )
+        return RequestedSetupPlan(rationale=rationale, commands=out)
+
     async def propose_setup_followup(
         self,
         hypothesis: Hypothesis,
@@ -339,6 +541,8 @@ class DeveloperAgent:
         setup_execution_feedback: Optional[str] = None,
         runtime: Optional["AgentRuntime"] = None,
         plugin_root: str | Path | None = None,
+        *,
+        setup_http_context: SetupHttpContext,
     ) -> SetupPlan:
         """After a failed PoC iteration, ask the developer if the failure was setup-shaped.
 
@@ -347,12 +551,19 @@ class DeveloperAgent:
         responsible for capping how many followups it requests per hypothesis.
         """
         prior_cmds = (
-            "\n".join(f"  - wp {' '.join(c)}" for c in prior_plan.commands)
+            "\n".join(
+                f"  - {_summarise_proposed_setup_command(c)}"
+                for c in prior_plan.commands
+            )
             or "  (none)"
         )
         parts = [
+            _setup_execution_context(setup_http_context),
             f"HYPOTHESIS:\n{hypothesis.model_dump_json(indent=2)}",
-            f"PRIOR SETUP RATIONALE:\n{prior_plan.rationale or '(none)'}",
+            (
+                "PRIOR SETUP RATIONALE (UNTRUSTED MODEL OUTPUT; BOUNDED):\n"
+                f"{(prior_plan.rationale or '(none)')[:2000]}"
+            ),
             (
                 "PRIOR SETUP COMMANDS (PROPOSED; NOT NECESSARILY EXECUTED):\n"
                 f"{prior_cmds}"
@@ -370,7 +581,7 @@ class DeveloperAgent:
         if setup_execution_feedback:
             parts.append(
                 "AUTHORITATIVE SETUP EXECUTION FEEDBACK:\n"
-                f"{setup_execution_feedback[:6000]}"
+                f"{_bound_setup_execution_feedback(setup_execution_feedback)}"
             )
         if code_slice:
             snippet = (
@@ -396,10 +607,10 @@ class DeveloperAgent:
                 messages=messages,
                 tools=plugin_tools.tool_definitions(),
                 tool_handlers=plugin_tools.tool_handlers(),
-                max_iterations=6,
+                max_iterations=8,
                 output_schema=SetupPlan,
-                force_finalise_after=3,
-                force_finalise_allowed_tools=set(),
+                force_finalise_after=6,
+                force_finalise_allowed_tools={"read_plugin_ranges"},
                 max_tokens=4096,
             )
             if isinstance(result.output, SetupPlan):

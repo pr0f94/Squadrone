@@ -1,0 +1,866 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "case_id": "duplicator-cve-2020-11738",
+      "cve_id": "CVE-2020-11738",
+      "plugin_slug": "duplicator",
+      "version": "1.3.26",
+      "mode": "confirm",
+      "hypothesis": {
+        "id": "authz-b002-001",
+        "specialist": "injection_files",
+        "bug_class": "CWE-22",
+        "entry_point": "GET /?action=duplicator_download&file=../wp-config.php via the public init hook",
+        "file": "duplicator.php",
+        "line": 175,
+        "sink": "Opening and streaming an attacker-selected filesystem path outside the backup directory",
+        "sink_code": "$fp = @fopen($filepath, 'r');",
+        "taint_path": [
+          "Unauthenticated GET parameter $_GET['file']",
+          "sanitize_text_field($_GET['file'])",
+          "$filepath = DUPLICATOR_SSDIR_PATH.'/'.$file",
+          "file_exists($filepath)",
+          "@fopen($filepath, 'r') followed by fread/echo streaming"
+        ],
+        "reasoning": "duplicator_init() is registered on the public init hook and handles action=duplicator_download without authentication, a nonce, a capability check, a download token, basename enforcement, realpath canonicalization, or directory-containment validation. sanitize_text_field() does not remove ../ path traversal. The request-selected file is appended beneath wp-snapshots and can resolve outside that directory before fopen() streams it to the unauthenticated requester.",
+        "confidence": "high",
+        "preconditions": "Unauthenticated attacker; Duplicator 1.3.26 is active and the PHP process can read the targeted file.",
+        "affected_versions": "1.3.26, as identified by the reviewed plugin header and DUPLICATOR_VERSION constant",
+        "root_cause_cwe": "CWE-22",
+        "vulnerability_type": "path_traversal_or_file_access",
+        "security_outcome": {
+          "confidentiality": "high",
+          "integrity": "none",
+          "availability": "none",
+          "description": "An unauthenticated attacker can read files outside wp-snapshots, including wp-config.php and its database credentials and authentication secrets."
+        },
+        "bounty_programs": [],
+        "evidence_summary": {
+          "attacker_role": "Unauthenticated",
+          "source": "GET parameter file, for example ../wp-config.php",
+          "control": "sanitize_text_field only; no authentication, nonce, capability, token, basename, realpath, or resolved-path containment check",
+          "sink": "@fopen($filepath, 'r') followed by fread/echo streaming, with a readfile fallback",
+          "reachable_path": "public init hook -> duplicator_init() -> construct DUPLICATOR_SSDIR_PATH.'/'.$file -> file_exists() -> fopen()/stream",
+          "boundary": "An anonymous web request crosses the protected server-filesystem boundary and reads a file outside the intended backup directory.",
+          "impact": "Disclosure of wp-config.php credentials and WordPress authentication secrets.",
+          "counterevidence": "Content-Disposition uses basename(), but file_exists(), fopen(), and readfile use the unconfined path. sanitize_text_field() does not remove ../ segments.",
+          "proof_gaps": "Confirm in the sandbox that PHP resolves wp-snapshots/../wp-config.php and that no server-level path restriction blocks the read."
+        },
+        "quality_gate": {},
+        "derived_severity": {}
+      },
+      "expected": {
+        "attribution": {
+          "hypothesis_id": "authz-b002-001",
+          "bug_class": "CWE-22",
+          "root_cause_cwe": "CWE-22",
+          "file": "duplicator.php",
+          "line": 175,
+          "sink": "Opening and streaming an attacker-selected filesystem path outside the backup directory",
+          "sink_code": "$fp = @fopen($filepath, 'r');"
+        },
+        "attacker_role": "unauthenticated",
+        "minimum_impact": {
+          "confidentiality": "high",
+          "integrity": "none",
+          "availability": "none"
+        },
+        "allowed_oracles": [
+          "response_marker"
+        ]
+      },
+      "source_tree_sha256": "baab9067bdca05dd1070b8f653dd441d764b4e20f36a3054cdcfad5c46b5772b",
+      "notes": "Canonical public duplicator_init handler registered on init; this is not an AJAX callback."
+    },
+    {
+      "case_id": "enhanced-search-box-cve-2024-8091",
+      "cve_id": "CVE-2024-8091",
+      "plugin_slug": "extended-search-plugin",
+      "version": "0.6.1",
+      "mode": "policy_reject",
+      "hypothesis": {
+        "id": "policy-cve-2024-8091",
+        "specialist": "authorization_workflows",
+        "bug_class": "CWE-352",
+        "entry_point": "POST to wp-admin/options-general.php?page=enhancedsb while a logged-in administrator views the plugin settings page",
+        "file": "enhanced-search-box.php",
+        "line": 159,
+        "sink": "Updates the cosmetic default search-box text option",
+        "sink_code": "update_option( 'enhanced_sb_default', esc_sql($_POST['enhanced_sb_default']) );",
+        "taint_path": [
+          "Forged POST parameter $_POST['enhanced_sb_default']",
+          "Enhanced_Search_Box::add_options_page() calls update_options() when submit is present",
+          "Enhanced_Search_Box::update_options()",
+          "update_option( 'enhanced_sb_default', esc_sql($_POST['enhanced_sb_default']) )"
+        ],
+        "reasoning": "The administrator-only settings page processes its POST form without a nonce or CSRF token. A cross-site request can therefore change the default search-box text when a logged-in administrator is induced to submit it. The affected setting is only a cosmetic search-box preference, and the stored value is escaped with esc_js() in the front-end script and esc_attr() in the settings form; no script execution or other high-impact security outcome is established.",
+        "confidence": "high",
+        "preconditions": "An unauthenticated attacker must induce a logged-in administrator with manage_options access to submit a forged POST request to the plugin settings page.",
+        "affected_versions": "0.6.1",
+        "root_cause_cwe": "CWE-352",
+        "vulnerability_type": "cross_site_request_forgery",
+        "security_outcome": {
+          "confidentiality": "none",
+          "integrity": "none",
+          "availability": "none",
+          "description": "A forged request can change only the cosmetic default search-box preference."
+        },
+        "bounty_programs": [],
+        "evidence_summary": {
+          "attacker_role": "unauthenticated",
+          "source": "Forged POST parameter $_POST['enhanced_sb_default']",
+          "control": "The options page requires manage_options, but the update handler has no nonce or CSRF-token validation.",
+          "sink": "update_option( 'enhanced_sb_default', esc_sql($_POST['enhanced_sb_default']) )",
+          "reachable_path": "forged settings form POST -> Enhanced_Search_Box::add_options_page() -> Enhanced_Search_Box::update_options() -> update_option()",
+          "boundary": "An unauthenticated attacker influences an administrator-only cosmetic preference by inducing a logged-in administrator to submit the form.",
+          "impact": "A forged request can change only the cosmetic default search-box preference.",
+          "counterevidence": "The stored value is escaped with esc_js() in the front-end script and esc_attr() in the settings form, so the reviewed flow does not establish XSS.",
+          "proof_gaps": "No runtime proof is needed for the deterministic policy rejection."
+        },
+        "quality_gate": {},
+        "derived_severity": {}
+      },
+      "expected": {
+        "attribution": {
+          "hypothesis_id": "policy-cve-2024-8091",
+          "bug_class": "CWE-352",
+          "root_cause_cwe": "CWE-352",
+          "file": "enhanced-search-box.php",
+          "line": 159,
+          "sink": "Updates the cosmetic default search-box text option",
+          "sink_code": "update_option( 'enhanced_sb_default', esc_sql($_POST['enhanced_sb_default']) );"
+        },
+        "attacker_role": "unauthenticated",
+        "minimum_impact": {
+          "confidentiality": "none",
+          "integrity": "none",
+          "availability": "none"
+        },
+        "allowed_oracles": [],
+        "rejection_rules": [
+          "cosmetic_or_no_security_impact",
+          "csrf_without_high_impact_outcome"
+        ]
+      },
+      "source_tree_sha256": "254adfdfbbabb5cd1579c58c12a2ebfe94719266b45fe0af284b86c9a6541dea",
+      "notes": "Deterministic policy-negative baseline: the missing nonce changes only a cosmetic preference and must not reach sandbox verification."
+    },
+    {
+      "case_id": "ultimate-member-cve-2020-36155",
+      "cve_id": "CVE-2020-36155",
+      "plugin_slug": "ultimate-member",
+      "version": "2.1.11",
+      "mode": "confirm",
+      "hypothesis": {
+        "id": "authz-b001-001",
+        "specialist": "authorization_workflows",
+        "bug_class": "CWE-915",
+        "entry_point": "POST to a published Ultimate Member registration form",
+        "file": "includes/core/class-user.php",
+        "line": 1842,
+        "sink": "attacker-selected user metadata write on the newly registered account",
+        "sink_code": "update_user_meta( $this->id, $key, $value );",
+        "taint_path": [
+          "registration POST including wp_capabilities[administrator]=1",
+          "um\\core\\Form::form_init() copies $_POST into post_form['submitted']",
+          "um_submit_form_register() creates the user and dispatches um_user_register",
+          "um_after_insert_user() calls User::set_registration_details()",
+          "Validation::validate_fields_values() leaves keys absent from the configured form fields unchanged",
+          "User::update_profile() iterates the submitted attacker-selected keys",
+          "update_user_meta( $this->id, $key, $value )"
+        ],
+        "reasoning": "The registration dispatcher copies the complete beautified POST array into submitted data before merging trusted form configuration. Registration nonce verification proves intent but does not constrain submitted metadata keys. The registration validation filter explicitly continues when a submitted key is absent from the form's configured custom fields, leaving that key in the changes array. set_registration_details() removes password fields but does not apply User::clean() or the class's banned_keys denylist before passing the remaining submitted array to update_profile(). update_profile() only separates a short list of wp_users properties; every other key is written directly as user metadata. Consequently, on a normal wp_ table prefix installation, an anonymous registrant can submit wp_capabilities as an array and replace the capabilities metadata of the account just created for them, crossing from anonymous registration to an administrator-capable account.",
+        "confidence": "high",
+        "preconditions": "Unauthenticated attacker; a published Ultimate Member registration form is available through the plugin's intended registration workflow, and the site uses the conventional wp_ table prefix so the protected key is wp_capabilities. The attacker first loads the form to obtain its shipped um_register_form nonce.",
+        "affected_versions": "Ultimate Member 2.1.11, as identified by the reviewed plugin header; broader version range requires version-diff validation.",
+        "root_cause_cwe": "CWE-915",
+        "vulnerability_type": "mass_assignment",
+        "security_outcome": {
+          "confidentiality": "high",
+          "integrity": "high",
+          "availability": "high",
+          "description": "An unauthenticated registrant can assign administrator capabilities to their newly created account, allowing access to protected site data, settings, content, users, plugins, and destructive administrative operations."
+        },
+        "bounty_programs": [],
+        "evidence_summary": {
+          "attacker_role": "Unauthenticated registrant who becomes the newly created user",
+          "source": "Arbitrary registration POST key and array value, such as wp_capabilities[administrator]=1",
+          "control": "A user-bound registration nonce is checked, but there is no server-side allowed-key set on registration metadata; validate_fields_values retains unknown keys",
+          "sink": "update_user_meta( $this->id, $key, $value )",
+          "reachable_path": "published registration form POST -> Form::form_init -> um_submit_form_register -> um_user_register -> um_after_insert_user -> set_registration_details -> update_profile -> update_user_meta",
+          "boundary": "Anonymous self-registration crosses the protected WordPress role and capability boundary for the newly created account",
+          "impact": "The attacker obtains an administrator-capable WordPress account",
+          "counterevidence": "Role fields receive dedicated validation, profile editing is ownership-gated and form-field constrained, account updates use a secure-field allowlist, and User defines banned_keys containing wp_capabilities; however, the registration-to-update_profile path does not invoke that banned-key cleaner",
+          "proof_gaps": "Confirm in a sandbox that PHP preserves the wp_capabilities array through the form beautification/filter pipeline and that WordPress recognizes the resulting metadata immediately after registration"
+        },
+        "quality_gate": {},
+        "derived_severity": {}
+      },
+      "expected": {
+        "attribution": {
+          "hypothesis_id": "authz-b001-001",
+          "bug_class": "CWE-915",
+          "root_cause_cwe": "CWE-915",
+          "file": "includes/core/class-user.php",
+          "line": 1842,
+          "sink": "attacker-selected user metadata write on the newly registered account",
+          "sink_code": "update_user_meta( $this->id, $key, $value );"
+        },
+        "attacker_role": "unauthenticated",
+        "minimum_impact": {
+          "confidentiality": "high",
+          "integrity": "high",
+          "availability": "high"
+        },
+        "allowed_oracles": [
+          "authorization"
+        ]
+      },
+      "source_tree_sha256": "ae51c31602b608cf999c6338f08f81f10f2db430b3ef77f6ba84187678416410"
+    },
+    {
+      "case_id": "planyo-cve-2026-3576",
+      "cve_id": "CVE-2026-3576",
+      "plugin_slug": "planyo-online-reservation-system",
+      "version": "2.9",
+      "mode": "confirm",
+      "hypothesis": {
+        "id": "inject-b001-001",
+        "specialist": "injection_files",
+        "bug_class": "CWE-918",
+        "entry_point": "Direct unauthenticated request to ulap.php with GET or POST parameter ulap_url",
+        "file": "ulap.php",
+        "line": 99,
+        "sink": "PHP URL-capable stream read followed by returning and echoing the retrieved bytes",
+        "sink_code": "$fp = @fopen($url, 'r', false, $context);",
+        "taint_path": [
+          "$_GET['ulap_url'] or $_POST['ulap_url']",
+          "send_http_post($url, $fields)",
+          "parse_url host allowlist accepts localhost without validating the URI scheme",
+          "curl_exec($cs), followed by fopen($url, 'r', false, $context) fallback",
+          "fread($fp, 8192)",
+          "echo send_http_post(...)"
+        ],
+        "reasoning": "The shipped ulap.php script independently handles direct requests without WordPress authentication, nonce, or capability checks. An attacker can supply file://localhost/etc/passwd. parse_url assigns localhost as the host, so the hostname allowlist accepts it, while no scheme allowlist restricts the URL to HTTP or HTTPS. libcurl may return local file bytes directly when FILE protocol support is enabled. If cURL returns false or an empty response, PHP's file stream wrapper can open the same local path; the function buffers the bytes with fread, returns them, and the direct dispatcher echoes them to the attacker. A more valuable readable target such as file://localhost/path/to/wp-config.php can disclose database credentials and WordPress secrets.",
+        "confidence": "high",
+        "preconditions": "Unauthenticated network access to the shipped ulap.php script and knowledge or discovery of a server-local readable file path; the target file must not be blocked by open_basedir or filesystem permissions.",
+        "affected_versions": "Version 2.9 as declared in the reviewed shipped planyo.php source",
+        "root_cause_cwe": "CWE-918",
+        "vulnerability_type": "server_side_request_forgery",
+        "security_outcome": {
+          "confidentiality": "high",
+          "integrity": "none",
+          "availability": "none",
+          "description": "An unauthenticated attacker can retrieve arbitrary server-local files readable by PHP, potentially exposing wp-config.php database credentials, salts, and other secrets."
+        },
+        "bounty_programs": [],
+        "evidence_summary": {
+          "attacker_role": "Unauthenticated remote attacker",
+          "source": "Attacker-controlled GET or POST ulap_url supplied directly to ulap.php",
+          "control": "The host allowlist accepts localhost, but no URI-scheme allowlist or cURL protocol restriction is applied",
+          "sink": "fopen($url, 'r') reads the selected URL and fread buffers its bytes",
+          "reachable_path": "Direct ulap.php request -> $_GET/$_POST['ulap_url'] -> send_http_post -> curl_exec or fopen -> fread -> return -> echo",
+          "boundary": "A public web request crosses into PHP's local file namespace and returns server-only file contents",
+          "impact": "Disclosure of arbitrary PHP-readable local files, including WordPress configuration secrets when the path is known",
+          "counterevidence": "The code validates the parsed host against four names, but file://localhost/... satisfies that check; filesystem permissions and open_basedir still constrain readable paths",
+          "proof_gaps": "Confirm in the target runtime that file://localhost resolves through either the installed libcurl FILE protocol or PHP file wrapper and identify the deployment's wp-config.php path."
+        },
+        "quality_gate": {},
+        "derived_severity": {}
+      },
+      "expected": {
+        "attribution": {
+          "hypothesis_id": "inject-b001-001",
+          "bug_class": "CWE-918",
+          "root_cause_cwe": "CWE-918",
+          "file": "ulap.php",
+          "line": 99,
+          "sink": "PHP URL-capable stream read followed by returning and echoing the retrieved bytes",
+          "sink_code": "$fp = @fopen($url, 'r', false, $context);"
+        },
+        "attacker_role": "unauthenticated",
+        "minimum_impact": {
+          "confidentiality": "low",
+          "integrity": "none",
+          "availability": "none"
+        },
+        "allowed_oracles": [
+          "response_marker"
+        ]
+      },
+      "source_tree_sha256": "239003ab0d77cd8bdd99d683aefe1fcba4c267e965ed8b04a5c341eae38ff22d"
+    },
+    {
+      "case_id": "ai-engine-cve-2025-7847",
+      "cve_id": "CVE-2025-7847",
+      "plugin_slug": "ai-engine",
+      "version": "2.9.4",
+      "mode": "confirm",
+      "hypothesis": {
+        "id": "inject-b008-001",
+        "specialist": "injection_files",
+        "bug_class": "CWE-434",
+        "entry_point": "POST /wp-json/mwai/v1/simpleFileUpload",
+        "file": "classes/modules/files.php",
+        "line": 367,
+        "sink": "Attacker-named file copied into the public WordPress uploads directory",
+        "sink_code": "copy( $path, $destination )",
+        "taint_path": [
+          "REST file upload or base64, filename, and target parameters",
+          "Meow_MWAI_API::rest_simpleFileUpload",
+          "Meow_MWAI_API::simpleFileUpload",
+          "Meow_MWAI_Modules_Files::upload_file",
+          "copy( $path, $destination )"
+        ],
+        "reasoning": "When the shipped Public API feature is enabled, its permission callback accepts any logged-in user through can_access_public_api(). A subscriber can submit arbitrary base64 bytes or an uploaded temporary file, choose a filename such as payload.php, and explicitly select target=uploads. Unlike the separate mwai-ui/v1/files/upload handler, this public API callback does not call wp_check_filetype_and_ext. upload_file derives the destination extension directly from the attacker-controlled filename and copies the bytes into wp_upload_dir()['path']; the generated URL is then returned. This permits an unauthorized executable-content file write and can become remote code execution where PHP execution is enabled in uploads.",
+        "confidence": "high",
+        "preconditions": "Subscriber or any logged-in user; the administrator has enabled the shipped Public API feature through its intended settings UI. No bearer token is required for an already logged-in user. The attacker selects target=uploads.",
+        "affected_versions": "2.9.4",
+        "root_cause_cwe": "CWE-434",
+        "vulnerability_type": "arbitrary_file_upload_or_write",
+        "security_outcome": {
+          "confidentiality": "high",
+          "integrity": "high",
+          "availability": "high",
+          "description": "A subscriber can write arbitrary attacker-controlled content with an attacker-selected executable extension into the public uploads directory; on servers that execute PHP there, this yields WordPress/server code execution and full confidentiality, integrity, and availability impact."
+        },
+        "bounty_programs": [],
+        "evidence_summary": {
+          "attacker_role": "Subscriber or any logged-in WordPress user",
+          "source": "POST file/base64 bytes, filename, and target sent to /mwai/v1/simpleFileUpload",
+          "control": "Public API must be enabled, but can_access_public_api permits every logged-in user; this route has no file-type validation",
+          "sink": "copy( $path, $destination ) where destination uses the filename-derived extension",
+          "reachable_path": "/mwai/v1/simpleFileUpload -> rest_simpleFileUpload -> simpleFileUpload -> files->upload_file -> copy",
+          "boundary": "A subscriber crosses the media/file-management boundary and writes arbitrary executable-content files into a public server directory",
+          "impact": "Arbitrary file write and potential unauthenticated follow-up code execution through the returned uploads URL",
+          "counterevidence": "The separate /mwai-ui/v1/files/upload route checks wp_check_filetype_and_ext and a REST nonce, but those controls are absent from the public API simpleFileUpload path; generated refIds prevent filename traversal but preserve the supplied extension",
+          "proof_gaps": "Confirm whether the target WordPress server executes PHP files from wp-content/uploads; arbitrary file write remains demonstrable even when execution is disabled"
+        },
+        "quality_gate": {},
+        "derived_severity": {}
+      },
+      "expected": {
+        "attribution": {
+          "hypothesis_id": "inject-b008-001",
+          "bug_class": "CWE-434",
+          "root_cause_cwe": "CWE-434",
+          "file": "classes/modules/files.php",
+          "line": 367,
+          "sink": "Attacker-named file copied into the public WordPress uploads directory",
+          "sink_code": "copy( $path, $destination )"
+        },
+        "attacker_role": "subscriber",
+        "minimum_impact": {
+          "confidentiality": "high",
+          "integrity": "high",
+          "availability": "high"
+        },
+        "allowed_oracles": [
+          "response_marker"
+        ]
+      },
+      "source_tree_sha256": "8f239b270373b2396478df591115719238af567ace8c885fdfdb615242aedabf"
+    },
+    {
+      "case_id": "wp-file-manager-cve-2020-25213",
+      "cve_id": "CVE-2020-25213",
+      "plugin_slug": "wp-file-manager",
+      "version": "6.0",
+      "mode": "confirm",
+      "hypothesis": {
+        "id": "inject-b007-001",
+        "specialist": "injection_files",
+        "bug_class": "CWE-434",
+        "entry_point": "lib/php/connector.minimal.php?cmd=upload",
+        "file": "lib/php/elFinderVolumeLocalFileSystem.class.php",
+        "line": 1037,
+        "sink": "Unauthenticated arbitrary file write into the web-addressable lib/files volume",
+        "sink_code": "file_put_contents($path, $fp, LOCK_EX)",
+        "taint_path": [
+          "Unauthenticated multipart upload to lib/php/connector.minimal.php?cmd=upload",
+          "elFinderConnector::run() reads $_GET, $_POST, and $_FILES",
+          "elFinder::exec('upload', $args)",
+          "elFinder::upload()",
+          "elFinderVolumeDriver::upload()",
+          "elFinderVolumeLocalFileSystem::_save()",
+          "file_put_contents($path, $fp, LOCK_EX)"
+        ],
+        "reasoning": "The shipped direct connector constructs and runs elFinder without WordPress authentication, a nonce, or a capability check. Its primary LocalFileSystem root is ../files/, and its upload policy denies all MIME types before allowing all MIME types, so the final deny/allow order permits arbitrary uploaded content. Request filenames and uploaded bytes flow through elFinder's upload implementation to the LocalFileSystem write. Filename validation blocks path separators and invalid names but does not establish a safe extension allowlist. An unauthenticated attacker can therefore create attacker-selected files, including PHP-named content, under the plugin's lib/files directory. This directly violates filesystem integrity; if the site's web-server configuration executes PHP in that directory, the upload also provides remote code execution and access to WordPress secrets.",
+        "confidence": "high",
+        "preconditions": "Unauthenticated network access to the shipped lib/php/connector.minimal.php script and a writable lib/files directory; PHP execution for uploaded extensions is only required for the stronger code-execution consequence.",
+        "affected_versions": "The shipped version represented by the reviewed source; the exact historical introduction and remediation range is not established by this batch.",
+        "root_cause_cwe": "CWE-434",
+        "vulnerability_type": "arbitrary_file_upload_or_write",
+        "security_outcome": {
+          "confidentiality": "high",
+          "integrity": "high",
+          "availability": "none",
+          "description": "An unauthenticated attacker can write arbitrary files into the plugin's lib/files volume; when PHP is executable there, the attacker can run server-side code and read WordPress credentials and private data."
+        },
+        "bounty_programs": [],
+        "evidence_summary": {
+          "attacker_role": "unauthenticated",
+          "source": "Multipart filename and bytes supplied to connector.minimal.php with cmd=upload",
+          "control": "No WordPress authentication, nonce, capability check, or restrictive MIME allowlist; only dotfile access and filename/path validation apply",
+          "sink": "file_put_contents($path, $fp, LOCK_EX)",
+          "reachable_path": "connector.minimal.php -> elFinderConnector::run -> elFinder::exec -> elFinder::upload -> elFinderVolumeDriver::upload -> LocalFileSystem::_save",
+          "boundary": "An unauthenticated Internet user gains write access to files inside the installed WordPress plugin tree",
+          "impact": "Arbitrary file creation and, where PHP execution is enabled in lib/files, remote code execution and disclosure of WordPress secrets",
+          "counterevidence": "The volume is confined to ../files/, dot-prefixed files are denied, upload names pass nameAccepted(), and traversal separators are rejected; however uploadAllow is array('all') and no safe-extension allowlist is configured",
+          "proof_gaps": "Confirm the deployed web server executes an uploaded PHP extension beneath wp-content/plugins/wp-file-manager/lib/files; arbitrary file creation does not depend on that runtime behavior"
+        },
+        "quality_gate": {},
+        "derived_severity": {}
+      },
+      "expected": {
+        "attribution": {
+          "hypothesis_id": "inject-b007-001",
+          "bug_class": "CWE-434",
+          "root_cause_cwe": "CWE-434",
+          "file": "lib/php/elFinderVolumeLocalFileSystem.class.php",
+          "line": 1029,
+          "sink": "Unauthenticated rename of the uploaded temporary file to the web-addressable lib/files volume, with a copy fallback",
+          "sink_code": "if (($isCmdCopy || !rename($uri, $path)) && !copy($uri, $path)) {"
+        },
+        "attacker_role": "unauthenticated",
+        "minimum_impact": {
+          "confidentiality": "none",
+          "integrity": "high",
+          "availability": "none"
+        },
+        "allowed_oracles": [
+          "file_effect"
+        ]
+      },
+      "source_tree_sha256": "9245ed645f7c95beebcfb1ee78e91d91d52bc3b71a3ad51b1c828e01c649f283"
+    },
+    {
+      "case_id": "bookingpress-cve-2022-0739",
+      "cve_id": "CVE-2022-0739",
+      "plugin_slug": "bookingpress-appointment-booking",
+      "version": "1.0.10",
+      "mode": "confirm",
+      "hypothesis": {
+        "id": "inject-b032-002",
+        "specialist": "injection_files",
+        "bug_class": "CWE-89",
+        "entry_point": "Unauthenticated POST to wp-admin/admin-ajax.php with action=bookingpress_front_get_category_services",
+        "file": "core/classes/frontend/class.bookingpress_appointment_bookings.php",
+        "line": 1166,
+        "sink": "$wpdb->get_results executes a service query containing attacker-controlled total_service SQL",
+        "sink_code": "$service_data = $wpdb->get_results( \"SELECT * FROM {$tbl_bookingpress_services} WHERE bookingpress_category_id = {$selected_category_id} {$bookingpress_search_query_where}\", ARRAY_A );",
+        "taint_path": [
+          "Unauthenticated POST total_service",
+          "sanitize_text_field($_POST['total_service'])",
+          "string construction of AND bookingpress_service_id IN ({$bookingpress_total_services})",
+          "$wpdb->get_results",
+          "JSON response containing query rows"
+        ],
+        "reasoning": "The callback is registered for wp_ajax_nopriv and accepts total_service from an unauthenticated POST. sanitize_text_field removes tags and line breaks but does not constrain the value to integer IDs or make it safe for SQL. The value is placed verbatim inside an IN clause and the resulting query is not prepared. Although the callback verifies a bpa_wp_nonce nonce, the shipped public booking-form shortcode emits that nonce into frontend JavaScript for the same AJAX action, so any visitor to a page containing the intended booking form can obtain it. Query rows are subsequently encoded into the AJAX response, giving an attacker an output channel for compatible UNION-based extraction; blind SQL expressions remain available if result-column constraints interfere.",
+        "confidence": "high",
+        "preconditions": "Unauthenticated visitor can load a publicly accessible page containing the shipped [bookingpress_form] shortcode and obtain its frontend bpa_wp_nonce",
+        "affected_versions": "1.0.10 as shipped in the reviewed source",
+        "root_cause_cwe": "CWE-89",
+        "vulnerability_type": "sql_injection",
+        "security_outcome": {
+          "confidentiality": "high",
+          "integrity": "none",
+          "availability": "none",
+          "description": "An unauthenticated visitor can execute injected SQL and extract protected information accessible to the WordPress database account."
+        },
+        "bounty_programs": [],
+        "evidence_summary": {
+          "attacker_role": "Unauthenticated visitor",
+          "source": "POST total_service supplied to bookingpress_front_get_category_services",
+          "control": "Publicly emitted nonce is verified, but total_service receives only sanitize_text_field and no numeric allowlist or prepared placeholder",
+          "sink": "Unprepared $wpdb->get_results query with an attacker-controlled IN clause",
+          "reachable_path": "public [bookingpress_form] page -> emitted bpa_wp_nonce -> nopriv AJAX callback -> sanitize_text_field -> SQL construction -> JSON response",
+          "boundary": "An anonymous frontend visitor gains the ability to query data under the WordPress database account",
+          "impact": "Disclosure of protected WordPress or BookingPress database values",
+          "counterevidence": "category_id is converted with intval and the callback rejects an invalid nonce; neither control constrains total_service, and the nonce is deliberately rendered on the public booking form",
+          "proof_gaps": "Confirm the extraction payload against the deployed database SQL mode and verify the exact UNION column mapping or blind response oracle."
+        },
+        "quality_gate": {},
+        "derived_severity": {}
+      },
+      "expected": {
+        "attribution": {
+          "hypothesis_id": "inject-b032-002",
+          "bug_class": "CWE-89",
+          "root_cause_cwe": "CWE-89",
+          "file": "core/classes/frontend/class.bookingpress_appointment_bookings.php",
+          "line": 1166,
+          "sink": "$wpdb->get_results executes a service query containing attacker-controlled total_service SQL",
+          "sink_code": "$service_data = $wpdb->get_results( \"SELECT * FROM {$tbl_bookingpress_services} WHERE bookingpress_category_id = {$selected_category_id} {$bookingpress_search_query_where}\", ARRAY_A );"
+        },
+        "attacker_role": "unauthenticated",
+        "minimum_impact": {
+          "confidentiality": "high",
+          "integrity": "none",
+          "availability": "none"
+        },
+        "allowed_oracles": [
+          "timing"
+        ]
+      },
+      "source_tree_sha256": "ecc23a1a18ea381b5fba431d9794cb8744d30b2563028a4f28f8f23f391a61a5"
+    },
+    {
+      "case_id": "document-gallery-cve-2026-12982",
+      "cve_id": "CVE-2026-12982",
+      "plugin_slug": "document-gallery",
+      "version": "5.1.0",
+      "mode": "confirm",
+      "hypothesis": {
+        "id": "xss-b002-001",
+        "specialist": "xss_lifecycle",
+        "bug_class": "CWE-79:reflected",
+        "entry_point": "POST /wp-admin/admin-ajax.php?action=dg_generate_gallery",
+        "file": "src/inc/class-gallery.php",
+        "line": 471,
+        "sink": "Unescaped gallery validation errors returned as HTML",
+        "sink_code": "return '<p>' . implode( '</p><p>', $this->errs ) . '</p>';",
+        "taint_path": [
+          "$_REQUEST['atts'] in DG_AjaxHandler::generateGallery",
+          "DocumentGallery::doShortcode",
+          "DG_Gallery::__construct",
+          "DG_Gallery::setTaxa",
+          "DG_Gallery::getTermXByNames appends an invalid term identifier to $this->errs",
+          "DG_Gallery::__toString returns the errors without HTML escaping",
+          "DG_AjaxHandler::generateGallery echoes the returned HTML"
+        ],
+        "reasoning": "Both authenticated and unauthenticated AJAX hooks invoke the complete generateGallery handler without a nonce or capability check. An attacker can submit a recognized taxonomy attribute containing a nonexistent term identifier with HTML markup. getTermXByNames interpolates that identifier into an error, and __toString places the error directly into paragraph HTML without esc_html or wp_kses. generateGallery then echoes it with a text/html content type. A cross-site form can navigate a victim to the AJAX response, making script markup execute in the site's origin rather than merely reflecting into an inert JSON response.",
+        "confidence": "medium",
+        "preconditions": "Unauthenticated attacker; the site has at least one registered taxonomy usable as an attribute, and the victim is induced to submit a nested atts POST to the public AJAX action.",
+        "affected_versions": "The shipped source in this review batch is affected; the exact historical version range is not established from the reviewed files.",
+        "root_cause_cwe": "CWE-79",
+        "vulnerability_type": "reflected_cross_site_scripting",
+        "security_outcome": {
+          "confidentiality": "high",
+          "integrity": "high",
+          "availability": "none",
+          "description": "Attacker-supplied JavaScript can execute in a victim's WordPress origin, allowing access to same-origin data available to the victim and authenticated actions performed as that victim."
+        },
+        "bounty_programs": [],
+        "evidence_summary": {
+          "attacker_role": "Unauthenticated",
+          "source": "$_REQUEST['atts'] taxonomy term value submitted to admin-ajax.php",
+          "control": "No nonce or capability check in generateGallery; taxonomy validation embeds the rejected term into an error but does not HTML-escape it",
+          "sink": "Raw $this->errs values concatenated into paragraph HTML and echoed as text/html",
+          "reachable_path": "wp_ajax_nopriv_dg_generate_gallery -> DG_AjaxHandler::generateGallery -> DocumentGallery::doShortcode -> DG_Gallery -> getTermXByNames -> __toString -> echo",
+          "boundary": "Unauthenticated input executes JavaScript in the origin of a victim visiting the crafted AJAX response",
+          "impact": "Same-origin script execution can read victim-accessible data and issue authenticated state-changing requests",
+          "counterevidence": "Known gallery parameters are parameter-specifically sanitized, and invalid taxonomy names are rejected; however, invalid term identifiers for an existing taxonomy are copied into the unescaped error HTML",
+          "proof_gaps": "Confirm in a browser that a cross-origin form encoding atts[category] with script markup reaches the invalid-term branch and that the returned top-level text/html response executes the markup."
+        },
+        "quality_gate": {},
+        "derived_severity": {}
+      },
+      "expected": {
+        "attribution": {
+          "hypothesis_id": "xss-b002-001",
+          "bug_class": "CWE-79:reflected",
+          "root_cause_cwe": "CWE-79",
+          "file": "src/inc/class-gallery.php",
+          "line": 471,
+          "sink": "Unescaped gallery validation errors returned as HTML",
+          "sink_code": "return '<p>' . implode( '</p><p>', $this->errs ) . '</p>';"
+        },
+        "attacker_role": "unauthenticated",
+        "minimum_impact": {
+          "confidentiality": "high",
+          "integrity": "high",
+          "availability": "none"
+        },
+        "allowed_oracles": [
+          "browser_execution"
+        ]
+      },
+      "source_tree_sha256": "c4da84850373513c12e06d26e864ffc7d20bc09adb3fdffe57128d33f05f4e72"
+    },
+    {
+      "case_id": "spiffy-calendar-cve-2022-29434",
+      "cve_id": "CVE-2022-29434",
+      "plugin_slug": "spiffy-calendar",
+      "version": "4.9.0",
+      "mode": "confirm",
+      "hypothesis": {
+        "id": "authz-b003-001",
+        "specialist": "authorization_workflows",
+        "bug_class": "CWE-639",
+        "entry_point": "POST /wp-admin/admin.php?page=spiffy-calendar&tab=event_edit",
+        "file": "spiffy-calendar.php",
+        "line": 905,
+        "sink": "Executes an UPDATE against the request-selected event ID",
+        "sink_code": "$db_result = $wpdb->get_results($sql);",
+        "taint_path": [
+          "POST event_id and event fields",
+          "admin_menu_output() dispatches spiffycal_settings_update_event_edit",
+          "settings_update_event_edit()",
+          "add_or_update_event()",
+          "$wpdb->get_results($sql)"
+        ],
+        "reasoning": "The administrator can use the shipped Event manager role option to grant Subscribers the read capability and can enable the shipped limit_author option, whose UI promises to limit non-administrators to their own events. The event list query then filters rows by event_author, but a Subscriber can submit another event's numeric ID directly. admin_menu_output() checks only the configurable read capability and the shared form nonce; settings_update_event_edit() and add_or_update_event() do not bind event_id to the current user. The resulting UPDATE predicate contains only event_id, allowing modification, publication, or reassignment of another user's event.",
+        "confidence": "high",
+        "preconditions": "Authenticated Subscriber; an administrator has selected Subscriber as the Event manager role and enabled the shipped 'Limit non-admins to editing their own events only' option. The Subscriber obtains the user-bound update_spiffycal_options nonce from their permitted event-management form.",
+        "affected_versions": "4.9.0",
+        "root_cause_cwe": "CWE-639",
+        "vulnerability_type": "insecure_direct_object_reference",
+        "security_outcome": {
+          "confidentiality": "none",
+          "integrity": "high",
+          "availability": "low",
+          "description": "A Subscriber can overwrite another user's calendar event, including its content, author, category, dates, and published/draft/pending status."
+        },
+        "bounty_programs": [],
+        "evidence_summary": {
+          "attacker_role": "Subscriber with the plugin's shipped Event manager role set to Subscriber",
+          "source": "POST event_id and attacker-selected event fields",
+          "control": "A valid shared form nonce and configurable read capability are checked, but no event ownership predicate protects the update",
+          "sink": "Event-table UPDATE executed through $wpdb->get_results($sql)",
+          "reachable_path": "admin.php event_edit POST -> admin_menu_output -> settings_update_event_edit -> sanitize_event_post -> add_or_update_event -> UPDATE",
+          "boundary": "The enabled limit_author workflow establishes that non-admin event managers may edit only events whose event_author is their own user ID",
+          "impact": "Cross-owner modification, publication, reassignment, or effective removal of protected event content",
+          "counterevidence": "The list query applies event_author=current user when limit_author is enabled, and the frontend delete route also checks ownership; neither check is repeated on this update path",
+          "proof_gaps": "Confirm in a WordPress runtime that a Subscriber can load the event form and submit its emitted nonce while limit_author is enabled"
+        },
+        "quality_gate": {},
+        "derived_severity": {}
+      },
+      "expected": {
+        "attribution": {
+          "hypothesis_id": "authz-b003-001",
+          "bug_class": "CWE-639",
+          "root_cause_cwe": "CWE-639",
+          "file": "spiffy-calendar.php",
+          "line": 905,
+          "sink": "Executes an UPDATE against the request-selected event ID",
+          "sink_code": "$db_result = $wpdb->get_results($sql);"
+        },
+        "attacker_role": "subscriber",
+        "minimum_impact": {
+          "confidentiality": "none",
+          "integrity": "high",
+          "availability": "none"
+        },
+        "allowed_oracles": [
+          "cross_object_access"
+        ]
+      },
+      "source_tree_sha256": "9acb8f59266e135622bca8eb6fa47b6ee4a40f30ea5279887e4598fcc7ecebe8"
+    },
+    {
+      "case_id": "vr-calendar-sync-cve-2022-2314",
+      "cve_id": "CVE-2022-2314",
+      "plugin_slug": "vr-calendar-sync",
+      "version": "2.3.1",
+      "mode": "confirm",
+      "hypothesis": {
+        "id": "authz-b001-001",
+        "specialist": "authorization_workflows",
+        "bug_class": "CWE-306",
+        "entry_point": "POST /wp-admin/admin-ajax.php with vrc_cmd=phpinfo",
+        "file": "Admin/Classes/VRCalendarAdmin.class.php",
+        "line": 88,
+        "sink": "Execution of an arbitrary zero-argument PHP callable selected by the request",
+        "sink_code": "call_user_func($callable);",
+        "taint_path": [
+          "$_REQUEST['vrc_cmd']",
+          "VRCalendarAdmin::handleCommands",
+          "sanitize_text_field and callable construction",
+          "call_user_func($callable)"
+        ],
+        "reasoning": "When the administrative singleton is initialized, its init callback accepts vrc_cmd and executes the resulting callable without a nonce, capability, callable allowlist, or authentication check. A logged-in subscriber can request the AJAX bootstrap with vrc_cmd=phpinfo; the admin menu's manage_options restriction does not protect this independent init dispatcher. sanitize_text_field constrains characters but still permits the callable name phpinfo, producing server and PHP configuration disclosure.",
+        "confidence": "medium",
+        "preconditions": "A logged-in subscriber on a default installation with plugin version 2.3.1 active; PHP's phpinfo function must not be disabled.",
+        "affected_versions": "2.3.1, as identified by the reviewed plugin header and source",
+        "root_cause_cwe": "CWE-306",
+        "vulnerability_type": "missing_authentication_for_critical_function",
+        "security_outcome": {
+          "confidentiality": "low",
+          "integrity": "none",
+          "availability": "none",
+          "description": "A subscriber can obtain PHP and server configuration information that is not ordinarily available to that role."
+        },
+        "bounty_programs": [],
+        "evidence_summary": {
+          "attacker_role": "Subscriber",
+          "source": "Request-controlled vrc_cmd value set to phpinfo",
+          "control": "No nonce, capability check, authentication check, or callable allowlist exists in the complete handleCommands function; sanitize_text_field does not reject phpinfo",
+          "sink": "call_user_func($callable) executes the selected zero-argument function",
+          "reachable_path": "admin AJAX bootstrap -> plugins_loaded -> VRCalendarAdmin::getInstance -> init -> handleCommands -> call_user_func",
+          "boundary": "A subscriber crosses the administrative configuration-disclosure boundary by invoking an arbitrary server-side callable",
+          "impact": "Disclosure of PHP version, extensions, paths, environment, and server configuration exposed by phpinfo",
+          "counterevidence": "Admin pages are registered with manage_options and the dispatcher cannot directly supply callable arguments, but neither restriction protects or prevents a zero-argument callable reached through init",
+          "proof_gaps": "Confirm in the target WordPress/PHP runtime that the authenticated admin-AJAX bootstrap reaches init with the administrative singleton loaded and that phpinfo is enabled"
+        },
+        "quality_gate": {},
+        "derived_severity": {}
+      },
+      "expected": {
+        "attribution": {
+          "hypothesis_id": "authz-b001-001",
+          "bug_class": "CWE-306",
+          "root_cause_cwe": "CWE-306",
+          "file": "Admin/Classes/VRCalendarAdmin.class.php",
+          "line": 88,
+          "sink": "Execution of an arbitrary zero-argument PHP callable selected by the request",
+          "sink_code": "call_user_func($callable);"
+        },
+        "attacker_role": "subscriber",
+        "minimum_impact": {
+          "confidentiality": "low",
+          "integrity": "none",
+          "availability": "none"
+        },
+        "allowed_oracles": [
+          "authorization"
+        ]
+      },
+      "source_tree_sha256": "04174ef0849f160c3301333f5a8ff05b480c2acf7cf0d1208e3a6e039755d7d7",
+      "notes": "Preserves the historical CWE-306 baseline without relaxing it to another CWE."
+    },
+    {
+      "case_id": "iwp-client-cve-2020-8772",
+      "cve_id": "CVE-2020-8772",
+      "plugin_slug": "iwp-client",
+      "version": "1.9.4.4",
+      "mode": "confirm",
+      "hypothesis": {
+        "id": "authn-b006-002",
+        "specialist": "authentication",
+        "bug_class": "CWE-287",
+        "entry_point": "top-level raw-body iwp_remote_request with iwp_action add_site or readd_site",
+        "file": "init.php",
+        "line": 269,
+        "sink": "WordPress authentication cookie creation for the attacker-selected administrator",
+        "sink_code": "wp_set_auth_cookie($user->ID);",
+        "taint_path": [
+          "unauthenticated raw JSON params.username and iwp_action",
+          "iwp_mmb_parse_request() stores pre-authentication add_site/readd_site params in $iwp_mmb_core->request_params",
+          "setup_theme invokes iwp_mmb_set_request() before iwp_mmb_add_readd_request()",
+          "wp_set_auth_cookie($user->ID)"
+        ],
+        "reasoning": "iwp_mmb_parse_request() checks only that params.username identifies an administrator, then the add_site and readd_site branches return before authenticate_message() and preserve the request in shared request_params state. The constructor registers iwp_mmb_set_request() on setup_theme before iwp_mmb_add_readd_request() at the same default priority. Consequently, iwp_mmb_set_request() consumes the unauthenticated onboarding state first, selects the supplied administrator, and establishes current-user and authentication-cookie state. Only afterward does iwp_mmb_add_readd_request() validate the activation key or onboarding signature. A later error response does not revoke the cookies already emitted.",
+        "confidence": "high",
+        "preconditions": "Unauthenticated attacker; InfiniteWP Client 1.9.4.4 is active in its shipped configuration, and the attacker knows the login name of an existing administrator. No valid activation key or panel signature is required for the authentication transition.",
+        "affected_versions": "Confirmed in the reviewed InfiniteWP Client 1.9.4.4 source",
+        "root_cause_cwe": "CWE-287",
+        "vulnerability_type": "authentication_bypass",
+        "security_outcome": {
+          "confidentiality": "high",
+          "integrity": "high",
+          "availability": "none",
+          "description": "An unauthenticated attacker obtains a WordPress administrator session, allowing access to protected data and arbitrary administrator actions."
+        },
+        "bounty_programs": [],
+        "evidence_summary": {
+          "attacker_role": "unauthenticated",
+          "source": "raw JSON iwp_action add_site/readd_site and params.username naming an administrator",
+          "control": "check_if_user_exists() validates the target role but does not authenticate the requester; onboarding authentication runs in a later callback",
+          "sink": "wp_set_current_user() followed by wp_set_auth_cookie() for the selected administrator",
+          "reachable_path": "top-level iwp_mmb_parse_request() -> pre-auth add_site/readd_site return -> shared request_params -> setup_theme iwp_mmb_set_request() -> authentication cookie",
+          "boundary": "anonymous onboarding traffic crosses into an authenticated WordPress administrator session",
+          "impact": "administrator account takeover with protected-data access and privileged write capabilities",
+          "counterevidence": "iwp_mmb_add_site() and iwp_mmb_readd_site() later check an activation key and signatures, but their setup_theme consumer is registered after the cookie-setting consumer",
+          "proof_gaps": "Confirm in a WordPress runtime that the setup_theme response preserves the Set-Cookie headers when the later onboarding callback exits with an invalid-activation-key response"
+        },
+        "quality_gate": {},
+        "derived_severity": {}
+      },
+      "expected": {
+        "attribution": {
+          "hypothesis_id": "authn-b006-002",
+          "bug_class": "CWE-287",
+          "root_cause_cwe": "CWE-287",
+          "file": "init.php",
+          "line": 269,
+          "sink": "WordPress authentication cookie creation for the attacker-selected administrator",
+          "sink_code": "wp_set_auth_cookie($user->ID);"
+        },
+        "attacker_role": "unauthenticated",
+        "minimum_impact": {
+          "confidentiality": "high",
+          "integrity": "none",
+          "availability": "none"
+        },
+        "allowed_oracles": [
+          "authorization"
+        ]
+      },
+      "source_tree_sha256": "36c4fa84016ccd6d67c1c4d8f363cda0deb561761ec75b67fb103b2bf84037ac"
+    },
+    {
+      "case_id": "getwid-cve-2023-1895",
+      "cve_id": "CVE-2023-1895",
+      "plugin_slug": "getwid",
+      "version": "1.8.3",
+      "mode": "confirm",
+      "hypothesis": {
+        "id": "authz-b015-001",
+        "specialist": "injection_files",
+        "bug_class": "CWE-918",
+        "entry_point": "GET /wp-json/getwid/v1/get_remote_content",
+        "file": "includes/rest-api.php",
+        "line": 213,
+        "sink": "Server-side HTTP GET to a request-controlled URL",
+        "sink_code": "$response = wp_remote_get(\n\t\t\t$get_content_url,\n\t\t\tarray(\n\t\t\t\t'timeout' => 15,\n\t\t\t\t)\n\t\t);",
+        "taint_path": [
+          "GET get_content_url",
+          "esc_url_raw( $_GET['get_content_url'] )",
+          "RestAPI::get_remote_content",
+          "wp_remote_get( $get_content_url )",
+          "decoded response returned through REST"
+        ],
+        "reasoning": "The route authorizes every logged-in user with the default read capability, including Subscribers. The callback accepts an arbitrary URL, applies only URL syntax sanitization, performs a server-side request with wp_remote_get rather than a safe-request API or host/private-address allowlist, decodes the response, and returns valid JSON to the caller. A Subscriber can therefore make the WordPress server query loopback or private-network JSON services and receive data that is not directly reachable from the attacker. REST cookie authentication and its user-bound nonce establish the Subscriber's identity and intent but do not authorize access to server-local network resources.",
+        "confidence": "high",
+        "preconditions": "A default logged-in Subscriber with a valid REST nonce; the WordPress host can reach a loopback or private-network endpoint that returns valid JSON. No administrator security control needs to be weakened.",
+        "affected_versions": "Getwid 1.8.3",
+        "root_cause_cwe": "CWE-918",
+        "vulnerability_type": "server_side_request_forgery",
+        "security_outcome": {
+          "confidentiality": "low",
+          "integrity": "none",
+          "availability": "none",
+          "description": "A Subscriber can read valid-JSON responses from HTTP services reachable by the WordPress server but not directly reachable from the attacker."
+        },
+        "bounty_programs": [],
+        "evidence_summary": {
+          "attacker_role": "Subscriber with the default read capability",
+          "source": "The get_content_url query parameter on GET /getwid/v1/get_remote_content",
+          "control": "permissions_check requires only current_user_can('read'); esc_url_raw validates URL syntax but does not restrict hosts or private addresses",
+          "sink": "wp_remote_get($get_content_url), followed by JSON decoding and return through REST",
+          "reachable_path": "REST registration -> permissions_check -> get_remote_content -> esc_url_raw -> wp_remote_get -> wp_remote_retrieve_body -> json_decode -> REST response",
+          "boundary": "A low-privilege user crosses from ordinary authenticated REST access into the server's loopback/private network reachability",
+          "impact": "Disclosure of valid-JSON data from an internal or server-local HTTP service",
+          "counterevidence": "The route is not anonymous, requires read, sanitizes the URL, and exposes only responses that decode as JSON; however, it has no scheme/host allowlist, private-address rejection, or stronger editor/administrator capability",
+          "proof_gaps": "Confirm in the sandbox that the WordPress HTTP transport can reach a test loopback/private endpoint and that its valid JSON body is preserved in the REST response"
+        },
+        "quality_gate": {},
+        "derived_severity": {}
+      },
+      "expected": {
+        "attribution": {
+          "hypothesis_id": "authz-b015-001",
+          "bug_class": "CWE-918",
+          "root_cause_cwe": "CWE-918",
+          "file": "includes/rest-api.php",
+          "line": 213,
+          "sink": "Server-side HTTP GET to a request-controlled URL",
+          "sink_code": "$response = wp_remote_get(\n\t\t\t$get_content_url,\n\t\t\tarray(\n\t\t\t\t'timeout' => 15,\n\t\t\t\t)\n\t\t);"
+        },
+        "attacker_role": "subscriber",
+        "minimum_impact": {
+          "confidentiality": "low",
+          "integrity": "none",
+          "availability": "none"
+        },
+        "allowed_oracles": [
+          "response_marker"
+        ]
+      },
+      "source_tree_sha256": "bbfe273d4b62b815243b29607459853e76344f85cda528324a6bac157b554d4e"
+    }
+  ]
+}

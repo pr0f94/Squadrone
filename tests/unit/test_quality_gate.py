@@ -16,6 +16,7 @@ from squadrone.schemas import (
     TriagedArtifact,
 )
 from squadrone.schemas.config import PipelineConfig
+from squadrone.services import quality_gate as quality_gate_service
 from squadrone.services.budget import BudgetTracker
 from squadrone.services.quality_gate import (
     apply_quality_gate,
@@ -25,6 +26,7 @@ from squadrone.services.quality_gate import (
     reconcile_verified_impact,
     recompute_severity,
     severity_from_finding,
+    validate_php_object_natural_finding_confirmation,
 )
 from squadrone.stages import report as report_stage
 
@@ -117,6 +119,174 @@ def _confirmed_finding(*, dedup_status: DedupStatus = DedupStatus.NOVEL) -> Find
     )
 
 
+def _natural_cwe502_finding(
+    *, effect_binding_kind: str = "direct_path"
+) -> Finding:
+    source = _hypothesis()
+    hypothesis = _hypothesis(
+        bug_class=BugClass.PHP_OBJECT_INJECTION,
+        security_outcome=SecurityOutcome(
+            integrity="low",
+            description="Deletion of a verifier-owned temporary file.",
+        ),
+        evidence_summary={
+            **source.evidence_summary,
+            "usable_gadget": True,
+            "impact": "Deletion of a verifier-owned temporary file.",
+        },
+    )
+    target_path_sha256 = "11" * 32
+    target_content_sha256 = "22" * 32
+    recipe_sha256 = "33" * 32
+    transport_sha256 = "44" * 32
+    snapshot = {
+        "effect_binding_kind": effect_binding_kind,
+        "target_path_sha256": target_path_sha256,
+        "target_content_sha256": target_content_sha256,
+        "runtime_binding": {
+            "effect_binding_kind": effect_binding_kind,
+            "recipe_sha256": recipe_sha256,
+        },
+        "transport_attestation": {
+            "transport_contract_sha256": transport_sha256,
+            "actor_role": "unauthenticated",
+        },
+    }
+    observation = {
+        "schema_version": 1,
+        "verdict": "vulnerable",
+        "oracle": "file_effect",
+        "attacker_role": "unauthenticated",
+        "request": {
+            "method": "POST",
+            "url": "http://localhost/wp-admin/admin-ajax.php",
+            "transport_contract_sha256": transport_sha256,
+        },
+        "attack": {
+            "observed": True,
+            "effect": "verifier_owned_temporary_file_deleted",
+            "target_path_sha256": target_path_sha256,
+            "target_content_sha256": target_content_sha256,
+            "source_recipe_sha256": recipe_sha256,
+            "collateral_paths_unchanged": True,
+        },
+        "control": {
+            "observed": False,
+            "effect": "verifier_owned_temporary_file_deleted",
+            "target_path_sha256": target_path_sha256,
+            "target_content_sha256": target_content_sha256,
+            "source_recipe_sha256": recipe_sha256,
+            "target_preserved": True,
+        },
+        "impact": {
+            "confidentiality": "none",
+            "integrity": "low",
+            "availability": "none",
+            "description": "Deletion of a verifier-owned temporary file.",
+        },
+    }
+    fingerprint = {
+        "method": "POST",
+        "route": "/wp-admin/admin-ajax.php",
+        "object_field": "company",
+        "object_location": "form",
+        "dispatch": {"form:action": "donate"},
+    }
+    primitive_observation = {
+        "schema_version": 1,
+        "verdict": "vulnerable",
+        "oracle": "object_instantiation",
+        "attacker_role": "unauthenticated",
+        "request": {
+            "method": "POST",
+            "url": "http://localhost/wp-admin/admin-ajax.php",
+        },
+        "attack": {
+            "observed": True,
+            "instantiated": True,
+            "effect": "verifier_inert_canary_wakeup",
+            "attacker_user_id": 0,
+            "identity_verified": True,
+            "request_fingerprint": fingerprint,
+        },
+        "control": {
+            "observed": False,
+            "instantiated": False,
+            "effect": "verifier_inert_canary_wakeup",
+            "attacker_user_id": 0,
+            "identity_verified": True,
+            "request_fingerprint": fingerprint,
+        },
+        "impact": {
+            "confidentiality": "none",
+            "integrity": "low",
+            "availability": "none",
+            "description": "Verifier-owned inert object instantiation only.",
+        },
+    }
+    script = "natural-poc.py"
+    return Finding(
+        id="f-natural",
+        hypothesis=hypothesis,
+        poc_status=PoCStatus.SUCCESS,
+        poc_script_path=script,
+        poc_attempts=[
+            PoCAttempt(
+                iteration=1,
+                phase="attack",
+                proof_kind="php_object_primitive",
+                script_path=script,
+                result=PoCStatus.SUCCESS,
+                observation=primitive_observation,
+            ),
+            PoCAttempt(
+                iteration=1,
+                phase="confirmation",
+                proof_kind="php_object_primitive",
+                script_path=script,
+                result=PoCStatus.SUCCESS,
+                observation=primitive_observation,
+            ),
+            PoCAttempt(
+                iteration=1,
+                phase="attack",
+                proof_kind="php_object_natural",
+                script_path=script,
+                result=PoCStatus.SUCCESS,
+                observation=observation,
+            ),
+            PoCAttempt(
+                iteration=1,
+                phase="confirmation",
+                proof_kind="php_object_natural",
+                script_path=script,
+                result=PoCStatus.SUCCESS,
+                observation=observation,
+            ),
+        ],
+        evidence={
+            "clean_state_restored": True,
+            "confirmation_run": {"observation": observation},
+            "php_object_natural_confirmation": {
+                "schema_version": 1,
+                "status": "confirmed",
+                "proof_kind": "php_object_natural",
+                "hypothesis_id": hypothesis.id,
+                "bug_class": "CWE-502",
+                "effect": "file_delete",
+                "clean_state_executions": 2,
+                "finding_promoted": True,
+                "promotion_policy": "source_bound_natural_gadget_v1",
+                "first_execution": dict(snapshot),
+                "confirmation_execution": dict(snapshot),
+            },
+        },
+        confidence_runs=2,
+        dedup_status=DedupStatus.NOVEL,
+        dedup_matches=[],
+    )
+
+
 def test_quality_gate_accepts_source_grounded_cia_candidate_without_guessing_cvss():
     grade = grade_hypothesis(_hypothesis())
 
@@ -169,6 +339,20 @@ def test_quality_gate_rejects_missing_concrete_cia_impact():
     assert grade.accepted is False
     assert "missing_concrete_cia_impact" in grade.rules
     assert "cosmetic_or_no_security_impact" in grade.rules
+
+
+def test_quality_gate_preserves_structured_usable_gadget_evidence():
+    evidence = dict(_hypothesis().evidence_summary)
+    evidence["usable_gadget"] = False
+
+    grade = grade_hypothesis(
+        _hypothesis(
+            bug_class=BugClass.PHP_OBJECT_INJECTION,
+            evidence_summary=evidence,
+        )
+    )
+
+    assert grade.evidence["usable_gadget"] is False
 
 
 @pytest.mark.parametrize(
@@ -515,6 +699,129 @@ def test_confirmed_finding_gets_cvss31_score_and_vector():
 
     assert severity["cvss_vector"] == "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
     assert severity["cvss_estimate"] == 9.8
+
+
+def test_cwe502_direct_natural_proof_unlocks_verified_impact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    finding = _natural_cwe502_finding()
+    calls: list[tuple[object, str | None]] = []
+
+    def validate(payload: object, *, hypothesis_id: str | None = None):
+        calls.append((payload, hypothesis_id))
+        return True, "valid persisted proof"
+
+    monkeypatch.setattr(
+        quality_gate_service,
+        "validate_persisted_php_object_gadget_confirmation",
+        validate,
+    )
+
+    accepted, reason = validate_php_object_natural_finding_confirmation(finding)
+    impact = reconcile_verified_impact(finding)
+    grade = grade_finding_for_report(finding)
+
+    assert accepted is True, reason
+    assert calls and all(call[1] == finding.hypothesis.id for call in calls)
+    assert impact == CIAImpact(
+        integrity="low",
+        description="Deletion of a verifier-owned temporary file.",
+    )
+    assert grade.accepted is True
+
+
+def test_cwe502_without_persisted_natural_proof_has_no_verified_impact() -> None:
+    finding = _natural_cwe502_finding()
+    del finding.evidence["php_object_natural_confirmation"]
+
+    assert reconcile_verified_impact(finding) is None
+    grade = grade_finding_for_report(finding)
+    assert grade.accepted is False
+    assert "php_object_natural_confirmation_missing" in grade.rules
+
+
+def test_cwe502_prefix_only_natural_proof_cannot_promote_full_finding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    finding = _natural_cwe502_finding(
+        effect_binding_kind="guarded_opaque_prefix"
+    )
+    monkeypatch.setattr(
+        quality_gate_service,
+        "validate_persisted_php_object_gadget_confirmation",
+        lambda _payload, *, hypothesis_id=None: (True, "valid lower-tier proof"),
+    )
+
+    accepted, reason = validate_php_object_natural_finding_confirmation(finding)
+
+    assert accepted is False
+    assert "direct-path" in reason
+    assert reconcile_verified_impact(finding) is None
+
+
+def test_cwe502_natural_attempts_must_be_successful_paired_and_same_script(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    finding = _natural_cwe502_finding()
+    next(
+        attempt
+        for attempt in finding.poc_attempts
+        if attempt.proof_kind == "php_object_natural"
+        and attempt.phase == "confirmation"
+    ).script_path = "different.py"
+    monkeypatch.setattr(
+        quality_gate_service,
+        "validate_persisted_php_object_gadget_confirmation",
+        lambda _payload, *, hypothesis_id=None: (True, "valid runtime proof"),
+    )
+
+    accepted, reason = validate_php_object_natural_finding_confirmation(finding)
+
+    assert accepted is False
+    assert "promoted script" in reason
+
+
+def test_cwe502_requires_unambiguous_bounded_primitive_pair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    finding = _natural_cwe502_finding()
+    primitive_confirmation = next(
+        attempt
+        for attempt in finding.poc_attempts
+        if attempt.proof_kind == "php_object_primitive"
+        and attempt.phase == "confirmation"
+    )
+    primitive_confirmation.observation = None
+    monkeypatch.setattr(
+        quality_gate_service,
+        "validate_persisted_php_object_gadget_confirmation",
+        lambda _payload, *, hypothesis_id=None: (True, "valid runtime proof"),
+    )
+
+    accepted, reason = validate_php_object_natural_finding_confirmation(finding)
+
+    assert accepted is False
+    assert "bounded to inert instantiation" in reason
+
+
+def test_cwe502_observation_must_match_parent_snapshot_and_bounded_impact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    finding = _natural_cwe502_finding()
+    observation = finding.evidence["confirmation_run"]["observation"]
+    observation["attack"]["target_path_sha256"] = "99" * 32
+    observation["impact"]["integrity"] = "high"
+    monkeypatch.setattr(
+        quality_gate_service,
+        "validate_persisted_php_object_gadget_confirmation",
+        lambda _payload, *, hypothesis_id=None: (True, "valid runtime proof"),
+    )
+
+    accepted, reason = validate_php_object_natural_finding_confirmation(finding)
+
+    assert accepted is False
+    assert "parent-attested" in reason
+    assert reconcile_verified_impact(finding) is None
 
 
 def test_confirmed_impact_replaces_broader_source_only_cia_claim():

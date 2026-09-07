@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from squadrone.agents import _specialist_base as specialist_base
-from squadrone.agents.critic import CriticAgent
+from squadrone.agents.critic import CriticAgent, _evidence_contract_payload
 from squadrone.schemas import (
     BugClass,
     Confidence,
@@ -41,17 +41,22 @@ from squadrone.stages.hypothesis import (
     _canonicalize_batch_hypotheses,
     _pre_verifier_dedup,
     _reconcile_batch_coverage,
+    _retry_progress_context,
 )
 from squadrone.stages import hypothesis as hypothesis_stage
 from squadrone.stages.triage import _validate_critic_accounting
 from squadrone.services.budget import BudgetTracker
 
 
-def _hypothesis(hypothesis_id: str = "h-1", line: int = 10) -> Hypothesis:
+def _hypothesis(
+    hypothesis_id: str = "h-1",
+    line: int = 10,
+    bug_class: BugClass = BugClass.IDOR,
+) -> Hypothesis:
     return Hypothesis(
         id=hypothesis_id,
         specialist="authorization_workflows",
-        bug_class=BugClass.IDOR,
+        bug_class=bug_class,
         entry_point="wp_ajax_demo",
         file="demo.php",
         line=line,
@@ -163,6 +168,137 @@ def test_injection_prompt_traces_read_streams_to_responses():
     assert "attacker-visible response sink" in prompt
 
 
+def test_injection_prompt_traces_implicit_metadata_deserialization_narrowly():
+    prompt = " ".join(load_prompt("specialists/injection_files").split())
+    idioms = " ".join(load_prompt("_wp_idioms").split())
+
+    assert "assigned `implicit_deserialization` operation" in prompt
+    assert "low-level raw database write" in prompt
+    assert "Bind the metadata type, object ID, and key" in prompt
+    assert "server-generated object ID is not counterevidence" in prompt
+    assert "attacker control is over the serialized value" in prompt
+    assert "paired raw insert and same-model high-level read or update" in prompt
+    assert "before exploring unrelated tables, migrations, or gadget code" in prompt
+    assert "every realistic external assignment" in prompt
+    assert "current and legacy public handlers coexist" in prompt
+    assert "not an explicit PHP-serialization rejection" in prompt
+    assert "exact transformation makes `is_serialized()` false" in prompt
+    assert "classes with `__wakeup`, `__unserialize`, `__destruct`" in prompt
+    assert "loaded or autoloadable" in prompt
+    assert "serialized properties and their visibility encoding" in prompt
+    assert "path/prefix constraints" in prompt
+    assert "`evidence_summary.usable_gadget`" in prompt
+    assert "verifier-owned canary class" in prompt
+    assert "during `update_metadata()` processing" in prompt
+    assert "WordPress core is intentionally outside" in prompt
+    assert "`$prev_value` can be empty" in prompt
+    assert "usable gadget chain" in prompt
+    assert "Normal metadata API writes" in prompt
+    assert "tuple mismatch between the raw write and later access" in prompt
+    assert "implicit deserialization boundary" in idioms
+    assert "when `$prev_value` is empty" in idioms
+    assert "calls unrestricted `unserialize()`" in idioms
+    assert "does not require a WordPress-core file" in idioms
+    assert "definitely non-empty `$prev_value`" in idioms
+    assert "attacker need control only the serialized value" in idioms
+    assert "runs in the same workflow" in idioms
+    assert "not by itself a PHP-serialization allowlist" in idioms
+    assert "no embedded-NUL rejection" in idioms
+    assert "PHP decodes `%HH` before populating `$_POST`" in idioms
+    assert "serialized protected or private property names" in idioms
+    assert "serialized byte lengths still match" in idioms
+    assert "alternate current and legacy public callers" in idioms
+    assert "serialize non-scalar values before storage" in idioms
+
+
+def test_shared_rules_expose_unreviewed_for_incomplete_forced_finalization():
+    prompt = " ".join(load_prompt("specialists/_shared_rules").split())
+
+    assert "candidate | reviewed | unreachable | unreviewed" in prompt
+    assert "If forced finalization leaves source or reachability unresolved" in prompt
+    assert "never convert an incomplete trace" in prompt
+    assert "`prior_incomplete_review` is non-authoritative progress" in prompt
+    assert "Continue its concrete proof gaps and check alternate callers" in prompt
+
+
+def test_critic_applies_verified_implicit_metadata_contract():
+    prompt = " ".join(load_prompt("critic").split())
+
+    assert "when `$prev_value` is empty" in prompt
+    assert "applies `maybe_unserialize()`" in prompt
+    assert "Do not require a WordPress core file" in prompt
+    assert "fixed key or server-generated object ID binds the record" in prompt
+    assert "definitely non-empty `$prev_value`" in prompt
+    assert "trusted taxonomy evidence contract" in prompt
+    assert "exact JSON type and value" in prompt
+    assert "do not preserve or copy a specialist assertion" in prompt
+    assert "missing or unrecognized contract" in prompt
+    assert "manual_review_only" in prompt
+    assert "CWE-502" not in prompt
+    assert "evidence_summary.usable_gadget" not in prompt
+
+
+def test_critic_renders_exact_cwe502_contract_only_for_matching_candidates():
+    php_object = _hypothesis(
+        "object-candidate",
+        bug_class=BugClass.PHP_OBJECT_INJECTION,
+    )
+    ordinary = _hypothesis("idor-candidate")
+
+    payload = _evidence_contract_payload(
+        HypothesesArtifact(
+            plugin_slug="demo",
+            hypotheses=[ordinary, php_object],
+        )
+    )
+
+    contracts = {
+        contract["bug_class"]: contract for contract in payload["contracts"]
+    }
+    object_contract = contracts["CWE-502"]
+    assert object_contract["acceptance_mode"] == "source_review"
+    assert object_contract["required_evidence"] == [
+        {
+            "path": "evidence_summary.usable_gadget",
+            "json_type": "boolean",
+            "required_value": True,
+            "source_requirement": (
+                "The independently reviewed shipped-source chain establishes a "
+                "reachable usable gadget and concrete side effect."
+            ),
+        }
+    ]
+    assert contracts["CWE-639"]["required_evidence"] == []
+    assert "usable_gadget" not in json.dumps(contracts["CWE-639"])
+
+
+def test_critic_open_cwe_contract_is_explicitly_manual_and_fail_closed():
+    open_candidate = _hypothesis(
+        "open-candidate",
+        bug_class=BugClass("CWE-1234"),
+    )
+
+    payload = _evidence_contract_payload(
+        HypothesesArtifact(plugin_slug="demo", hypotheses=[open_candidate])
+    )
+
+    assert payload["contracts"] == [
+        {
+            "bug_class": "CWE-1234",
+            "family": "open_unmapped",
+            "contract_source": "open_cwe_fallback",
+            "acceptance_mode": "manual_review_only",
+            "acceptance_requirements": [
+                "No reviewed family-specific evidence contract exists for this "
+                "canonical open CWE. Apply the shared source-validity checks, but "
+                "route a surviving candidate to manual_review instead of accepted."
+            ],
+            "required_evidence": [],
+            "non_evidence": [],
+        }
+    ]
+
+
 def test_injection_prompt_anchors_file_uploads_at_the_write_operation():
     prompt = " ".join(load_prompt("specialists/injection_files").split())
 
@@ -174,6 +310,109 @@ def test_injection_prompt_anchors_file_uploads_at_the_write_operation():
     assert "impact evidence" in prompt
     assert "do not substitute it for the primary upload/write anchor" in prompt
     assert "record that as a proof gap" in prompt
+
+
+def test_injection_prompt_uses_php_include_resolution_not_filesystem_prechecks():
+    prompt = " ".join(load_prompt("specialists/injection_files").split())
+
+    assert "fixed filename prefix" in prompt
+    assert "`.php` suffix" in prompt
+    assert "file_exists" in prompt
+    assert "realpath" in prompt
+    assert "stream_resolve_include_path" in prompt
+    assert "strict finite allowlist" in prompt
+    assert "canonical post-resolution containment check" in prompt
+    assert "Classify request-controlled directory escape" in prompt
+    assert "CWE-22" in prompt
+    assert "synthetic `view-..` component is not a real directory" in prompt
+    assert "following `/..` lexically cancels" in prompt
+    assert "Do not require a directory or symlink" in prompt
+
+
+def test_developer_consult_uses_php_include_semantics_not_directory_intuition():
+    prompt = " ".join(load_prompt("developer").split())
+
+    assert "PHP virtual-CWD resolution" in prompt
+    assert "file_exists" in prompt
+    assert "synthetic `view-..` component" in prompt
+    assert "without any real directory or symlink" in prompt
+    assert "fixed prefix or `.php` suffix" in prompt
+    assert "ordinary filesystem intuition" in prompt
+    assert "isolated runtime verification" in prompt
+
+
+def test_injection_prompt_separates_file_inclusion_from_file_write_chain():
+    prompt = " ".join(load_prompt("specialists/injection_files").split())
+
+    assert "file-inclusion primitive separate" in prompt
+    assert "without requiring the same component" in prompt
+    assert "upload or arbitrary-byte-write primitive" in prompt
+    assert "condition on maximum code-execution impact" in prompt
+    assert "do not claim attacker-planted code execution" in prompt
+    assert "negative control" in prompt
+
+
+def test_critic_rechecks_php_include_resolution_before_rejecting_fixed_prefix():
+    prompt = " ".join(load_prompt("critic").split())
+
+    assert "exact completed path under PHP include-path semantics" in prompt
+    assert "fixed filename prefix or suffix" in prompt
+    assert "is not containment proof" in prompt
+    assert "strict finite allowlist" in prompt
+    assert "no file-write primitive" in prompt
+    assert "conditional amplification" in prompt
+
+
+def test_critic_does_not_treat_discarded_body_as_php_include_containment():
+    prompt = " ".join(load_prompt("critic").split())
+
+    assert "response-body suppression is not proof" in prompt
+    assert "cannot undo code that PHP already executed at the include site" in prompt
+    assert "headers, termination, and other behavior may survive" in prompt
+    assert "even when emitted body bytes do not" in prompt
+    assert "keep the candidate for sandbox verification" in prompt
+    assert "useful body-emitting shipped target" in prompt
+
+
+def test_critic_constrains_blind_php_include_claim_and_requires_strict_proof():
+    prompt = " ".join(load_prompt("critic").split())
+
+    assert "request-selected inclusion primitive" in prompt
+    assert "`confidentiality=low`" in prompt
+    assert "`integrity=none`" in prompt
+    assert "`availability=none`" in prompt
+    assert "input hypothesis that already limits itself" in prompt
+    assert "do not silently rewrite an overclaimed high-impact or RCE" in prompt
+    assert "Do not infer arbitrary protected-file disclosure" in prompt
+    assert "attacker-planted code execution, or RCE" in prompt
+    assert "exact source-derived request route and field" in prompt
+    assert "verifier-owned PHP canary" in prompt
+    assert "response receipt is bound to the attack trace and actor" in prompt
+    assert "absent sibling control" in prompt
+    assert "clean-state replay with a fresh private marker" in prompt
+    assert "if that sandbox proof fails" in prompt
+
+
+def test_injection_prompt_audits_request_selected_public_method_dispatch():
+    prompt = " ".join(load_prompt("specialists/injection_files").split())
+
+    assert "request-selected method dispatch as an alternate caller" in prompt
+    assert "is_callable([$object, $method])" in prompt
+    assert "$object->$method()" in prompt
+    assert "every compatible public method" in prompt
+    assert "static call graph has no edge" in prompt
+    assert "hook/route registration" in prompt
+    assert "normal admin-menu or UI caller" in prompt
+    assert "dominates that dispatcher-to-method path" in prompt
+
+
+def test_critic_rechecks_dynamic_dispatch_before_accepting_admin_only_rejection():
+    prompt = " ".join(load_prompt("critic").split())
+
+    assert "request-selected method dispatch" in prompt
+    assert "do not rely only on explicit static call edges" in prompt
+    assert "compatible public methods" in prompt
+    assert "separate low-privilege dispatcher-to-method path" in prompt
 
 
 def test_injection_prompt_separates_query_safety_from_object_authorization():
@@ -222,7 +461,10 @@ def test_authorization_prompts_distinguish_object_ownership_from_attribute_autho
     assert "CWE-915" in normalized
 
 
-@pytest.mark.parametrize("prompt_name", ["developer_setup", "developer_setup_followup"])
+@pytest.mark.parametrize(
+    "prompt_name",
+    ["developer_setup", "developer_setup_followup", "developer_setup_requested"],
+)
 def test_setup_prompts_do_not_misstate_plugin_activation_identity(prompt_name: str):
     prompt = " ".join(load_prompt(prompt_name).split())
 
@@ -279,6 +521,103 @@ def test_default_review_areas_are_four_fixed_owners():
     ]
 
 
+def test_hypothesis_review_areas_filter_reviewers_in_fixed_order():
+    reviewers = hypothesis_stage._build_specialists(
+        _Runtime(),
+        "test-model",
+        ["xss_lifecycle", "injection_files"],
+    )
+
+    assert [reviewer.NAME for reviewer in reviewers] == [
+        "injection_files",
+        "xss_lifecycle",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_hypothesis_review_item_types_filter_targets_and_dispositions(
+    monkeypatch, tmp_path
+):
+    selected = CoverageItem(
+        id="cov-deserialization",
+        kind="sink",
+        review_areas=["injection_files"],
+        type="deserialization",
+        name="unserialize",
+        file="demo.php",
+        line=2,
+        snippet="unserialize($value);",
+    )
+    excluded = selected.model_copy(
+        update={
+            "id": "cov-sql-query",
+            "type": "sql_query",
+            "name": "$wpdb->query",
+            "line": 3,
+            "snippet": "$wpdb->query($sql);",
+        }
+    )
+    recon = _recon().model_copy(
+        update={"coverage": CoverageArtifact(items=[selected, excluded])}
+    )
+    (tmp_path / "demo.php").write_text("<?php\nunserialize($value);\n")
+
+    class FakeSpecialist:
+        NAME = "injection_files"
+
+        def __init__(self) -> None:
+            self.seen: list[CoverageItem] = []
+
+        async def analyze(self, *_args, coverage_targets, **_kwargs):
+            self.seen.extend(coverage_targets)
+            return SpecialistReviewArtifact(
+                hypotheses=[],
+                coverage=[
+                    CoverageDisposition(
+                        item_id=target.id,
+                        reviewer=self.NAME,
+                        status="reviewed",
+                        reason="Exact source target reviewed without a candidate.",
+                        evidence_locations=[f"{target.file}:{target.line}"],
+                    )
+                    for target in coverage_targets
+                ],
+            )
+
+    async def fake_verify(_verifier, hypotheses, _plugin_path):
+        assert hypotheses == []
+        return []
+
+    specialist = FakeSpecialist()
+    monkeypatch.setattr(
+        hypothesis_stage, "_build_specialists", lambda *_args: [specialist]
+    )
+    monkeypatch.setattr(hypothesis_stage, "_verify_hypotheses", fake_verify)
+    config = PipelineConfig.from_yaml("pipelines/test.yaml")
+    config.hypothesis_review_item_types = ["deserialization"]
+    runs_root = tmp_path / "runs"
+
+    artifact = await hypothesis_stage.run(
+        recon,
+        str(tmp_path),
+        config,
+        BudgetTracker(10.0),
+        SimpleNamespace(),
+        runs_root=str(runs_root),
+        run_id="focused-items",
+    )
+
+    assert artifact.hypotheses == []
+    assert [target.id for target in specialist.seen] == [selected.id]
+    assert recon.coverage is not None
+    assert [item.item_id for item in recon.coverage.dispositions] == [selected.id]
+    persisted = CoverageArtifact.model_validate_json(
+        (runs_root / "focused-items" / "coverage.json").read_text()
+    )
+    assert [item.id for item in persisted.items] == [selected.id, excluded.id]
+    assert [item.item_id for item in persisted.dispositions] == [selected.id]
+
+
 def test_critic_slice_is_centered_on_emitted_location_not_file_prefix(tmp_path):
     lines = [f"line {number}" for number in range(1, 901)]
     lines[749] = "get_post_meta($_GET['id'], '_secret', true);"
@@ -305,6 +644,29 @@ async def test_critic_is_adversarial_but_scope_independent():
     assert "strongest technical reason" in system
     assert "Disclosure-program routing happens separately" in system
     assert "Patchstack or Wordfence rejection" not in system
+    assert '"bug_class": "CWE-639"' in system
+    assert "evidence_summary.usable_gadget" not in system
+
+
+def test_critic_system_prompt_injects_only_active_family_contracts():
+    critic = CriticAgent(_Runtime(), model="test-model")
+    system = critic._build_system_prompt(
+        HypothesesArtifact(
+            plugin_slug="demo",
+            hypotheses=[
+                _hypothesis(
+                    "object-candidate",
+                    bug_class=BugClass.PHP_OBJECT_INJECTION,
+                )
+            ],
+        )
+    )
+
+    assert '"bug_class": "CWE-502"' in system
+    assert '"path": "evidence_summary.usable_gadget"' in system
+    assert '"json_type": "boolean"' in system
+    assert '"required_value": true' in system
+    assert '"bug_class": "CWE-639"' not in system
 
 
 def test_critic_accounting_requires_every_input_disposition():
@@ -393,6 +755,84 @@ def test_non_authorization_batches_amortize_source_local_reviews():
     assert [item.id for batch in batches for item in batch] == [
         item.id for item in targets
     ]
+
+
+def test_injection_batches_isolate_variable_php_include_sinks():
+    targets = [
+        CoverageItem(
+            id="fixed-include",
+            kind="sink",
+            review_areas=["injection_files"],
+            type="dynamic_include",
+            name="require_once",
+            file="admin.php",
+            line=10,
+            snippet="require_once PLUGIN_DIR . '/fixed.php';",
+        ),
+        CoverageItem(
+            id="variable-include",
+            kind="sink",
+            review_areas=["injection_files"],
+            type="dynamic_include",
+            name="require_once",
+            file="admin.php",
+            line=20,
+            snippet="require_once PLUGIN_DIR . '/view-' . $view . '.php';",
+        ),
+        CoverageItem(
+            id="query",
+            kind="sink",
+            review_areas=["injection_files"],
+            type="sql_query",
+            name="query",
+            file="admin.php",
+            line=30,
+            snippet="$wpdb->query($sql);",
+        ),
+    ]
+
+    batches = _build_review_batches(targets, "injection_files")
+
+    assert sum(len(batch) for batch in batches) == len(targets)
+    assert batches[0] == [targets[1]]
+    assert next(batch for batch in batches if batch[0].id == "variable-include") == [
+        targets[1]
+    ]
+    ordinary = [
+        item.id
+        for batch in batches
+        if batch[0].id != "variable-include"
+        for item in batch
+    ]
+    assert ordinary == ["fixed-include", "query"]
+
+
+def test_injection_batches_isolate_implicit_metadata_deserialization_sinks():
+    implicit = CoverageItem(
+        id="implicit-deserialization",
+        kind="sink",
+        review_areas=["injection_files"],
+        type="implicit_deserialization",
+        name="update_metadata",
+        file="metadata.php",
+        line=20,
+        snippet="update_metadata('post', $id, 'payload', $value);",
+    )
+    ordinary = CoverageItem(
+        id="query",
+        kind="sink",
+        review_areas=["injection_files"],
+        type="sql_query",
+        name="query",
+        file="metadata.php",
+        line=30,
+        snippet="$wpdb->query($sql);",
+    )
+
+    batches = _build_review_batches([ordinary, implicit], "injection_files")
+
+    assert batches[0] == [implicit]
+    assert batches[1] == [ordinary]
 
 
 def test_authentication_state_targets_are_isolated_from_crypto_noise():
@@ -899,6 +1339,55 @@ async def test_dynamic_write_runtime_limits_are_authorization_specific(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("target_type", "expected_limits"),
+    [
+        ("implicit_deserialization", (52, 44)),
+        ("deserialization", (25, 20)),
+        ("sql_query", (25, 20)),
+    ],
+)
+async def test_implicit_deserialization_runtime_limits_are_batch_specific(
+    tmp_path,
+    target_type,
+    expected_limits,
+):
+    target = CoverageItem(
+        id="cov-0001",
+        kind="sink",
+        review_areas=["injection_files"],
+        type=target_type,
+        name="update_metadata" if target_type == "implicit_deserialization" else "sink",
+        file="demo.php",
+        line=2,
+        snippet="update_metadata('post', $id, 'payload', $value);",
+    )
+    captured = {}
+
+    class CapturingRuntime:
+        async def run(self, **kwargs):
+            captured.update(kwargs)
+            return _Result(SpecialistReviewArtifact(hypotheses=[], coverage=[]))
+
+    await run_specialist(
+        runtime=CapturingRuntime(),
+        name="injection_files",
+        prompt_path="specialists/injection_files",
+        model="test-model",
+        recon=_recon(),
+        plugin_path=str(tmp_path),
+        priority_files=["demo.php"],
+        coverage_targets=[target],
+        batch_id="b001",
+    )
+
+    assert (
+        captured["max_iterations"],
+        captured["force_finalise_after"],
+    ) == expected_limits
+
+
+@pytest.mark.asyncio
 async def test_authentication_state_review_runs_independent_alternate_path_audit(
     tmp_path,
 ):
@@ -1095,6 +1584,7 @@ def test_alternate_path_policy_only_invalidates_authentication_state_batches(
         _batch_input_fingerprint(recon, [crypto], "authentication")
         == crypto_before
     )
+
 
 def test_wider_reviewer_locality_policy_does_not_invalidate_authorization(
     monkeypatch,
@@ -1409,6 +1899,72 @@ def test_compact_recon_includes_every_static_caller_to_shared_sink():
     )
 
 
+def test_compact_recon_keeps_request_selected_dispatch_for_variable_include():
+    dispatcher = EntryPoint(
+        type="ajax_nopriv",
+        name="wp_ajax_nopriv_demo",
+        file="includes/dispatcher.php",
+        line=20,
+        handler_function="dispatch",
+        body_slice=(
+            "$method = $_REQUEST['method'];\n"
+            "if (is_callable([$this, $method])) { $this->$method(); }"
+        ),
+        requires_auth=False,
+        has_nonce_check=False,
+        has_capability_check=False,
+    )
+    unrelated = EntryPoint(
+        type="ajax_nopriv",
+        name="wp_ajax_nopriv_unrelated",
+        file="includes/unrelated.php",
+        line=10,
+        handler_function="unrelated",
+        requires_auth=False,
+        has_nonce_check=False,
+        has_capability_check=False,
+    )
+    recon = ReconArtifact(
+        plugin_slug="demo",
+        entry_points=[dispatcher, unrelated],
+        sinks=[
+            Sink(
+                type="dynamic_include",
+                function="require_once",
+                file="admin/partials/render.php",
+                line=50,
+                tainted_args=["view"],
+            )
+        ],
+        entry_to_sink_paths={},
+        raw_grep_hits={},
+    )
+    variable_target = CoverageItem(
+        id="cov-variable",
+        kind="sink",
+        review_areas=["injection_files"],
+        type="dynamic_include",
+        name="require_once",
+        file="admin/partials/render.php",
+        line=50,
+        snippet="require_once BASE . '/view-' . $view . '.php';",
+    )
+    fixed_target = variable_target.model_copy(
+        update={
+            "id": "cov-fixed",
+            "snippet": "require_once BASE . '/view-default.php';",
+        }
+    )
+
+    variable_compact = _compact_recon(recon, [variable_target])
+    fixed_compact = _compact_recon(recon, [fixed_target])
+
+    assert [entry["name"] for entry in variable_compact["entry_points"]] == [
+        "wp_ajax_nopriv_demo"
+    ]
+    assert fixed_compact["entry_points"] == []
+
+
 def test_compact_recon_prunes_large_unrelated_static_call_subgraphs():
     noise_width = 80
     edges = [
@@ -1687,6 +2243,123 @@ def test_candidate_disposition_must_link_an_emitted_hypothesis():
     assert resolved == []
     assert accepted[0].status == "candidate"
     assert valid_linked == {"model-id"}
+
+
+def test_retry_progress_context_is_bounded_and_excludes_other_targets():
+    unresolved = CoverageItem(
+        id="cov-unresolved",
+        kind="sink",
+        review_areas=["injection_files"],
+        type="implicit_deserialization",
+        name="update_metadata",
+        file="metadata.php",
+        line=20,
+        snippet="update_metadata('post', $id, 'payload', $value);",
+    )
+    result = SpecialistReviewArtifact(
+        hypotheses=[_hypothesis("discarded")],
+        coverage=[
+            CoverageDisposition(
+                item_id=unresolved.id,
+                reviewer="injection_files",
+                status="unreviewed",
+                reason="x" * 2_500,
+                evidence_locations=[f"metadata.php:{index}" for index in range(1, 30)],
+            ),
+            CoverageDisposition(
+                item_id="cov-other",
+                reviewer="injection_files",
+                status="reviewed",
+                reason="Unrelated completed work.",
+                evidence_locations=["other.php:1"],
+            ),
+        ],
+    )
+
+    context = _retry_progress_context(result, [unresolved], "injection_files")
+
+    assert len(context) == 1
+    assert context[0]["item_id"] == unresolved.id
+    assert len(context[0]["reason"]) == 2_000
+    assert len(context[0]["evidence_locations"]) == 24
+    assert "hypotheses" not in context[0]
+
+
+@pytest.mark.asyncio
+async def test_hypothesis_retry_continues_bounded_incomplete_progress(
+    monkeypatch, tmp_path
+):
+    target = CoverageItem(
+        id="cov-0001",
+        kind="sink",
+        review_areas=["injection_files"],
+        type="implicit_deserialization",
+        name="update_metadata",
+        file="metadata.php",
+        line=2,
+        snippet="update_metadata('post', $id, 'payload', $value);",
+    )
+    recon = _recon().model_copy(update={"coverage": CoverageArtifact(items=[target])})
+    (tmp_path / "metadata.php").write_text("<?php\nupdate_metadata();\n")
+
+    class FakeSpecialist:
+        NAME = "injection_files"
+
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        async def analyze(self, *_args, **kwargs):
+            self.calls.append(kwargs)
+            first = len(self.calls) == 1
+            return SpecialistReviewArtifact(
+                hypotheses=[],
+                coverage=[
+                    CoverageDisposition(
+                        item_id=target.id,
+                        reviewer=self.NAME,
+                        status="unreviewed" if first else "reviewed",
+                        reason=(
+                            "External ingress remains unresolved."
+                            if first
+                            else "The retry re-read the path and resolved the gap."
+                        ),
+                        evidence_locations=["metadata.php:2"],
+                    )
+                ],
+            )
+
+    async def fake_verify(_verifier, hypotheses, _plugin_path):
+        assert hypotheses == []
+        return []
+
+    specialist = FakeSpecialist()
+    monkeypatch.setattr(
+        hypothesis_stage, "_build_specialists", lambda *_args: [specialist]
+    )
+    monkeypatch.setattr(hypothesis_stage, "_verify_hypotheses", fake_verify)
+    config = PipelineConfig.from_yaml("pipelines/test.yaml")
+
+    artifact = await hypothesis_stage.run(
+        recon,
+        str(tmp_path),
+        config,
+        BudgetTracker(10.0),
+        SimpleNamespace(),
+        runs_root=str(tmp_path / "runs"),
+        run_id="retry-progress",
+    )
+
+    assert artifact.hypotheses == []
+    assert len(specialist.calls) == 2
+    assert "prior_incomplete_review" not in specialist.calls[0]
+    assert specialist.calls[1]["prior_incomplete_review"] == [
+        {
+            "item_id": target.id,
+            "status": "unreviewed",
+            "reason": "External ingress remains unresolved.",
+            "evidence_locations": ["metadata.php:2"],
+        }
+    ]
 
 
 def test_canonical_hypothesis_ids_can_replace_coverage_links():

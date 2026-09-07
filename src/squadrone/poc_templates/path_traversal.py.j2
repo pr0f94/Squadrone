@@ -1,3 +1,87 @@
+{% if php_include_attack_path | default("") %}
+import re
+
+import requests
+
+from poc_result import emit_result
+
+TARGET = {{ target_url | tojson }}
+METHOD = {{ request_method | default("") | tojson }}
+ROUTE = {{ request_route | default("") | tojson }}
+DISPATCH = {{ request_dispatch | default({}) | tojson }}
+ENDPOINT = f"{TARGET.rstrip('/')}{ROUTE}" if ROUTE else ""
+DESTINATION_PARAMETER = {{ injectable_param | tojson }}
+DESTINATION_LOCATION = {{ php_include_destination_location | default("") | tojson }}
+ATTACK_PATH = {{ php_include_attack_path | tojson }}
+CONTROL_PATH = {{ php_include_control_path | tojson }}
+RECEIPT_HEADER = {{ php_include_header_name | tojson }}
+ATTACKER_ROLE = {{ attacker_role | tojson }}
+MARKER_RE = re.compile(r"SQUADRONE_PHP_INCLUDE_[0-9a-f]{64}\Z")
+
+{% if php_include_unauthenticated | default(false) %}
+# For an unauthenticated proof, both result arms below deliberately use the
+# literal string "anonymous". Never substitute 0, None, "guest", or a username.
+{% else %}
+# The authenticated actor fields below deliberately fail closed as None/False.
+# Replace both only after successful wp_login with that result's measured positive
+# login.identity.user_id, and set identity_verified=True for both arms.
+{% endif %}
+
+
+def _destination_value(absolute_path: str) -> str:
+    """Adapt this only from the cited include expression.
+
+    Account for its fixed directory, filename prefix, and suffix so PHP resolves
+    the completed expression to ``absolute_path``. Do not request or open the
+    verifier path directly from this Python process.
+
+    If the request value is concatenated immediately after a fixed filename
+    prefix, its traversal must begin with ``/..`` (separator, then parent), not
+    bare ``..``. The separator makes the fixed prefix a synthetic component that
+    PHP virtual-CWD resolution can cancel. Do not add a redundant separator when
+    the exact sink already supplies one.
+    """
+    raise RuntimeError("derive the traversal value from the cited PHP sink")
+
+
+# This trusted-oracle skeleton deliberately fails closed until source inspection
+# supplies the exact destination transformation and request. Send precisely two
+# proof-bound target requests: attack first, then the absent-sibling control.
+emit_result(
+    verdict="not_vulnerable",
+    oracle="response_marker",
+    attacker_role=ATTACKER_ROLE,
+    request={"method": METHOD, "url": ENDPOINT},
+    attack={
+        "observed": False,
+        "marker_present": False,
+        "include_path": ATTACK_PATH,
+        "destination_value": "",
+{% if php_include_unauthenticated | default(false) %}
+        "attacker_user_id": "anonymous",
+        "identity_verified": True,
+{% else %}
+        "attacker_user_id": None,
+        "identity_verified": False,
+{% endif %}
+    },
+    control={
+        "observed": False,
+        "marker_present": False,
+        "include_path": CONTROL_PATH,
+        "destination_value": "",
+{% if php_include_unauthenticated | default(false) %}
+        "attacker_user_id": "anonymous",
+        "identity_verified": True,
+{% else %}
+        "attacker_user_id": None,
+        "identity_verified": False,
+{% endif %}
+    },
+    confidentiality="none",
+    impact="The source-derived PHP include proof has not been implemented.",
+)
+{% else %}
 import requests
 from wp_login import wp_login
 from poc_result import emit_result
@@ -61,3 +145,4 @@ if __name__ == "__main__":
         confidentiality="high" if observed and not control_has_marker else "none",
         impact="The request returned a marker from wp-config.php." if observed and not control_has_marker else "No protected-file marker was returned.",
     )
+{% endif %}

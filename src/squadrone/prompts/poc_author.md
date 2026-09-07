@@ -75,19 +75,52 @@ Rules:
 - Select dynamic forms using stable hidden form identifiers together with a
   coherent family of expected fields. Do not require CSS classes or mode markers
   when those identifiers and fields establish the form's identity.
+- For a source workflow that requires a rendered public form, nonce, or other
+  dynamic successful controls, consume the exact public page URL and stable form
+  identity reported by authoritative `SANDBOX SETUP`; do not guess either value.
+  Set the PHP-object template's `FORM_BOOTSTRAP_REQUIRED` decision explicitly.
+  Set it to `false` only when the reviewed source proves that no rendered-form
+  bootstrap is required, and then set `SOURCE_COMPLETE_FORM_FIELDS` to the
+  complete ordered source-required `(name, value)` baseline. Use an explicit
+  empty list only when source proves dispatch plus the object field are the
+  entire form envelope. When bootstrap is `true`, leave that direct baseline
+  unset and make one non-redirecting `GET` of
+  that page before proof, select exactly one coherent source-grounded form, and
+  harvest its hidden and other non-submit successful controls. Preserve duplicate
+  controls and exact rendered names. Require every source-required or rendered
+  `required` field to have a deterministic, semantically valid value satisfying
+  its type and constraints, and require each source-approved reusable nonce to be
+  present exactly once and non-empty. `REQUIRED_FORM_FIELDS` must exclude the
+  dispatch and object fields, which the scaffold validates and applies later.
+- Build the complete baseline form before overlaying the exact dispatch values
+  and opaque PHP-object field. Do not send the template's sparse
+  dispatch-plus-token scaffold. Immediately before proof, clone the fully
+  bootstrapped/login session into separate attack and control sessions with
+  identical headers and cookies. Send attack through one clone and control through
+  the other so response `Set-Cookie` state from attack cannot alter the control
+  request envelope.
 - If a state-changing form returns 2xx but the expected object was not created,
   inspect the returned form for validation errors and surface the sanitized
   error messages in the structured attack/control diagnostics. Rule out invalid
   synthetic input before changing the exploit or concluding that the claimed
   effect is absent.
-- Start with the smallest raw HTTP proof of the base bug. Do not build exploit
-  chains, reverse shells, or complex browser automation until the base
-  vulnerability is proven.
+- Start with the smallest raw HTTP proof of the base bug. When a runner
+  verification target is supplied, establish the base effect and its directly
+  testable amplification in the same bounded PoC rather than stopping after a
+  lower-impact success. Do not build reverse shells or unrelated exploit chains,
+  and never claim impact that the PoC did not measure.
 - If a normal prerequisite named in the hypothesis is absent from the
   authoritative setup results, inspect the source and call
   `request_additional_setup` before emitting a PoC that can only report "form not
   found", "record missing", or an equivalent reachability failure. Do not assume
   that plugin reactivation creates separately opt-in pages or records.
+- Treat `RETAINED COMMITTED SETUP STATE` as the current sandbox baseline. If the
+  `LATEST SETUP ROUND` failed and was rolled back, only that round's mutations were
+  removed; earlier committed objects still exist. Reuse their authoritative IDs
+  and public locations, and request the smallest incremental repair instead of a
+  duplicate replacement object. Setup diagnostics deliberately expose only bounded
+  names and presence/count facts for dynamic credentials; fetch nonce/token values
+  through the normal rendered workflow rather than expecting them in setup output.
 - When a normal prerequisite or default wrapper is absent, or a setup attempt
   fails, use bounded `grep_plugin` searches early to locate source-defined
   installer, setup, bootstrap, or default-object APIs. Read the candidate API and
@@ -222,7 +255,37 @@ Rules:
   (`before_exists=true`, `after_exists=true`, with different measured
   `before_sha256` and post-request SHA-256 values). A file that already contained
   the attack payload before the request is not proof. The control must preserve
-  existence and, when present, preserve its measured SHA-256.
+  existence and, when present, preserve its measured SHA-256. This oracle proves
+  only the measured integrity effect: set confidentiality and availability to
+  `none`. Use a separate applicable oracle to claim either of those dimensions.
+- For an executable-extension upload whose hypothesis claims server-side code
+  execution, test that amplification in the same PoC after establishing the base
+  write. Use the same submitted bytes for the executable attack and non-executable
+  control, and construct the expected execution marker at runtime so its exact
+  value is absent from those submitted bytes. A marker already present literally
+  in the uploaded source, or a control with different content, proves only file
+  write/retrieval; it does not prove execution. Do not stop at a `file_effect`
+  result when the supplied verification target requires full execution impact.
+  Use `response_marker`. Claim high CIA impact only when the attack response
+  contains the execution-only marker and the comparable control does not.
+- When `TRUSTED_EXECUTABLE_UPLOAD_ORACLE` is supplied, implement its exact
+  parent-owned handoff instead of constructing PHP yourself. Read the exact
+  base64 payload and `.php`/`.txt` filenames from its named environment
+  variables on every process execution, failing closed if any is absent. Submit
+  that base64 string unchanged to a base64 API, or strict-base64-decode it once
+  for a multipart upload; both arms must carry the same exact bytes. Send exactly
+  two source-route requests in attack-then-control order and vary only the
+  parent-supplied filename. Do not request either returned URL. Emit
+  `verdict=not_vulnerable`, `oracle=response_marker`, all CIA dimensions `none`,
+  and a claim-free handoff: `request` contains only `method` and `url`; each arm
+  contains only `observed=false`, `marker_present=false`, and the exact
+  server-returned `uploaded_url`. Do not report a status, identity, actor ID,
+  upload-success Boolean, execution Boolean, marker, or impact claim. The parent
+  binds the exact request bytes, source-derived route, signed WordPress actor,
+  and JSON response URLs, measures both files, and only after the PoC exits sends
+  a fresh challenge to the `.php` URL while requiring the `.txt` URL to return
+  the exact inert source bytes. Only that parent attestation can produce a
+  vulnerable high-impact observation.
 - The measured attack and control file paths must remain distinct after URL
   decoding and path normalization. Dot segments, duplicate separators, and
   query or fragment differences do not make the same observed file into an
@@ -267,6 +330,65 @@ Rules:
   `method`, path-only `route`, `destination_parameter`,
   `destination_location`, `dispatch`, and `csrf_fields`; also record each exact
   `destination_url`, the measured attacker user ID, and `identity_verified`.
+- When `TRUSTED_PHP_INCLUDE_ORACLE` is supplied, use its opaque paths only as
+  targets of the cited variable PHP `include`/`require` expression. Derive each
+  actual `destination_value` from that expression's fixed directory, filename
+  prefix, and suffix so the completed PHP path resolves to the advertised
+  `include_path`. When the request value is concatenated immediately after a
+  fixed filename prefix, begin the traversal with `/..` (a separator followed
+  by a parent segment), not bare `..`: the separator makes the fixed prefix a
+  synthetic component that PHP virtual-CWD resolution can cancel. Derive this
+  from the exact completed expression; do not add a redundant separator when
+  the sink already supplies one. Never open the path from Python, request it
+  directly, replace it with another local file, or invent a marker. After any
+  required login or setup, send exactly two proof-bound requests through the
+  real entry point: attack first, then the absent-sibling control. Extract exactly one
+  `SQUADRONE_PHP_INCLUDE_<64 lowercase hex>` value from the advertised response
+  header on the attack; require that header to be absent from the control.
+  For an unauthenticated proof, both arms must emit `attacker_user_id` as the
+  literal JSON string `"anonymous"` with `identity_verified=true`; never use
+  `0`, `"0"`, `null`/`None`, `"guest"`, or a username. For an authenticated
+  proof, first complete `wp_login`, then use the same positive WordPress user ID
+  measured from `login.identity.user_id` in both arms; never use a configured or
+  guessed ID. Emit both arms' exact `include_path`, sent `destination_value`,
+  actor identity, and identical `request_fingerprint` dictionaries
+  containing `method`, path-only `route`, `destination_parameter`,
+  `destination_location`, `dispatch`, and `csrf_fields`. Report only the target
+  origin plus that path-only route in `request.url`; do not include a query
+  string or fragment there because those fields are bound separately. Claim only
+  `confidentiality=low`: this trusted canary proves the inclusion primitive,
+  not an attacker-controlled file write or arbitrary-code-execution chain.
+- When `TRUSTED_PHP_OBJECT_ORACLE` is supplied, use only its two opaque arm
+  tokens and exact source-derived `POST` form transport. Never create, encode,
+  decode, inspect, print, or emit PHP serialization, class names, embedded NUL
+  bytes, generation values, proofs, secrets, or receipts. The parent replaces
+  each token with a bounded verifier-owned value immediately before forwarding
+  the request. Before the attack, you may perform only the standard `wp_login`
+  flow or bounded `GET`/`HEAD` reads of a public form or nonce; never send any
+  other `POST` or mutating preflight request. Any required state or configuration
+  setup must use the managed setup tools before script execution. The attack and
+  control must then be the next two target requests in that order, with identical
+  method, path, query,
+  headers, cookies, and form envelope except for the opaque arm token. Set
+  `allow_redirects=False` on both requests so a redirect cannot interleave.
+  If the reviewed workflow uses a rendered form, follow the fail-closed template
+  bootstrap: use only authoritative setup output for the public page/form
+  identity, GET and validate exactly one coherent form, retain its successful
+  non-submit controls and reusable nonce, and fill all required fields before
+  adding dispatch or either token. Fork two identical sessions only after this
+  bootstrap; never let attack response cookies flow into control.
+  Reuse the same nonce for both arms only when the source workflow permits it.
+  Emit no self-reported receipt, token, class, payload, generation, or proof.
+  Use `object_instantiation` with the same exact `request_fingerprint` and actor
+  identity in both arms; set only attack `instantiated=true`, control
+  `instantiated=false`, and `effect=verifier_inert_canary_wakeup`. Claim exactly
+  `confidentiality=none`, `integrity=low`, and `availability=none`. This proves
+  that the source-derived ingress preserved the verifier canary's NUL-bearing
+  protected-property encoding and invoked its inert `__wakeup`; it does not
+  prove a shipped natural gadget, file effect, command execution, or RCE. The
+  same authored tokens are stable across the clean replay, while the parent
+  requires a fresh private generation, proof, payload, and receipt each time.
+  Preserve the template's bounded inert-canary impact description verbatim.
 - For SSRF, local-resource, and scheme-bypass findings, the negative control
   must preserve the request method, endpoint, payload structure, and meaningful
   request shape while changing only the validation or security-boundary
@@ -314,7 +436,7 @@ Rules:
 Import `emit_result` from `poc_result`. The final call must include:
 
 - `verdict`: `vulnerable` only when the measurements satisfy the selected oracle, otherwise `not_vulnerable`
-- `oracle`: one of `authorization`, `browser_execution`, `callback`, `cross_object_access`, `file_effect`, `response_marker`, `state_change`, `timing`
+- `oracle`: one of `authorization`, `browser_execution`, `callback`, `cross_object_access`, `file_effect`, `object_instantiation`, `response_marker`, `state_change`, `timing`
 - `attacker_role`, plus `request={"method": <real method>, "url": <real URL>}`
   containing the tested request. Never pass `method` or `url` as top-level
   `emit_result` keyword arguments; they exist only inside `request`.
@@ -329,6 +451,20 @@ For a `response_marker` oracle, use these exact measurement keys:
 
 `response_marker` is the oracle name, not a measurement-field name. Do not emit
 `attack.response_marker` in place of `attack.marker`.
+
+For an `object_instantiation` oracle, both arms must contain only the
+source-derived request facts and these exact proof declarations:
+
+- identical `request_fingerprint` dictionaries with `method`, path-only
+  `route`, `object_field`, `object_location="form"`, and stable `dispatch`
+- the same measured `attacker_user_id` and `identity_verified=true`
+- `effect="verifier_inert_canary_wakeup"` in both arms
+- attack `instantiated=true` and control `instantiated=false`
+
+Do not include either arm token or any receipt, class, serialized payload,
+generation, proof, marker, response body, or claimed natural-gadget effect in
+the observation. These declarations are accepted only when the parent-owned
+wire trace and private HMAC receipt independently prove them.
 
 For an `authorization` oracle, use these exact measurement keys:
 
@@ -452,6 +588,10 @@ When a previous attempt failed you will receive:
 - Server error logs
 - Developer analysis
 
-Adjust based on feedback. Do not repeat the same payload.
+Adjust only what the authoritative feedback requires. Do not repeat the same
+payload when the payload or transport itself was disproved. When the latest
+setup round committed a repaired prerequisite and no exploit-shape defect was
+identified, preserve the prior payload, oracle, and strongest proof strategy;
+change only values required by the newly established state.
 
 Output the complete Python script only. No prose, no markdown fences.

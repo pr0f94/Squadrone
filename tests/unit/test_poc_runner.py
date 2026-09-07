@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -23,6 +24,8 @@ import squadrone.poc_proxy as poc_proxy
 
 from squadrone.poc_proxy import (
     ACTOR_RECEIPT_HEADER,
+    REQUEST_BINDING_HEADER,
+    ExecutableUploadPolicy,
     MAX_REQUEST_BODY_BYTES,
     POC_PROXY_ENV,
     PRIVATE_TRACE_ENV_NAMES,
@@ -35,6 +38,7 @@ from squadrone.poc_proxy import (
     TRACE_TOKEN_ENV,
     TRACE_TOKEN_HEADER,
     PocProxySupervisor,
+    canonical_request_binding,
     canonical_request_digest,
     classify_request_sentinels,
     minimal_poc_environment,
@@ -43,6 +47,32 @@ from squadrone.poc_proxy import (
     salted_headers_sha256,
     salted_scalar_sha256,
 )
+
+
+_UPLOAD_BOUNDARY = "squadrone-fixed-upload-boundary"
+_UPLOAD_PAYLOAD = b"<?php echo 'parent-owned-upload-test';"
+_UPLOAD_ATTACK_FILENAME = "squadrone-upload-test.php"
+_UPLOAD_CONTROL_FILENAME = "squadrone-upload-test.txt"
+
+
+def _multipart_upload_body(filename: str) -> bytes:
+    return (
+        f"--{_UPLOAD_BOUNDARY}\r\n"
+        f'Content-Disposition: form-data; name="upload"; filename="{filename}"\r\n'
+        "Content-Type: application/octet-stream\r\n"
+        "\r\n"
+    ).encode("ascii") + _UPLOAD_PAYLOAD + (
+        f"\r\n--{_UPLOAD_BOUNDARY}--\r\n"
+    ).encode("ascii")
+
+
+def _multipart_upload_body_with_action(filename: str, action: str) -> bytes:
+    return (
+        f"--{_UPLOAD_BOUNDARY}\r\n"
+        'Content-Disposition: form-data; name="action"\r\n'
+        "\r\n"
+        f"{action}\r\n"
+    ).encode("ascii") + _multipart_upload_body(filename)
 
 
 class _Upstream(ThreadingHTTPServer):
@@ -210,6 +240,79 @@ def test_scalar_and_request_digest_protocols_are_stable() -> None:
     )
 
 
+def test_canonical_request_binding_authenticates_the_exact_proxy_request() -> None:
+    secret = bytes.fromhex("21" * 32)
+    nonce = "32" * 32
+    digest = "43" * 32
+    target = "/wp-json/example/v1/upload?context=edit%2Fraw"
+    message = (
+        b"SQUADRONE-REQUEST-BINDING-V1\0"
+        b"POST\0"
+        + target.encode("ascii")
+        + b"\0"
+        + nonce.encode("ascii")
+        + b"\0"
+        + digest.encode("ascii")
+    )
+
+    binding = canonical_request_binding(
+        secret,
+        method="post",
+        raw_path_and_query=target,
+        request_nonce=nonce,
+        request_digest=digest,
+    )
+
+    assert binding == hmac.new(secret, message, hashlib.sha256).hexdigest()
+    assert re.fullmatch(r"[0-9a-f]{64}", binding)
+    assert canonical_request_binding(
+        secret,
+        method="POST",
+        raw_path_and_query=target,
+        request_nonce=nonce,
+        request_digest=digest,
+    ) == binding
+    for changed in (
+        {"raw_path_and_query": target + "&changed=1"},
+        {"request_nonce": "52" * 32},
+        {"request_digest": "63" * 32},
+    ):
+        arguments = {
+            "method": "POST",
+            "raw_path_and_query": target,
+            "request_nonce": nonce,
+            "request_digest": digest,
+            **changed,
+        }
+        assert canonical_request_binding(secret, **arguments) != binding
+
+
+@pytest.mark.parametrize(
+    ("secret", "nonce", "digest", "target"),
+    [
+        (b"short", "32" * 32, "43" * 32, "/upload"),
+        (bytes.fromhex("21" * 32), "32" * 31, "43" * 32, "/upload"),
+        (bytes.fromhex("21" * 32), "AA" * 32, "43" * 32, "/upload"),
+        (bytes.fromhex("21" * 32), "32" * 32, "43" * 31, "/upload"),
+        (bytes.fromhex("21" * 32), "32" * 32, "43" * 32, "upload"),
+    ],
+)
+def test_canonical_request_binding_rejects_ambiguous_inputs(
+    secret: bytes,
+    nonce: str,
+    digest: str,
+    target: str,
+) -> None:
+    with pytest.raises(ValueError):
+        canonical_request_binding(
+            secret,
+            method="POST",
+            raw_path_and_query=target,
+            request_nonce=nonce,
+            request_digest=digest,
+        )
+
+
 def test_header_digest_binds_sensitive_forwarded_values_but_not_proxy_headers() -> None:
     salt = bytes.fromhex("12" * 32)
     headers = [
@@ -240,6 +343,27 @@ def test_header_digest_binds_sensitive_forwarded_values_but_not_proxy_headers() 
             for header_name, value in headers
         ]
         assert salted_headers_sha256(changed, salt) != expected
+
+
+def test_forwarded_headers_strip_php_normalized_verifier_aliases() -> None:
+    child_headers = [
+        (REQUEST_BINDING_HEADER, "forged-hyphenated-binding"),
+        ("X_Squadrone_Request_Binding", "forged-underscore-binding"),
+        ("X-Squadrone_Request-Binding", "forged-mixed-binding"),
+        ("X.Squadrone.Request.Binding", "forged-dotted-binding"),
+        ("x_squadrone_trace_token", "forged-trace-token"),
+        ("X.Squadrone.Request.Nonce", "forged-request-nonce"),
+        ("X_Squadrone_Request_Digest", "forged-request-digest"),
+        ("X-Squadroneish-Public", "retained"),
+        ("X-Public", "also-retained"),
+    ]
+
+    forwarded = poc_proxy._forwarded_child_headers(child_headers)
+
+    assert forwarded == [
+        ("X-Squadroneish-Public", "retained"),
+        ("X-Public", "also-retained"),
+    ]
 
 
 def test_sentinel_classifier_detects_safe_reversible_encodings() -> None:
@@ -468,6 +592,158 @@ async def test_proxy_records_wire_request_and_injects_fresh_bindings() -> None:
         "SQUADRONE_ATTACK_101",
     ):
         assert forbidden not in serialized
+
+
+@pytest.mark.asyncio
+async def test_upload_proxy_optionally_injects_a_parent_signed_multipart_binding() -> (
+    None
+):
+    secret = bytes.fromhex("54" * 32)
+    trace_salt = bytes.fromhex("65" * 32)
+    trace_token = "parent-only-upload-trace-token"
+    content_type = f"multipart/form-data; boundary={_UPLOAD_BOUNDARY}"
+    attack_body = _multipart_upload_body(_UPLOAD_ATTACK_FILENAME)
+    control_body = _multipart_upload_body(_UPLOAD_CONTROL_FILENAME)
+    attestations: list[tuple[str, str]] = []
+
+    async def attest(phase: str, arm: str) -> None:
+        attestations.append((phase, arm))
+
+    policy = ExecutableUploadPolicy(
+        method="POST",
+        route_kind="path",
+        route="/upload",
+        dispatch=(),
+        payload=_UPLOAD_PAYLOAD,
+        attack_filename=_UPLOAD_ATTACK_FILENAME,
+        control_filename=_UPLOAD_CONTROL_FILENAME,
+    )
+
+    with _upstream() as (upstream, origin):
+        async with PocProxySupervisor(origin, trace_token=trace_token) as ordinary:
+            ordinary_response = await _proxied_request(
+                ordinary.proxy_url,
+                "POST",
+                origin + "/ordinary",
+                content=attack_body,
+                headers={"Content-Type": content_type},
+            )
+        async with PocProxySupervisor(
+            origin,
+            trace_token=trace_token,
+            trace_salt=trace_salt,
+            executable_upload_policy=policy,
+            executable_upload_arm_attestor=attest,
+            request_binding_secret=secret,
+        ) as upload_proxy:
+            for filename in (
+                _UPLOAD_ATTACK_FILENAME,
+                _UPLOAD_CONTROL_FILENAME,
+            ):
+                response = await _proxied_request(
+                    upload_proxy.proxy_url,
+                    "POST",
+                    origin + "/upload",
+                    content=_multipart_upload_body(filename),
+                    headers={
+                        "Content-Type": content_type,
+                        REQUEST_BINDING_HEADER: "child-forged-binding",
+                        "X_Squadrone_Request_Binding": "child-forged-alias",
+                    },
+                )
+                assert response.status_code == 200
+                assert REQUEST_BINDING_HEADER not in response.headers
+            records = upload_proxy.records
+            upload_complete = upload_proxy.executable_upload_complete
+
+    assert ordinary_response.status_code == 200
+    ordinary_headers = upstream.observed[0]["headers"]
+    assert isinstance(ordinary_headers, dict)
+    assert REQUEST_BINDING_HEADER.casefold() not in ordinary_headers
+
+    assert len(records) == 2
+    assert upload_complete is True
+    assert attestations == [
+        ("before", "attack"),
+        ("after", "attack"),
+        ("before", "control"),
+        ("after", "control"),
+    ]
+    bindings: list[str] = []
+    for observed, record, body in zip(
+        upstream.observed[1:],
+        records,
+        (attack_body, control_body),
+        strict=True,
+    ):
+        headers = observed["headers"]
+        assert isinstance(headers, dict)
+        nonce = str(record["request_nonce"])
+        digest = canonical_request_digest("POST", "/upload", body)
+        binding = canonical_request_binding(
+            secret,
+            method="POST",
+            raw_path_and_query="/upload",
+            request_nonce=nonce,
+            request_digest=digest,
+        )
+        bindings.append(binding)
+        assert record["request_digest"] == digest
+        assert headers[TRACE_TOKEN_HEADER.casefold()] == trace_token
+        assert headers[REQUEST_NONCE_HEADER.casefold()] == nonce
+        assert headers[REQUEST_DIGEST_HEADER.casefold()] == digest
+        assert headers[REQUEST_BINDING_HEADER.casefold()] == binding
+        assert "child-forged" not in json.dumps(record)
+
+    assert len(set(bindings)) == 2
+    serialized = json.dumps(records)
+    assert secret.hex() not in serialized
+    assert all(binding not in serialized for binding in bindings)
+
+
+@pytest.mark.asyncio
+async def test_upload_proxy_accepts_hook_form_dispatch_in_multipart_wire_body() -> None:
+    attestations: list[tuple[str, str]] = []
+
+    async def attest(phase: str, arm: str) -> None:
+        attestations.append((phase, arm))
+
+    policy = ExecutableUploadPolicy(
+        method="POST",
+        route_kind="path",
+        route="/wp-admin/admin-ajax.php",
+        dispatch=(("form", "action", "upload"),),
+        payload=_UPLOAD_PAYLOAD,
+        attack_filename=_UPLOAD_ATTACK_FILENAME,
+        control_filename=_UPLOAD_CONTROL_FILENAME,
+    )
+    content_type = f"multipart/form-data; boundary={_UPLOAD_BOUNDARY}"
+
+    with _upstream() as (_upstream_server, origin):
+        async with PocProxySupervisor(
+            origin,
+            trace_token="upload-hook-token",
+            executable_upload_policy=policy,
+            executable_upload_arm_attestor=attest,
+            request_binding_secret=bytes.fromhex("76" * 32),
+        ) as proxy:
+            for filename in (_UPLOAD_ATTACK_FILENAME, _UPLOAD_CONTROL_FILENAME):
+                response = await _proxied_request(
+                    proxy.proxy_url,
+                    "POST",
+                    origin + "/wp-admin/admin-ajax.php",
+                    content=_multipart_upload_body_with_action(filename, "upload"),
+                    headers={"Content-Type": content_type},
+                )
+                assert response.status_code == 200
+
+    assert proxy.executable_upload_complete is True
+    assert attestations == [
+        ("before", "attack"),
+        ("after", "attack"),
+        ("before", "control"),
+        ("after", "control"),
+    ]
 
 
 @pytest.mark.asyncio
@@ -887,6 +1163,11 @@ async def test_proxy_rejects_cross_origin_connect_and_chunked_requests() -> None
         ),
         (
             b"X-HTTP-Method-Override: SQUADRONE_OVERRIDE\r\n",
+            400,
+            "behavior_changing_header",
+        ),
+        (
+            b"X-HTTP-Method.Override: SQUADRONE_OVERRIDE\r\n",
             400,
             "behavior_changing_header",
         ),

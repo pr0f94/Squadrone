@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -10,16 +11,28 @@ import tempfile
 import uuid
 from bisect import bisect_right
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from importlib.resources import files as _pkg_files
 from pathlib import Path, PurePosixPath
-from typing import Any, Literal
+from typing import Any, Awaitable, Callable, Literal
 
-from ..agents.developer import DeveloperAgent, SetupPlan
-from ..agents.poc_author import PoCAuthorAgent, _parse_entry_point_transport
+from ..agents.developer import DeveloperAgent, RequestedSetupPlan, SetupPlan
+from ..agents.poc_author import (
+    PHP_OBJECT_INERT_IMPACT_DESCRIPTION,
+    PoCAuthorAgent,
+    _parse_entry_point_transport,
+)
 from ..agents.runtime import AgentRuntime
+from ..poc_isolation import (
+    EXECUTABLE_UPLOAD_ATTACK_FILENAME_ENV,
+    EXECUTABLE_UPLOAD_CONTROL_FILENAME_ENV,
+    EXECUTABLE_UPLOAD_PAYLOAD_ENV,
+)
 from ..schemas.config import PipelineConfig
 from ..schemas.finding import DedupStatus, Finding, PoCAttempt, PoCStatus
 from ..schemas.hypothesis import Hypothesis, SecurityOutcome, TriagedArtifact
+from ..schemas.observation import CIAImpact, PoCObservation
+from ..schemas.php_object_gadget import PhpObjectGadgetRecipe
 from ..schemas.taxonomy import BugClass, OPEN_CWE_POC_TEMPLATE
 from ..services.artifacts import (
     atomic_write_json,
@@ -29,21 +42,572 @@ from ..services.artifacts import (
 )
 from ..services.budget import BudgetTracker
 from ..services.decision_ledger import append_decision
-from ..services.quality_gate import infer_attacker_role
+from ..services.diagnostics import bound_diagnostic
+from ..services.quality_gate import (
+    infer_attacker_role,
+    validate_php_object_natural_finding_confirmation,
+)
+from ..services.php_object_oracle import PhpObjectCallsite, PhpObjectOracleSnapshot
+from ..services.php_object_gadget_oracle import (
+    PHP_OBJECT_GADGET_ORACLE_MODE,
+    PHP_OBJECT_GADGET_ORACLE_SCHEMA_VERSION,
+    PhpObjectGadgetOracleSnapshot,
+    validate_php_object_gadget_snapshot_pair,
+)
 from ..services.roles import normalize_attacker_role
+from ..services.setup_http import SetupHttpContext
 from ..services.sandbox import (
+    EXECUTABLE_UPLOAD_CHALLENGE_PARAMETER,
+    EXECUTABLE_UPLOAD_RESPONSE_PREFIX,
     SandboxManager,
+    SandboxRunResult,
     WORDPRESS_WEB_USER,
+    php_include_private_marker_from_observation,
+    redact_php_include_run_result,
     validate_confirmation_observations,
     validate_plugin_slug,
 )
 from ..services import verify_helpers
+from .triage import validate_php_object_gadget_recipe_sources
 
 logger = logging.getLogger(__name__)
 
 VERIFY_COMPLETE_FILENAME = "verify_complete.json"
 OPEN_CWE_MANUAL_REVIEW_FILENAME = "manual_review.json"
+PHP_OBJECT_PRIMITIVE_CONFIRMATION_FILENAME = "primitive_confirmation.json"
+PHP_OBJECT_NATURAL_CONFIRMATION_FILENAME = "natural_gadget_confirmation.json"
+PHP_OBJECT_NATURAL_IMPACT_DESCRIPTION = (
+    "PHP object injection deleted one verifier-created, non-executable regular "
+    "file in the isolated sandbox temporary directory; the object-free control "
+    "preserved the same file."
+)
 _OPEN_CWE_MANUAL_REVIEW_SOURCE = "verify_open_cwe"
+_POC_RESULT_PREFIX = "SQUADRONE_RESULT="
+
+
+def _strip_child_result_lines(value: str | None) -> str:
+    """Remove machine self-reports from text after the runner rejected them."""
+    if not value:
+        return ""
+    return "\n".join(
+        line for line in value.splitlines() if _POC_RESULT_PREFIX not in line
+    ).strip()
+
+
+def _runner_failure_feedback(result: SandboxRunResult) -> str:
+    """Render failure context without presenting a child claim as evidence."""
+    if result.success:
+        raise ValueError("runner failure feedback requires a failed result")
+    lines = [
+        "AUTHORITATIVE RUNNER VERDICT: FAILED",
+        "AUTHORITATIVE VALIDATION REASON: "
+        + (result.validation_reason or "runner rejected the execution"),
+    ]
+    if (
+        result.evidence.get("php_object_oracle_error") == "transport_incomplete"
+        and result.evidence.get("php_object_oracle_failure_reason")
+        == "php_object_transport_incomplete"
+    ):
+        lines.append(
+            "TRUSTED PHP OBJECT DIAGNOSTIC: expected attack/control transport "
+            "did not complete; this was not classified as executable-surface drift."
+        )
+    if result.rejected_observation is not None:
+        lines.extend(
+            [
+                "REJECTED CHILD OBSERVATION: the PoC emitted a machine self-report, "
+                "but none of its success declarations are established measurements.",
+                "REPORTED ORACLE TYPE (diagnostic only): "
+                + result.rejected_observation.oracle,
+                "OTHER CHILD OUTPUT: withheld because the runner rejected the "
+                "observation; consult only the authoritative validation reason.",
+            ]
+        )
+    else:
+        remaining_output = _strip_child_result_lines(result.output)
+        lines.append(
+            "OTHER POC OUTPUT (diagnostic only):\n"
+            + (
+                bound_diagnostic(remaining_output, limit=2000)
+                if remaining_output
+                else "(none)"
+            )
+        )
+    return "\n".join(lines)
+
+
+def _attempt_response_snippet(result: SandboxRunResult) -> str | None:
+    """Persist accepted output or an explicitly rejected failure summary."""
+    if result.success:
+        return (result.response or "")[:500] or None
+    return bound_diagnostic(_runner_failure_feedback(result), limit=500)
+
+
+def _attempt_error_log_snippet(result: SandboxRunResult) -> str | None:
+    """Keep diagnostics but never persist a rejected machine-result line."""
+    error_log = result.error_log or ""
+    if not result.success:
+        error_log = _strip_child_result_lines(error_log)
+        return bound_diagnostic(error_log, limit=500) or None
+    return error_log[:500] or None
+
+
+def _runner_failure_error_feedback(result: SandboxRunResult) -> str:
+    """Expose runtime errors only when no rejected success claim accompanied them."""
+    if result.rejected_observation is not None:
+        return ""
+    return _strip_child_result_lines(result.error_log)
+
+
+def _consume_php_include_live_observation(
+    result: SandboxRunResult,
+    *,
+    php_include_expected: bool,
+) -> PoCObservation | None:
+    """Take the raw verifier observation and leave only persistence-safe fields."""
+    if not php_include_expected:
+        return result.observation
+    trusted_observation = result.take_trusted_php_include_observation()
+    live_observation = trusted_observation or result.observation
+    private_marker = php_include_private_marker_from_observation(live_observation)
+    redact_php_include_run_result(result, private_marker)
+    return live_observation
+
+
+_PHP_OBJECT_OBSERVATION_FIELDS = frozenset(
+    {
+        "observed",
+        "instantiated",
+        "effect",
+        "attacker_user_id",
+        "identity_verified",
+        "request_fingerprint",
+    }
+)
+_PHP_OBJECT_FINGERPRINT_FIELDS = frozenset(
+    {"method", "route", "object_field", "object_location", "dispatch"}
+)
+
+
+def _bounded_php_object_observation(
+    observation: PoCObservation | None,
+) -> tuple[bool, str]:
+    """Restrict the trusted canary to its measured object-lifecycle claim."""
+    if observation is None or observation.oracle != "object_instantiation":
+        return False, "trusted PHP object run lacks object_instantiation evidence"
+    if (
+        observation.impact.confidentiality != "none"
+        or observation.impact.integrity != "low"
+        or observation.impact.availability != "none"
+        or observation.impact.description != PHP_OBJECT_INERT_IMPACT_DESCRIPTION
+    ):
+        return False, "trusted PHP object run exceeded the inert-canary impact bound"
+    if set(observation.request) != {"method", "url"}:
+        return False, "trusted PHP object request contains unsupported claims"
+    if (
+        set(observation.attack) != _PHP_OBJECT_OBSERVATION_FIELDS
+        or set(observation.control) != _PHP_OBJECT_OBSERVATION_FIELDS
+    ):
+        return False, "trusted PHP object arms contain unsupported claims"
+    if (
+        observation.attack.get("observed") is not True
+        or observation.control.get("observed") is not False
+        or observation.attack.get("instantiated") is not True
+        or observation.control.get("instantiated") is not False
+        or observation.attack.get("effect") != "verifier_inert_canary_wakeup"
+        or observation.control.get("effect") != "verifier_inert_canary_wakeup"
+        or observation.attack.get("identity_verified") is not True
+        or observation.control.get("identity_verified") is not True
+        or observation.attack.get("attacker_user_id")
+        != observation.control.get("attacker_user_id")
+    ):
+        return False, "trusted PHP object attack/control declaration is invalid"
+    attack_fingerprint = observation.attack.get("request_fingerprint")
+    control_fingerprint = observation.control.get("request_fingerprint")
+    if (
+        not isinstance(attack_fingerprint, dict)
+        or not isinstance(control_fingerprint, dict)
+        or set(attack_fingerprint) != _PHP_OBJECT_FINGERPRINT_FIELDS
+        or set(control_fingerprint) != _PHP_OBJECT_FINGERPRINT_FIELDS
+        or attack_fingerprint != control_fingerprint
+    ):
+        return False, "trusted PHP object request fingerprints are invalid"
+    return True, "trusted PHP object claim is bounded to inert canary instantiation"
+
+
+def _consume_php_object_snapshot(
+    result: SandboxRunResult,
+    *,
+    php_object_expected: bool,
+) -> PhpObjectOracleSnapshot | None:
+    """Take parent-private object evidence without copying it into persistence."""
+    if not php_object_expected:
+        return None
+    return result.take_trusted_php_object_snapshot()
+
+
+def _validate_php_object_confirmation_snapshots(
+    first: PhpObjectOracleSnapshot | None,
+    confirmation: PhpObjectOracleSnapshot | None,
+) -> tuple[bool, str]:
+    """Bind two successful runs to stable tokens and fresh private generations."""
+    if first is None or confirmation is None:
+        return False, "clean replay lacks parent-attested PHP object evidence"
+    first_execution = first.execution
+    confirmation_execution = confirmation.execution
+    if (
+        first.schema_version != 1
+        or confirmation.schema_version != 1
+        or first.mode != "php_object"
+        or confirmation.mode != "php_object"
+        or first.generation_id_sha256 != first_execution.generation_id_sha256
+        or confirmation.generation_id_sha256
+        != confirmation_execution.generation_id_sha256
+        or not first_execution.attack_receipt_matched
+        or not confirmation_execution.attack_receipt_matched
+        or not first_execution.control_receipt_absent
+        or not confirmation_execution.control_receipt_absent
+    ):
+        return False, "clean replay contains an invalid PHP object attestation"
+    stable_fields = (
+        "class_name_sha256",
+        "callsite_path_sha256",
+        "callsite_start_line",
+        "callsite_end_line",
+        "callsite_source_sha256",
+        "backtrace_limit",
+        "canary_class_source_sha256",
+        "canary_class_source_size_bytes",
+        "attack_token_sha256",
+        "control_token_sha256",
+        "attack_payload_size_bytes",
+        "control_payload_size_bytes",
+    )
+    if any(
+        getattr(first_execution, field) != getattr(confirmation_execution, field)
+        for field in stable_fields
+    ):
+        return False, "clean replay changed its canary identity or authored arm tokens"
+    rotating_pairs = (
+        (first.generation_id_sha256, confirmation.generation_id_sha256),
+        (first_execution.proof_sha256, confirmation_execution.proof_sha256),
+        (
+            first_execution.attack_payload_sha256,
+            confirmation_execution.attack_payload_sha256,
+        ),
+        (
+            first_execution.control_payload_sha256,
+            confirmation_execution.control_payload_sha256,
+        ),
+        (
+            first_execution.expected_receipt_sha256,
+            confirmation_execution.expected_receipt_sha256,
+        ),
+    )
+    if any(left == right for left, right in rotating_pairs):
+        return False, "clean replay reused private PHP object generation material"
+    if (
+        confirmation_execution.execution_started_monotonic_ns
+        < first_execution.attested_monotonic_ns
+    ):
+        return False, "clean replay PHP object attestations are out of order"
+    return True, "clean replay used stable arm tokens and fresh private object material"
+
+
+def _php_object_natural_observation(
+    snapshot: PhpObjectGadgetOracleSnapshot,
+    *,
+    attacker_role: str,
+    target_url: str,
+    transport: dict[str, object],
+) -> PoCObservation:
+    """Render one bounded parent-attested natural-gadget measurement."""
+    if (
+        snapshot.schema_version != PHP_OBJECT_GADGET_ORACLE_SCHEMA_VERSION
+        or snapshot.mode != PHP_OBJECT_GADGET_ORACLE_MODE
+        or snapshot.effect != "file_delete"
+        or snapshot.effect_binding_kind != "direct_path"
+        or snapshot.effect_attestation.attack_deleted_exact_target is not True
+        or snapshot.effect_attestation.control_preserved_exact_target is not True
+        or snapshot.effect_attestation.collateral_paths_unchanged is not True
+    ):
+        raise ValueError("invalid PHP object natural-gadget snapshot")
+    method = transport.get("method")
+    route = transport.get("route")
+    if (
+        not isinstance(method, str)
+        or not method
+        or not isinstance(route, str)
+        or not route.startswith("/")
+    ):
+        raise ValueError("invalid PHP object natural-gadget transport")
+    return PoCObservation(
+        verdict="vulnerable",
+        oracle="file_effect",
+        attacker_role=attacker_role,
+        request={
+            "method": method,
+            "url": target_url.rstrip("/") + route,
+            "transport_contract_sha256": (
+                snapshot.transport_attestation.transport_contract_sha256
+            ),
+        },
+        attack={
+            "observed": True,
+            "effect": "verifier_owned_temporary_file_deleted",
+            "target_path_sha256": snapshot.target_path_sha256,
+            "target_content_sha256": snapshot.target_content_sha256,
+            "source_recipe_sha256": snapshot.runtime_binding.recipe_sha256,
+            "collateral_paths_unchanged": True,
+        },
+        control={
+            "observed": False,
+            "effect": "verifier_owned_temporary_file_deleted",
+            "target_path_sha256": snapshot.target_path_sha256,
+            "target_content_sha256": snapshot.target_content_sha256,
+            "source_recipe_sha256": snapshot.runtime_binding.recipe_sha256,
+            "target_preserved": True,
+        },
+        impact=CIAImpact(
+            confidentiality="none",
+            integrity="low",
+            availability="none",
+            description=PHP_OBJECT_NATURAL_IMPACT_DESCRIPTION,
+        ),
+    )
+
+
+def _php_object_natural_confirmation_payload(
+    hypothesis: Hypothesis,
+    first: PhpObjectGadgetOracleSnapshot,
+    confirmation: PhpObjectGadgetOracleSnapshot,
+) -> dict[str, object]:
+    """Build the persistence-safe promotion record for two natural executions."""
+    if (
+        first.effect_binding_kind != "direct_path"
+        or confirmation.effect_binding_kind != "direct_path"
+    ):
+        raise ValueError(
+            "only a direct-path natural gadget can promote a full CWE-502 finding"
+        )
+    accepted, reason = validate_php_object_gadget_snapshot_pair(first, confirmation)
+    if not accepted:
+        raise ValueError(reason)
+    return {
+        "schema_version": PHP_OBJECT_GADGET_ORACLE_SCHEMA_VERSION,
+        "status": "confirmed",
+        "proof_kind": "php_object_natural",
+        "hypothesis_id": hypothesis.id,
+        "bug_class": hypothesis.bug_class.value,
+        "effect": "file_delete",
+        "clean_state_executions": 2,
+        "finding_promoted": True,
+        "promotion_policy": "source_bound_natural_gadget_v1",
+        "first_execution": first.as_dict(),
+        "confirmation_execution": confirmation.as_dict(),
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class _PhpObjectNaturalReplay:
+    first_result: SandboxRunResult
+    first_snapshot: PhpObjectGadgetOracleSnapshot | None
+    confirmation_result: SandboxRunResult | None
+    confirmation_snapshot: PhpObjectGadgetOracleSnapshot | None
+    confirmed: bool
+    reason: str
+
+
+def _attach_php_object_natural_observation(
+    result: SandboxRunResult,
+    snapshot: PhpObjectGadgetOracleSnapshot,
+    *,
+    attacker_role: str,
+    target_url: str,
+    transport: dict[str, object],
+) -> None:
+    """Attach only a parent-derived observation to one successful run result."""
+    if not result.success or result.observation is not None:
+        raise ValueError(
+            "natural PHP object evidence requires a successful observation-free run"
+        )
+    _discard_ignored_php_object_child_report(result)
+    observation = _php_object_natural_observation(
+        snapshot,
+        attacker_role=attacker_role,
+        target_url=target_url,
+        transport=transport,
+    )
+    result.observation = observation
+    result.evidence["observation"] = observation.model_dump(mode="json")
+    result.evidence["observation_disposition"] = "accepted_parent_attestation"
+
+
+def _discard_ignored_php_object_child_report(result: SandboxRunResult) -> None:
+    """Remove the reused inert template's stdout from natural-proof surfaces."""
+    if not result.success:
+        return
+    result.output = ""
+    result.response = None
+    result.error_log = _strip_child_result_lines(result.error_log) or None
+    if "stdout_tail" in result.evidence:
+        result.evidence["stdout_tail"] = ""
+
+
+def _php_object_natural_attempt(
+    result: SandboxRunResult,
+    *,
+    iteration: int,
+    phase: Literal["attack", "confirmation"],
+    script_path: Path,
+) -> PoCAttempt:
+    """Convert one natural-gadget runner result into a bounded audit attempt."""
+    _discard_ignored_php_object_child_report(result)
+    return PoCAttempt(
+        iteration=iteration,
+        phase=phase,
+        proof_kind="php_object_natural",
+        script_path=str(script_path),
+        result=PoCStatus.SUCCESS if result.success else PoCStatus.FAILED,
+        http_status=result.http_status,
+        response_snippet=_attempt_response_snippet(result),
+        timing_seconds=result.elapsed,
+        error_log_snippet=_attempt_error_log_snippet(result),
+        observation=result.observation,
+        rejected_observation=result.rejected_observation,
+        validation_reason=(
+            result.validation_reason
+            or ((result.error_log or "")[:1000] if not result.success else "")
+            or (
+                "natural PHP object execution failed"
+                if not result.success
+                else None
+            )
+        ),
+    )
+
+
+async def _run_php_object_natural_replay(
+    sb: SandboxManager,
+    *,
+    script_path: Path,
+    recipe: PhpObjectGadgetRecipe,
+    expected_bug_class: str,
+    attacker_role: str,
+    transport: dict[str, object],
+    pre_attempt_snapshot: Path,
+    restore_attempt_state: Callable[[Path], Awaitable[None]],
+) -> _PhpObjectNaturalReplay:
+    """Execute one source-bound gadget twice from the same clean outer state."""
+    if recipe.effect_binding.kind != "direct_path":
+        raise ValueError(
+            "only direct-path PHP object recipes qualify for natural promotion"
+        )
+
+    first: SandboxRunResult | None = None
+    first_snapshot: PhpObjectGadgetOracleSnapshot | None = None
+    confirmation: SandboxRunResult | None = None
+    confirmation_snapshot: PhpObjectGadgetOracleSnapshot | None = None
+    await restore_attempt_state(pre_attempt_snapshot)
+    try:
+        await sb.prepare_php_object_gadget_oracle(recipe)
+        first = await sb.run_poc(
+            str(script_path),
+            expected_bug_class=expected_bug_class,
+            expected_attacker_role=attacker_role,
+            expected_http_transport=transport,
+            expected_php_object_gadget=True,
+            expected_php_object_transport=transport,
+        )
+        first_snapshot = first.take_trusted_php_object_gadget_snapshot()
+        if first.success:
+            if first_snapshot is None:
+                first.reject(
+                    "trusted natural PHP object run lacks parent attestation"
+                )
+            else:
+                _attach_php_object_natural_observation(
+                    first,
+                    first_snapshot,
+                    attacker_role=attacker_role,
+                    target_url=sb.target_url,
+                    transport=transport,
+                )
+        if not first.success:
+            return _PhpObjectNaturalReplay(
+                first_result=first,
+                first_snapshot=first_snapshot,
+                confirmation_result=None,
+                confirmation_snapshot=None,
+                confirmed=False,
+                reason=(
+                    first.validation_reason
+                    or "natural PHP object file effect did not reproduce"
+                ),
+            )
+
+        await restore_attempt_state(pre_attempt_snapshot)
+        confirmation = await sb.run_poc(
+            str(script_path),
+            expected_bug_class=expected_bug_class,
+            expected_attacker_role=attacker_role,
+            expected_http_transport=transport,
+            expected_php_object_gadget=True,
+            expected_php_object_transport=transport,
+        )
+        confirmation_snapshot = (
+            confirmation.take_trusted_php_object_gadget_snapshot()
+        )
+        if confirmation.success:
+            if confirmation_snapshot is None:
+                confirmation.reject(
+                    "trusted natural PHP object replay lacks parent attestation"
+                )
+            else:
+                _attach_php_object_natural_observation(
+                    confirmation,
+                    confirmation_snapshot,
+                    attacker_role=attacker_role,
+                    target_url=sb.target_url,
+                    transport=transport,
+                )
+        if not confirmation.success:
+            return _PhpObjectNaturalReplay(
+                first_result=first,
+                first_snapshot=first_snapshot,
+                confirmation_result=confirmation,
+                confirmation_snapshot=confirmation_snapshot,
+                confirmed=False,
+                reason=(
+                    confirmation.validation_reason
+                    or "clean-state natural PHP object replay did not reproduce"
+                ),
+            )
+
+        matching, reason = validate_php_object_gadget_snapshot_pair(
+            first_snapshot,
+            confirmation_snapshot,
+        )
+        if not matching:
+            confirmation.reject(reason)
+            return _PhpObjectNaturalReplay(
+                first_result=first,
+                first_snapshot=first_snapshot,
+                confirmation_result=confirmation,
+                confirmation_snapshot=confirmation_snapshot,
+                confirmed=False,
+                reason=reason,
+            )
+        return _PhpObjectNaturalReplay(
+            first_result=first,
+            first_snapshot=first_snapshot,
+            confirmation_result=confirmation,
+            confirmation_snapshot=confirmation_snapshot,
+            confirmed=True,
+            reason="two clean parent-attested direct-path gadget runs matched",
+        )
+    finally:
+        await restore_attempt_state(pre_attempt_snapshot)
 
 
 class VerifyStageError(RuntimeError):
@@ -211,6 +775,34 @@ _APPLICATION_PASSWORD_STORAGE_KEY_RE = re.compile(
     re.IGNORECASE,
 )
 
+_WP_USER_SESSION_CLI_MUTATION_RE = re.compile(
+    r"\buser\b.{0,1000}\bsession\b.{0,1000}\b(?:destroy|destroy-all)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
+_PHP_AUTH_SESSION_MUTATION_RE = re.compile(
+    r"\b(?:wp_generate_auth_cookie|wp_set_auth_cookie|wp_clear_auth_cookie|"
+    r"wp_destroy_current_session|wp_destroy_other_sessions|"
+    r"wp_destroy_all_sessions|wp_signon|wp_logout)\b",
+    re.IGNORECASE,
+)
+
+_PHP_SESSION_TOKENS_CLASS_RE = re.compile(
+    r"\bWP_(?:User_Meta_)?Session_Tokens\b",
+    re.IGNORECASE,
+)
+
+_PHP_SESSION_TOKEN_MUTATOR_RE = re.compile(
+    r"(?:(?:->|::)\s*|['\"])(?:create|update|destroy|destroy_others|"
+    r"destroy_all|destroy_all_for_all_users)(?:\s*\(|['\"])",
+    re.IGNORECASE,
+)
+
+_SESSION_TOKEN_STORAGE_KEY_RE = re.compile(
+    r"(?<![A-Za-z0-9_])session_tokens(?![A-Za-z0-9_])",
+    re.IGNORECASE,
+)
+
 _MANAGED_CAPABILITY_KEY_RE = re.compile(
     r"(?:\bwp_user_roles\b|(?:^|[^A-Za-z0-9])(?:[A-Za-z0-9_]+_)?"
     r"(?:capabilities|user_level)(?:[^A-Za-z0-9]|$))",
@@ -219,6 +811,50 @@ _MANAGED_CAPABILITY_KEY_RE = re.compile(
 
 _ACTIVE_PLUGIN_STATE_KEY_RE = re.compile(
     r"\b(?:active_plugins|active_sitewide_plugins)\b",
+    re.IGNORECASE,
+)
+
+_CANONICAL_URL_OPTION_KEYS = frozenset({"home", "siteurl"})
+_CANONICAL_URL_CONFIG_KEYS = frozenset({"wp_home", "wp_siteurl"})
+
+_PHP_CANONICAL_URL_OPTION_MUTATION_RE = re.compile(
+    r"(?<![A-Za-z0-9_>:\\])\\?(?:add|update|delete)_option\s*\(\s*"
+    r"['\"](?:home|siteurl)['\"]\s*(?:,|\))|"
+    r"\bcall_user_func\s*\(\s*['\"](?:add|update|delete)_option['\"]\s*,\s*"
+    r"['\"](?:home|siteurl)['\"]|"
+    r"\bcall_user_func_array\s*\(\s*"
+    r"['\"](?:add|update|delete)_option['\"]\s*,\s*"
+    r"(?:array\s*\(\s*|\[\s*)['\"](?:home|siteurl)['\"]",
+    re.IGNORECASE,
+)
+
+_EMBEDDED_WP_CLI_CANONICAL_URL_MUTATION_RE = re.compile(
+    r"\bWP_CLI\s*::\s*runcommand\s*\(\s*['\"]\s*"
+    r"(?!site\s+option\b)option\s+(?:(?:add|update|delete)\s+|patch\s+"
+    r"(?:add|update|delete|insert)\s+)(?:home|siteurl)(?:\s|['\"]|$)",
+    re.IGNORECASE,
+)
+
+_EMBEDDED_WP_CLI_CANONICAL_URL_CONFIG_MUTATION_RE = re.compile(
+    r"\bWP_CLI\s*::\s*runcommand\s*\(\s*['\"]\s*config\s+"
+    r"(?:set|delete)\s+(?:wp_home|wp_siteurl)(?:\s|['\"]|$)",
+    re.IGNORECASE,
+)
+
+_WP_CONFIG_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_.-])wp-config\.php\b",
+    re.IGNORECASE,
+)
+_PHP_WP_CONFIG_DELETE_RE = re.compile(r"\b(?:unlink|rmdir)\s*\(", re.IGNORECASE)
+
+_RAW_CANONICAL_URL_OPTION_ROW_RE = re.compile(
+    r"(?:['\"]option_name['\"]\s*=>|\boption_name\b\s*=)\s*"
+    r"['\"](?:home|siteurl)['\"]",
+    re.IGNORECASE,
+)
+
+_WORDPRESS_OPTIONS_TABLE_RE = re.compile(
+    r"\$wpdb\s*->\s*options\b|(?<![A-Za-z0-9_])`?wp_options`?(?![A-Za-z0-9_])",
     re.IGNORECASE,
 )
 
@@ -377,8 +1013,72 @@ def _setup_command_directly_writes_file(args: list[str]) -> bool:
     )
 
 
+def _setup_command_mutates_canonical_url(args: list[str]) -> bool:
+    """Recognise writes to WordPress's runner-owned public URL options."""
+    lowered = [str(token).casefold() for token in args]
+    for option_index, token in enumerate(lowered):
+        if token != "option" or (
+            option_index > 0 and lowered[option_index - 1] == "site"
+        ):
+            continue
+        positionals = [
+            value for value in lowered[option_index + 1 :] if not value.startswith("-")
+        ]
+        if not positionals:
+            continue
+        action = positionals[0]
+        if action in {"add", "update"} and len(positionals) >= 2:
+            if positionals[1] in _CANONICAL_URL_OPTION_KEYS:
+                return True
+        elif action == "delete" and any(
+            value in _CANONICAL_URL_OPTION_KEYS for value in positionals[1:]
+        ):
+            return True
+        elif (
+            action == "patch"
+            and len(positionals) >= 3
+            and positionals[1] in {"add", "update", "delete", "insert"}
+            and positionals[2] in _CANONICAL_URL_OPTION_KEYS
+        ):
+            return True
+
+    for config_index, token in enumerate(lowered):
+        if token != "config":
+            continue
+        positionals = [
+            value for value in lowered[config_index + 1 :] if not value.startswith("-")
+        ]
+        if (
+            len(positionals) >= 2
+            and positionals[0] in {"set", "delete"}
+            and positionals[1] in _CANONICAL_URL_CONFIG_KEYS
+        ):
+            return True
+
+    command = " ".join(args)
+    if _PHP_CANONICAL_URL_OPTION_MUTATION_RE.search(command):
+        return True
+    if _EMBEDDED_WP_CLI_CANONICAL_URL_MUTATION_RE.search(command):
+        return True
+    if _EMBEDDED_WP_CLI_CANONICAL_URL_CONFIG_MUTATION_RE.search(command):
+        return True
+    if _WP_CONFIG_PATH_RE.search(command) and (
+        _PHP_DIRECT_FILE_WRITE_RE.search(command)
+        or _PHP_WP_CONFIG_DELETE_RE.search(command)
+    ):
+        return True
+    return bool(
+        _DIRECT_STORAGE_WRITE_RE.search(command)
+        and _WORDPRESS_OPTIONS_TABLE_RE.search(command)
+        and _RAW_CANONICAL_URL_OPTION_ROW_RE.search(command)
+    )
+
+
 def _setup_command_mutates_managed_context(args: list[str]) -> str | None:
     """Reject identity overrides and plugin lifecycle changes owned by the sandbox."""
+    if _setup_command_mutates_canonical_url(args):
+        return "setup command mutates WordPress home/siteurl managed by the sandbox"
+
     for index, token in enumerate(args):
         if token.lower() != "plugin":
             continue
@@ -393,6 +1093,8 @@ def _setup_command_mutates_managed_context(args: list[str]) -> str | None:
         return "setup command mutates a sandbox-managed plugin or user security state"
     if _WP_APPLICATION_PASSWORD_CLI_MUTATION_RE.search(command):
         return "setup command mutates a managed user's application-password credentials"
+    if _WP_USER_SESSION_CLI_MUTATION_RE.search(command):
+        return "setup command mutates a managed user's authentication sessions"
     if _EMBEDDED_WP_CLI_ELEVATED_USER_CREATE_RE.search(command):
         return "setup command creates an elevated WordPress user"
     if _PHP_PLUGIN_LIFECYCLE_RE.search(command):
@@ -476,10 +1178,20 @@ def _setup_command_mutates_managed_context(args: list[str]) -> str | None:
         # These distinctive WordPress core method names remain visible when
         # dispatched through call_user_func(), an array callable, or variables.
         return "setup command mutates a managed user's application-password credentials"
+    if _PHP_AUTH_SESSION_MUTATION_RE.search(command):
+        return "setup command creates or mutates authentication cookies or sessions"
+    if _PHP_SESSION_TOKENS_CLASS_RE.search(
+        command
+    ) and _PHP_SESSION_TOKEN_MUTATOR_RE.search(command):
+        return "setup command mutates WordPress session-token credentials"
     if _APPLICATION_PASSWORD_STORAGE_KEY_RE.search(
         command
     ) and _setup_command_is_raw_state_write(args):
         return "setup command writes application-password credential storage directly"
+    if _SESSION_TOKEN_STORAGE_KEY_RE.search(
+        command
+    ) and _setup_command_is_raw_state_write(args):
+        return "setup command writes session-token credential storage directly"
     if _DIRECT_CREDENTIAL_STORAGE_RE.search(
         command
     ) and _DIRECT_STORAGE_WRITE_RE.search(command):
@@ -552,35 +1264,232 @@ def _summarise_forbidden_setup(results: list[dict]) -> str:
     return "\n".join(lines)
 
 
+_SETUP_SENSITIVE_KEY_RE = re.compile(
+    r"(?:password|passwd|secret|token|nonce|cookie|session|authorization|"
+    r"api[_-]?key|private[_-]?key|hash|receipt|proof)",
+    re.IGNORECASE,
+)
+_SETUP_SENSITIVE_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b([a-z0-9_-]*(?:password|passwd|secret|token|nonce|cookie|session|"
+    r"authorization|api[_-]?key|private[_-]?key|hash|receipt|proof)[a-z0-9_-]*)"
+    r"(\s*(?:=|:)\s*|\s+)([^\s,;&|]+)"
+)
+_SETUP_SENSITIVE_HEADER_RE = re.compile(
+    r"(?i)\b(authorization|proxy-authorization|cookie|set-cookie)\s*:\s*[^|]+"
+)
+
+
+def _redact_setup_output_value(value: object, *, key: str = "") -> object:
+    """Retain setup evidence while withholding credentials and nonce material."""
+    if key and _SETUP_SENSITIVE_KEY_RE.search(key):
+        if isinstance(value, bool):
+            return value
+        if (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and re.search(r"(?:count|length|size)$", key, re.IGNORECASE)
+        ):
+            return value
+        if value is None or value is False or value == "" or value == [] or value == {}:
+            return "<redacted:absent>"
+        return "<redacted:present>"
+    if isinstance(value, dict):
+        return {
+            str(child_key): _redact_setup_output_value(
+                child_value, key=str(child_key)
+            )
+            for child_key, child_value in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_setup_output_value(item) for item in value[:20]]
+    if isinstance(value, str):
+        return _redact_setup_output_text(value)
+    return value
+
+
+def _redact_setup_output_text(value: str) -> str:
+    """Best-effort redaction for non-JSON diagnostics before model exposure."""
+    without_headers = _SETUP_SENSITIVE_HEADER_RE.sub(
+        lambda match: f"{match.group(1)}: <redacted>", value
+    )
+    return _SETUP_SENSITIVE_ASSIGNMENT_RE.sub(
+        lambda match: f"{match.group(1)}{match.group(2)}<redacted>",
+        without_headers,
+    )
+
+
+def _bounded_setup_output(raw: object, *, limit: int = 500) -> str:
+    """Prefer one structured result and keep setup feedback predictably bounded."""
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for line in reversed(lines):
+        try:
+            parsed = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(parsed, (dict, list)):
+            redacted = _redact_setup_output_value(parsed)
+            rendered = json.dumps(
+                redacted,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            return rendered[:limit] + ("..." if len(rendered) > limit else "")
+        if parsed is None or isinstance(parsed, (str, int, float, bool)):
+            return "<non-object structured output omitted>"
+    rendered = _redact_setup_output_text(" ".join(lines))
+    return rendered[:limit] + ("..." if len(rendered) > limit else "")
+
+
+def _bounded_setup_diagnostic(raw: object, *, limit: int = 360) -> str:
+    """Surface stable errors before noisy bootstrap warnings, without secrets."""
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    lines = [" ".join(line.split()) for line in text.splitlines() if line.strip()]
+    priority = [
+        line
+        for line in lines
+        if line.startswith("Error:") or "setup postcondition failed" in line.lower()
+    ]
+    selected = priority or lines
+    rendered = _redact_setup_output_text(" | ".join(selected[:3]))
+    return rendered[:limit] + ("..." if len(rendered) > limit else "")
+
+
+def _summarise_setup_command(args: object) -> str:
+    """Return a bounded, non-secret command identity for prompt diagnostics."""
+    if not isinstance(args, list) or not args:
+        return "wp <command unavailable>"
+    values = [str(arg) for arg in args]
+    digest = hashlib.sha256(
+        "\0".join(values).encode("utf-8", errors="replace")
+    ).hexdigest()[:12]
+    verb = " ".join(values[0].split())[:48] or "<empty verb>"
+    if verb == "eval":
+        php_chars = len(values[1]) if len(values) > 1 else 0
+        return f"wp eval <PHP omitted; chars={php_chars}; sha256={digest}>"
+    subcommand = ""
+    if len(values) > 1:
+        subcommand = " " + " ".join(values[1].split())[:48]
+    omitted = max(len(values) - 2, 0)
+    suffix = f" <{omitted} args omitted; sha256={digest}>" if omitted else ""
+    return f"wp {verb}{subcommand}{suffix}"
+
+
 def _summarise_setup_results(results: list[dict]) -> str:
+    """Summarise results with outcome/evidence before bounded command identity."""
     lines: list[str] = []
-    for item in results:
+    for index, item in enumerate(results, start=1):
         blocked = item.get("blocked_before_execution") is True
-        if blocked:
+        rolled_back = item.get("setup_round_rolled_back") is True
+        if rolled_back and blocked:
+            status = "BLOCKED BEFORE EXECUTION — SETUP ROUND ROLLED BACK"
+        elif rolled_back and item.get("failed"):
+            status = "FAILED AFTER EXECUTION — ENTIRE SETUP ROUND ROLLED BACK"
+        elif rolled_back:
+            status = "NOT COMMITTED — SETUP ROUND ROLLED BACK"
+        elif blocked:
             status = "BLOCKED BEFORE EXECUTION"
         elif item.get("failed") and item.get("executed", True) is not False:
             status = "FAILED AFTER EXECUTION — STATE MAY BE PARTIAL"
         elif item.get("failed"):
             status = "FAILED"
         elif item.get("advisory_bootstrap_warning"):
-            status = "OK WITH WARNINGS"
-        else:
-            status = "OK"
-        cmd = " ".join(item.get("args", [])[:8])
-        output = " ".join(
-            part.strip().replace("\n", " ")
-            for part in (item.get("output") or "", item.get("stderr") or "")
-            if part.strip()
-        )
-        if len(output) > 500:
-            output = output[:500] + "..."
-        if blocked:
-            suffix = (
-                " No part of this command ran. Submit a new command containing only "
-                "permitted prerequisite operations."
+            status = (
+                "OK WITH WARNINGS — COMMITTED / RETAINED"
+                if item.get("setup_state_committed") is True
+                else "OK WITH WARNINGS"
             )
-            output = (output + suffix).strip()
-        lines.append(f"{status}: wp {cmd} -> {output}")
+        else:
+            status = (
+                "OK — COMMITTED / RETAINED"
+                if item.get("setup_state_committed") is True
+                else "OK"
+            )
+        output = _bounded_setup_output(item.get("output"))
+        diagnostic = _bounded_setup_diagnostic(item.get("stderr"))
+        lines.append(f"[{index}] {status}")
+        if output:
+            lines.append(f"  verified output: {output}")
+        if diagnostic:
+            label = "diagnostic" if item.get("failed") else "advisory"
+            lines.append(f"  {label}: {diagnostic}")
+        if blocked:
+            lines.append(
+                "  runner note: No part of this command ran. Submit a new command "
+                "containing only permitted prerequisite operations."
+            )
+        lines.append(f"  command: {_summarise_setup_command(item.get('args'))}")
+    return "\n".join(lines)
+
+
+def _summarise_setup_state(
+    results: list[dict],
+    *,
+    latest_round_results: list[dict] | None = None,
+) -> str:
+    """Describe retained setup separately from one transactional repair attempt."""
+    if not results and not latest_round_results:
+        return "(no setup commands were executed)"
+    committed = [
+        item for item in results if item.get("setup_state_committed") is True
+    ]
+    latest = list(latest_round_results or (results[-1:] if results else []))
+    lines = [
+        "RETAINED COMMITTED SETUP STATE "
+        "(authoritative current baseline; results ordered oldest to newest):"
+    ]
+    if committed:
+        lines.append(_summarise_setup_results(committed))
+        lines.append(
+            "For overlapping fields, treat a newer self-verified result as canonical. "
+            "Preserve these established objects and repair them incrementally."
+        )
+    else:
+        lines.append("(none established)")
+
+    lines.append("LATEST SETUP ROUND (authoritative transactional outcome):")
+    lines.append(_summarise_setup_results(latest) if latest else "(none)")
+    lines.append(
+        "FAILED or partial commands are not evidence that their attempted state "
+        "exists."
+    )
+    if any(item.get("setup_round_rolled_back") is True for item in latest):
+        lines.append(
+            "STATE TRANSITION: Only the latest failed setup round shown above was "
+            "rolled back. Its attempted mutations do not exist. Earlier committed "
+            "setup state remains present; inspect and repair that retained state "
+            "instead of recreating it."
+        )
+    elif latest and all(
+        item.get("blocked_before_execution") is True for item in latest
+    ):
+        lines.append(
+            "STATE TRANSITION: The latest round made no change. Earlier committed "
+            "setup state remains present."
+        )
+    elif latest and all(
+        item.get("setup_state_committed") is True for item in latest
+    ):
+        lines.append(
+            "STATE TRANSITION: The latest round committed and is included in the "
+            "retained baseline above."
+        )
+    rolled_back_count = sum(
+        item.get("setup_round_rolled_back") is True for item in results
+    )
+    blocked_count = sum(
+        item.get("blocked_before_execution") is True for item in results
+    )
+    lines.append(
+        "CUMULATIVE HISTORY COUNTS: "
+        f"committed={len(committed)}, rolled_back={rolled_back_count}, "
+        f"blocked_before_execution={blocked_count}."
+    )
     return "\n".join(lines)
 
 
@@ -608,12 +1517,10 @@ def _managed_setup_state_drift(before: dict, after: dict) -> str | None:
 
     def _normalised_paths(value: object) -> frozenset[str]:
         if isinstance(value, dict):
-            values = value.keys()
-        elif isinstance(value, (list, tuple, set, frozenset)):
-            values = value
-        else:
-            return frozenset()
-        return frozenset(str(path) for path in values)
+            return frozenset(str(path) for path in value)
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return frozenset(str(path) for path in value)
+        return frozenset()
 
     if _normalised_paths(before.get("active_plugins")) != _normalised_paths(
         after.get("active_plugins")
@@ -621,6 +1528,9 @@ def _managed_setup_state_drift(before: dict, after: dict) -> str | None:
         after.get("active_sitewide_plugins")
     ):
         return "generated setup changed managed plugin activation state"
+
+    if before.get("canonical_urls") != after.get("canonical_urls"):
+        return "generated setup changed WordPress home/siteurl"
 
     before_users = before.get("users") or {}
     after_users = after.get("users") or {}
@@ -714,6 +1624,17 @@ def _trusted_setup_wp_user(sb: SandboxManager) -> str:
     if callable(admin_id_reader):
         return str(admin_id_reader())
     return str(sb.config.wp_admin_email)
+
+
+def _setup_http_context_for_sandbox(sb: SandboxManager) -> SetupHttpContext:
+    """Read the typed setup-only HTTP contract from a live sandbox."""
+    context_factory = getattr(sb, "setup_http_context", None)
+    if not callable(context_factory):
+        raise RuntimeError("sandbox does not expose a setup HTTP context")
+    context = context_factory()
+    if not isinstance(context, SetupHttpContext):
+        raise RuntimeError("sandbox returned an invalid setup HTTP context")
+    return context
 
 
 async def _run_setup_commands(
@@ -842,7 +1763,7 @@ async def _run_setup_commands(
                 "executed": True,
             }
 
-        if before_state is not None:
+        if before_state is not None and callable(state_reader):
             try:
                 after_state = await state_reader(plugin_slug)
                 state_violation = _managed_setup_state_drift(
@@ -873,6 +1794,183 @@ async def _run_setup_commands(
         log = logger.warning if result.get("failed") else logger.info
         log("setup wp %s -> %s", " ".join(args[:6]), combined.strip()[:160])
     return results
+
+
+async def _run_setup_round_atomically(
+    sb: SandboxManager,
+    commands: list[list[str]],
+    *,
+    hypothesis: Hypothesis | None = None,
+    plugin_slug: str | None = None,
+) -> list[dict]:
+    """Run one generated setup round and roll back every partial failure.
+
+    A developer round can contain several commands, and a single ``wp eval`` may
+    mutate state before its final postcondition fails. The pre-round snapshot makes
+    the whole proposal transactional from the verifier's perspective.
+    """
+    if not commands:
+        return []
+    snapshot = await sb.snapshot()
+    retain_snapshot_for_recovery = True
+
+    async def _rollback() -> None:
+        await sb.restore(snapshot)
+        restart_runtime = getattr(sb, "restart_wordpress_runtime", None)
+        if callable(restart_runtime):
+            await restart_runtime()
+
+    try:
+        try:
+            results = await _run_setup_commands(
+                sb,
+                commands,
+                hypothesis=hypothesis,
+                plugin_slug=plugin_slug,
+            )
+        except BaseException:
+            await _rollback()
+            retain_snapshot_for_recovery = False
+            raise
+        failed = any(item.get("failed") for item in results)
+        any_executed = any(
+            item.get("executed", True) is not False for item in results
+        )
+        rolled_back = failed and any_executed
+        if rolled_back:
+            await _rollback()
+        retain_snapshot_for_recovery = False
+        for item in results:
+            item["setup_round_rolled_back"] = rolled_back
+            item["setup_state_committed"] = not failed
+        return results
+    finally:
+        # A failed restore leaves this as the only recovery copy. Retain it for
+        # sandbox-level recovery/teardown instead of deleting evidence and state.
+        if not retain_snapshot_for_recovery:
+            shutil.rmtree(snapshot, ignore_errors=True)
+
+
+_POC_CODE_FAILURE_MARKERS = (
+    "Traceback (most recent call last)",
+    "JSONDecodeError",
+    "KeyError",
+    "IndexError",
+    "AttributeError",
+)
+
+
+def _poc_failure_looks_like_code_error(result: SandboxRunResult) -> bool:
+    """Return whether trusted stderr shows the PoC itself crashed."""
+    stderr = result.error_log or ""
+    return any(marker in stderr for marker in _POC_CODE_FAILURE_MARKERS)
+
+
+def _should_replay_poc_after_setup(
+    result: SandboxRunResult,
+    followup: SetupPlan | None,
+    rounds: list[tuple[SetupPlan, list[dict]]],
+    *,
+    replaying_setup_repair: bool,
+) -> bool:
+    """Allow one exact replay only after a cleanly committed setup repair."""
+    if (
+        replaying_setup_repair
+        or followup is None
+        or followup.failure_class != "setup"
+        or not followup.commands
+        or not rounds
+        or rounds[-1][0] is not followup
+        or _poc_failure_looks_like_code_error(result)
+    ):
+        return False
+
+    final_results = rounds[-1][1]
+    reusable_oracle_state = (
+        result.evidence.get("ssrf_oracle_error") in (None, "")
+        and result.evidence.get("php_include_oracle_error") in (None, "")
+        and result.evidence.get("php_include_oracle_cleanup_error") in (None, "")
+        and result.evidence.get("php_object_oracle_error")
+        in (None, "", "transport_incomplete")
+    )
+    return bool(final_results) and reusable_oracle_state and all(
+        item.get("failed") is False
+        and item.get("executed") is True
+        and item.get("setup_state_committed") is True
+        and item.get("setup_round_rolled_back") is False
+        and item.get("blocked_before_execution") is False
+        and not _setup_result_taints_confirmation(item)
+        for item in final_results
+    )
+
+
+_IMPACT_LEVEL_RANK = {"none": 0, "low": 1, "high": 2}
+
+
+def _has_full_compromise_target(outcome: SecurityOutcome) -> bool:
+    """Return whether source review explicitly claimed high impact in every dimension."""
+    return all(
+        getattr(outcome, dimension) == "high"
+        for dimension in ("confidentiality", "integrity", "availability")
+    )
+
+
+def _full_compromise_gaps(impact: CIAImpact) -> dict[str, str]:
+    """Describe measured dimensions that remain below an explicit full-compromise target."""
+    return {
+        dimension: getattr(impact, dimension)
+        for dimension in ("confidentiality", "integrity", "availability")
+        if getattr(impact, dimension) != "high"
+    }
+
+
+def _confirmed_impact_vector(attempt: PoCAttempt) -> tuple[int, int, int]:
+    """Return a fixed CIA vector for stable component-wise comparison."""
+    if attempt.observation is None:
+        return (-1, -1, -1)
+    impact = attempt.observation.impact
+    return (
+        _IMPACT_LEVEL_RANK[impact.confidentiality],
+        _IMPACT_LEVEL_RANK[impact.integrity],
+        _IMPACT_LEVEL_RANK[impact.availability],
+    )
+
+
+def _confirmed_impact_dominates(
+    candidate: PoCAttempt,
+    incumbent: PoCAttempt,
+) -> bool:
+    """Return whether a confirmation improves impact without losing a dimension."""
+    candidate_ranks = _confirmed_impact_vector(candidate)
+    incumbent_ranks = _confirmed_impact_vector(incumbent)
+    return all(
+        candidate_rank >= incumbent_rank
+        for candidate_rank, incumbent_rank in zip(
+            candidate_ranks,
+            incumbent_ranks,
+            strict=True,
+        )
+    ) and any(
+        candidate_rank > incumbent_rank
+        for candidate_rank, incumbent_rank in zip(
+            candidate_ranks,
+            incumbent_ranks,
+            strict=True,
+        )
+    )
+
+
+def _select_strongest_confirmation(
+    confirmations: list[PoCAttempt],
+) -> PoCAttempt:
+    """Select only monotonic improvements, retaining the first incomparable proof."""
+    if not confirmations:
+        raise ValueError("at least one confirmation is required")
+    selected = confirmations[0]
+    for candidate in confirmations[1:]:
+        if _confirmed_impact_dominates(candidate, selected):
+            selected = candidate
+    return selected
 
 
 # Tables referenced in raw SQL — used to seed schema diagnostics for the followup developer call.
@@ -1167,7 +2265,7 @@ def _build_setup_code_context(
         (0, 0, 0),
     )
     for head_lines, config_radius, anchor_radius in compact_shapes:
-        selected = set()
+        selected: set[int] = set()
         for line in explicit_primary:
             selected.update(
                 range(
@@ -2164,6 +3262,1005 @@ def _expected_ssrf_http_transport(
     return transport
 
 
+_PHP_INCLUDE_CONSTRUCT_RE = re.compile(
+    r"\b(?:include|include_once|require|require_once)\b\s*(?:\(|\s)",
+    re.IGNORECASE,
+)
+_PHP_INCLUDE_VARIABLE_RE = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*")
+_PHP_REQUEST_REFERENCE_RE = re.compile(
+    r"\$_(?P<source>GET|POST|REQUEST)\s*\[\s*"
+    r"(?P<quote>['\"])(?P<name>[A-Za-z_][A-Za-z0-9_.:-]{0,127})(?P=quote)\s*\]",
+    re.IGNORECASE,
+)
+_PHP_DESCRIBED_ENTRY_RE = re.compile(
+    r"\A(?P<head>.+?)\s+with\s+(?P<fields>[^\r\n]+)\Z",
+    re.IGNORECASE,
+)
+_PHP_DESCRIBED_FIELD_RE = re.compile(
+    r"\A(?P<name>[A-Za-z_][A-Za-z0-9_.:-]{0,127})=(?P<value>[^&]+)\Z"
+)
+_PHP_WORDPRESS_HOOK_RE = re.compile(
+    r"\A(?:wp_ajax_(?:nopriv_)?|admin_post_(?:nopriv_)?)"
+    r"[A-Za-z_][A-Za-z0-9_.:-]{0,127}\Z"
+)
+_PHP_INCLUDE_MAX_FILES = 4096
+_PHP_INCLUDE_MAX_TOTAL_SOURCE_BYTES = 64 * 1024 * 1024
+
+
+def _has_variable_php_include_operand(source_quote: str) -> bool:
+    """Require one request-shaped variable inside the actual include operand."""
+    masked = _mask_php_non_code(source_quote)
+    matches = list(_PHP_INCLUDE_CONSTRUCT_RE.finditer(masked))
+    if len(matches) != 1:
+        return False
+    match = matches[0]
+    if match.group(0).rstrip().endswith("("):
+        closing_parenthesis = _matching_delimiter(
+            masked,
+            match.end() - 1,
+            "(",
+            ")",
+        )
+        if closing_parenthesis is None:
+            return False
+        operand = masked[match.end() : closing_parenthesis]
+        return bool(operand.strip() and _PHP_INCLUDE_VARIABLE_RE.search(operand))
+
+    round_depth = 0
+    square_depth = 0
+    brace_depth = 0
+    end = len(masked)
+    for index in range(match.end(), len(masked)):
+        char = masked[index]
+        if char == "(":
+            round_depth += 1
+        elif char == ")":
+            if round_depth == 0:
+                return False
+            round_depth -= 1
+        elif char == "[":
+            square_depth += 1
+        elif char == "]":
+            if square_depth == 0:
+                return False
+            square_depth -= 1
+        elif char == "{":
+            brace_depth += 1
+        elif char == "}":
+            if brace_depth == 0:
+                return False
+            brace_depth -= 1
+        elif char == ";" and not (round_depth or square_depth or brace_depth):
+            end = index
+            break
+    operand = masked[match.end() : end]
+    return bool(operand.strip() and _PHP_INCLUDE_VARIABLE_RE.search(operand))
+
+
+def _is_source_grounded_php_include_hypothesis(
+    hypothesis: Hypothesis,
+    plugin_root: str | Path,
+) -> bool:
+    """Enable the trusted canary only for an exact dynamic PHP include sink."""
+    if hypothesis.bug_class != BugClass.PATH_TRAVERSAL:
+        return False
+    source_file = _resolve_ssrf_source_file(plugin_root, hypothesis.file)
+    if source_file is None or not hypothesis.sink_code.strip():
+        return False
+    try:
+        lines = source_file.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return False
+    quote_lines = hypothesis.sink_code.strip("\r\n").splitlines()
+    start = hypothesis.line - 1
+    if start < 0 or start + len(quote_lines) > len(lines):
+        return False
+    if [line.strip() for line in quote_lines] != [
+        line.strip() for line in lines[start : start + len(quote_lines)]
+    ]:
+        return False
+    return _has_variable_php_include_operand(hypothesis.sink_code)
+
+
+def _bounded_php_include_sources(
+    plugin_root: str | Path,
+) -> list[tuple[str, str]] | None:
+    """Read a bounded, symlink-confined PHP corpus for literal route facts."""
+    try:
+        root = Path(plugin_root).resolve(strict=True)
+    except OSError:
+        return None
+    if not root.is_dir():
+        return None
+    paths = sorted(root.rglob("*.php"))
+    if len(paths) > _PHP_INCLUDE_MAX_FILES:
+        return None
+    total = 0
+    sources: list[tuple[str, str]] = []
+    for path in paths:
+        try:
+            resolved = path.resolve(strict=True)
+            resolved.relative_to(root)
+            size = resolved.stat().st_size
+        except (OSError, ValueError):
+            return None
+        if not resolved.is_file() or size > _SSRF_MAX_SOURCE_BYTES:
+            return None
+        total += size
+        if total > _PHP_INCLUDE_MAX_TOTAL_SOURCE_BYTES:
+            return None
+        try:
+            source = resolved.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+        sources.append((source, _mask_php_non_code(source)))
+    return sources
+
+
+def _php_include_source_facts(
+    plugin_root: str | Path,
+    entry_head: str,
+    hypothesis: Hypothesis,
+    plugin_slug: str | None,
+) -> dict[str, frozenset[Literal["query", "form"]]] | None:
+    """Collect scoped literal request keys for one source-backed entry point."""
+    sources = _bounded_php_include_sources(plugin_root)
+    if sources is None:
+        return None
+    head = entry_head.strip()
+    allowed_functions: set[str] | None = None
+    if _PHP_WORDPRESS_HOOK_RE.fullmatch(head):
+        callback_names: set[str] = set()
+        add_action = re.compile(r"\badd_action\s*\(", re.IGNORECASE)
+        quoted_identifier = re.compile(
+            r"\A\s*(?P<quote>['\"])(?P<value>[A-Za-z_][A-Za-z0-9_]*)"
+            r"(?P=quote)\s*\Z"
+        )
+        quoted_hook = re.compile(
+            r"\A\s*(?P<quote>['\"])" + re.escape(head) + r"(?P=quote)\s*\Z",
+            re.IGNORECASE,
+        )
+        array_callback = re.compile(
+            r"\A\s*(?:array\s*\(|\[).*?(?P<quote>['\"])"
+            r"(?P<value>[A-Za-z_][A-Za-z0-9_]*)(?P=quote)\s*(?:\)|\])\s*\Z",
+            re.IGNORECASE | re.DOTALL,
+        )
+        for source, masked in sources:
+            for registration in add_action.finditer(masked):
+                opening_parenthesis = registration.end() - 1
+                closing_parenthesis = _matching_delimiter(
+                    masked,
+                    opening_parenthesis,
+                    "(",
+                    ")",
+                    limit=min(
+                        len(masked),
+                        opening_parenthesis + _SSRF_MAX_CALL_CHARS,
+                    ),
+                )
+                if closing_parenthesis is None:
+                    continue
+                arguments = _call_arguments(
+                    source,
+                    masked,
+                    opening_parenthesis,
+                    closing_parenthesis,
+                )
+                if arguments is None or len(arguments) < 2:
+                    continue
+                if quoted_hook.fullmatch(arguments[0]) is None:
+                    continue
+                direct = quoted_identifier.fullmatch(arguments[1])
+                array_value = array_callback.fullmatch(arguments[1])
+                if direct is not None:
+                    callback_names.add(direct.group("value").casefold())
+                elif array_value is not None:
+                    callback_names.add(array_value.group("value").casefold())
+                elif (
+                    re.fullmatch(
+                        r"\s*\$[A-Za-z_][A-Za-z0-9_]*\s*",
+                        arguments[1],
+                    )
+                    and len(arguments) >= 3
+                ):
+                    loader_callback = quoted_identifier.fullmatch(arguments[2])
+                    if loader_callback is not None:
+                        callback_names.add(loader_callback.group("value").casefold())
+
+        defined_functions = {
+            match.group("name").casefold()
+            for _source, masked in sources
+            for match in _SSRF_NAMED_FUNCTION_RE.finditer(masked)
+        }
+        callback_names &= defined_functions
+        if not callback_names:
+            return None
+
+        described = _PHP_DESCRIBED_ENTRY_RE.fullmatch(hypothesis.entry_point.strip())
+        described_handlers: set[str] = set()
+        if described:
+            for raw_field in described.group("fields").split("&"):
+                field = _PHP_DESCRIBED_FIELD_RE.fullmatch(raw_field.strip())
+                if field is None:
+                    continue
+                value = field.group("value").strip()
+                if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
+                    described_handlers.add(value.casefold())
+        allowed_functions = callback_names | (described_handlers & defined_functions)
+    else:
+        parsed = _parse_entry_point_transport(head)
+        route = str(parsed.get("route") or "")
+        try:
+            root = Path(plugin_root).resolve(strict=True)
+        except OSError:
+            return None
+        # Exact direct plugin files are source-grounded by their route. Other
+        # callback/REST descriptions need a structured hook and fail closed.
+        if plugin_slug is None:
+            return None
+        direct_prefix = f"/wp-content/plugins/{plugin_slug}/"
+        if not route.startswith(direct_prefix):
+            return None
+        relative = route.removeprefix(direct_prefix)
+        if _resolve_ssrf_source_file(root, relative) is None:
+            return None
+
+    facts: dict[str, set[Literal["query", "form"]]] = {}
+    for source, masked in sources:
+        for match in _PHP_REQUEST_REFERENCE_RE.finditer(source):
+            if masked[match.start() : match.start() + 2] != "$_":
+                continue
+            if allowed_functions is not None:
+                enclosing = _enclosing_named_php_function(
+                    source,
+                    masked,
+                    match.start(),
+                )
+                if (
+                    enclosing is not None
+                    and enclosing[0].casefold() not in allowed_functions
+                ):
+                    continue
+            request_source = match.group("source").upper()
+            options: tuple[Literal["query", "form"], ...]
+            if request_source == "GET":
+                options = ("query",)
+            elif request_source == "POST":
+                options = ("form",)
+            else:
+                options = ("query", "form")
+            facts.setdefault(match.group("name"), set()).update(options)
+    return {name: frozenset(options) for name, options in facts.items()}
+
+
+def _php_request_parameter_locations(
+    hypothesis: Hypothesis,
+    source_facts: dict[str, frozenset[Literal["query", "form"]]],
+) -> dict[str, frozenset[Literal["query", "form"]]]:
+    """Map explicitly described PHP request inputs to bounded HTTP locations."""
+    evidence = hypothesis.evidence_summary or {}
+    values = [
+        *hypothesis.taint_path,
+        hypothesis.reasoning,
+        hypothesis.preconditions,
+        *(str(value) for value in evidence.values() if isinstance(value, str)),
+    ]
+    locations: dict[str, set[Literal["query", "form"]]] = {}
+    for value in values:
+        for match in _PHP_REQUEST_REFERENCE_RE.finditer(value):
+            source = match.group("source").upper()
+            options: tuple[Literal["query", "form"], ...]
+            if source == "GET":
+                options = ("query",)
+            elif source == "POST":
+                options = ("form",)
+            else:
+                options = ("query", "form")
+            locations.setdefault(match.group("name"), set()).update(options)
+    return {
+        name: frozenset(found & set(source_facts.get(name, frozenset())))
+        for name, found in locations.items()
+        if found & set(source_facts.get(name, frozenset()))
+    }
+
+
+def _php_include_destination_parameter(hypothesis: Hypothesis) -> str:
+    """Prefer one explicit placeholder, then the request input nearest the sink."""
+    described = _PHP_DESCRIBED_ENTRY_RE.fullmatch(hypothesis.entry_point.strip())
+    if described:
+        placeholders: list[str] = []
+        for raw_field in described.group("fields").split("&"):
+            field = _PHP_DESCRIBED_FIELD_RE.fullmatch(raw_field.strip())
+            if field and re.fullmatch(r"<[^<>]{1,80}>", field.group("value").strip()):
+                placeholders.append(field.group("name"))
+        if len(placeholders) == 1:
+            return placeholders[0]
+
+    for step in reversed(hypothesis.taint_path):
+        names = {
+            match.group("name") for match in _PHP_REQUEST_REFERENCE_RE.finditer(step)
+        }
+        if len(names) == 1:
+            return next(iter(names))
+    return ""
+
+
+def _expected_php_include_http_transport(
+    hypothesis: Hypothesis,
+    plugin_root: str | Path,
+    plugin_slug: str | None = None,
+) -> dict[str, object] | None:
+    """Derive bounded request variants from the accepted source-backed claim."""
+    if plugin_slug is not None:
+        try:
+            plugin_slug = validate_plugin_slug(plugin_slug)
+        except ValueError:
+            return None
+    if not _is_source_grounded_php_include_hypothesis(hypothesis, plugin_root):
+        return None
+    destination = _php_include_destination_parameter(hypothesis)
+    if not destination:
+        return None
+
+    described = _PHP_DESCRIBED_ENTRY_RE.fullmatch(hypothesis.entry_point.strip())
+    head = described.group("head").strip() if described else hypothesis.entry_point
+    base = dict(_parse_entry_point_transport(head))
+    if not base.get("method") or not base.get("route"):
+        return None
+    dispatch = base.get("dispatch")
+    if not isinstance(dispatch, dict):
+        return None
+    source_facts = _php_include_source_facts(
+        plugin_root,
+        head,
+        hypothesis,
+        plugin_slug,
+    )
+    if source_facts is None:
+        return None
+    locations = _php_request_parameter_locations(hypothesis, source_facts)
+    destination_locations = sorted(locations.get(destination, frozenset()))
+    if not destination_locations:
+        return None
+    variants: list[dict[str, str]] = [dict(dispatch)]
+
+    if described:
+        described_fields: list[tuple[str, str]] = []
+        for raw_field in described.group("fields").split("&"):
+            field = _PHP_DESCRIBED_FIELD_RE.fullmatch(raw_field.strip())
+            if field is None:
+                return None
+            name = field.group("name")
+            value = field.group("value").strip()
+            if name != destination:
+                described_fields.append((name, value))
+        if len(described_fields) > 6:
+            return None
+        for name, value in described_fields:
+            field_locations = sorted(locations.get(name, frozenset()))
+            if not field_locations:
+                return None
+            expanded: list[dict[str, str]] = []
+            for current in variants:
+                for location in field_locations:
+                    key = f"{location}:{name}"
+                    if key in current and current[key] != value:
+                        continue
+                    candidate = dict(current)
+                    candidate[key] = value
+                    expanded.append(candidate)
+            if not expanded or len(expanded) > 4:
+                return None
+            variants = expanded
+
+    alternatives: list[dict[str, object]] = []
+    for destination_location in destination_locations:
+        for current in variants:
+            candidate_dispatch = dict(current)
+            candidate_dispatch.pop(f"{destination_location}:{destination}", None)
+            alternatives.append(
+                {
+                    "method": str(base["method"]),
+                    "route": str(base["route"]),
+                    "dispatch": candidate_dispatch,
+                    "destination_parameter": destination,
+                    "destination_location": destination_location,
+                }
+            )
+    unique: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for alternative in alternatives:
+        key = json.dumps(alternative, sort_keys=True)
+        if key not in seen:
+            seen.add(key)
+            unique.append(alternative)
+    if not unique or len(unique) > 4:
+        return None
+    return unique[0] if len(unique) == 1 else {"alternatives": unique}
+
+
+def _php_include_oracle_enabled_for_hypotheses(
+    hypotheses: list[Hypothesis],
+    plugin_root: str | Path,
+    plugin_slug: str,
+) -> bool:
+    """Return whether this sandbox needs the additive PHP include capability."""
+    return any(
+        _expected_php_include_http_transport(
+            hypothesis,
+            plugin_root,
+            plugin_slug,
+        )
+        is not None
+        for hypothesis in hypotheses
+    )
+
+
+_PHP_OBJECT_SINK_RE = re.compile(
+    r"\b(?P<name>unserialize|maybe_unserialize|update_metadata)\s*\(",
+    re.IGNORECASE,
+)
+_PHP_OBJECT_ARRAY_KEY_RE = re.compile(
+    r"\$(?P<variable>[A-Za-z_][A-Za-z0-9_]*)\s*"
+    r"\[\s*(?P<quote>['\"])(?P<name>[A-Za-z_][A-Za-z0-9_.:-]{0,127})"
+    r"(?P=quote)\s*\]",
+)
+_PHP_OBJECT_LITERAL_SUBSCRIPT_RE = re.compile(
+    r"\[\s*(?P<quote>['\"])(?P<name>[A-Za-z_][A-Za-z0-9_.:-]{0,127})"
+    r"(?P=quote)\s*\]",
+)
+_PHP_OBJECT_EVIDENCE_FUNCTION_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:[A-Za-z_][A-Za-z0-9_\\]*::)?"
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\(",
+)
+_PHP_OBJECT_POST_FIELD_RE = re.compile(
+    r"\bPOST\s+(?:form\s+|body\s+|field\s+|parameter\s+)?"
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_.:-]{0,127})\b",
+    re.IGNORECASE,
+)
+_PHP_OBJECT_FIELD_POST_RE = re.compile(
+    r"\b(?P<name>[A-Za-z_][A-Za-z0-9_.:-]{0,127})\s+"
+    r"(?:POST|form|body)\s+(?:field|parameter)\b",
+    re.IGNORECASE,
+)
+_PHP_OBJECT_FIELD_STOPWORDS = frozenset(
+    {"body", "data", "field", "fields", "form", "parameter", "request"}
+)
+_PHP_OBJECT_MAX_DESCRIBED_DISPATCH_FIELDS = 8
+
+
+def _is_source_grounded_php_object_hypothesis(
+    hypothesis: Hypothesis,
+    plugin_root: str | Path,
+) -> bool:
+    """Require an exact plugin-local unrestricted-deserialization sink call."""
+    if (
+        hypothesis.bug_class != BugClass.PHP_OBJECT_INJECTION
+        or (hypothesis.evidence_summary or {}).get("usable_gadget") is not True
+    ):
+        return False
+    source_file = _resolve_ssrf_source_file(plugin_root, hypothesis.file)
+    if source_file is None or not hypothesis.sink_code.strip():
+        return False
+    try:
+        lines = source_file.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return False
+    quote_lines = hypothesis.sink_code.strip("\r\n").splitlines()
+    start = hypothesis.line - 1
+    if start < 0 or start + len(quote_lines) > len(lines):
+        return False
+    if [line.strip() for line in quote_lines] != [
+        line.strip() for line in lines[start : start + len(quote_lines)]
+    ]:
+        return False
+
+    source_quote = hypothesis.sink_code
+    masked = _mask_php_non_code(source_quote)
+    calls = list(_PHP_OBJECT_SINK_RE.finditer(masked))
+    if len(calls) != 1:
+        return False
+    call = calls[0]
+    if re.search(r"\bfunction\s*\Z", masked[: call.start()], re.IGNORECASE):
+        return False
+    opening_parenthesis = call.end() - 1
+    closing_parenthesis = _matching_delimiter(
+        masked,
+        opening_parenthesis,
+        "(",
+        ")",
+        limit=min(len(masked), opening_parenthesis + _SSRF_MAX_CALL_CHARS),
+    )
+    if closing_parenthesis is None:
+        return False
+    arguments = _call_arguments(
+        source_quote,
+        masked,
+        opening_parenthesis,
+        closing_parenthesis,
+    )
+    if arguments is None:
+        return False
+    sink_name = call.group("name").casefold()
+    value_index = 3 if sink_name == "update_metadata" else 0
+    if len(arguments) <= value_index:
+        return False
+    value_argument = _mask_php_non_code(arguments[value_index])
+    if _PHP_INCLUDE_VARIABLE_RE.search(value_argument) is None:
+        return False
+    if sink_name == "update_metadata" and len(arguments) >= 5:
+        previous_value = arguments[4].strip().casefold()
+        if (
+            previous_value
+            and previous_value not in {"''", '""', "null"}
+            and (_PHP_INCLUDE_VARIABLE_RE.fullmatch(previous_value) is None)
+        ):
+            return False
+    return True
+
+
+def _expected_php_object_callsite(
+    hypothesis: Hypothesis,
+    plugin_root: str | Path,
+) -> PhpObjectCallsite | None:
+    """Bind the cited sink to one exact plugin-relative file and line range."""
+    if not _is_source_grounded_php_object_hypothesis(hypothesis, plugin_root):
+        return None
+    source_file = _resolve_ssrf_source_file(plugin_root, hypothesis.file)
+    if source_file is None:
+        return None
+    try:
+        root = Path(plugin_root).resolve(strict=True)
+        resolved = source_file.resolve(strict=True)
+        relative_path = resolved.relative_to(root).as_posix()
+        source_bytes = resolved.read_bytes()
+    except (OSError, ValueError):
+        return None
+    quote_lines = hypothesis.sink_code.strip("\r\n").splitlines()
+    if not quote_lines:
+        return None
+    try:
+        return PhpObjectCallsite(
+            relative_path=relative_path,
+            start_line=hypothesis.line,
+            end_line=hypothesis.line + len(quote_lines) - 1,
+            source_sha256=hashlib.sha256(source_bytes).hexdigest(),
+        )
+    except ValueError:
+        return None
+
+
+def _php_object_entry_callbacks(
+    sources: list[tuple[str, str]],
+    hook: str,
+) -> frozenset[str]:
+    """Resolve one literal WordPress hook to one literal callback name."""
+    if _PHP_WORDPRESS_HOOK_RE.fullmatch(hook) is None:
+        return frozenset()
+    quoted_hook = re.compile(
+        r"\A\s*(?P<quote>['\"])" + re.escape(hook) + r"(?P=quote)\s*\Z",
+        re.IGNORECASE,
+    )
+    quoted_callback = re.compile(
+        r"\A\s*(?P<quote>['\"])(?P<name>[A-Za-z_][A-Za-z0-9_]*)"
+        r"(?P=quote)\s*\Z"
+    )
+    array_callback = re.compile(
+        r"\A\s*(?:array\s*\(|\[).*?(?P<quote>['\"])"
+        r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?P=quote)\s*(?:\)|\])\s*\Z",
+        re.IGNORECASE | re.DOTALL,
+    )
+    callbacks: set[str] = set()
+    for source, masked in sources:
+        for registration in re.finditer(r"\badd_action\s*\(", masked, re.IGNORECASE):
+            opening_parenthesis = registration.end() - 1
+            closing_parenthesis = _matching_delimiter(
+                masked,
+                opening_parenthesis,
+                "(",
+                ")",
+                limit=min(len(masked), opening_parenthesis + _SSRF_MAX_CALL_CHARS),
+            )
+            if closing_parenthesis is None:
+                continue
+            arguments = _call_arguments(
+                source,
+                masked,
+                opening_parenthesis,
+                closing_parenthesis,
+            )
+            if arguments is None or len(arguments) < 2:
+                continue
+            if quoted_hook.fullmatch(arguments[0]) is None:
+                continue
+            callback = quoted_callback.fullmatch(arguments[1])
+            array_value = array_callback.fullmatch(arguments[1])
+            if callback is not None:
+                callbacks.add(callback.group("name").casefold())
+            elif array_value is not None:
+                callbacks.add(array_value.group("name").casefold())
+    defined = {
+        match.group("name").casefold()
+        for _source, masked in sources
+        for match in _SSRF_NAMED_FUNCTION_RE.finditer(masked)
+    }
+    resolved = callbacks & defined
+    return frozenset(resolved) if len(resolved) == 1 else frozenset()
+
+
+def _php_object_function_spans(
+    source: str,
+    masked: str,
+    names: frozenset[str] | set[str] | None,
+) -> tuple[tuple[str, int, int], ...]:
+    """Index selected named PHP function bodies once for bounded lookups."""
+    spans: list[tuple[str, int, int]] = []
+    for match in _SSRF_NAMED_FUNCTION_RE.finditer(masked):
+        name = match.group("name").casefold()
+        if names is not None and name not in names:
+            continue
+        opening_parenthesis = match.end() - 1
+        closing_parenthesis = _matching_delimiter(
+            masked,
+            opening_parenthesis,
+            "(",
+            ")",
+            limit=min(len(masked), opening_parenthesis + _SSRF_MAX_CALL_CHARS),
+        )
+        if closing_parenthesis is None:
+            continue
+        terminator = re.search(r"[;{]", masked[closing_parenthesis + 1 :])
+        if terminator is None:
+            continue
+        body_start = closing_parenthesis + 1 + terminator.start()
+        if masked[body_start] != "{":
+            continue
+        body_end = _matching_delimiter(masked, body_start, "{", "}")
+        if body_end is not None:
+            spans.append((name, body_start, body_end))
+    return tuple(spans)
+
+
+def _php_object_enclosing_function_name(
+    spans: tuple[tuple[str, int, int], ...],
+    anchor: int,
+) -> str | None:
+    enclosing = [span for span in spans if span[1] < anchor <= span[2]]
+    return max(enclosing, key=lambda item: item[1])[0] if enclosing else None
+
+
+def _php_object_whole_post_aliases(
+    sources: list[tuple[str, str]],
+    callbacks: frozenset[str] | None,
+) -> frozenset[str]:
+    """Find callback-local aliases assigned the whole ``$_POST`` array."""
+    aliases: set[str] = set()
+    whole_post = re.compile(r"\$_POST\b(?!\s*\[)", re.IGNORECASE)
+    assignment = re.compile(
+        r"\$(?P<alias>[A-Za-z_][A-Za-z0-9_]*)\s*=",
+        re.IGNORECASE,
+    )
+    for source, masked in sources:
+        callback_spans = _php_object_function_spans(source, masked, callbacks)
+        for post in whole_post.finditer(masked):
+            enclosing_name = _php_object_enclosing_function_name(
+                callback_spans,
+                post.start(),
+            )
+            if callbacks is not None and (
+                enclosing_name is None or enclosing_name not in callbacks
+            ):
+                continue
+            enclosing_span = next(
+                (
+                    span
+                    for span in callback_spans
+                    if span[0] == enclosing_name and span[1] < post.start() <= span[2]
+                ),
+                None,
+            )
+            body_start = enclosing_span[1] if enclosing_span is not None else 0
+            body_end = enclosing_span[2] if enclosing_span is not None else len(masked)
+            statement_start = max(
+                masked.rfind(";", body_start + 1, post.start()),
+                masked.rfind("{", body_start, post.start()),
+            )
+            statement_end = masked.find(";", post.end(), body_end)
+            if statement_end < 0:
+                continue
+            statement = masked[statement_start + 1 : statement_end]
+            found = assignment.search(statement)
+            if found is not None and found.start() < post.start() - statement_start:
+                aliases.add(found.group("alias").casefold())
+    return frozenset(aliases)
+
+
+def _php_object_source_form_fields(
+    sources: list[tuple[str, str]],
+    callbacks: frozenset[str] | None,
+    whole_post_aliases: frozenset[str],
+    hypothesis: Hypothesis,
+) -> frozenset[str]:
+    """Collect literal form keys backed by direct or whole-POST source reads."""
+    fields: set[str] = set()
+    evidence_values = [
+        *hypothesis.taint_path,
+        hypothesis.reasoning,
+        str((hypothesis.evidence_summary or {}).get("reachable_path") or ""),
+    ]
+    evidence_functions = {
+        match.group("name").casefold()
+        for value in evidence_values
+        for match in _PHP_OBJECT_EVIDENCE_FUNCTION_RE.finditer(value)
+    }
+    for source, masked in sources:
+        relevant_names = set(evidence_functions)
+        if callbacks is not None:
+            relevant_names.update(callbacks)
+        relevant_spans = _php_object_function_spans(
+            source,
+            masked,
+            relevant_names,
+        )
+        for match in _PHP_REQUEST_REFERENCE_RE.finditer(source):
+            if masked[match.start() : match.start() + 2] != "$_":
+                continue
+            if match.group("source").upper() != "POST":
+                continue
+            enclosing_name = _php_object_enclosing_function_name(
+                relevant_spans,
+                match.start(),
+            )
+            if callbacks is None or (
+                enclosing_name is not None and enclosing_name in callbacks
+            ):
+                fields.add(match.group("name"))
+        if whole_post_aliases:
+            for match in _PHP_OBJECT_ARRAY_KEY_RE.finditer(source):
+                if masked[match.start()] != "$":
+                    continue
+                enclosing_name = _php_object_enclosing_function_name(
+                    relevant_spans,
+                    match.start(),
+                )
+                if match.group("variable").casefold() in whole_post_aliases and (
+                    callbacks is None
+                    or (enclosing_name is not None and enclosing_name in callbacks)
+                ):
+                    fields.add(match.group("name"))
+            # Whole request arrays are frequently handed to DTOs or adapters.
+            # Accept a downstream literal only inside a function explicitly
+            # named by the reviewed taint path; an unrelated plugin-wide key is
+            # not transport evidence.
+            for match in _PHP_OBJECT_LITERAL_SUBSCRIPT_RE.finditer(source):
+                if masked[match.start()] != "[":
+                    continue
+                enclosing_name = _php_object_enclosing_function_name(
+                    relevant_spans,
+                    match.start(),
+                )
+                if enclosing_name is not None and enclosing_name in evidence_functions:
+                    fields.add(match.group("name"))
+    return frozenset(fields)
+
+
+def _php_object_candidate_fields(
+    hypothesis: Hypothesis,
+    *,
+    whole_post_aliases: frozenset[str],
+    dispatch_fields: frozenset[str],
+) -> frozenset[str]:
+    """Extract exactly described POST field candidates without guessing."""
+    described = _PHP_DESCRIBED_ENTRY_RE.fullmatch(hypothesis.entry_point.strip())
+    if described is not None:
+        placeholders: set[str] = set()
+        for raw_field in described.group("fields").split("&"):
+            field = _PHP_DESCRIBED_FIELD_RE.fullmatch(raw_field.strip())
+            if field is None:
+                return frozenset()
+            if re.fullmatch(r"<[^<>]{1,80}>", field.group("value").strip()):
+                placeholders.add(field.group("name"))
+        if placeholders:
+            return frozenset(placeholders - set(dispatch_fields))
+
+    def from_values(values: list[str]) -> set[str]:
+        candidates: set[str] = set()
+        for value in values:
+            for match in _PHP_REQUEST_REFERENCE_RE.finditer(value):
+                if match.group("source").upper() == "POST":
+                    candidates.add(match.group("name"))
+            for match in _PHP_OBJECT_ARRAY_KEY_RE.finditer(value):
+                if match.group("variable").casefold() in whole_post_aliases:
+                    candidates.add(match.group("name"))
+            for pattern in (_PHP_OBJECT_POST_FIELD_RE, _PHP_OBJECT_FIELD_POST_RE):
+                for match in pattern.finditer(value):
+                    name = match.group("name")
+                    if name.casefold() not in _PHP_OBJECT_FIELD_STOPWORDS:
+                        candidates.add(name)
+        return candidates - set(dispatch_fields)
+
+    evidence_source = (hypothesis.evidence_summary or {}).get("source")
+    if isinstance(evidence_source, str):
+        evidence_candidates = from_values([evidence_source])
+        if evidence_candidates:
+            return frozenset(evidence_candidates)
+    return frozenset(
+        from_values(
+            [
+                *hypothesis.taint_path,
+                hypothesis.reasoning,
+                hypothesis.preconditions,
+            ]
+        )
+    )
+
+
+def _expected_php_object_http_transport(
+    hypothesis: Hypothesis,
+    plugin_root: str | Path,
+    plugin_slug: str | None = None,
+) -> dict[str, object] | None:
+    """Derive one exact form rewrite policy from source and reviewed evidence."""
+    if plugin_slug is not None:
+        try:
+            validate_plugin_slug(plugin_slug)
+        except ValueError:
+            return None
+    if not _is_source_grounded_php_object_hypothesis(hypothesis, plugin_root):
+        return None
+
+    described = _PHP_DESCRIBED_ENTRY_RE.fullmatch(hypothesis.entry_point.strip())
+    head = described.group("head").strip() if described else hypothesis.entry_point
+    base = dict(_parse_entry_point_transport(head))
+    if base.get("method") != "POST" or not base.get("route"):
+        return None
+    dispatch = base.get("dispatch")
+    if not isinstance(dispatch, dict):
+        return None
+    if any(
+        not isinstance(key, str)
+        or not isinstance(value, str)
+        or key.partition(":")[0] not in {"query", "form"}
+        for key, value in dispatch.items()
+    ):
+        return None
+
+    sources = _bounded_php_include_sources(plugin_root)
+    if sources is None:
+        return None
+    callbacks: frozenset[str] | None
+    if _PHP_WORDPRESS_HOOK_RE.fullmatch(head):
+        callbacks = _php_object_entry_callbacks(sources, head)
+        if not callbacks:
+            return None
+    else:
+        if plugin_slug is None:
+            return None
+        direct_prefix = f"/wp-content/plugins/{plugin_slug}/"
+        route = str(base["route"])
+        if not route.startswith(direct_prefix):
+            return None
+        relative = route.removeprefix(direct_prefix)
+        direct_file = _resolve_ssrf_source_file(plugin_root, relative)
+        if direct_file is None:
+            return None
+        try:
+            direct_source = direct_file.read_text(
+                encoding="utf-8",
+                errors="replace",
+            )
+        except OSError:
+            return None
+        sources = [(direct_source, _mask_php_non_code(direct_source))]
+        callbacks = None
+    whole_post_aliases = _php_object_whole_post_aliases(sources, callbacks)
+    source_fields = _php_object_source_form_fields(
+        sources,
+        callbacks,
+        whole_post_aliases,
+        hypothesis,
+    )
+    dispatch_fields = frozenset(key.partition(":")[2] for key in dispatch)
+    candidates = _php_object_candidate_fields(
+        hypothesis,
+        whole_post_aliases=whole_post_aliases,
+        dispatch_fields=dispatch_fields,
+    )
+    if len(candidates) != 1:
+        return None
+    object_field = next(iter(candidates))
+    if object_field not in source_fields:
+        return None
+
+    exact_dispatch = dict(dispatch)
+    if described is not None:
+        described_fields = []
+        for raw_field in described.group("fields").split("&"):
+            field = _PHP_DESCRIBED_FIELD_RE.fullmatch(raw_field.strip())
+            if field is None:
+                return None
+            if field.group("name") != object_field:
+                described_fields.append((field.group("name"), field.group("value")))
+        if len(described_fields) > _PHP_OBJECT_MAX_DESCRIBED_DISPATCH_FIELDS:
+            return None
+        for name, value in described_fields:
+            if name not in source_fields and name not in dispatch_fields:
+                return None
+            typed_name = f"form:{name}"
+            existing = exact_dispatch.get(typed_name)
+            if existing is not None and existing != value:
+                return None
+            exact_dispatch[typed_name] = value
+
+    if f"form:{object_field}" in exact_dispatch:
+        return None
+    return {
+        "method": "POST",
+        "route": str(base["route"]),
+        "dispatch": exact_dispatch,
+        "object_field": object_field,
+        "object_location": "form",
+    }
+
+
+def _php_object_oracle_enabled_for_hypotheses(
+    hypotheses: list[Hypothesis],
+    plugin_root: str | Path,
+    plugin_slug: str,
+) -> bool:
+    return any(
+        _expected_php_object_http_transport(
+            hypothesis,
+            plugin_root,
+            plugin_slug,
+        )
+        is not None
+        for hypothesis in hypotheses
+    )
+
+
+def _php_object_gadget_oracle_enabled_for_hypotheses(
+    hypotheses: list[Hypothesis],
+    plugin_root: str | Path,
+    plugin_slug: str,
+) -> bool:
+    """Enable the natural-gadget surface only for a promotable typed recipe."""
+    return any(
+        hypothesis.bug_class == BugClass.PHP_OBJECT_INJECTION
+        and hypothesis.php_object_gadget_recipe is not None
+        and hypothesis.php_object_gadget_recipe.effect_binding.kind == "direct_path"
+        and validate_php_object_gadget_recipe_sources(
+            Path(plugin_root),
+            hypothesis.php_object_gadget_recipe,
+        )
+        is None
+        and _expected_php_object_http_transport(
+            hypothesis,
+            plugin_root,
+            plugin_slug,
+        )
+        is not None
+        and _expected_php_object_callsite(hypothesis, plugin_root) is not None
+        for hypothesis in hypotheses
+    )
+
+
+def _php_object_gadget_directory_constants(
+    recipe: PhpObjectGadgetRecipe,
+) -> frozenset[str]:
+    """Return only source-reviewed constants that must resolve to the tmpfs."""
+    constants = {
+        guarded.directory_constant for guarded in recipe.guarded_effect_anchors
+    }
+    if recipe.effect_binding.kind == "direct_path":
+        local_path_check = recipe.effect_binding.local_path_check
+        if local_path_check is not None:
+            constants.add(local_path_check.directory_constant)
+    else:
+        constants.add(recipe.effect_binding.effect.directory_constant)
+    return frozenset(constants)
+
+
 async def _verify_one(
     hyp: Hypothesis,
     plugin_path: str,
@@ -2188,6 +4285,10 @@ async def _verify_one(
     atomic_write_text(poc_dir / "poc_result.py", _POC_RESULT_SRC)
     attempts: list[PoCAttempt] = []
     last_evidence: dict = {}
+    confirmed_evidence_by_script: dict[str, dict] = {}
+    php_object_primitive_confirmation: dict[str, object] | None = None
+    php_object_natural_confirmation: dict[str, object] | None = None
+    php_object_natural_failure_reason = ""
     expected_attacker_role = infer_attacker_role(hyp)
     expected_bug_class = hyp.bug_class.oracle_key
     ssrf_expected = expected_bug_class in {
@@ -2195,8 +4296,74 @@ async def _verify_one(
         BugClass.SSRF.value,
     }
     ssrf_oracle_mode = _ssrf_oracle_mode(hyp) if ssrf_expected else "http"
-    sandbox_ssrf_modes = (
-        frozenset({ssrf_oracle_mode}) if ssrf_expected else frozenset()
+    sandbox_ssrf_modes = frozenset({ssrf_oracle_mode}) if ssrf_expected else frozenset()
+    php_include_http_transport = _expected_php_include_http_transport(
+        hyp,
+        plugin_path,
+        plugin_slug,
+    )
+    php_include_expected = php_include_http_transport is not None
+    php_object_candidate = hyp.bug_class == BugClass.PHP_OBJECT_INJECTION
+    if (
+        php_object_candidate
+        and (hyp.evidence_summary or {}).get("usable_gadget") is not True
+    ):
+        raise RuntimeError(
+            "automatic CWE-502 verification requires the source reviewer to "
+            "establish evidence_summary.usable_gadget=true exactly"
+        )
+    php_object_http_transport = (
+        _expected_php_object_http_transport(hyp, plugin_path, plugin_slug)
+        if php_object_candidate
+        else None
+    )
+    php_object_callsite = (
+        _expected_php_object_callsite(hyp, plugin_path)
+        if php_object_candidate
+        else None
+    )
+    if php_object_candidate and (
+        php_object_http_transport is None or php_object_callsite is None
+    ):
+        raise RuntimeError(
+            "trusted PHP object verification requires one unambiguous "
+            "source-derived POST form transport and installed callsite binding"
+        )
+    php_object_expected = (
+        php_object_http_transport is not None and php_object_callsite is not None
+    )
+    seek_full_compromise = _has_full_compromise_target(
+        hyp.security_outcome
+    ) and not (ssrf_expected or php_include_expected or php_object_expected)
+    executable_upload_http_transport = _parse_entry_point_transport(hyp.entry_point)
+    executable_upload_candidate = bool(
+        seek_full_compromise
+        and hyp.bug_class == BugClass.ARBITRARY_FILE_WRITE
+    )
+    if executable_upload_candidate and (
+        executable_upload_http_transport.get("method") != "POST"
+        or not executable_upload_http_transport.get("route")
+    ):
+        raise RuntimeError(
+            "trusted executable-upload verification requires one unambiguous "
+            "source-derived POST transport"
+        )
+    executable_upload_expected = executable_upload_candidate
+    php_object_gadget_recipe = hyp.php_object_gadget_recipe
+    if php_object_candidate and php_object_gadget_recipe is not None:
+        gadget_source_error = validate_php_object_gadget_recipe_sources(
+            Path(plugin_path),
+            php_object_gadget_recipe,
+        )
+        if gadget_source_error is not None:
+            raise RuntimeError(
+                "trusted PHP object gadget recipe no longer matches installed "
+                f"source: {gadget_source_error}"
+            )
+    php_object_natural_expected = bool(
+        php_object_expected
+        and php_object_gadget_recipe is not None
+        and php_object_gadget_recipe.effect_binding.kind == "direct_path"
     )
     code_slice: str | None = None
     readme: str | None = None
@@ -2206,6 +4373,7 @@ async def _verify_one(
         readme = _read_readme(plugin_root)
     setup_plan = SetupPlan()
     setup_exec_results: list[dict] = []
+    latest_setup_round_results: list[dict] = []
     setup_round_notes: list[str] = []
     automatic_followups_used = 0
     automatic_followup_cap = _SETUP_FOLLOWUP_CAP
@@ -2213,7 +4381,12 @@ async def _verify_one(
     poc_requested_followup_cap = _POC_REQUESTED_SETUP_FOLLOWUP_CAP
 
     def _checkpoint_attempts(
-        status: Literal["in_progress", "not_confirmed", "confirmed"] = "in_progress",
+        status: Literal[
+            "in_progress",
+            "not_confirmed",
+            "primitive_confirmed",
+            "confirmed",
+        ] = "in_progress",
     ) -> None:
         """Persist rejected attempts too, including the terminal validator reason."""
         atomic_write_json(
@@ -2230,6 +4403,19 @@ async def _verify_one(
     # execution can be interrupted.  An empty in-progress attempt list is
     # intentionally non-terminal and will be retried by ``run()``.
     _checkpoint_attempts()
+
+    def _record_setup_round(results: list[dict]) -> None:
+        """Append one atomic round while retaining its transactional boundary."""
+        nonlocal latest_setup_round_results
+        setup_exec_results.extend(results)
+        if results:
+            latest_setup_round_results = list(results)
+
+    def _authoritative_setup_feedback() -> str:
+        return _summarise_setup_state(
+            setup_exec_results,
+            latest_round_results=latest_setup_round_results,
+        )
 
     def _checkpoint_setup_results() -> None:
         """Persist exact setup execution state for audit and interrupted runs."""
@@ -2256,25 +4442,20 @@ async def _verify_one(
             return None
         reasons = [f"Initial plan: {setup_plan.rationale or '(none stated)'}"]
         reasons.extend(setup_round_notes)
-        execution_summary = (
-            _summarise_setup_results(setup_exec_results)
-            or "(no setup commands were executed)"
-        )
+        execution_summary = _authoritative_setup_feedback()
         return (
             "The runner configured the sandbox before this PoC attempt.\n"
             "Setup rationale history:\n- "
             + "\n- ".join(reasons)
-            + "\nAuthoritative cumulative setup execution results:\n"
+            + "\nAuthoritative setup state and latest round:\n"
             + execution_summary
-            + "\nResults are ordered oldest to newest. Use only state whose result "
-            "is OK or OK WITH WARNINGS, and treat a newer self-verified result as "
-            "canonical when it contradicts or supersedes an older value. FAILED "
-            "or partial commands are not evidence that their requested state exists. "
-            "A BLOCKED BEFORE EXECUTION command made no state change."
+            + "\nUse only RETAINED COMMITTED SETUP STATE as current state. A failed "
+            "latest round is an atomic repair attempt whose mutations were removed; "
+            "it does not erase earlier committed setup."
         )
 
     # Bound once the sandbox and developer are available.
-    setup_callback_state: dict[str, Any] = {"sb": None}
+    setup_callback_state: dict[str, Any] = {"sb": None, "error": None}
 
     async def _request_setup_followup(
         sb_local: SandboxManager,
@@ -2285,35 +4466,19 @@ async def _verify_one(
         last_error_log: str,
         schema_diagnostics: str = "",
         setup_execution_feedback: str = "",
-        quota_kind: Literal["automatic", "poc_requested"] = "automatic",
     ) -> tuple[SetupPlan | None, list[tuple[SetupPlan, list[dict]]]]:
         """Request and apply bounded setup repairs, retrying atomic blocks directly."""
-        nonlocal automatic_followups_used, poc_requested_followups_used
-
-        if quota_kind == "poc_requested":
-            quota_cap = poc_requested_followup_cap
-        elif quota_kind == "automatic":
-            quota_cap = automatic_followup_cap
-        else:
-            raise ValueError(f"unknown setup followup quota kind: {quota_kind}")
-
-        def _quota_used() -> int:
-            if quota_kind == "poc_requested":
-                return poc_requested_followups_used
-            return automatic_followups_used
+        nonlocal automatic_followups_used
 
         rounds: list[tuple[SetupPlan, list[dict]]] = []
         followup: SetupPlan | None = None
         feedback = setup_execution_feedback
         diagnostics = schema_diagnostics
         atomic_retries = 0
-        while developer is not None and _quota_used() < quota_cap:
+        while developer is not None and automatic_followups_used < automatic_followup_cap:
             # Count every developer request, including empty or errored responses.
-            if quota_kind == "poc_requested":
-                poc_requested_followups_used += 1
-            else:
-                automatic_followups_used += 1
-            quota_used = _quota_used()
+            automatic_followups_used += 1
+            quota_used = automatic_followups_used
             try:
                 followup = await developer.propose_setup_followup(
                     hypothesis=hyp,
@@ -2327,6 +4492,7 @@ async def _verify_one(
                     setup_execution_feedback=feedback,
                     runtime=runtime,
                     plugin_root=plugin_path,
+                    setup_http_context=_setup_http_context_for_sandbox(sb_local),
                 )
             except Exception as exc:
                 logger.warning("propose_setup_followup for %s failed: %s", hyp.id, exc)
@@ -2338,24 +4504,24 @@ async def _verify_one(
                 return followup, rounds
 
             logger.info(
-                "verify: %s applying %d %s followup setup commands (round %d/%d)",
+                "verify: %s applying %d automatic followup setup commands "
+                "(round %d/%d)",
                 hyp.id,
                 len(followup.commands),
-                quota_kind,
                 quota_used,
-                quota_cap,
+                automatic_followup_cap,
             )
-            results = await _run_setup_commands(
+            results = await _run_setup_round_atomically(
                 sb_local,
                 followup.commands,
                 hypothesis=hyp,
                 plugin_slug=plugin_slug,
             )
-            setup_exec_results.extend(results)
+            _record_setup_round(results)
             # Preserve proposed history, but execution status is carried separately.
             setup_plan.commands.extend(followup.commands)
             setup_round_notes.append(
-                f"{quota_kind.replace('_', '-')} followup {quota_used}: "
+                f"automatic followup {quota_used}: "
                 f"{followup.rationale or '(no rationale)'}"
             )
             rounds.append((followup, results))
@@ -2378,12 +4544,7 @@ async def _verify_one(
                 return followup, rounds
             atomic_retries += 1
 
-            latest_feedback = _summarise_setup_results(results)
-            cumulative_feedback = _summarise_setup_results(setup_exec_results)
-            feedback = (
-                f"LATEST SETUP ROUND:\n{latest_feedback}\n\n"
-                f"CUMULATIVE SETUP HISTORY:\n{cumulative_feedback}"
-            )
+            feedback = _authoritative_setup_feedback()
             retry_diagnostics = await _collect_schema_diagnostics(
                 sb_local, followup.commands
             )
@@ -2393,6 +4554,104 @@ async def _verify_one(
                 )
 
         return followup, rounds
+
+    async def _request_poc_requested_setup(
+        sb_local: SandboxManager,
+        *,
+        request_description: str,
+    ) -> tuple[
+        RequestedSetupPlan | None,
+        list[tuple[RequestedSetupPlan, list[dict]]],
+    ]:
+        """Plan and apply bounded PoC-requested state without inventing a failure.
+
+        The child description stays a separately labelled, untrusted planning
+        input.  Safety checks, atomic execution, repair retries, checkpointing,
+        and the dedicated PoC-requested quota remain runner-owned.
+        """
+        nonlocal poc_requested_followups_used
+
+        rounds: list[tuple[RequestedSetupPlan, list[dict]]] = []
+        requested_plan: RequestedSetupPlan | None = None
+        feedback = _authoritative_setup_feedback()
+        diagnostics = ""
+        atomic_retries = 0
+        while (
+            developer is not None
+            and poc_requested_followups_used < poc_requested_followup_cap
+        ):
+            # Count every planning request, including empty or errored responses.
+            poc_requested_followups_used += 1
+            quota_used = poc_requested_followups_used
+            try:
+                requested_plan = await developer.propose_requested_setup(
+                    hypothesis=hyp,
+                    prior_plan=setup_plan,
+                    request_description=request_description,
+                    schema_diagnostics=diagnostics,
+                    code_slice=code_slice,
+                    setup_execution_feedback=feedback,
+                    runtime=runtime,
+                    plugin_root=plugin_path,
+                    setup_http_context=_setup_http_context_for_sandbox(sb_local),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "propose_requested_setup for %s failed: %s", hyp.id, exc
+                )
+                _checkpoint_setup_results()
+                return None, rounds
+
+            if not requested_plan.commands:
+                _checkpoint_setup_results()
+                return requested_plan, rounds
+
+            logger.info(
+                "verify: %s applying %d poc_requested setup commands (round %d/%d)",
+                hyp.id,
+                len(requested_plan.commands),
+                quota_used,
+                poc_requested_followup_cap,
+            )
+            results = await _run_setup_round_atomically(
+                sb_local,
+                requested_plan.commands,
+                hypothesis=hyp,
+                plugin_slug=plugin_slug,
+            )
+            _record_setup_round(results)
+            # Preserve proposed history; execution status is recorded separately.
+            setup_plan.commands.extend(requested_plan.commands)
+            setup_round_notes.append(
+                f"poc-requested followup {quota_used}: "
+                f"{requested_plan.rationale or '(no rationale)'}"
+            )
+            rounds.append((requested_plan, results))
+            _checkpoint_setup_results()
+
+            if not any(item.get("failed") for item in results):
+                return requested_plan, rounds
+
+            blocked_before_execution = any(
+                item.get("blocked_before_execution") is True for item in results
+            )
+            if (
+                not blocked_before_execution
+                or atomic_retries >= _ATOMIC_SETUP_RETRY_CAP
+            ):
+                return requested_plan, rounds
+            atomic_retries += 1
+
+            feedback = _authoritative_setup_feedback()
+            retry_diagnostics = await _collect_schema_diagnostics(
+                sb_local, requested_plan.commands
+            )
+            if retry_diagnostics:
+                diagnostics = "\n".join(
+                    part for part in (diagnostics, retry_diagnostics) if part
+                )
+
+        return requested_plan, rounds
 
     async def _setup_callback(description: str) -> str:
         sb_local = setup_callback_state["sb"]
@@ -2404,52 +4663,51 @@ async def _verify_one(
                 f"({poc_requested_followup_cap}/{poc_requested_followup_cap})"
             )
 
-        followup, rounds = await _request_setup_followup(
-            sb_local,
-            last_iteration=0,
-            last_stdout="",
-            last_stderr="",
-            last_error_log="",
-            schema_diagnostics=(
-                f"PoC author requested additional setup:\n{description}"
-            ),
-            setup_execution_feedback=_summarise_setup_results(setup_exec_results),
-            quota_kind="poc_requested",
-        )
+        try:
+            followup, rounds = await _request_poc_requested_setup(
+                sb_local,
+                request_description=description,
+            )
+        except Exception as exc:
+            # The agent runtime may turn tool exceptions into model-visible text.
+            # Retain a runner-owned latch so a failed atomic rollback/restore can
+            # never be mistaken for a harmless authoring failure.
+            setup_callback_state["error"] = exc
+            raise
         if not rounds:
             rationale = followup.rationale if followup else "none"
             return (
                 "[request_additional_setup] developer returned no applicable commands "
-                f"(rationale: {rationale!r})"
+                f"(rationale: {rationale!r}). No setup state changed.\n"
+                f"{_authoritative_setup_feedback()}"
             )
 
         final_plan, final_results = rounds[-1]
         all_round_results = [item for _plan, results in rounds for item in results]
-        result_summary = "\n".join(
-            f"Round {round_number}:\n{_summarise_setup_results(results)}"
-            for round_number, (_plan, results) in enumerate(rounds, start=1)
-        )
         if any(item.get("failed") for item in final_results):
             applied = sum(
                 1
                 for item in all_round_results
-                if item.get("executed") and not item.get("failed")
+                if item.get("executed")
+                and item.get("setup_state_committed") is True
             )
             return (
                 "[request_additional_setup] setup remains incomplete; "
-                f"{applied} permitted commands were applied. "
-                "Execution feedback is authoritative:\n"
-                f"{result_summary}"
+                f"{applied} permitted commands were committed. "
+                "The latest failed repair round was rolled back without erasing "
+                "earlier committed setup. Execution feedback is authoritative:\n"
+                f"{_authoritative_setup_feedback()}"
             )
         executed = sum(
             1
             for item in all_round_results
-            if item.get("executed") and not item.get("failed")
+            if item.get("executed") and item.get("setup_state_committed") is True
         )
         return (
             f"[request_additional_setup] applied {executed} permitted commands. "
             f"Rationale: {final_plan.rationale or '(none)'}\n"
-            f"Execution feedback:\n{result_summary}"
+            "Execution feedback:\n"
+            f"{_authoritative_setup_feedback()}"
         )
 
     poc_author = PoCAuthorAgent(
@@ -2459,16 +4717,21 @@ async def _verify_one(
         setup_callback=_setup_callback,
     )
 
-    # Every route type can depend on plugin-created objects, forms, pages, nonces,
-    # or settings. Ask for legitimate setup even when the HTTP endpoint itself is
-    # directly reachable.
-    if developer is not None:
+    initial_setup_requested = False
+
+    async def _request_initial_setup(sb_local: SandboxManager) -> None:
+        """Plan setup only after the live sandbox exposes its canonical Host."""
+        nonlocal initial_setup_requested, setup_plan
+        if developer is None or initial_setup_requested:
+            return
+        initial_setup_requested = True
         try:
             setup_plan = await developer.propose_setup(
                 hyp,
                 plugin_slug=plugin_slug,
                 code_slice=code_slice,
                 readme_excerpt=readme,
+                setup_http_context=_setup_http_context_for_sandbox(sb_local),
             )
         except Exception as e:
             logger.warning("propose_setup for %s failed: %s", hyp.id, e)
@@ -2483,13 +4746,14 @@ async def _verify_one(
             # Caller manages lifecycle — also already installed the plugin + test users
             # and applied snapshot/restore as needed. We only run the per-hypothesis
             # propose-setup commands.
-            setup_exec_results.extend(
-                await _run_setup_commands(
+            await _request_initial_setup(persistent_sb)
+            _record_setup_round(
+                await _run_setup_round_atomically(
                     persistent_sb,
                     setup_plan.commands,
                     hypothesis=hyp,
                     plugin_slug=plugin_slug,
-                ),
+                )
             )
             _checkpoint_setup_results()
             yield persistent_sb
@@ -2499,16 +4763,26 @@ async def _verify_one(
             boot_timeout_s=max(config.sandbox_timeout_seconds, 180),
             poc_timeout_s=config.sandbox_timeout_seconds,
             ssrf_oracle_modes=sandbox_ssrf_modes,
+            php_include_oracle_enabled=php_include_expected,
+            php_object_oracle_enabled=php_object_expected,
+            php_object_gadget_oracle_enabled=php_object_natural_expected,
+            php_object_gadget_directory_constants=(
+                _php_object_gadget_directory_constants(php_object_gadget_recipe)
+                if php_object_natural_expected
+                and php_object_gadget_recipe is not None
+                else frozenset()
+            ),
         ) as fresh_sb:
             await fresh_sb.install_plugin(plugin_zip, plugin_slug)
             await fresh_sb.setup_test_users()
-            setup_exec_results.extend(
-                await _run_setup_commands(
+            await _request_initial_setup(fresh_sb)
+            _record_setup_round(
+                await _run_setup_round_atomically(
                     fresh_sb,
                     setup_plan.commands,
                     hypothesis=hyp,
                     plugin_slug=plugin_slug,
-                ),
+                )
             )
             _checkpoint_setup_results()
             yield fresh_sb
@@ -2519,7 +4793,11 @@ async def _verify_one(
 
         async def _restore_attempt_state(snapshot: Path) -> None:
             await sb.restore(snapshot)
-            if ssrf_oracle_mode == "local_resource":
+            if (
+                ssrf_oracle_mode == "local_resource"
+                or php_include_expected
+                or php_object_expected
+            ):
                 await sb.restart_wordpress_runtime()
 
         setup_failed = any(item.get("failed") for item in setup_exec_results)
@@ -2536,10 +4814,7 @@ async def _verify_one(
                     last_stderr="",
                     last_error_log="",
                     schema_diagnostics=diagnostics,
-                    setup_execution_feedback=_summarise_setup_results(
-                        setup_exec_results
-                    ),
-                    quota_kind="automatic",
+                    setup_execution_feedback=_authoritative_setup_feedback(),
                 )
 
         # Surface the credential table the sandbox provisioned. PoC author MUST
@@ -2554,48 +4829,153 @@ async def _verify_one(
             if role_account is not None
             else "unauthenticated"
         )
-        expected_http_transport = (
-            _expected_ssrf_http_transport(hyp, plugin_path, plugin_slug)
-            if ssrf_expected
-            else None
-        )
+        expected_http_transport: dict[str, object] | None
         if ssrf_expected:
+            expected_http_transport = _expected_ssrf_http_transport(
+                hyp,
+                plugin_path,
+                plugin_slug,
+            )
+        elif php_include_expected:
+            expected_http_transport = php_include_http_transport
+        elif php_object_expected:
+            expected_http_transport = php_object_http_transport
+        elif executable_upload_expected:
+            expected_http_transport = dict(executable_upload_http_transport)
+        else:
+            expected_http_transport = None
+        if (
+            ssrf_expected
+            or php_include_expected
+            or php_object_expected
+            or executable_upload_expected
+        ):
             author_user_accounts = [role_account] if role_account is not None else []
         else:
             author_user_accounts = user_accounts
 
+        ssrf_oracle: dict[str, str] | None = None
+        php_include_oracle: dict[str, str] | None = None
+        php_object_oracle: dict[str, str] | None = None
+        replay_script_after_setup: str | None = None
+        verified_partial_proof: dict[str, object] | None = None
         for iteration in range(1, config.verify_max_iterations + 1):
-            # Each authored SSRF attempt receives fresh, short-lived capabilities.
-            # The same prepared oracle remains authoritative for that attempt's
-            # attack and clean-state confirmation executions; each execution
-            # rotates its private response marker inside SandboxManager.
-            if not ssrf_expected:
-                ssrf_oracle = None
-            elif ssrf_oracle_mode == "local_resource":
-                ssrf_oracle = await sb.prepare_ssrf_local_resource_oracle()
+            replay_script = replay_script_after_setup
+            replay_script_after_setup = None
+            replaying_setup_repair = replay_script is not None
+            if replaying_setup_repair:
+                # A committed setup-only repair changes the prerequisite state, not
+                # the exploit shape. Reuse both the exact prior script and its
+                # already-prepared verifier oracle once before permitting a rewrite.
+                assert replay_script is not None
+                script = replay_script
+                logger.info(
+                    "verify: %s iter %d replaying the prior PoC unchanged after "
+                    "committed setup repair",
+                    hyp.id,
+                    iteration,
+                )
             else:
-                ssrf_oracle = await sb.prepare_ssrf_oracle()
-            # Rebuild from the complete execution ledger immediately before each
-            # author call. This includes setup requested by earlier PoC tool turns
-            # and cannot drift from the checkpointed command results.
-            setup_summary = _current_setup_summary()
-            extra_ctx: dict = {
-                "user_accounts": author_user_accounts,
-                "attacker_role": normalized_role,
-                "test_username": role_account["login"] if role_account else "",
-                "test_password": role_account["password"] if role_account else "",
-            }
-            if ssrf_oracle is not None:
-                extra_ctx["ssrf_oracle"] = ssrf_oracle
-                extra_ctx["ssrf_http_transport"] = expected_http_transport
-            if setup_summary:
-                extra_ctx["setup_summary"] = setup_summary
-            script = await poc_author.write(
-                hypothesis=hyp,
-                target_url=sb.target_url,
-                previous_attempts=attempts,
-                extra_context=extra_ctx or None,
-            )
+                # Each authored SSRF attempt receives fresh, short-lived capabilities.
+                # The same prepared oracle remains authoritative for that attempt's
+                # attack and clean-state confirmation executions; each execution
+                # rotates its private response marker inside SandboxManager.
+                if not ssrf_expected:
+                    ssrf_oracle = None
+                elif ssrf_oracle_mode == "local_resource":
+                    ssrf_oracle = await sb.prepare_ssrf_local_resource_oracle()
+                else:
+                    ssrf_oracle = await sb.prepare_ssrf_oracle()
+                php_include_oracle = (
+                    await sb.prepare_php_include_oracle()
+                    if php_include_expected
+                    else None
+                )
+                php_object_oracle = (
+                    await sb.prepare_php_object_oracle(php_object_callsite)
+                    if php_object_expected and php_object_callsite is not None
+                    else None
+                )
+                # Rebuild from the complete execution ledger immediately before each
+                # author call. This includes setup requested by earlier PoC tool turns
+                # and cannot drift from the checkpointed command results.
+                setup_summary = _current_setup_summary()
+                extra_ctx: dict = {
+                    "user_accounts": author_user_accounts,
+                    "attacker_role": normalized_role,
+                    "test_username": role_account["login"] if role_account else "",
+                    "test_password": role_account["password"] if role_account else "",
+                }
+                if seek_full_compromise:
+                    extra_ctx["verification_target"] = {
+                        "confidentiality": "high",
+                        "integrity": "high",
+                        "availability": "high",
+                        "description": hyp.security_outcome.description,
+                        "proof_gap": str(
+                            (hyp.evidence_summary or {}).get("proof_gaps") or ""
+                        ),
+                    }
+                if executable_upload_expected:
+                    extra_ctx["executable_upload_oracle"] = {
+                        "mode": "post_upload_challenge_v1",
+                        "payload_environment": EXECUTABLE_UPLOAD_PAYLOAD_ENV,
+                        "attack_filename_environment": (
+                            EXECUTABLE_UPLOAD_ATTACK_FILENAME_ENV
+                        ),
+                        "control_filename_environment": (
+                            EXECUTABLE_UPLOAD_CONTROL_FILENAME_ENV
+                        ),
+                        "challenge_parameter": (
+                            EXECUTABLE_UPLOAD_CHALLENGE_PARAMETER
+                        ),
+                        "response_prefix": EXECUTABLE_UPLOAD_RESPONSE_PREFIX,
+                        "response_derivation": (
+                            "implemented by the exact parent-generated PHP payload; "
+                            "the child must not reconstruct or alter those bytes"
+                        ),
+                    }
+                if verified_partial_proof is not None:
+                    extra_ctx["verified_partial_proof"] = verified_partial_proof
+                if ssrf_oracle is not None:
+                    extra_ctx["ssrf_oracle"] = ssrf_oracle
+                    extra_ctx["ssrf_http_transport"] = expected_http_transport
+                if php_include_oracle is not None:
+                    extra_ctx["php_include_oracle"] = php_include_oracle
+                    extra_ctx["php_include_http_transport"] = expected_http_transport
+                if php_object_oracle is not None:
+                    extra_ctx["php_object_oracle"] = php_object_oracle
+                    extra_ctx["php_object_http_transport"] = php_object_http_transport
+                if setup_summary:
+                    extra_ctx["setup_summary"] = setup_summary
+                setup_callback_state["error"] = None
+                try:
+                    script = await poc_author.write(
+                        hypothesis=hyp,
+                        target_url=sb.target_url,
+                        previous_attempts=attempts,
+                        extra_context=extra_ctx or None,
+                    )
+                except Exception as exc:
+                    callback_error = setup_callback_state.get("error")
+                    if isinstance(callback_error, Exception):
+                        raise RuntimeError(
+                            "PoC-requested setup failed during authoring"
+                        ) from callback_error
+                    if verified_partial_proof is None:
+                        raise
+                    logger.warning(
+                        "verify: %s could not author the optional full-compromise "
+                        "refinement (%s); retaining the confirmed lower bound",
+                        hyp.id,
+                        exc,
+                    )
+                    break
+                callback_error = setup_callback_state.get("error")
+                if isinstance(callback_error, Exception):
+                    raise RuntimeError(
+                        "PoC-requested setup failed during authoring"
+                    ) from callback_error
             script_path = poc_dir / f"iter_{iteration}.py"
             atomic_write_text(script_path, script)
 
@@ -2608,12 +4988,24 @@ async def _verify_one(
                 attempts.append(
                     PoCAttempt(
                         iteration=iteration,
+                        proof_kind=(
+                            "php_object_primitive"
+                            if php_object_expected
+                            else "standard"
+                        ),
                         script_path=str(script_path),
                         result=PoCStatus.FAILED,
                         validation_reason=reason,
                     )
                 )
                 _checkpoint_attempts()
+                if verified_partial_proof is not None:
+                    logger.warning(
+                        "verify: %s could not snapshot the optional full-compromise "
+                        "refinement; retaining the confirmed lower bound",
+                        hyp.id,
+                    )
+                    break
                 raise RuntimeError(reason) from exc
 
             result = await sb.run_poc(
@@ -2621,18 +5013,44 @@ async def _verify_one(
                 expected_bug_class=expected_bug_class,
                 expected_attacker_role=normalized_role,
                 expected_http_transport=expected_http_transport,
+                expected_php_include=php_include_expected,
+                expected_php_object=php_object_expected,
+                expected_php_object_transport=php_object_http_transport,
+                expected_executable_upload=executable_upload_expected,
+            )
+            first_php_object_snapshot = _consume_php_object_snapshot(
+                result,
+                php_object_expected=php_object_expected,
+            )
+            if result.success and php_object_expected:
+                bounded, bounded_reason = _bounded_php_object_observation(
+                    result.observation
+                )
+                if not bounded or first_php_object_snapshot is None:
+                    result.reject(
+                        bounded_reason
+                        if not bounded
+                        else "trusted PHP object run lacks parent attestation"
+                    )
+            live_result_observation = _consume_php_include_live_observation(
+                result,
+                php_include_expected=php_include_expected,
             )
             attempt = PoCAttempt(
                 iteration=iteration,
                 phase="attack",
+                proof_kind=(
+                    "php_object_primitive" if php_object_expected else "standard"
+                ),
                 script_path=str(script_path),
                 result=PoCStatus.SUCCESS if result.success else PoCStatus.FAILED,
                 http_status=result.http_status,
-                response_snippet=(result.response or "")[:500] or None,
+                response_snippet=_attempt_response_snippet(result),
                 timing_seconds=result.elapsed,
-                error_log_snippet=(result.error_log or "")[:500] or None,
+                error_log_snippet=_attempt_error_log_snippet(result),
                 developer_analysis=None,  # PoC author re-evaluates with consult_developer in next iter
                 observation=result.observation,
+                rejected_observation=result.rejected_observation,
                 validation_reason=(
                     result.validation_reason
                     or ((result.error_log or "")[:1000] if not result.success else "")
@@ -2656,8 +5074,8 @@ async def _verify_one(
                         "activation state, and must submit malicious values through a real "
                         "plugin/WordPress entry point reachable by the claimed attacker role."
                     )
-                    attempt.result = PoCStatus.FAILED
-                    attempt.validation_reason = reason[:1000]
+                    result.reject(reason[:1000])
+                    attempt.mark_failed(reason[:1000])
                     attempt.developer_analysis = reason[:1000]
                     _checkpoint_attempts()
                     logger.warning(
@@ -2666,6 +5084,7 @@ async def _verify_one(
                     if pre_attempt_snapshot is not None:
                         await _restore_attempt_state(pre_attempt_snapshot)
                         shutil.rmtree(pre_attempt_snapshot, ignore_errors=True)
+                    live_result_observation = None
                     break
                 # Re-run from the exact state that existed before the first
                 # attempt. This prevents one-shot state mutation from being
@@ -2676,17 +5095,45 @@ async def _verify_one(
                     expected_bug_class=expected_bug_class,
                     expected_attacker_role=normalized_role,
                     expected_http_transport=expected_http_transport,
+                    expected_php_include=php_include_expected,
+                    expected_php_object=php_object_expected,
+                    expected_php_object_transport=php_object_http_transport,
+                    expected_executable_upload=executable_upload_expected,
+                )
+                confirmation_php_object_snapshot = _consume_php_object_snapshot(
+                    confirm,
+                    php_object_expected=php_object_expected,
+                )
+                if confirm.success and php_object_expected:
+                    bounded, bounded_reason = _bounded_php_object_observation(
+                        confirm.observation
+                    )
+                    if not bounded or confirmation_php_object_snapshot is None:
+                        confirm.reject(
+                            bounded_reason
+                            if not bounded
+                            else "trusted PHP object replay lacks parent attestation"
+                        )
+                live_confirmation_observation = _consume_php_include_live_observation(
+                    confirm,
+                    php_include_expected=php_include_expected,
                 )
                 confirmation_attempt = PoCAttempt(
                     iteration=iteration,
                     phase="confirmation",
+                    proof_kind=(
+                        "php_object_primitive"
+                        if php_object_expected
+                        else "standard"
+                    ),
                     script_path=str(script_path),
                     result=PoCStatus.SUCCESS if confirm.success else PoCStatus.FAILED,
                     http_status=confirm.http_status,
-                    response_snippet=(confirm.response or "")[:500] or None,
+                    response_snippet=_attempt_response_snippet(confirm),
                     timing_seconds=confirm.elapsed,
-                    error_log_snippet=(confirm.error_log or "")[:500] or None,
+                    error_log_snippet=_attempt_error_log_snippet(confirm),
                     observation=confirm.observation,
+                    rejected_observation=confirm.rejected_observation,
                     validation_reason=(
                         confirm.validation_reason
                         or (
@@ -2703,21 +5150,180 @@ async def _verify_one(
                 )
                 matching_confirmation = False
                 confirmation_reason = "confirmation did not produce a valid observation"
-                if result.observation is not None and confirm.observation is not None:
+                if (
+                    live_result_observation is not None
+                    and live_confirmation_observation is not None
+                ):
                     matching_confirmation, confirmation_reason = (
                         validate_confirmation_observations(
-                            result.observation,
-                            confirm.observation,
+                            live_result_observation,
+                            live_confirmation_observation,
                         )
                     )
+                    if matching_confirmation and php_object_expected:
+                        matching_confirmation, confirmation_reason = (
+                            _validate_php_object_confirmation_snapshots(
+                                first_php_object_snapshot,
+                                confirmation_php_object_snapshot,
+                            )
+                        )
+                live_result_observation = None
+                live_confirmation_observation = None
                 if confirm.success and matching_confirmation:
                     attempts.append(confirmation_attempt)
                     _checkpoint_attempts()
-                    last_evidence = {
+                    if php_object_expected:
+                        primitive_evidence = {
+                            "first_run": result.evidence,
+                            "confirmation_run": confirm.evidence,
+                            "clean_state_restored": True,
+                        }
+                        if (
+                            not php_object_natural_expected
+                            or php_object_gadget_recipe is None
+                            or php_object_http_transport is None
+                        ):
+                            php_object_natural_failure_reason = (
+                                "The verifier cannot reproduce a source-bound natural "
+                                "gadget because the candidate has no validated "
+                                "direct-path recipe; only the inert object-instantiation "
+                                "primitive was reproduced."
+                            )
+                            last_evidence = primitive_evidence
+                            shutil.rmtree(pre_attempt_snapshot, ignore_errors=True)
+                            break
+
+                        try:
+                            natural_replay = await _run_php_object_natural_replay(
+                                sb,
+                                script_path=script_path,
+                                recipe=php_object_gadget_recipe,
+                                expected_bug_class=expected_bug_class,
+                                attacker_role=normalized_role,
+                                transport=php_object_http_transport,
+                                pre_attempt_snapshot=pre_attempt_snapshot,
+                                restore_attempt_state=_restore_attempt_state,
+                            )
+                        except Exception:
+                            shutil.rmtree(pre_attempt_snapshot, ignore_errors=True)
+                            raise
+
+                        natural_first_attempt = _php_object_natural_attempt(
+                            natural_replay.first_result,
+                            iteration=iteration,
+                            phase="attack",
+                            script_path=script_path,
+                        )
+                        natural_confirmation_attempt = (
+                            _php_object_natural_attempt(
+                                natural_replay.confirmation_result,
+                                iteration=iteration,
+                                phase="confirmation",
+                                script_path=script_path,
+                            )
+                            if natural_replay.confirmation_result is not None
+                            else None
+                        )
+                        if not natural_replay.confirmed:
+                            php_object_natural_failure_reason = (
+                                natural_replay.reason[:1000]
+                            )
+                            attempts.append(natural_first_attempt)
+                            if natural_confirmation_attempt is not None:
+                                attempts.append(natural_confirmation_attempt)
+                            last_evidence = primitive_evidence
+                            _checkpoint_attempts()
+                            shutil.rmtree(pre_attempt_snapshot, ignore_errors=True)
+                            break
+
+                        if (
+                            natural_replay.first_snapshot is None
+                            or natural_replay.confirmation_snapshot is None
+                            or natural_replay.confirmation_result is None
+                            or natural_confirmation_attempt is None
+                        ):
+                            shutil.rmtree(pre_attempt_snapshot, ignore_errors=True)
+                            raise RuntimeError(
+                                "confirmed natural PHP object replay lacks evidence"
+                            )
+                        attempts.extend(
+                            [natural_first_attempt, natural_confirmation_attempt]
+                        )
+                        php_object_natural_confirmation = (
+                            _php_object_natural_confirmation_payload(
+                                hyp,
+                                natural_replay.first_snapshot,
+                                natural_replay.confirmation_snapshot,
+                            )
+                        )
+                        last_evidence = {
+                            "first_run": natural_replay.first_result.evidence,
+                            "confirmation_run": (
+                                natural_replay.confirmation_result.evidence
+                            ),
+                            "primitive_confirmation_runs": primitive_evidence,
+                            "php_object_natural_confirmation": (
+                                php_object_natural_confirmation
+                            ),
+                            "clean_state_restored": True,
+                        }
+                        _checkpoint_attempts()
+                        shutil.rmtree(pre_attempt_snapshot, ignore_errors=True)
+                        if config.report.screenshot_capture:
+                            screenshot_dir = poc_dir / "screenshots"
+                            await verify_helpers.screenshot_url(
+                                sb.target_url + "/wp-admin/",
+                                screenshot_dir / f"{hyp.id}_admin.png",
+                                timeout_s=verify_cfg.headless_browser_timeout_s,
+                            )
+                        break
+
+                    current_evidence = {
                         "first_run": result.evidence,
                         "confirmation_run": confirm.evidence,
                         "clean_state_restored": True,
                     }
+                    confirmed_evidence_by_script[str(script_path)] = current_evidence
+                    last_evidence = current_evidence
+                    confirmed_observation = confirmation_attempt.observation
+                    if confirmed_observation is None:
+                        raise RuntimeError(
+                            "successful confirmation lacks a structured observation"
+                        )
+                    full_compromise_gaps = (
+                        _full_compromise_gaps(confirmed_observation.impact)
+                        if seek_full_compromise
+                        else {}
+                    )
+                    if (
+                        full_compromise_gaps
+                        and verified_partial_proof is None
+                        and iteration < config.verify_max_iterations
+                    ):
+                        verified_partial_proof = {
+                            "status": "confirmed_lower_bound",
+                            "confirmation_iteration": iteration,
+                            "oracle": confirmed_observation.oracle,
+                            "verified_impact": confirmed_observation.impact.model_dump(
+                                mode="json"
+                            ),
+                            "target_impact": {
+                                "confidentiality": "high",
+                                "integrity": "high",
+                                "availability": "high",
+                            },
+                            "unmet_dimensions": full_compromise_gaps,
+                        }
+                        await _restore_attempt_state(pre_attempt_snapshot)
+                        shutil.rmtree(pre_attempt_snapshot, ignore_errors=True)
+                        logger.info(
+                            "verify: %s iter %d confirmed a lower-bound %s proof; "
+                            "retaining it and authoring one full-compromise refinement",
+                            hyp.id,
+                            iteration,
+                            confirmed_observation.oracle,
+                        )
+                        continue
                     shutil.rmtree(pre_attempt_snapshot, ignore_errors=True)
                     if config.report.screenshot_capture:
                         screenshot_dir = poc_dir / "screenshots"
@@ -2728,25 +5334,26 @@ async def _verify_one(
                         )
                     break
                 if confirm.success:
-                    confirmation_attempt.result = PoCStatus.FAILED
-                    confirmation_attempt.validation_reason = confirmation_reason
+                    confirm.reject(confirmation_reason)
+                    confirmation_attempt.mark_failed(confirmation_reason)
                 elif not confirmation_attempt.validation_reason:
                     confirmation_attempt.validation_reason = (
                         "clean-state confirmation oracle did not reproduce"
                     )
-                attempt.result = PoCStatus.FAILED
-                attempt.validation_reason = "clean-state confirmation failed: " + (
-                    confirmation_reason
-                    if confirm.success
-                    else (confirm.validation_reason or "oracle did not reproduce")
+                first_run_rejection = (
+                    "clean-state confirmation failed: "
+                    + (confirm.validation_reason or "oracle did not reproduce")
                 )
-                attempt.developer_analysis = attempt.validation_reason[:1000]
+                result.reject(first_run_rejection)
+                attempt.mark_failed(first_run_rejection)
+                attempt.developer_analysis = (attempt.validation_reason or "")[:1000]
                 attempts.append(confirmation_attempt)
                 _checkpoint_attempts()
                 result = confirm
                 await _restore_attempt_state(pre_attempt_snapshot)
                 shutil.rmtree(pre_attempt_snapshot, ignore_errors=True)
             else:
+                live_result_observation = None
                 if pre_attempt_snapshot is not None:
                     await _restore_attempt_state(pre_attempt_snapshot)
                     shutil.rmtree(pre_attempt_snapshot, ignore_errors=True)
@@ -2762,34 +5369,45 @@ async def _verify_one(
                 followup, _followup_rounds = await _request_setup_followup(
                     sb,
                     last_iteration=iteration,
-                    last_stdout=result.response or "",
-                    last_stderr=result.error_log or "",
-                    last_error_log=result.error_log or "",
+                    last_stdout=_runner_failure_feedback(result),
+                    last_stderr=_runner_failure_error_feedback(result),
+                    last_error_log=_runner_failure_error_feedback(result),
                     schema_diagnostics=diagnostics,
-                    setup_execution_feedback=_summarise_setup_results(
-                        setup_exec_results
-                    ),
-                    quota_kind="automatic",
+                    setup_execution_feedback=_authoritative_setup_feedback(),
                 )
-                if followup is not None and not followup.commands:
+                poc_crashed = _poc_failure_looks_like_code_error(result)
+                if _should_replay_poc_after_setup(
+                    result,
+                    followup,
+                    _followup_rounds,
+                    replaying_setup_repair=replaying_setup_repair,
+                ):
+                    replay_script_after_setup = script
+                    logger.info(
+                        "verify: %s iter %d committed setup repair; scheduling one "
+                        "unchanged PoC replay",
+                        hyp.id,
+                        iteration,
+                    )
+                elif followup is not None and not followup.commands:
                     # No setup change is needed, but a failed generated request is not proof
                     # that the source candidate is safe. Give the PoC author the diagnosis
                     # and continue within the configured iteration bound.
                     fc = followup.failure_class
-                    stderr_blob = result.error_log or ""
-                    poc_crashed = (
-                        "Traceback (most recent call last)" in stderr_blob
-                        or "JSONDecodeError" in stderr_blob
-                        or "KeyError" in stderr_blob
-                        or "IndexError" in stderr_blob
-                        or "AttributeError" in stderr_blob
-                    )
                     classification = (
                         "poc_code" if poc_crashed else (fc or "exploit_shape")
                     )
-                    attempt.developer_analysis = (
-                        f"{classification}: {followup.rationale or '(none)'}"
-                    )[:1000]
+                    if attempt.rejected_observation is not None:
+                        attempt.developer_analysis = (
+                            "UNTRUSTED DEVELOPER CLASSIFICATION ONLY; the runner "
+                            "failure remains authoritative: "
+                            f"classification={classification}; model rationale "
+                            "withheld after rejected child observation"
+                        )[:1000]
+                    else:
+                        attempt.developer_analysis = (
+                            f"{classification}: {followup.rationale or '(none)'}"
+                        )[:1000]
                     _checkpoint_attempts()
                     logger.info(
                         "verify: %s iter %d failure classified as %s — continuing PoC "
@@ -2799,6 +5417,17 @@ async def _verify_one(
                         classification,
                         (followup.rationale or "(none)")[:200],
                     )
+
+            if (
+                verified_partial_proof is not None
+                and replay_script_after_setup is None
+            ):
+                logger.info(
+                    "verify: %s full-compromise refinement did not confirm a "
+                    "stronger proof; retaining the confirmed lower bound",
+                    hyp.id,
+                )
+                break
 
         _checkpoint_attempts()
 
@@ -2818,19 +5447,122 @@ async def _verify_one(
     successful = [
         attempt for attempt in attempts if attempt.result == PoCStatus.SUCCESS
     ]
-    confirmations = [
-        attempt for attempt in successful if attempt.phase == "confirmation"
-    ]
-    if not confirmations:
-        _checkpoint_attempts(status="not_confirmed")
-        logger.info(
-            "verify: %s NOT confirmed after %d iterations", hyp.id, len(attempts)
+    if php_object_expected:
+        successful_primitive = [
+            attempt
+            for attempt in successful
+            if attempt.proof_kind == "php_object_primitive"
+        ]
+        primitive_confirmations = [
+            attempt
+            for attempt in successful_primitive
+            if attempt.phase == "confirmation"
+        ]
+        if not primitive_confirmations:
+            _checkpoint_attempts(status="not_confirmed")
+            logger.info(
+                "verify: %s NOT confirmed after %d attempts",
+                hyp.id,
+                len(attempts),
+            )
+            return None
+        primitive_observation = primitive_confirmations[-1].observation
+        if primitive_observation is None:
+            raise RuntimeError(
+                "successful PHP object primitive confirmation lacks an observation"
+            )
+        successful_natural = [
+            attempt
+            for attempt in successful
+            if attempt.proof_kind == "php_object_natural"
+        ]
+        confirmations = [
+            attempt
+            for attempt in successful_natural
+            if attempt.phase == "confirmation"
+        ]
+        natural_promoted = php_object_natural_confirmation is not None
+        proof_gap = (hyp.evidence_summary or {}).get("proof_gaps")
+        unmet_requirement = (
+            None
+            if natural_promoted
+            else (
+                proof_gap.strip()
+                if isinstance(proof_gap, str) and proof_gap.strip()
+                else (
+                    "Trusted reproduction of the source-reviewed natural gadget's "
+                    "concrete side effect."
+                )
+            )
         )
-        return None
+        reason = (
+            "Two clean trusted executions confirmed the PHP object-instantiation "
+            "primitive, and two clean parent-attested executions reproduced the "
+            "source-bound direct-path natural gadget."
+            if natural_promoted
+            else (
+                php_object_natural_failure_reason
+                or (
+                    "Two clean trusted executions confirmed only the PHP object "
+                    "instantiation primitive; the source-bound direct-path natural "
+                    "gadget was not reproduced twice from clean state."
+                )
+            )
+        )
+        php_object_primitive_confirmation = {
+            "schema_version": 1,
+            "status": "primitive_confirmed",
+            "hypothesis_id": hyp.id,
+            "bug_class": hyp.bug_class.value,
+            "finding_promoted": natural_promoted,
+            "promotion_policy": (
+                "source_bound_natural_gadget_v1" if natural_promoted else None
+            ),
+            "source_gadget_reviewed": True,
+            "clean_state_executions": len(successful_primitive),
+            "oracle_observation": primitive_observation.impact.model_dump(
+                mode="json"
+            ),
+            "source_reviewed_outcome": hyp.security_outcome.model_dump(mode="json"),
+            "unmet_proof_requirement": unmet_requirement,
+            "reason": reason,
+        }
+        if not natural_promoted:
+            atomic_write_json(
+                poc_dir / PHP_OBJECT_PRIMITIVE_CONFIRMATION_FILENAME,
+                php_object_primitive_confirmation,
+            )
+            _checkpoint_attempts(status="primitive_confirmed")
+            logger.info("verify: %s primitive confirmed but not promoted", hyp.id)
+            return None
+        if not confirmations:
+            raise RuntimeError(
+                "natural PHP object confirmation artifact lacks a successful replay"
+            )
+    else:
+        confirmations = [
+            attempt for attempt in successful if attempt.phase == "confirmation"
+        ]
+        if not confirmations:
+            _checkpoint_attempts(status="not_confirmed")
+            logger.info(
+                "verify: %s NOT confirmed after %d iterations", hyp.id, len(attempts)
+            )
+            return None
 
-    confirmed_observation = confirmations[-1].observation
+    selected_confirmation = (
+        confirmations[-1]
+        if php_object_expected
+        else _select_strongest_confirmation(confirmations)
+    )
+    confirmed_observation = selected_confirmation.observation
     if confirmed_observation is None:
         raise RuntimeError("successful confirmation lacks a structured observation")
+    if not php_object_expected:
+        last_evidence = confirmed_evidence_by_script.get(
+            selected_confirmation.script_path,
+            last_evidence,
+        )
     verified_hypothesis = hyp.model_copy(deep=True)
     verified_hypothesis.security_outcome = SecurityOutcome(
         confidentiality=confirmed_observation.impact.confidentiality,
@@ -2842,14 +5574,34 @@ async def _verify_one(
         id=_next_finding_id(),
         hypothesis=verified_hypothesis,
         poc_status=PoCStatus.SUCCESS,
-        poc_script_path=confirmations[-1].script_path,
+        poc_script_path=selected_confirmation.script_path,
         poc_attempts=attempts,
         evidence=last_evidence,
-        confidence_runs=len(successful),
+        confidence_runs=2,
         verified_impact=confirmed_observation.impact.model_copy(deep=True),
         dedup_status=DedupStatus.NOT_CHECKED,
         dedup_matches=[],
     )
+
+    if php_object_expected:
+        accepted, reason = validate_php_object_natural_finding_confirmation(finding)
+        if not accepted:
+            raise RuntimeError(
+                "constructed CWE-502 finding failed its promotion gate: " + reason
+            )
+        if (
+            php_object_primitive_confirmation is None
+            or php_object_natural_confirmation is None
+        ):
+            raise RuntimeError("confirmed CWE-502 finding lacks promotion artifacts")
+        atomic_write_json(
+            poc_dir / PHP_OBJECT_PRIMITIVE_CONFIRMATION_FILENAME,
+            php_object_primitive_confirmation,
+        )
+        atomic_write_json(
+            poc_dir / PHP_OBJECT_NATURAL_CONFIRMATION_FILENAME,
+            php_object_natural_confirmation,
+        )
 
     _checkpoint_attempts(status="confirmed")
 
@@ -2944,7 +5696,12 @@ def _attempt_checkpoint_state(hyp_dir: Path) -> str | None:
     if payload.get("hypothesis_id") != hyp_dir.name:
         return "incomplete"
     status = payload.get("status")
-    if status not in {"in_progress", "not_confirmed", "confirmed"}:
+    if status not in {
+        "in_progress",
+        "not_confirmed",
+        "primitive_confirmed",
+        "confirmed",
+    }:
         return "incomplete"
     attempts = payload.get("attempts")
     if not isinstance(attempts, list) or not attempts:
@@ -2960,6 +5717,65 @@ def _attempt_checkpoint_state(hyp_dir: Path) -> str | None:
         # A reproduced clean-state confirmation cannot be reconciled with a
         # terminal negative.  Retry rather than silently discarding it.
         return "incomplete"
+    if status == "primitive_confirmed":
+        successful_primitive = [
+            attempt
+            for attempt in parsed_attempts
+            if attempt.result == PoCStatus.SUCCESS
+            and attempt.proof_kind == "php_object_primitive"
+        ]
+        primitive_by_phase = {
+            attempt.phase: attempt for attempt in successful_primitive
+        }
+        if (
+            len(successful_primitive) != 2
+            or set(primitive_by_phase) != {"attack", "confirmation"}
+            or len({attempt.script_path for attempt in successful_primitive}) != 1
+            or any(
+                not _bounded_php_object_observation(attempt.observation)[0]
+                for attempt in successful_primitive
+            )
+            or any(
+                attempt.proof_kind == "standard" for attempt in parsed_attempts
+            )
+            or any(
+                attempt.result == PoCStatus.SUCCESS
+                and attempt.proof_kind == "php_object_natural"
+                and attempt.phase == "confirmation"
+                for attempt in parsed_attempts
+            )
+            or (hyp_dir / PHP_OBJECT_NATURAL_CONFIRMATION_FILENAME).exists()
+        ):
+            return "incomplete"
+        primitive_confirmation_observation = primitive_by_phase[
+            "confirmation"
+        ].observation
+        if primitive_confirmation_observation is None:
+            return "incomplete"
+        primitive_path = hyp_dir / PHP_OBJECT_PRIMITIVE_CONFIRMATION_FILENAME
+        try:
+            primitive = json.loads(primitive_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return "incomplete"
+        if not (
+            isinstance(primitive, dict)
+            and primitive.get("schema_version") == 1
+            and primitive.get("status") == "primitive_confirmed"
+            and primitive.get("hypothesis_id") == hyp_dir.name
+            and primitive.get("bug_class") == BugClass.PHP_OBJECT_INJECTION.value
+            and primitive.get("finding_promoted") is False
+            and primitive.get("promotion_policy") is None
+            and primitive.get("source_gadget_reviewed") is True
+            and type(primitive.get("clean_state_executions")) is int
+            and primitive.get("clean_state_executions") == 2
+            and primitive.get("oracle_observation")
+            == primitive_confirmation_observation.impact.model_dump(
+                mode="json"
+            )
+            and isinstance(primitive.get("reason"), str)
+            and bool(primitive["reason"].strip())
+        ):
+            return "incomplete"
     return str(status)
 
 
@@ -3086,12 +5902,46 @@ async def run(
                     ]
                 },
             )
+        unproven_php_object_findings: list[Finding] = []
         for f in parsed:
             if f.hypothesis.id not in accepted_hypothesis_ids:
                 continue
             if not f.hypothesis.bug_class.is_known:
                 continue
+            if f.hypothesis.bug_class == BugClass.PHP_OBJECT_INJECTION:
+                accepted, _reason = (
+                    validate_php_object_natural_finding_confirmation(f)
+                )
+                if not accepted:
+                    unproven_php_object_findings.append(f)
+                    continue
             previously_confirmed[f.hypothesis.id] = f
+        if unproven_php_object_findings:
+            quarantine_path = run_dir / "findings_php_object_unproven.jsonl"
+            atomic_write_jsonl(quarantine_path, unproven_php_object_findings)
+            logger.warning(
+                "verify: quarantined %d prior CWE-502 finding(s) without a "
+                "complete direct-path natural proof to %s",
+                len(unproven_php_object_findings),
+                quarantine_path,
+            )
+            append_decision(
+                run_dir,
+                stage="verify",
+                action="recover",
+                result="php_object_findings_quarantined",
+                reason=(
+                    f"{len(unproven_php_object_findings)} prior CWE-502 finding(s) "
+                    "lacked the complete parent-attested direct-path proof"
+                ),
+                artifact=quarantine_path,
+                details={
+                    "hypothesis_ids": [
+                        finding.hypothesis.id
+                        for finding in unproven_php_object_findings
+                    ]
+                },
+            )
         if corrupt_count:
             logger.warning(
                 "verify: quarantined %d malformed findings.jsonl line(s) to %s",
@@ -3126,15 +5976,43 @@ async def run(
     # restore between hypotheses. Cuts ~80% of sandbox cost for multi-hypothesis runs.
     persistent_sb: SandboxManager | None = None
     persistent_snapshot: Path | None = None
-    if config.verify.persistent_sandbox and automatic_hypotheses:
+    persistent_hypotheses = [
+        hypothesis
+        for hypothesis in automatic_hypotheses
+        if not _php_object_gadget_oracle_enabled_for_hypotheses(
+            [hypothesis],
+            plugin_path,
+            triaged.plugin_slug,
+        )
+    ]
+    if config.verify.persistent_sandbox and persistent_hypotheses:
         try:
             persistent_sb = SandboxManager(
                 config.sandbox,
                 boot_timeout_s=max(config.sandbox_timeout_seconds, 180),
                 poc_timeout_s=config.sandbox_timeout_seconds,
                 ssrf_oracle_modes=_ssrf_oracle_modes_for_hypotheses(
-                    automatic_hypotheses
+                    persistent_hypotheses
                 ),
+                php_include_oracle_enabled=(
+                    _php_include_oracle_enabled_for_hypotheses(
+                        persistent_hypotheses,
+                        plugin_path,
+                        triaged.plugin_slug,
+                    )
+                ),
+                php_object_oracle_enabled=(
+                    _php_object_oracle_enabled_for_hypotheses(
+                        persistent_hypotheses,
+                        plugin_path,
+                        triaged.plugin_slug,
+                    )
+                ),
+                # Natural gadgets require an exact, recipe-specific constant set
+                # and TMPDIR. Keep the ordinary shared sandbox unchanged; the
+                # candidate loop gives each promotable recipe a fresh sandbox.
+                php_object_gadget_oracle_enabled=False,
+                php_object_gadget_directory_constants=frozenset(),
             )
             await persistent_sb.boot()
             await persistent_sb.install_plugin(plugin_zip, triaged.plugin_slug)
@@ -3271,7 +6149,11 @@ async def run(
             # if one or more iteration scripts were written first.  Directories
             # without attempts.json predate the checkpoint and retain the legacy
             # iteration-only skip behavior.
-            terminal_not_confirmed = checkpoint_state in {None, "not_confirmed"}
+            terminal_not_confirmed = checkpoint_state in {
+                None,
+                "not_confirmed",
+                "primitive_confirmed",
+            }
             if (
                 hyp_dir.exists()
                 and iter_files
@@ -3318,8 +6200,26 @@ async def run(
             logger.info("verify: %s (%s)", hyp.id, hyp.bug_class.value)
             hyp_dir.mkdir(parents=True, exist_ok=True)
 
+            dedicated_natural_sandbox = (
+                _php_object_gadget_oracle_enabled_for_hypotheses(
+                    [hyp],
+                    plugin_path,
+                    triaged.plugin_slug,
+                )
+            )
+            if dedicated_natural_sandbox:
+                logger.info(
+                    "verify: %s — using a dedicated recipe-bound natural-gadget "
+                    "sandbox",
+                    hyp.id,
+                )
+
             # Restore baseline before each hypothesis to prevent state leakage.
-            if persistent_sb is not None and persistent_snapshot is not None:
+            if (
+                not dedicated_natural_sandbox
+                and persistent_sb is not None
+                and persistent_snapshot is not None
+            ):
                 try:
                     await persistent_sb.restore(persistent_snapshot)
                 except Exception as e:
@@ -3345,7 +6245,9 @@ async def run(
                     runtime,
                     poc_dir=hyp_dir,
                     developer=developer,
-                    persistent_sb=persistent_sb,
+                    persistent_sb=(
+                        None if dedicated_natural_sandbox else persistent_sb
+                    ),
                 )
             except Exception as e:
                 import traceback
@@ -3401,13 +6303,23 @@ async def run(
                 unresolved_errors.append((hyp.id, reason))
                 continue
             if finding is None:
+                primitive_confirmation = (
+                    hyp_dir / PHP_OBJECT_PRIMITIVE_CONFIRMATION_FILENAME
+                )
+                primitive_confirmed = primitive_confirmation.is_file()
                 append_decision(
                     run_dir,
                     stage="verify",
                     action="reject",
-                    result="not_confirmed",
+                    result=(
+                        "primitive_confirmed_not_promoted"
+                        if primitive_confirmed
+                        else "not_confirmed"
+                    ),
                     hypothesis_id=hyp.id,
-                    artifact=hyp_dir,
+                    artifact=(
+                        primitive_confirmation if primitive_confirmed else hyp_dir
+                    ),
                 )
                 continue
             findings.append(finding)

@@ -10,7 +10,9 @@ rather than referencing a request superglobal in the wrapper script.
 Sinks: $wpdb->query/get_results/get_var/get_row with non-literal args, file_put_contents,
 move_uploaded_file, unlink, include/require with variables, eval(), shell_exec(),
 exec(), system(), passthru(), popen(), wp_remote_get/post with user-controlled URLs,
-unserialize()/maybe_unserialize() with non-literal args.
+unserialize()/maybe_unserialize() with non-literal args, and direct
+update_metadata() calls as implicit-deserialization review anchors. Do not add
+every get_*_meta()/update_*_meta() wrapper as a separate sink.
 
 For each entry point, note presence of wp_verify_nonce/check_ajax_referer and
 current_user_can().

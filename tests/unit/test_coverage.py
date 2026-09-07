@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import re
+
 from squadrone.schemas import EntryPoint, ReconArtifact
 from squadrone.agents._specialist_base import _requires_dynamic_key_trace
 from squadrone.services.coverage import (
     build_coverage_artifact,
     merge_deterministic_coverage,
 )
+from squadrone.stages.recon import RIPGREP_PATTERNS
 
 
 def test_coverage_inventories_callbacks_storage_outputs_and_built_js(tmp_path):
@@ -93,6 +96,44 @@ def test_registry_routes_authorization_storage_surfaces_without_losing_xss(tmp_p
     for item in storage_items.values():
         assert "authorization_workflows" in item.review_areas
         assert "xss_lifecycle" in item.review_areas
+
+
+def test_implicit_metadata_deserialization_surface_is_narrow_and_routed(tmp_path):
+    (tmp_path / "plugin.php").write_text(
+        "<?php\n"
+        "update_metadata('post', $object_id, 'payload', $replacement);\n"
+        "UPDATE_METADATA('user', $user_id, 'payload', $replacement);\n"
+        "update_post_meta($object_id, 'payload', $replacement);\n"
+        "get_metadata('post', $object_id, 'payload', true);\n"
+        "get_post_meta($object_id, 'payload', true);\n"
+        "// update_metadata('post', $object_id, 'commented', $value);\n"
+        'echo "update_metadata(inside a string)";\n'
+    )
+
+    artifact, _, sinks = build_coverage_artifact(tmp_path)
+
+    implicit = [
+        item for item in artifact.items if item.type == "implicit_deserialization"
+    ]
+    assert [(item.line, item.name) for item in implicit] == [
+        (2, "update_metadata"),
+        (3, "UPDATE_METADATA"),
+    ]
+    assert all(item.kind == "sink" for item in implicit)
+    assert all(item.review_areas == ["injection_files"] for item in implicit)
+    assert [
+        (sink["line"], sink["function"])
+        for sink in sinks
+        if sink["type"] == "implicit_deserialization"
+    ] == [(2, "update_metadata"), (3, "UPDATE_METADATA")]
+
+
+def test_recon_grep_tracks_only_direct_implicit_metadata_anchor():
+    pattern = re.compile(RIPGREP_PATTERNS["implicit_deserialization"])
+
+    assert pattern.search("UPDATE_METADATA('post', $id, $key, $value)")
+    assert not pattern.search("update_post_meta($id, $key, $value)")
+    assert not pattern.search("get_metadata('post', $id, $key, true)")
 
 
 def test_dynamic_sql_identity_crud_routes_to_authorization_without_broad_sql_routing(

@@ -22,6 +22,14 @@ calls. The list below is a defensive reference, not exhaustive.
   `javascript:` URLs. Preserved links or markup are not XSS unless JavaScript
   execution is demonstrated in a supported browser.
 - `sanitize_text_field` strips tags + line breaks but keeps `=()`, quotes, etc.
+  Its core `_sanitize_text_fields()` implementation has no embedded-NUL
+  rejection: it checks UTF-8, handles `<`/tags, collapses selected whitespace,
+  trims the ends, and removes literal `%HH` substrings. For ordinary
+  form-encoded input, PHP decodes `%HH` before populating `$_POST`, so an encoded
+  NUL arrives as an embedded raw NUL before `wp_unslash()` and text cleaning.
+  Do not treat this sanitizer alone as proof that PHP serialized protected or
+  private property names cannot survive; trace the actual transport and every
+  subsequent transform, and verify that serialized byte lengths still match.
 - `sanitize_file_name` aggressively strips `<>"|?*\:` — filenames cannot carry
   HTML-attribute breakout payloads through this filter.
 
@@ -85,10 +93,55 @@ calls. The list below is a defensive reference, not exhaustive.
 
 - `maybe_unserialize($x)` runs `unserialize` only if `is_serialized($x)` returns true.
   Both reach `unserialize` if the bytes look serialized.
+- Metadata can be an implicit deserialization boundary even when plugin source
+  has no visible `unserialize()` call. A raw low-level database write that puts
+  attacker-controlled serialized bytes into a metadata value can later reach
+  core deserialization through a high-level metadata read or update, including
+  `update_metadata()` handling of the existing value. The verified WordPress
+  core contract is: when `$prev_value` is empty, `update_metadata()` calls
+  `get_metadata_raw()` with the non-empty metadata key; that function applies
+  `maybe_unserialize()` to the stored value, which calls unrestricted
+  `unserialize()` when the bytes are serialized. This supplied core contract
+  does not require a WordPress-core file inside the plugin source tree. Trace
+  the same metadata type, object ID, and key across both plugin operations.
+  That tuple binds the raw write to the later access; the attacker need control
+  only the serialized value. A fixed type/key or a server-generated object ID
+  does not make the path safe. A definitely non-empty `$prev_value` is relevant
+  counterevidence because it skips this old-value comparison path.
+- After finding a raw insert paired with a same-model metadata read or update,
+  first trace the mapped value to external ingress and prove the later operation
+  runs in the same workflow. Defer unrelated tables, migrations, and gadget
+  inspection until this source-to-implicit-sink path is established.
+- A generic text sanitizer or recursive text-cleaning wrapper is not by itself a
+  PHP-serialization allowlist. Prove that its exact output cannot satisfy
+  `is_serialized()`; do not infer that from tag/whitespace cleaning. Also check
+  alternate current and legacy public callers that assign the same raw-written
+  model property.
+- Normal `add_metadata()`/`update_metadata()` and object-specific metadata API
+  writes serialize non-scalar values before storage. Those API writes alone do
+  not establish raw attacker-controlled serialized-byte ingress.
 - For a POI to be exploitable, the bytes feeding into `unserialize` must be
   attacker-controlled. If they come from a `wp_options` key written only by
   internal `update_option` calls with sanitized data, the bug is **chained** —
   flag explicitly, don't claim direct exploit.
+- A natural-gadget proof recipe is not serialized-payload authoring. The safe
+  v1 form is one shipped object triggered by `__wakeup` or `__destruct`, with
+  exact complete source anchors, one parent-supplied ephemeral path, and only a
+  source-reviewed `unlink` file-delete effect. Every additional unlink must be
+  controlled by a complete reviewed condition over one parent-derived opaque
+  generation ID and source-bound directory/basename literals. A local-path
+  helper is usable only when its complete body routes HTTP(S) away, rejects
+  every other scheme, and reaches builtin `file_exists` on the same no-scheme
+  argument. The capability/property/iteration value must remain immutable to
+  the sink (no assignment, indexed write, unset, alias, or by-reference helper),
+  including foreach/destructuring rebinding and by-reference returns,
+  and no unreviewed magic hook besides `__construct` may accompany the selected
+  trigger. Any class-static write must be only a source-bound empty native array
+  read once and set to boolean `true` once at the opaque-ID key.
+  Prefix-constrained deletion is not proof of a direct
+  attacker-selected path. Raw paths/serialization, nested objects/references,
+  callbacks, dynamic helpers, unresolved calls, and other terminal effects are
+  outside this bounded contract and must not be approximated.
 
 ## File upload
 

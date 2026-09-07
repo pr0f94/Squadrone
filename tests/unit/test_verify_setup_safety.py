@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from squadrone.agents.developer import SetupPlan
+from squadrone.agents.developer import RequestedSetupPlan, SetupPlan
 from squadrone.schemas.config import PipelineConfig
 from squadrone.schemas.hypothesis import BugClass, Confidence, Hypothesis
 from squadrone.services.sandbox import SandboxRunResult
@@ -15,11 +15,13 @@ from squadrone.stages.verify import (
     _managed_setup_state_drift,
     _required_attacker_account,
     _run_setup_commands,
+    _run_setup_round_atomically,
     _setup_command_mutates_managed_context,
     _setup_command_plants_exploit_payload,
     _setup_result_taints_confirmation,
     _summarise_forbidden_setup,
     _summarise_setup_results,
+    _summarise_setup_state,
 )
 
 
@@ -139,6 +141,69 @@ def test_blocks_managed_identity_and_plugin_lifecycle_mutations(args, reason_fra
     reason = _setup_command_mutates_managed_context(args)
 
     assert reason and reason_fragment in reason
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["option", "add", "home", "http://127.0.0.1:80"],
+        ["option", "update", "siteurl", "http://127.0.0.1:80"],
+        ["option", "delete", "home"],
+        ["option", "patch", "update", "siteurl", "host", "localhost"],
+        ["config", "set", "WP_HOME", "http://127.0.0.1:80", "--raw"],
+        ["config", "delete", "WP_SITEURL"],
+        ["eval", "update_option('home', 'http://127.0.0.1:80');"],
+        ["eval", "delete_option(\"siteurl\");"],
+        [
+            "eval",
+            "call_user_func('update_option', 'siteurl', 'http://127.0.0.1:80');",
+        ],
+        ["eval", "WP_CLI::runcommand('option update home http://127.0.0.1:80');"],
+        ["eval", "WP_CLI::runcommand('config set WP_HOME http://127.0.0.1:80');"],
+        ["eval", "WP_CLI::runcommand(\"config delete WP_SITEURL\");"],
+        [
+            "eval",
+            "file_put_contents(ABSPATH . 'wp-config.php', $replacement);",
+        ],
+        ["eval", "unlink(ABSPATH . '/wp-config.php');"],
+        [
+            "eval",
+            "global $wpdb; $wpdb->update($wpdb->options, "
+            "['option_value' => 'http://127.0.0.1:80'], "
+            "['option_name' => 'home']);",
+        ],
+        [
+            "db",
+            "query",
+            "UPDATE wp_options SET option_value='http://127.0.0.1:80' "
+            "WHERE option_name='siteurl'",
+        ],
+    ],
+)
+def test_blocks_canonical_wordpress_url_mutations(args):
+    reason = _setup_command_mutates_managed_context(args)
+
+    assert reason and "home/siteurl" in reason
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["option", "get", "home"],
+        ["option", "get", "siteurl"],
+        ["option", "update", "homepage_enabled", "1"],
+        ["option", "update", "demo_siteurl", "https://example.test"],
+        ["eval", "$url = home_url('/'); update_option('demo_url', $url);"],
+        ["eval", "$url = get_option('siteurl'); WP_CLI::log($url);"],
+        ["eval", "$plugin->update_option('home', 'landing');"],
+        ["eval", "Plugin_Settings::delete_option('siteurl');"],
+        ["site", "option", "update", "home", "network-value"],
+        ["eval", "WP_CLI::runcommand('site option update home network-value');"],
+        ["eval", "$config = file_get_contents(ABSPATH . '/wp-config.php');"],
+    ],
+)
+def test_allows_canonical_url_reads_and_unrelated_option_writes(args):
+    assert _setup_command_mutates_managed_context(args) is None
 
 
 @pytest.mark.parametrize(
@@ -352,6 +417,64 @@ def test_allows_read_only_application_password_diagnostics(args):
     assert _setup_command_mutates_managed_context(args) is None
 
 
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["eval", "wp_generate_auth_cookie(1, time() + 3600, 'auth');"],
+        ["eval", "wp_set_auth_cookie(1);"],
+        ["eval", "wp_signon(['user_login' => 'admin', 'user_password' => 'x']);"],
+        [
+            "eval",
+            "call_user_func('wp_generate_auth_cookie', 1, time() + 3600, 'auth');",
+        ],
+        [
+            "eval",
+            "$tokens = WP_Session_Tokens::get_instance(1); "
+            "$tokens->create(time() + 3600);",
+        ],
+        ["eval", "WP_Session_Tokens::destroy_all_for_all_users();"],
+        [
+            "eval",
+            "$tokens = WP_User_Meta_Session_Tokens::get_instance(1); "
+            "call_user_func([$tokens, 'update'], 'token', []);",
+        ],
+        ["user", "session", "destroy", "admin", "token"],
+        ["user", "session", "destroy-all", "admin"],
+        ["eval", "WP_CLI::runcommand('user session destroy-all admin');"],
+        ["user", "meta", "update", "admin", "session_tokens", "[]"],
+        ["eval", "update_user_meta(1, 'session_tokens', []);"],
+    ],
+)
+def test_blocks_synthetic_auth_cookie_and_session_token_mutations(args):
+    reason = _setup_command_mutates_managed_context(args)
+
+    assert reason and "session" in reason.casefold()
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["eval", "$user_id = wp_validate_auth_cookie($cookie, 'auth');"],
+        ["eval", "$parts = wp_parse_auth_cookie($cookie, 'auth');"],
+        ["eval", "$token = wp_get_session_token();"],
+        [
+            "eval",
+            "$tokens = WP_Session_Tokens::get_instance(1); "
+            "$valid = $tokens->verify($token);",
+        ],
+        ["user", "session", "list", "admin", "--format=json"],
+        ["user", "meta", "get", "admin", "session_tokens"],
+        ["option", "update", "plugin_session_tokens_enabled", "1"],
+        [
+            "eval",
+            "$response = wp_remote_get('http://127.0.0.1:80/wp-login.php');",
+        ],
+    ],
+)
+def test_allows_auth_diagnostics_and_unauthenticated_reachability_gets(args):
+    assert _setup_command_mutates_managed_context(args) is None
+
+
 def test_managed_context_guard_allows_benign_installer_and_object_setup():
     assert (
         _setup_command_mutates_managed_context(
@@ -396,7 +519,192 @@ async def test_managed_context_violation_is_blocked_before_execution():
     assert results[0]["executed"] is False
 
 
-def _managed_state(*, subscriber_caps=None, active_plugins=None, privileged_users=None):
+@pytest.mark.asyncio
+async def test_failed_setup_round_rolls_back_all_partial_state(tmp_path):
+    class RecordingWPCli:
+        def __init__(self, sandbox):
+            self.sandbox = sandbox
+
+        async def _exec_result(self, *args, user=None, wp_user=None):
+            self.sandbox.state.append(args[-1])
+            if args[-1] == "second":
+                return 1, "", "Error: setup postcondition failed: public page"
+            return 0, "updated", ""
+
+    class FakeSandbox:
+        config = SimpleNamespace(wp_admin_email="owner@example.test")
+
+        def __init__(self):
+            self.state = []
+            self.saved = {}
+            self.restore_count = 0
+            self.restart_count = 0
+            self.wp_cli = RecordingWPCli(self)
+
+        async def snapshot(self):
+            path = tmp_path / "setup-round-snapshot"
+            path.mkdir()
+            self.saved[path] = list(self.state)
+            return path
+
+        async def restore(self, snapshot):
+            self.restore_count += 1
+            self.state = list(self.saved[snapshot])
+
+        async def restart_wordpress_runtime(self):
+            self.restart_count += 1
+
+    sandbox = FakeSandbox()
+    results = await _run_setup_round_atomically(
+        sandbox,  # type: ignore[arg-type]
+        [["option", "update", "first"], ["option", "update", "second"]],
+        hypothesis=_hyp(BugClass.ARBITRARY_FILE_WRITE),
+    )
+
+    assert sandbox.state == []
+    assert sandbox.restore_count == 1
+    assert sandbox.restart_count == 1
+    assert all(item["setup_round_rolled_back"] is True for item in results)
+    assert all(item["setup_state_committed"] is False for item in results)
+    summary = _summarise_setup_results(results)
+    assert "NOT COMMITTED — SETUP ROUND ROLLED BACK" in summary
+    assert "ENTIRE SETUP ROUND ROLLED BACK" in summary
+    assert not (tmp_path / "setup-round-snapshot").exists()
+
+
+@pytest.mark.asyncio
+async def test_successful_setup_round_commits_without_restore(tmp_path):
+    class RecordingWPCli:
+        async def _exec_result(self, *args, user=None, wp_user=None):
+            return 0, "updated", ""
+
+    class FakeSandbox:
+        config = SimpleNamespace(wp_admin_email="owner@example.test")
+        wp_cli = RecordingWPCli()
+
+        def __init__(self):
+            self.restore_count = 0
+
+        async def snapshot(self):
+            path = tmp_path / "successful-setup-snapshot"
+            path.mkdir()
+            return path
+
+        async def restore(self, _snapshot):
+            self.restore_count += 1
+
+    sandbox = FakeSandbox()
+    results = await _run_setup_round_atomically(
+        sandbox,  # type: ignore[arg-type]
+        [["option", "update", "demo_enabled", "1"]],
+        hypothesis=_hyp(BugClass.ARBITRARY_FILE_WRITE),
+    )
+
+    assert sandbox.restore_count == 0
+    assert results[0]["setup_round_rolled_back"] is False
+    assert results[0]["setup_state_committed"] is True
+    assert not (tmp_path / "successful-setup-snapshot").exists()
+
+
+def test_setup_state_summary_keeps_committed_state_ahead_of_latest_rollback():
+    huge_program = "create_normal_object();" + ("x" * 12000) + "HIDDEN_PROGRAM_TAIL"
+    committed = {
+        "args": ["eval", huge_program],
+        "returncode": 0,
+        "output": json.dumps(
+            {
+                "object_id": 41,
+                "public_url": (
+                    "http://example.test/object/41?_wpnonce=url-secret-must-not-leak"
+                ),
+                "form_nonce": "nonce-value-must-not-leak",
+                "nonce_present": True,
+                "token_count": 1,
+            }
+        ),
+        "stderr": "",
+        "failed": False,
+        "executed": True,
+        "setup_round_rolled_back": False,
+        "setup_state_committed": True,
+    }
+    rolled_back = {
+        "args": ["eval", huge_program.replace("41", "42")],
+        "returncode": 1,
+        "output": "",
+        "stderr": (
+            "PHP Notice: unrelated bootstrap notice\n"
+            "Error: setup postcondition failed: missing controls: "
+            "email,amount nonce=second-secret"
+        ),
+        "failed": True,
+        "executed": True,
+        "setup_round_rolled_back": True,
+        "setup_state_committed": False,
+    }
+
+    summary = _summarise_setup_state(
+        [committed, rolled_back], latest_round_results=[rolled_back]
+    )
+
+    assert summary.index("RETAINED COMMITTED SETUP STATE") < summary.index(
+        "LATEST SETUP ROUND"
+    )
+    assert '"object_id":41' in summary
+    assert '"form_nonce":"<redacted:present>"' in summary
+    assert '"nonce_present":true' in summary
+    assert '"token_count":1' in summary
+    assert "nonce-value-must-not-leak" not in summary
+    assert "url-secret-must-not-leak" not in summary
+    assert "_wpnonce=<redacted>" in summary
+    assert "second-secret" not in summary
+    assert "missing controls: email,amount" in summary
+    assert "HIDDEN_PROGRAM_TAIL" not in summary
+    assert "wp eval <PHP omitted; chars=" in summary
+    assert "Only the latest failed setup round shown above was rolled back" in summary
+    assert "Earlier committed setup state remains present" in summary
+    assert "instead of recreating it" in summary
+    assert len(summary) < 3000
+
+
+@pytest.mark.asyncio
+async def test_failed_setup_round_retains_snapshot_when_rollback_fails(tmp_path):
+    class FailingWPCli:
+        async def _exec_result(self, *args, user=None, wp_user=None):
+            return 1, "", "Error: setup postcondition failed: expected state"
+
+    class FakeSandbox:
+        config = SimpleNamespace(wp_admin_email="owner@example.test")
+        wp_cli = FailingWPCli()
+
+        async def snapshot(self):
+            path = tmp_path / "unrestored-setup-snapshot"
+            path.mkdir()
+            (path / "db.sql").write_text("recovery")
+            return path
+
+        async def restore(self, _snapshot):
+            raise RuntimeError("simulated rollback failure")
+
+    with pytest.raises(RuntimeError, match="simulated rollback failure"):
+        await _run_setup_round_atomically(
+            FakeSandbox(),  # type: ignore[arg-type]
+            [["option", "update", "demo_enabled", "1"]],
+            hypothesis=_hyp(BugClass.ARBITRARY_FILE_WRITE),
+        )
+
+    retained = tmp_path / "unrestored-setup-snapshot"
+    assert retained.is_dir()
+    assert (retained / "db.sql").read_text() == "recovery"
+
+
+def _managed_state(
+    *,
+    subscriber_caps=None,
+    active_plugins=None,
+    privileged_users=None,
+    canonical_urls=None,
+):
     return {
         "users": {
             "sandbox-owner": {
@@ -426,6 +734,11 @@ def _managed_state(*, subscriber_caps=None, active_plugins=None, privileged_user
             else active_plugins
         ),
         "active_sitewide_plugins": [],
+        "canonical_urls": canonical_urls
+        or {
+            "home": "http://localhost:8100",
+            "siteurl": "http://localhost:8100",
+        },
         "privileged_users": (
             {
                 "sandbox-owner": {
@@ -595,6 +908,44 @@ async def test_post_execution_state_monitor_taints_indirect_plugin_deactivation(
 
 
 @pytest.mark.asyncio
+async def test_post_execution_state_monitor_taints_indirect_canonical_url_mutation():
+    states = iter(
+        [
+            _managed_state(),
+            _managed_state(
+                canonical_urls={
+                    "home": "http://127.0.0.1:80",
+                    "siteurl": "http://localhost:8100",
+                }
+            ),
+        ]
+    )
+
+    class RecordingWPCli:
+        async def _exec_result(self, *args, user=None, wp_user=None):
+            return 0, "installer complete", ""
+
+    class FakeSandbox:
+        config = SimpleNamespace(wp_admin_email="owner@example.test")
+        wp_cli = RecordingWPCli()
+
+        async def capture_setup_security_state(self, _plugin_slug):
+            return next(states)
+
+    results = await _run_setup_commands(
+        FakeSandbox(),
+        [["eval", "Plugin_Setup::install_defaults();"]],
+        hypothesis=_hyp(BugClass.XSS_STORED),
+        plugin_slug="demo-plugin",
+    )
+
+    assert results[0]["failed"] is True
+    assert results[0]["managed_context_violation"] is True
+    assert "home/siteurl" in results[0]["forbidden_setup_reason"]
+    assert _setup_result_taints_confirmation(results[0]) is True
+
+
+@pytest.mark.asyncio
 async def test_post_execution_state_monitor_taints_new_elevated_user():
     before = _managed_state()
     after_privileged = dict(before["privileged_users"])
@@ -736,7 +1087,7 @@ async def test_verification_rejects_success_after_indirect_managed_state_drift(
             return 0, "installer complete", ""
 
     class FakeSandbox:
-        target_url = "http://sandbox.invalid"
+        target_url = "http://localhost:8100"
         config = SimpleNamespace(wp_admin_email="owner@example.test")
         wp_cli = FakeWPCli()
 
@@ -755,6 +1106,14 @@ async def test_verification_rejects_success_after_indirect_managed_state_drift(
                     "role": "subscriber",
                 }
             ]
+
+        def setup_http_context(self):
+            return verify_stage.SetupHttpContext.from_wordpress_origins(
+                internal_connect_origin=(
+                    verify_stage.SandboxManager.INTERNAL_WORDPRESS_ORIGIN
+                ),
+                canonical_wordpress_origin=self.target_url,
+            )
 
         async def snapshot(self):
             path = tmp_path / "snapshot"
@@ -813,9 +1172,13 @@ async def test_verification_rejects_success_after_indirect_managed_state_drift(
 
     assert finding is None
     assert sandbox.poc_runs == 1
-    assert sandbox.restores == 1
+    # The failed setup round is restored immediately, then the attempted PoC is
+    # restored before the protected-boundary rejection returns.
+    assert sandbox.restores == 2
     checkpoint = json.loads((poc_dir / "setup_results.json").read_text())
     assert checkpoint["results"][0]["managed_context_violation"] is True
+    assert checkpoint["results"][0]["setup_round_rolled_back"] is True
+    assert checkpoint["results"][0]["setup_state_committed"] is False
     attempts_checkpoint = json.loads((poc_dir / "attempts.json").read_text())
     assert attempts_checkpoint["schema_version"] == 1
     assert attempts_checkpoint["hypothesis_id"] == "h"
@@ -1061,7 +1424,8 @@ async def test_successful_wp_cli_command_is_not_failed_by_advisory_output(adviso
 
     assert results[0]["failed"] is False
     summary = _summarise_setup_results(results)
-    assert "OK: wp rewrite flush" in summary
+    assert "[1] OK" in summary
+    assert "command: wp rewrite flush" in summary
     assert "Success: Rewrite rules flushed." in summary
     assert advisory in summary
 
@@ -1100,7 +1464,8 @@ async def test_structured_postcondition_survives_unrelated_plugin_bootstrap_warn
     assert results[0]["failed"] is False
     assert results[0]["advisory_bootstrap_warning"] is True
     summary = _summarise_setup_results(results)
-    assert "OK WITH WARNINGS: wp eval" in summary
+    assert "[1] OK WITH WARNINGS" in summary
+    assert "command: wp eval <PHP omitted" in summary
     assert '"foreign_id":41' in summary
     assert bootstrap_warning in summary
 
@@ -1351,7 +1716,7 @@ async def test_atomic_setup_repair_does_not_consume_poc_requested_quota(
             return 0, "directory ready", ""
 
     class FakeSandbox:
-        target_url = "http://sandbox.invalid"
+        target_url = "http://localhost:8100"
         config = SimpleNamespace(wp_admin_email="owner@example.test")
 
         def __init__(self):
@@ -1366,6 +1731,14 @@ async def test_atomic_setup_repair_does_not_consume_poc_requested_quota(
                     "role": "subscriber",
                 }
             ]
+
+        def setup_http_context(self):
+            return verify_stage.SetupHttpContext.from_wordpress_origins(
+                internal_connect_origin=(
+                    verify_stage.SandboxManager.INTERNAL_WORDPRESS_ORIGIN
+                ),
+                canonical_wordpress_origin=self.target_url,
+            )
 
         async def snapshot(self):
             self.snapshot_count += 1
@@ -1387,6 +1760,7 @@ async def test_atomic_setup_repair_does_not_consume_poc_requested_quota(
     class FakeDeveloper:
         def __init__(self):
             self.followup_feedback = []
+            self.requested_setup_calls = []
 
         async def propose_setup(self, *_args, **_kwargs):
             return SetupPlan(
@@ -1401,16 +1775,20 @@ async def test_atomic_setup_repair_does_not_consume_poc_requested_quota(
                 return SetupPlan(
                     rationale="Use only the safe operation.", commands=[safe]
                 )
-            if len(self.followup_feedback) == 3:
-                return SetupPlan(
+            raise AssertionError("an automatic setup followup quota was exceeded")
+
+        async def propose_requested_setup(self, **kwargs):
+            self.requested_setup_calls.append(kwargs)
+            if len(self.requested_setup_calls) == 1:
+                return RequestedSetupPlan(
                     rationale="Apply the source-grounded PoC prerequisite.",
                     commands=[poc_forbidden],
                 )
-            if len(self.followup_feedback) == 4:
-                return SetupPlan(
+            if len(self.requested_setup_calls) == 2:
+                return RequestedSetupPlan(
                     rationale="Do not bypass the setup safety guard.", commands=[]
                 )
-            raise AssertionError("a setup followup quota was exceeded")
+            raise AssertionError("a PoC-requested setup quota was exceeded")
 
     callback_results = []
 
@@ -1442,10 +1820,24 @@ async def test_atomic_setup_repair_does_not_consume_poc_requested_quota(
     )
 
     assert finding is None
-    assert len(developer.followup_feedback) == 4
+    assert len(developer.followup_feedback) == 2
+    assert len(developer.requested_setup_calls) == 2
     assert "BLOCKED BEFORE EXECUTION" in developer.followup_feedback[0]
     assert "LATEST SETUP ROUND" in developer.followup_feedback[1]
-    assert "CUMULATIVE SETUP HISTORY" in developer.followup_feedback[1]
+    assert "RETAINED COMMITTED SETUP STATE" in developer.followup_feedback[1]
+    assert "CUMULATIVE HISTORY COUNTS" in developer.followup_feedback[1]
+    assert all(
+        call["request_description"] == "request more setup"
+        for call in developer.requested_setup_calls
+    )
+    assert all("last_iteration" not in call for call in developer.requested_setup_calls)
+    assert all("last_stdout" not in call for call in developer.requested_setup_calls)
+    assert all("last_stderr" not in call for call in developer.requested_setup_calls)
+    assert all("last_error_log" not in call for call in developer.requested_setup_calls)
+    assert (
+        "BLOCKED BEFORE EXECUTION"
+        in developer.requested_setup_calls[1]["setup_execution_feedback"]
+    )
     assert sandbox.wp_cli.calls == [(tuple(safe), "www-data", "owner@example.test")]
     assert len(callback_results) == 1
     assert callback_results[0].startswith(
@@ -1495,7 +1887,7 @@ async def test_blocked_lifecycle_repairs_cannot_starve_poc_requested_setup(
             return 0, "updated", ""
 
     class FakeSandbox:
-        target_url = "http://sandbox.invalid"
+        target_url = "http://localhost:8100"
         config = SimpleNamespace(wp_admin_email="owner@example.test")
 
         def __init__(self):
@@ -1510,6 +1902,14 @@ async def test_blocked_lifecycle_repairs_cannot_starve_poc_requested_setup(
                     "role": "subscriber",
                 }
             ]
+
+        def setup_http_context(self):
+            return verify_stage.SetupHttpContext.from_wordpress_origins(
+                internal_connect_origin=(
+                    verify_stage.SandboxManager.INTERNAL_WORDPRESS_ORIGIN
+                ),
+                canonical_wordpress_origin=self.target_url,
+            )
 
         async def snapshot(self):
             self.snapshot_count += 1
@@ -1531,8 +1931,11 @@ async def test_blocked_lifecycle_repairs_cannot_starve_poc_requested_setup(
     class FakeDeveloper:
         def __init__(self):
             self.followup_calls = []
+            self.requested_setup_calls = []
+            self.initial_setup_http_contexts = []
 
-        async def propose_setup(self, *_args, **_kwargs):
+        async def propose_setup(self, *_args, **kwargs):
+            self.initial_setup_http_contexts.append(kwargs["setup_http_context"])
             return SetupPlan(
                 rationale="Incorrectly cycle the managed plugin.",
                 commands=[initial_lifecycle],
@@ -1550,17 +1953,22 @@ async def test_blocked_lifecycle_repairs_cannot_starve_poc_requested_setup(
                     rationale="Incorrect identity and lifecycle retry.",
                     commands=[second_repair],
                 )
-            if call_number == 3:
-                return SetupPlan(
+            raise AssertionError("an automatic setup followup quota was exceeded")
+
+        async def propose_requested_setup(self, **kwargs):
+            self.requested_setup_calls.append(kwargs)
+            call_number = len(self.requested_setup_calls)
+            if call_number == 1:
+                return RequestedSetupPlan(
                     rationale="Create the source-grounded normal prerequisite.",
                     commands=[poc_initial],
                 )
-            if call_number == 4:
-                return SetupPlan(
+            if call_number == 2:
+                return RequestedSetupPlan(
                     rationale="Correct the source-grounded frontend postcondition.",
                     commands=[poc_corrective],
                 )
-            raise AssertionError("a setup followup quota was exceeded")
+            raise AssertionError("a PoC-requested setup quota was exceeded")
 
     callback_results = []
     write_setup_summaries = []
@@ -1605,19 +2013,41 @@ async def test_blocked_lifecycle_repairs_cannot_starve_poc_requested_setup(
     )
 
     assert finding is None
-    assert len(developer.followup_calls) == 4
-    assert all(call["runtime"] is runtime for call in developer.followup_calls)
+    assert len(developer.initial_setup_http_contexts) == 1
+    assert (
+        developer.initial_setup_http_contexts[0].internal_connect_origin
+        == verify_stage.SandboxManager.INTERNAL_WORDPRESS_ORIGIN
+    )
+    assert developer.initial_setup_http_contexts[0].canonical_host_header == (
+        "localhost:8100"
+    )
+    assert len(developer.followup_calls) == 2
+    assert len(developer.requested_setup_calls) == 2
+    all_setup_calls = developer.followup_calls + developer.requested_setup_calls
+    assert all(
+        call["setup_http_context"].internal_connect_origin
+        == verify_stage.SandboxManager.INTERNAL_WORDPRESS_ORIGIN
+        for call in all_setup_calls
+    )
+    assert all(
+        call["setup_http_context"].canonical_host_header == "localhost:8100"
+        for call in all_setup_calls
+    )
+    assert sandbox.target_url == "http://localhost:8100"
+    assert all(call["runtime"] is runtime for call in all_setup_calls)
     assert all(
         call["plugin_root"] == str(plugin_root)
-        for call in developer.followup_calls
+        for call in all_setup_calls
     )
-    assert (
-        "PoC author requested additional setup"
-        in developer.followup_calls[2]["schema_diagnostics"]
+    assert developer.requested_setup_calls[0]["request_description"] == (
+        "create the source-grounded normal state"
     )
-    assert (
-        "failed frontend postcondition"
-        in developer.followup_calls[3]["schema_diagnostics"]
+    assert developer.requested_setup_calls[1]["request_description"] == (
+        "correct the failed frontend postcondition"
+    )
+    assert all(
+        call["schema_diagnostics"] == ""
+        for call in developer.requested_setup_calls
     )
     assert sandbox.wp_cli.calls == [
         (tuple(poc_initial), "www-data", "owner@example.test"),

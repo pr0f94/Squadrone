@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -379,13 +380,20 @@ async def test_verify_restarts_wordpress_after_every_local_resource_restore_only
             self.run_count += 1
             phase = "attack" if self.run_count == 1 else "confirmation"
             self.events.append(f"run:{phase}")
-            success = self.run_count == 1
+            child_line = 'SQUADRONE_RESULT={"verdict":"vulnerable"}'
+            replay_observation = observation.model_copy(deep=True)
+            if phase == "confirmation":
+                replay_observation.request["url"] = (
+                    "http://sandbox.invalid/wp-json/example/v1/different"
+                )
             return SandboxRunResult(
-                success=success,
-                output="SQUADRONE_RESULT={}" if success else "",
+                success=True,
+                output=child_line,
+                response=child_line,
+                error_log=child_line,
                 elapsed=0,
-                validation_reason="" if success else "forced confirmation failure",
-                observation=observation.model_copy(deep=True),
+                validation_reason="parent oracle accepted this individual run",
+                observation=replay_observation,
             )
 
     monkeypatch.setattr(verify_stage, "PoCAuthorAgent", FakePoCAuthor)
@@ -448,6 +456,14 @@ echo file_get_contents($destination);
     assert sandbox.events.count("restart_wordpress_runtime") == (
         2 if oracle_mode == "local_resource" else 0
     )
+    checkpoint = json.loads((tmp_path / "verification" / "attempts.json").read_text())
+    assert len(checkpoint["attempts"]) == 2
+    for attempt in checkpoint["attempts"]:
+        assert attempt["result"] == "failed"
+        assert attempt["observation"] is None
+        assert attempt["rejected_observation"]["verdict"] == "vulnerable"
+        assert "SQUADRONE_RESULT=" not in (attempt["response_snippet"] or "")
+        assert "SQUADRONE_RESULT=" not in (attempt["error_log_snippet"] or "")
 
 
 def test_ssrf_destination_inference_fails_closed_without_one_exact_source(

@@ -13,6 +13,8 @@ from ..schemas.hypothesis import SpecialistReviewArtifact
 from ..schemas.recon import (
     CoverageDisposition,
     CoverageItem,
+    CoverageStatus,
+    EntryPoint,
     ReconArtifact,
     ReviewArea,
     StaticCallEdge,
@@ -29,6 +31,13 @@ logger = logging.getLogger(__name__)
 
 _LOCATION_RE = re.compile(r"^(?P<path>.+):(?P<line>[1-9][0-9]*)$")
 _GENERIC_HANDLERS = {"", "closure", "function", "init", "__invoke"}
+_PHP_VARIABLE_RE = re.compile(r"\$[A-Za-z_\x80-\xff]")
+_REQUEST_SELECTED_METHOD_CALL_RE = re.compile(
+    r"(?:->\s*\$[A-Za-z_][A-Za-z0-9_]*\s*\(|"
+    r"\bis_callable\s*\([^\n]{0,300}\$[A-Za-z_][A-Za-z0-9_]*|"
+    r"\bcall_user_func(?:_array)?\s*\([^\n]{0,300}\$[A-Za-z_][A-Za-z0-9_]*)",
+    re.IGNORECASE,
+)
 _DYNAMIC_KEY_ARGUMENTS = {
     "add_comment_meta": 1,
     "add_blog_option": 1,
@@ -72,6 +81,8 @@ _DEFAULT_MAX_ITERATIONS = 25
 _DEFAULT_FORCE_FINALISE_AFTER = 20
 _DYNAMIC_KEY_MAX_ITERATIONS = 40
 _DYNAMIC_KEY_FORCE_FINALISE_AFTER = 32
+_IMPLICIT_DESERIALIZATION_MAX_ITERATIONS = 52
+_IMPLICIT_DESERIALIZATION_FORCE_FINALISE_AFTER = 44
 AUTHENTICATION_ALTERNATE_PATH_AUDIT_VERSION = 1
 
 
@@ -328,6 +339,29 @@ def _requires_dynamic_key_trace(targets: list[CoverageItem]) -> bool:
     return any(_target_requires_dynamic_key_trace(target) for target in targets)
 
 
+def _requires_implicit_deserialization_trace(targets: list[CoverageItem]) -> bool:
+    """Whether a batch must trace a raw write into an implicit metadata sink."""
+    return any(target.type == "implicit_deserialization" for target in targets)
+
+
+def _requires_variable_php_include_trace(item: CoverageItem) -> bool:
+    """Return whether an include/require operand contains a runtime variable."""
+    return (
+        item.kind == "sink"
+        and item.type == "dynamic_include"
+        and item.name.lower() in {"include", "include_once", "require", "require_once"}
+        and _PHP_VARIABLE_RE.search(item.snippet) is not None
+    )
+
+
+def _is_request_selected_method_dispatch(entry: EntryPoint) -> bool:
+    """Recognize recon entries that invoke a request-selected object method."""
+    if "<public_callable>" in entry.name.lower():
+        return True
+    evidence = "\n".join((entry.handler_function, entry.body_slice or ""))
+    return _REQUEST_SELECTED_METHOD_CALL_RE.search(evidence) is not None
+
+
 def _requires_authentication_alternate_path_audit(
     name: ReviewArea,
     targets: list[CoverageItem],
@@ -418,6 +452,7 @@ def _merge_alternate_path_reviews(
             )
         )
         reasons = [item.reason for item in dispositions if item.reason]
+        status: CoverageStatus
         if invalid:
             status = "unreviewed"
             candidate_ids = []
@@ -463,6 +498,11 @@ def _specialist_iteration_limits(
     targets: list[CoverageItem],
 ) -> tuple[int, int]:
     """Return max iterations and force-finalise limit for one review batch."""
+    if _requires_implicit_deserialization_trace(targets):
+        return (
+            _IMPLICIT_DESERIALIZATION_MAX_ITERATIONS,
+            _IMPLICIT_DESERIALIZATION_FORCE_FINALISE_AFTER,
+        )
     if name == "authorization_workflows" and _requires_dynamic_key_trace(targets):
         return _DYNAMIC_KEY_MAX_ITERATIONS, _DYNAMIC_KEY_FORCE_FINALISE_AFTER
     return _DEFAULT_MAX_ITERATIONS, _DEFAULT_FORCE_FINALISE_AFTER
@@ -704,6 +744,9 @@ def _trace_static_paths(
 
 def _compact_recon(recon: ReconArtifact, targets: list[CoverageItem]) -> dict:
     """Return only recon facts directly related to a bounded review batch."""
+    needs_dynamic_dispatch_context = any(
+        _requires_variable_php_include_trace(item) for item in targets
+    )
     target_entry_keys = {
         (item.type, item.name) for item in targets if item.kind == "entry_point"
     }
@@ -754,10 +797,19 @@ def _compact_recon(recon: ReconArtifact, targets: list[CoverageItem]) -> dict:
             entry.type in {"direct_php", "direct_php_candidate"}
             and PurePosixPath(entry.file).parent in target_directories
         )
+        request_selected_dispatch = (
+            needs_dynamic_dispatch_context
+            and _is_request_selected_method_dispatch(entry)
+        )
         reaches_target = any(
             location in path for location in target_locations for path in paths
         )
-        if not direct_target and not nearby_direct_php and not reaches_target:
+        if (
+            not direct_target
+            and not nearby_direct_php
+            and not request_selected_dispatch
+            and not reaches_target
+        ):
             continue
         related_entries.append(entry.model_dump(mode="json", exclude={"body_slice"}))
         if paths:
@@ -839,7 +891,7 @@ def _enforce_read_evidence(
 async def run_specialist(
     *,
     runtime: "AgentRuntime",
-    name: str,
+    name: ReviewArea,
     prompt_path: str,
     model: str,
     recon: ReconArtifact,
@@ -847,6 +899,7 @@ async def run_specialist(
     priority_files: list[str],
     coverage_targets: list[CoverageItem],
     batch_id: str,
+    prior_incomplete_review: list[dict[str, object]] | None = None,
 ) -> SpecialistReviewArtifact:
     parts = [
         load_prompt(prompt_path),
@@ -867,17 +920,36 @@ async def run_specialist(
         if entry.get("type") in {"direct_php", "direct_php_candidate"}
         and entry.get("file")
     }
+    dynamic_dispatch_files = {
+        entry.file
+        for entry in recon.entry_points
+        if any(
+            _requires_variable_php_include_trace(target)
+            for target in coverage_targets
+        )
+        and _is_request_selected_method_dispatch(entry)
+    }
     user_payload: dict = {
         "plugin_slug": recon.plugin_slug,
         "review_area": name,
         "batch_id": batch_id,
         "hypothesis_id_prefix": batch_id,
         "related_recon": related_recon,
-        "priority_files": sorted({*priority_files, *direct_php_files}),
+        "priority_files": sorted(
+            {*priority_files, *direct_php_files, *dynamic_dispatch_files}
+        ),
         "coverage_targets": [
             target.model_dump(mode="json") for target in coverage_targets
         ],
     }
+    if prior_incomplete_review:
+        user_payload["prior_incomplete_review"] = prior_incomplete_review
+        user_payload["retry_contract"] = (
+            "This is non-authoritative progress from an incomplete first pass. "
+            "Re-read every cited source location used in your decision, do not "
+            "assume its conclusions, continue the stated proof gaps and alternate "
+            "callers, and avoid repeating unrelated searches already ruled out."
+        )
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": json.dumps(user_payload, default=str)},
@@ -893,9 +965,18 @@ async def run_specialist(
         name == "authorization_workflows"
         and _requires_dynamic_key_trace(coverage_targets)
     )
+    implicit_deserialization_trace = _requires_implicit_deserialization_trace(
+        coverage_targets
+    )
     if dynamic_key_trace:
         logger.info(
             "specialist %s.%s: extended trace budget for dynamic field/key write",
+            name,
+            batch_id,
+        )
+    elif implicit_deserialization_trace:
+        logger.info(
+            "specialist %s.%s: extended trace budget for implicit deserialization",
             name,
             batch_id,
         )
@@ -1013,6 +1094,7 @@ class FocusedSpecialist:
         priority_files: list[str],
         coverage_targets: list[CoverageItem],
         batch_id: str,
+        prior_incomplete_review: list[dict[str, object]] | None = None,
     ) -> SpecialistReviewArtifact:
         return await run_specialist(
             runtime=self.runtime,
@@ -1024,4 +1106,5 @@ class FocusedSpecialist:
             priority_files=priority_files,
             coverage_targets=coverage_targets,
             batch_id=batch_id,
+            prior_incomplete_review=prior_incomplete_review,
         )

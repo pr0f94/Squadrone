@@ -3,9 +3,9 @@ services:
     image: mariadb:10.11
     environment:
       MYSQL_ROOT_PASSWORD: rootpass
-      MYSQL_DATABASE: wordpress
-      MYSQL_USER: wpuser
-      MYSQL_PASSWORD: wppass
+      MYSQL_DATABASE: {{ database_name }}
+      MYSQL_USER: {{ database_user }}
+      MYSQL_PASSWORD: {{ database_password }}
     healthcheck:
       test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
       interval: 5s
@@ -25,15 +25,23 @@ services:
       - "{{ port }}:80"
     environment:
       WORDPRESS_DB_HOST: db
-      WORDPRESS_DB_USER: wpuser
-      WORDPRESS_DB_PASSWORD: wppass
-      WORDPRESS_DB_NAME: wordpress
+      WORDPRESS_DB_USER: {{ database_user }}
+      WORDPRESS_DB_PASSWORD: {{ database_password }}
+      WORDPRESS_DB_NAME: {{ database_name }}
       WORDPRESS_DEBUG: "1"
+{% if enable_php_object_gadget_oracle %}
+      TMPDIR: "/var/lib/squadrone/php-object-gadget"
+{% endif %}
       WORDPRESS_CONFIG_EXTRA: |
         define('WP_DEBUG_LOG', true);
         define('WP_DEBUG_DISPLAY', false);
         @ini_set('display_errors', 0);
         define('SAVEQUERIES', true);
+{% if enable_php_object_gadget_oracle %}
+{% for constant_name in php_object_gadget_directory_constants %}
+        if (!defined('{{ constant_name }}')) { define('{{ constant_name }}', '/var/lib/squadrone/php-object-gadget/'); }
+{% endfor %}
+{% endif %}
       WP_URL: "{{ wp_url }}"
       WP_TITLE: "{{ wp_title }}"
       WP_ADMIN_USER: "{{ wp_admin_user }}"
@@ -44,6 +52,13 @@ services:
       - ./wp-init.sh:/docker-entrypoint.d/99-wp-init.sh
 {% if enable_local_resource_ssrf %}
       - "{{ ssrf_local_host_dir }}:/var/lib/squadrone/ssrf:ro"
+{% endif %}
+{% if enable_php_include_oracle %}
+      - "{{ php_include_host_dir }}:/var/lib/squadrone/php-include:ro"
+{% endif %}
+{% if enable_php_object_gadget_oracle %}
+    tmpfs:
+      - "/var/lib/squadrone/php-object-gadget:rw,noexec,nosuid,nodev,mode=0770,uid=0,gid=33"
 {% endif %}
 
 volumes:

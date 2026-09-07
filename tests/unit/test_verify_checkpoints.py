@@ -369,6 +369,49 @@ async def test_open_cwe_prior_finding_is_quarantined_not_resumed(
 
 
 @pytest.mark.asyncio
+async def test_primitive_only_cwe502_finding_is_quarantined_and_retried(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_zip(monkeypatch, tmp_path)
+    hypothesis = _hyp("legacy-object-finding", BugClass.PHP_OBJECT_INJECTION)
+    hypothesis.evidence_summary["usable_gadget"] = True
+    run_dir = tmp_path / "runs" / "run-1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "findings.jsonl").write_text(
+        _finding("f-primitive-only", hypothesis).model_dump_json() + "\n"
+    )
+    verified: list[str] = []
+
+    async def retry(*args, poc_dir: Path, **_kwargs):
+        verified.append(args[0].id)
+        (poc_dir / "iter_1.py").write_text("# retried incomplete CWE-502 proof")
+        return None
+
+    monkeypatch.setattr(verify_stage, "_verify_one", retry)
+
+    findings = await _run(
+        tmp_path,
+        TriagedArtifact(
+            plugin_slug="plugin",
+            accepted=[hypothesis],
+            rejected=[],
+            merged=[],
+        ),
+    )
+
+    assert findings == []
+    assert verified == [hypothesis.id]
+    quarantined = [
+        Finding.model_validate_json(line)
+        for line in (run_dir / "findings_php_object_unproven.jsonl")
+        .read_text()
+        .splitlines()
+    ]
+    assert [finding.id for finding in quarantined] == ["f-primitive-only"]
+
+
+@pytest.mark.asyncio
 async def test_open_cwe_manual_handoff_does_not_block_known_candidate(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

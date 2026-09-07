@@ -39,6 +39,8 @@ def test_ssrf_bind_source_aliases_are_exact_and_darwin_only() -> None:
 def _manager(
     *,
     ssrf_oracle_modes: frozenset[str] = frozenset(),
+    php_include_oracle_enabled: bool = False,
+    php_object_oracle_enabled: bool = False,
 ) -> SandboxManager:
     manager = SandboxManager(
         SandboxConfig(
@@ -50,6 +52,8 @@ def _manager(
             wp_url="http://localhost:8080",
         ),
         ssrf_oracle_modes=ssrf_oracle_modes,  # type: ignore[arg-type]
+        php_include_oracle_enabled=php_include_oracle_enabled,
+        php_object_oracle_enabled=php_object_oracle_enabled,
     )
     manager.container_name = "test-project-wordpress-1"
     manager._pre_plugin_role_capabilities = {
@@ -94,10 +98,12 @@ def _manager(
     ],
     ids=("none", "http", "local-resource", "both"),
 )
+@pytest.mark.parametrize("php_include_oracle_enabled", [False, True])
 async def test_boot_renders_only_requested_ssrf_resources(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     ssrf_oracle_modes: frozenset[str],
+    php_include_oracle_enabled: bool,
 ) -> None:
     workdir = tmp_path / "sandbox-workdir"
     workdir.mkdir()
@@ -108,7 +114,10 @@ async def test_boot_renders_only_requested_ssrf_resources(
     async def no_op() -> None:
         return None
 
-    manager = _manager(ssrf_oracle_modes=ssrf_oracle_modes)
+    manager = _manager(
+        ssrf_oracle_modes=ssrf_oracle_modes,
+        php_include_oracle_enabled=php_include_oracle_enabled,
+    )
     monkeypatch.setattr(sandbox_module, "_alloc_port", lambda: 8199)
     monkeypatch.setattr(
         sandbox_module.tempfile,
@@ -139,6 +148,11 @@ async def test_boot_renders_only_requested_ssrf_resources(
     assert (workdir / "ssrf-local-resource").exists() is (
         "local_resource" in ssrf_oracle_modes
     )
+    assert ("/var/lib/squadrone/php-include:ro" in compose_text) is (
+        php_include_oracle_enabled
+    )
+    assert (manager._php_include_host_dir is not None) is (php_include_oracle_enabled)
+    assert (workdir / "php-include").exists() is php_include_oracle_enabled
 
 
 @pytest.mark.asyncio
@@ -154,9 +168,12 @@ async def test_unrequested_ssrf_oracles_fail_before_side_effects() -> None:
         match="local-resource SSRF oracle was not enabled",
     ):
         await manager.prepare_ssrf_local_resource_oracle()
+    with pytest.raises(RuntimeError, match="PHP include oracle was not enabled"):
+        await manager.prepare_php_include_oracle()
 
     assert manager._ssrf_oracle is None
     assert manager._ssrf_local_oracle is None
+    assert manager._php_include_oracle is None
 
 
 def _baseline_inspection(
@@ -461,6 +478,7 @@ async def test_setup_users_rejects_administrator_boundary_escalation(field, valu
 @pytest.mark.asyncio
 async def test_setup_security_state_captures_managed_users_and_plugin_activity():
     manager = _manager()
+    manager.target_url = "http://localhost:8100/"
     _seed_verified_accounts(manager)
     managed_users = {
         account["login"]: {
@@ -491,6 +509,10 @@ async def test_setup_security_state_captures_managed_users_and_plugin_activity()
         },
         "active_plugins": ["other/other.php", "demo-plugin/demo.php"],
         "active_sitewide_plugins": ["network/network.php"],
+        "canonical_urls": {
+            "home": "http://localhost:8100",
+            "siteurl": "http://localhost:8100",
+        },
     }
     calls = []
 
@@ -517,14 +539,75 @@ async def test_setup_security_state_captures_managed_users_and_plugin_activity()
         "demo-plugin/demo.php",
         "other/other.php",
     ]
+    assert state["canonical_urls"] == {
+        "home": "http://localhost:8100",
+        "siteurl": "http://localhost:8100",
+    }
     assert len(calls) == 1
     args, os_user, wp_user = calls[0]
     assert args[0] == "eval"
     assert "subscriber_user" not in args[1]
     assert "'admin'" not in args[1]
     assert "'password'" not in args[1]
+    assert "get_option('home', '')" in args[1]
+    assert "get_option('siteurl', '')" in args[1]
     assert os_user == "www-data"
     assert wp_user == "1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "canonical_urls",
+    [
+        {
+            "home": "http://127.0.0.1:80",
+            "siteurl": "http://localhost:8100",
+        },
+        {
+            "home": "http://localhost:8100",
+            "siteurl": "http://localhost:8101",
+        },
+    ],
+)
+async def test_setup_security_state_rejects_urls_outside_sandbox_target(
+    canonical_urls,
+):
+    manager = _manager()
+    manager.target_url = "http://localhost:8100/"
+    _seed_verified_accounts(manager)
+    managed_users = {
+        account["login"]: {
+            "id": account["id"],
+            "login": account["login"],
+            "roles": [account["role"]],
+            "caps": {},
+            "allcaps": [],
+            "privileged_caps": [],
+            "network_super_admin": False,
+            "credential_fingerprint": "a" * 64,
+        }
+        for account in manager.baseline_user_accounts()
+    }
+    payload = {
+        "users": managed_users,
+        "privileged_users": {},
+        "active_plugins": ["demo-plugin/demo.php"],
+        "active_sitewide_plugins": [],
+        "canonical_urls": canonical_urls,
+    }
+
+    class FakeWPCli:
+        async def _exec_result(self, *args, user=None, wp_user=None):
+            return (
+                0,
+                "SQUADRONE_SETUP_SECURITY_STATE=" + json.dumps(payload),
+                "",
+            )
+
+    manager.wp_cli = FakeWPCli()  # type: ignore[assignment]
+
+    with pytest.raises(RuntimeError, match="do not match the sandbox target URL"):
+        await manager.capture_setup_security_state("demo-plugin")
 
 
 @pytest.mark.asyncio
@@ -617,6 +700,131 @@ async def test_ensure_upload_path_fails_closed_when_web_user_cannot_write():
 
     with pytest.raises(RuntimeError, match="failed to prepare WordPress upload path"):
         await manager._ensure_wp_upload_path()
+
+
+@pytest.mark.asyncio
+async def test_actor_receipt_install_enforces_sticky_shared_directory_and_root_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
+
+    async def fake_run(
+        *args: str,
+        **kwargs: object,
+    ) -> tuple[int, str, str]:
+        calls.append((args, kwargs))
+        if args[3:] == ("id", "-u", "www-data"):
+            return 0, "33\n", ""
+        if args[3:] == ("id", "-g", "www-data"):
+            return 0, "82\n", ""
+        if args[3:6] == ("stat", "-c", "%u:%g:%a"):
+            return 0, "0:82:1775\n0:0:444\n", ""
+        return 0, "", ""
+
+    manager = _manager()
+    manager.workdir = tmp_path
+    monkeypatch.setattr(sandbox_module, "_run", fake_run)
+
+    await manager._install_actor_receipt_plugin()
+
+    destination_dir = "/var/www/html/wp-content/mu-plugins"
+    destination = f"{destination_dir}/squadrone-actor-receipt.php"
+    container_exec = ("docker", "exec", "test-project-wordpress-1")
+    commands = [args for args, _kwargs in calls]
+    assert commands == [
+        (*container_exec, "id", "-u", "www-data"),
+        (*container_exec, "id", "-g", "www-data"),
+        (*container_exec, "mkdir", "-p", destination_dir),
+        (*container_exec, "chown", "root:82", destination_dir),
+        (*container_exec, "chmod", "1775", destination_dir),
+        (
+            "docker",
+            "cp",
+            str(tmp_path / "squadrone-actor-receipt.php"),
+            f"test-project-wordpress-1:{destination}",
+        ),
+        (*container_exec, "chown", "root:root", destination),
+        (*container_exec, "chmod", "0444", destination),
+        (
+            *container_exec,
+            "stat",
+            "-c",
+            "%u:%g:%a",
+            destination_dir,
+            destination,
+        ),
+        (*container_exec, "php", "-l", destination),
+    ]
+    assert [kwargs for _args, kwargs in calls] == [
+        {"check": False},
+        {"check": False},
+        {},
+        {},
+        {},
+        {},
+        {},
+        {},
+        {"check": False},
+        {"check": False},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_actor_receipt_install_rejects_root_web_identity_before_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_run(*args: str, **_kwargs: object) -> tuple[int, str, str]:
+        calls.append(args)
+        return 0, "0\n", ""
+
+    manager = _manager()
+    manager.workdir = tmp_path
+    monkeypatch.setattr(sandbox_module, "_run", fake_run)
+
+    with pytest.raises(RuntimeError, match="must resolve to a non-root UID"):
+        await manager._install_actor_receipt_plugin()
+
+    assert calls == [
+        (
+            "docker",
+            "exec",
+            "test-project-wordpress-1",
+            "id",
+            "-u",
+            "www-data",
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_actor_receipt_install_fails_closed_on_metadata_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_run(*args: str, **_kwargs: object) -> tuple[int, str, str]:
+        calls.append(args)
+        if args[3:] == ("id", "-u", "www-data"):
+            return 0, "33\n", ""
+        if args[3:] == ("id", "-g", "www-data"):
+            return 0, "33\n", ""
+        if args[3:6] == ("stat", "-c", "%u:%g:%a"):
+            return 0, "0:33:775\n0:33:644\n", ""
+        return 0, "", ""
+
+    manager = _manager()
+    manager.workdir = tmp_path
+    monkeypatch.setattr(sandbox_module, "_run", fake_run)
+
+    with pytest.raises(RuntimeError, match="filesystem protections are invalid"):
+        await manager._install_actor_receipt_plugin()
+
+    assert not any("php" in call for call in calls)
 
 
 @pytest.mark.asyncio

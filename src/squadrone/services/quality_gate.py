@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ..schemas.finding import Finding
+from ..schemas.finding import Finding, PoCStatus
 from ..schemas.hypothesis import (
     BugClass,
     Confidence,
@@ -16,9 +16,12 @@ from ..schemas.hypothesis import (
     SecurityOutcome,
     TriagedArtifact,
 )
-from ..schemas.observation import CIAImpact
+from ..schemas.observation import CIAImpact, PoCObservation
 from ..schemas.taxonomy import get_known_cwe_profile
 from .artifacts import atomic_write_json
+from .php_object_gadget_oracle import (
+    validate_persisted_php_object_gadget_confirmation,
+)
 from .roles import UNKNOWN_ATTACKER_ROLE, normalize_attacker_role
 
 
@@ -192,7 +195,7 @@ def infer_evidence(hypothesis: Hypothesis) -> dict[str, Any]:
     )
     proof_gaps = supplied.get("proof_gaps") or supplied.get("proof_gap") or ""
     dimensions = _impact_dimensions(hypothesis, impact)
-    return {
+    evidence: dict[str, Any] = {
         "attacker_role": infer_attacker_role(hypothesis),
         "entry_point": hypothesis.entry_point,
         "source": source,
@@ -217,6 +220,12 @@ def infer_evidence(hypothesis: Hypothesis) -> dict[str, Any]:
         "has_broad_proof_gap": bool(PROOF_GAP_RE.search(str(proof_gaps))),
         "bounty_programs": list(hypothesis.bounty_programs),
     }
+    # Keep the structured CWE-502 routing fact across source and report gates.
+    # Preserve even an invalid authored value so downstream routing can fail
+    # closed instead of falling back to keyword matching.
+    if "usable_gadget" in supplied:
+        evidence["usable_gadget"] = supplied["usable_gadget"]
+    return evidence
 
 
 def owasp_2021_for(bug_class: BugClass) -> str:
@@ -426,12 +435,343 @@ def _cvss31_score(vector: dict[str, str]) -> float:
     return _round_up_1(base)
 
 
+def _is_bounded_php_object_primitive_observation(
+    observation: PoCObservation | None,
+) -> bool:
+    if (
+        observation is None
+        or observation.schema_version != 1
+        or observation.verdict != "vulnerable"
+        or observation.oracle != "object_instantiation"
+        or observation.impact.confidentiality != "none"
+        or observation.impact.integrity != "low"
+        or observation.impact.availability != "none"
+        or type(observation.impact.description) is not str
+        or len(observation.impact.description.encode("utf-8")) > 2_000
+        or set(observation.request) != {"method", "url"}
+    ):
+        return False
+    fields = {
+        "observed",
+        "instantiated",
+        "effect",
+        "attacker_user_id",
+        "identity_verified",
+        "request_fingerprint",
+    }
+    attack = observation.attack
+    control = observation.control
+    if (
+        set(attack) != fields
+        or set(control) != fields
+        or attack.get("observed") is not True
+        or control.get("observed") is not False
+        or attack.get("instantiated") is not True
+        or control.get("instantiated") is not False
+        or attack.get("effect") != "verifier_inert_canary_wakeup"
+        or control.get("effect") != "verifier_inert_canary_wakeup"
+        or attack.get("identity_verified") is not True
+        or control.get("identity_verified") is not True
+        or attack.get("attacker_user_id") != control.get("attacker_user_id")
+    ):
+        return False
+    fingerprint_fields = {
+        "method",
+        "route",
+        "object_field",
+        "object_location",
+        "dispatch",
+    }
+    attack_fingerprint = attack.get("request_fingerprint")
+    control_fingerprint = control.get("request_fingerprint")
+    return bool(
+        type(attack_fingerprint) is dict
+        and type(control_fingerprint) is dict
+        and set(attack_fingerprint) == fingerprint_fields
+        and set(control_fingerprint) == fingerprint_fields
+        and attack_fingerprint == control_fingerprint
+    )
+
+
+def _php_object_natural_attempt_matches_snapshot(
+    observation: PoCObservation | None,
+    snapshot: dict[str, object],
+) -> bool:
+    runtime = snapshot.get("runtime_binding")
+    transport = snapshot.get("transport_attestation")
+    if (
+        observation is None
+        or observation.schema_version != 1
+        or observation.verdict != "vulnerable"
+        or observation.oracle != "file_effect"
+        or observation.impact.confidentiality != "none"
+        or observation.impact.integrity != "low"
+        or observation.impact.availability != "none"
+        or type(observation.impact.description) is not str
+        or not observation.impact.description
+        or len(observation.impact.description.encode("utf-8")) > 2_000
+        or type(runtime) is not dict
+        or type(transport) is not dict
+        or set(observation.request)
+        != {"method", "url", "transport_contract_sha256"}
+        or type(observation.request.get("method")) is not str
+        or not observation.request["method"]
+        or type(observation.request.get("url")) is not str
+        or not observation.request["url"]
+        or observation.attacker_role != transport.get("actor_role")
+        or observation.request.get("transport_contract_sha256")
+        != transport.get("transport_contract_sha256")
+    ):
+        return False
+    attack = observation.attack
+    control = observation.control
+    return bool(
+        set(attack)
+        == {
+            "observed",
+            "effect",
+            "target_path_sha256",
+            "target_content_sha256",
+            "source_recipe_sha256",
+            "collateral_paths_unchanged",
+        }
+        and set(control)
+        == {
+            "observed",
+            "effect",
+            "target_path_sha256",
+            "target_content_sha256",
+            "source_recipe_sha256",
+            "target_preserved",
+        }
+        and attack.get("observed") is True
+        and attack.get("effect") == "verifier_owned_temporary_file_deleted"
+        and attack.get("target_path_sha256") == snapshot.get("target_path_sha256")
+        and attack.get("target_content_sha256")
+        == snapshot.get("target_content_sha256")
+        and attack.get("source_recipe_sha256") == runtime.get("recipe_sha256")
+        and attack.get("collateral_paths_unchanged") is True
+        and control.get("observed") is False
+        and control.get("effect") == "verifier_owned_temporary_file_deleted"
+        and control.get("target_path_sha256") == snapshot.get("target_path_sha256")
+        and control.get("target_content_sha256")
+        == snapshot.get("target_content_sha256")
+        and control.get("source_recipe_sha256") == runtime.get("recipe_sha256")
+        and control.get("target_preserved") is True
+    )
+
+
+def validate_php_object_natural_finding_confirmation(
+    finding: Finding,
+) -> tuple[bool, str]:
+    """Require the complete parent-attested proof used to promote CWE-502.
+
+    A primitive object-instantiation receipt or a prefix-constrained natural
+    gadget run is intentionally insufficient.  The persisted runtime proof,
+    finding attempts, and final observation must all describe the same two-run
+    direct-path file effect.
+    """
+    if not isinstance(finding, Finding):
+        return False, "PHP object natural confirmation requires one finding"
+    if finding.hypothesis.bug_class != BugClass.PHP_OBJECT_INJECTION:
+        return False, "finding is not CWE-502"
+    if finding.poc_status != PoCStatus.SUCCESS:
+        return False, "CWE-502 finding is not successfully confirmed"
+    if type(finding.confidence_runs) is not int or finding.confidence_runs != 2:
+        return False, "CWE-502 finding must count exactly two natural confidence runs"
+
+    evidence = finding.evidence
+    if type(evidence) is not dict:
+        return False, "CWE-502 finding evidence has an invalid shape"
+    confirmation = evidence.get("php_object_natural_confirmation")
+    accepted, reason = validate_persisted_php_object_gadget_confirmation(
+        confirmation,
+        hypothesis_id=finding.hypothesis.id,
+    )
+    if not accepted:
+        return False, reason
+    if type(confirmation) is not dict:
+        return False, "CWE-502 natural confirmation has an invalid shape"
+    if confirmation.get("bug_class") != finding.hypothesis.bug_class.value:
+        return False, "CWE-502 natural confirmation changed bug class"
+
+    snapshots: list[dict[str, object]] = []
+    for key in ("first_execution", "confirmation_execution"):
+        snapshot = confirmation.get(key)
+        if type(snapshot) is not dict:
+            return False, "CWE-502 natural confirmation lacks a runtime snapshot"
+        runtime_binding = snapshot.get("runtime_binding")
+        if (
+            snapshot.get("effect_binding_kind") != "direct_path"
+            or type(runtime_binding) is not dict
+            or runtime_binding.get("effect_binding_kind") != "direct_path"
+        ):
+            return False, "CWE-502 full promotion requires direct-path deletion"
+        snapshots.append(snapshot)
+
+    successful_primitive = [
+        attempt
+        for attempt in finding.poc_attempts
+        if attempt.result == PoCStatus.SUCCESS
+        and attempt.proof_kind == "php_object_primitive"
+    ]
+    if len(successful_primitive) != 2:
+        return False, "CWE-502 full promotion requires two primitive PoC attempts"
+    primitive_by_phase = {attempt.phase: attempt for attempt in successful_primitive}
+    if set(primitive_by_phase) != {"attack", "confirmation"}:
+        return False, "CWE-502 primitive PoC attempts must include attack and confirmation"
+    if (
+        {attempt.script_path for attempt in successful_primitive}
+        != {finding.poc_script_path}
+        or any(
+            not _is_bounded_php_object_primitive_observation(attempt.observation)
+            for attempt in successful_primitive
+        )
+    ):
+        return False, "CWE-502 primitive PoC pair is not bounded to inert instantiation"
+
+    successful_natural = [
+        attempt
+        for attempt in finding.poc_attempts
+        if attempt.result == PoCStatus.SUCCESS
+        and attempt.proof_kind == "php_object_natural"
+    ]
+    if len(successful_natural) != 2:
+        return False, "CWE-502 full promotion requires two natural PoC attempts"
+    attempts_by_phase = {attempt.phase: attempt for attempt in successful_natural}
+    if set(attempts_by_phase) != {"attack", "confirmation"}:
+        return False, "CWE-502 natural PoC attempts must include attack and confirmation"
+    script_paths = {attempt.script_path for attempt in successful_natural}
+    if (
+        len(script_paths) != 1
+        or not finding.poc_script_path
+        or script_paths != {finding.poc_script_path}
+    ):
+        return False, "CWE-502 natural PoC attempts must use the promoted script"
+    if any(
+        not _php_object_natural_attempt_matches_snapshot(
+            attempts_by_phase[phase].observation,
+            snapshots[index],
+        )
+        for index, phase in enumerate(("attack", "confirmation"))
+    ):
+        return False, "CWE-502 natural PoC attempts do not match runtime snapshots"
+
+    confirmation_run = evidence.get("confirmation_run")
+    observation = (
+        confirmation_run.get("observation")
+        if type(confirmation_run) is dict
+        else None
+    )
+    observation_keys = {
+        "schema_version",
+        "verdict",
+        "oracle",
+        "attacker_role",
+        "request",
+        "attack",
+        "control",
+        "impact",
+    }
+    if type(observation) is not dict or set(observation) != observation_keys:
+        return False, "CWE-502 confirmation observation has an invalid shape"
+    if (
+        type(observation.get("schema_version")) is not int
+        or observation.get("schema_version") != 1
+        or observation.get("verdict") != "vulnerable"
+        or observation.get("oracle") != "file_effect"
+    ):
+        return False, "CWE-502 confirmation observation is not a file effect"
+
+    final_snapshot = snapshots[1]
+    runtime_binding = final_snapshot["runtime_binding"]
+    transport_attestation = final_snapshot.get("transport_attestation")
+    if type(runtime_binding) is not dict or type(transport_attestation) is not dict:
+        return False, "CWE-502 confirmation runtime binding is invalid"
+    request = observation.get("request")
+    attack = observation.get("attack")
+    control = observation.get("control")
+    impact = observation.get("impact")
+    if (
+        type(request) is not dict
+        or set(request) != {"method", "url", "transport_contract_sha256"}
+        or type(request.get("method")) is not str
+        or not request["method"]
+        or type(request.get("url")) is not str
+        or not request["url"]
+        or request.get("transport_contract_sha256")
+        != transport_attestation.get("transport_contract_sha256")
+        or observation.get("attacker_role")
+        != transport_attestation.get("actor_role")
+    ):
+        return False, "CWE-502 observation is not bound to the confirmed transport"
+    if (
+        type(attack) is not dict
+        or set(attack)
+        != {
+            "observed",
+            "effect",
+            "target_path_sha256",
+            "target_content_sha256",
+            "source_recipe_sha256",
+            "collateral_paths_unchanged",
+        }
+        or attack.get("observed") is not True
+        or attack.get("effect") != "verifier_owned_temporary_file_deleted"
+        or attack.get("target_path_sha256") != final_snapshot.get("target_path_sha256")
+        or attack.get("target_content_sha256")
+        != final_snapshot.get("target_content_sha256")
+        or attack.get("source_recipe_sha256") != runtime_binding.get("recipe_sha256")
+        or attack.get("collateral_paths_unchanged") is not True
+    ):
+        return False, "CWE-502 attack observation is not parent-attested"
+    if (
+        type(control) is not dict
+        or set(control)
+        != {
+            "observed",
+            "effect",
+            "target_path_sha256",
+            "target_content_sha256",
+            "source_recipe_sha256",
+            "target_preserved",
+        }
+        or control.get("observed") is not False
+        or control.get("effect") != "verifier_owned_temporary_file_deleted"
+        or control.get("target_path_sha256") != final_snapshot.get("target_path_sha256")
+        or control.get("target_content_sha256")
+        != final_snapshot.get("target_content_sha256")
+        or control.get("source_recipe_sha256") != runtime_binding.get("recipe_sha256")
+        or control.get("target_preserved") is not True
+    ):
+        return False, "CWE-502 control observation is not parent-attested"
+    if (
+        type(impact) is not dict
+        or set(impact)
+        != {"confidentiality", "integrity", "availability", "description"}
+        or impact.get("confidentiality") != "none"
+        or impact.get("integrity") != "low"
+        or impact.get("availability") != "none"
+        or type(impact.get("description")) is not str
+        or not impact["description"]
+        or len(impact["description"].encode("utf-8")) > 2_000
+    ):
+        return False, "CWE-502 confirmation impact exceeds the bounded file effect"
+    return True, "CWE-502 direct-path natural confirmation is valid"
+
+
 def _confirmed_observation(finding: Finding) -> dict[str, Any] | None:
     evidence = finding.evidence or {}
     confirmation = evidence.get("confirmation_run")
     if isinstance(confirmation, dict) and isinstance(
         confirmation.get("observation"), dict
     ):
+        if finding.hypothesis.bug_class == BugClass.PHP_OBJECT_INJECTION:
+            accepted, _reason = validate_php_object_natural_finding_confirmation(
+                finding
+            )
+            if not accepted:
+                return None
         return confirmation["observation"]
     return None
 
@@ -555,6 +895,12 @@ def grade_finding_for_report(
         grade.rules.append("clean_confirmation_missing")
     if _confirmed_observation(finding) is None:
         grade.rules.append("structured_poc_evidence_missing")
+    if finding.hypothesis.bug_class == BugClass.PHP_OBJECT_INJECTION:
+        natural_confirmed, _reason = (
+            validate_php_object_natural_finding_confirmation(finding)
+        )
+        if not natural_confirmed:
+            grade.rules.append("php_object_natural_confirmation_missing")
     if verified_impact is None and explicit_impact is not None:
         grade.rules.append("verified_impact_mismatch")
     grade.rules = list(dict.fromkeys(grade.rules))

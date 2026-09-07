@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import socket
 import subprocess
@@ -8,6 +9,7 @@ import threading
 from pathlib import Path
 
 import pytest
+import squadrone.poc_isolation as isolation_module
 
 from squadrone.poc_isolation import (
     CROSS_OBJECT_HTTP_CAPABILITY,
@@ -82,6 +84,23 @@ def _make_probe(tmp_path: Path) -> Path:
     script = tmp_path / "probe.py"
     script.write_text(_PROBE, encoding="utf-8")
     return script
+
+
+def _stub_portable_isolation_dependencies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = Path(sys.executable).resolve()
+    monkeypatch.setattr(
+        isolation_module,
+        "require_seatbelt",
+        lambda _sandbox_exec=DEFAULT_SANDBOX_EXEC: runtime,
+    )
+    monkeypatch.setattr(isolation_module, "_current_python_runtime", lambda: runtime)
+    monkeypatch.setattr(
+        isolation_module,
+        "render_seatbelt_profile",
+        lambda **_kwargs: "(version 1)\n(deny default)\n",
+    )
 
 
 def _seatbelt_is_available() -> bool:
@@ -160,6 +179,73 @@ def test_bundle_copies_main_and_regular_python_helpers(tmp_path: Path) -> None:
         assert "PYTHONPATH" not in child_environment
         with pytest.raises(ValueError, match="must match"):
             launch.child_environment("http://127.0.0.1:54322")
+
+
+def test_isolated_bundle_manifest_binds_copied_main_helpers_and_bootstrap(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _stub_portable_isolation_dependencies(monkeypatch)
+    script = _make_probe(tmp_path)
+    helper = tmp_path / "helper.py"
+    helper.write_text("VALUE = 1\n", encoding="utf-8")
+
+    with prepare_poc_isolation(
+        script,
+        proxy_port=54321,
+        protected_paths=[],
+        temp_parent=tmp_path,
+    ) as launch:
+        manifest = launch.attest_bundle()
+        roles = {entry.name: entry.role for entry in manifest.files}
+        assert roles == {
+            "_squadrone_poc_bootstrap.py": "trusted_bootstrap",
+            "helper.py": "helper",
+            "probe.py": "entrypoint",
+        }
+        assert manifest.source_file_count == 2
+        assert manifest.script_sha256 == hashlib.sha256(_PROBE.encode()).hexdigest()
+        assert (
+            manifest.manifest_sha256
+            == hashlib.sha256(manifest.canonical_bytes()).hexdigest()
+        )
+
+        # The source directory is no longer authoritative after preparation.
+        script.write_text("raise SystemExit(99)\n", encoding="utf-8")
+        assert launch.attest_bundle() == manifest
+
+        # Every copied helper contributes to the executed-bundle identity.
+        (launch.cwd / "helper.py").write_text("VALUE = 2\n", encoding="utf-8")
+        changed = launch.attest_bundle()
+        assert changed.script_sha256 == manifest.script_sha256
+        assert changed.manifest_sha256 != manifest.manifest_sha256
+
+
+@pytest.mark.parametrize("mutation", ["extra_python", "helper_symlink"])
+def test_isolated_bundle_manifest_rejects_inventory_substitution(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    _stub_portable_isolation_dependencies(monkeypatch)
+    script = _make_probe(tmp_path)
+    helper = tmp_path / "helper.py"
+    helper.write_text("VALUE = 1\n", encoding="utf-8")
+
+    with prepare_poc_isolation(
+        script,
+        proxy_port=54321,
+        protected_paths=[],
+        temp_parent=tmp_path,
+    ) as launch:
+        if mutation == "extra_python":
+            (launch.cwd / "late.py").write_text("VALUE = 2\n", encoding="utf-8")
+        else:
+            copied_helper = launch.cwd / "helper.py"
+            copied_helper.unlink()
+            copied_helper.symlink_to(helper)
+        with pytest.raises(PoCBundleRejected, match="inventory|regular file"):
+            launch.attest_bundle()
 
 
 @pytest.mark.parametrize("bad_helper_kind", ["symlink", "directory"])

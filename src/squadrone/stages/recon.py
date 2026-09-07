@@ -26,6 +26,7 @@ RIPGREP_PATTERNS: dict[str, str] = {
     "add_shortcode": r"add_shortcode\s*\(",
     "wpdb": r"\$wpdb->",
     "unserialize": r"\b(?:maybe_)?unserialize\s*\(",
+    "implicit_deserialization": r"(?i:\bupdate_metadata)\s*\(",
     "file_put_contents": r"\bfile_put_contents\s*\(",
     "move_uploaded_file": r"\bmove_uploaded_file\s*\(",
     "unlink": r"\bunlink\s*\(",

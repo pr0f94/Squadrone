@@ -14,6 +14,7 @@ OracleType = Literal[
     "callback",
     "cross_object_access",
     "file_effect",
+    "object_instantiation",
     "response_marker",
     "state_change",
     "timing",

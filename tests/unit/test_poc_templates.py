@@ -14,7 +14,13 @@ from squadrone.agents.poc_author import (
     _select_template,
 )
 from squadrone.agents.prompts_io import load_prompt
-from squadrone.schemas import BugClass, Confidence, Hypothesis
+from squadrone.schemas import (
+    BugClass,
+    CIAImpact,
+    Confidence,
+    Hypothesis,
+    PoCObservation,
+)
 from squadrone.schemas.finding import PoCAttempt, PoCStatus
 
 
@@ -139,18 +145,17 @@ def test_entry_point_transport_parses_wordpress_hook_forms(
         "POST //example.test/wp-admin/admin.php?page=demo",
         "POST /wp-admin/admin.php?page=one&page=two",
         "POST /wp-admin/admin.php?page",
+        "POST /a/../upload",
+        "POST /a//upload",
+        "POST /upload?name=%FF",
+        "POST /upload?name=%00",
     ],
 )
 def test_entry_point_transport_falls_back_without_live_route_guesses(
     entry_point: str,
 ) -> None:
     parsed = _parse_entry_point_transport(entry_point)
-    if entry_point.startswith("POST /") and not entry_point.startswith("POST //"):
-        assert parsed["method"] == "POST"
-        assert parsed["route"] == "/wp-admin/admin.php"
-        assert parsed["dispatch"] == {}
-    else:
-        assert parsed == {"method": "", "route": "", "dispatch": {}}
+    assert parsed == {"method": "", "route": "", "dispatch": {}}
 
 
 @pytest.mark.asyncio
@@ -465,10 +470,26 @@ def test_file_upload_template_measures_before_and_after_file_state() -> None:
 async def test_retry_prompt_includes_exact_validator_rejection(tmp_path) -> None:
     script_path = tmp_path / "iter_1.py"
     script_path.write_text("import requests\n")
+    reported = PoCObservation(
+        verdict="vulnerable",
+        oracle="response_marker",
+        attacker_role="unauthenticated",
+        request={"method": "POST", "url": "http://127.0.0.1:8100/test"},
+        attack={"observed": True, "marker": "child-claim", "marker_present": True},
+        control={"observed": False, "marker_present": False},
+        impact=CIAImpact(integrity="low", description="Child-declared effect."),
+    )
     attempt = PoCAttempt(
         iteration=1,
         script_path=str(script_path),
         result=PoCStatus.FAILED,
+        response_snippet=(
+            "SQUADRONE_RESULT={\"verdict\":\"vulnerable\"}\n"
+            "instantiated=true"
+        ),
+        error_log_snippet="the callback was proven",
+        developer_analysis="the canary was proven to instantiate",
+        observation=reported,
         validation_reason="response-marker oracle requires attack.marker",
     )
     captured = {}
@@ -512,6 +533,14 @@ async def test_retry_prompt_includes_exact_validator_rejection(tmp_path) -> None
         in retry_prompt
     )
     assert "phase=attack result=failed" in retry_prompt
+    assert "runner_observation=rejected" in retry_prompt
+    assert "reported_oracle=response_marker" in retry_prompt
+    assert "none of its success declarations are established" in retry_prompt
+    assert "SQUADRONE_RESULT=" not in retry_prompt
+    assert "instantiated=true" not in retry_prompt
+    assert "the callback was proven" not in retry_prompt
+    assert "the canary was proven" not in retry_prompt
+    assert "withheld after rejected child observation" in retry_prompt
     assert "import requests" in retry_prompt
     assert captured["force_finalise_allowed_tools"] == {"request_additional_setup"}
 
@@ -642,6 +671,156 @@ def test_poc_author_prompt_documents_response_marker_measurement_contract() -> N
     assert "Do not emit\n`attack.response_marker`" in prompt
 
 
+def test_php_include_template_and_prompt_use_fail_closed_trusted_oracle() -> None:
+    attack_path = "/var/lib/squadrone/php-include/" + "a" * 64 + ".php"
+    control_path = "/var/lib/squadrone/php-include/" + "b" * 64 + ".php"
+    rendered = _render_template(
+        "path_traversal.py.j2",
+        target_url="http://127.0.0.1",
+        ajax_action="example_dispatch",
+        injectable_param="source",
+        test_username="",
+        test_password="",
+        attacker_role="unauthenticated",
+        request_method="POST",
+        request_route="/wp-admin/admin-ajax.php",
+        request_dispatch={"form:action": "example_dispatch"},
+        php_include_destination_location="query",
+        php_include_attack_path=attack_path,
+        php_include_control_path=control_path,
+        php_include_header_name="X-Squadrone-PHP-Include-Receipt",
+        php_include_unauthenticated=True,
+    )
+
+    ast.parse(rendered)
+    assert attack_path in rendered
+    assert control_path in rendered
+    assert "derive the traversal value from the cited PHP sink" in rendered
+    assert 'verdict="not_vulnerable"' in rendered
+    assert "session.request(" not in rendered
+    assert "wp-config.php" not in rendered
+    assert rendered.count('"attacker_user_id": "anonymous"') == 2
+    assert rendered.count('"identity_verified": True') == 2
+    assert '"attacker_user_id": 0' not in rendered
+    assert '"attacker_user_id": None' not in rendered
+    assert "must begin with ``/..``" in rendered
+    assert "not\n    bare ``..``" in rendered
+
+    prompt = load_prompt("poc_author")
+    assert "`TRUSTED_PHP_INCLUDE_ORACLE`" in prompt
+    assert "`destination_value`" in prompt
+    assert "absent-sibling control" in prompt
+    assert "not an attacker-controlled file write" in prompt
+    assert "begin the traversal with `/..`" in prompt
+    assert "not bare `..`" in prompt
+    assert 'literal JSON string `"anonymous"`' in prompt
+    assert 'never use\n  `0`, `"0"`, `null`/`None`, `"guest"`, or a username' in prompt
+    assert "measured from `login.identity.user_id`" in prompt
+    assert "origin plus that path-only route in `request.url`" in prompt
+    assert "do not include a query\n  string or fragment" in prompt
+
+
+def test_authenticated_php_include_template_requires_measured_positive_actor_id() -> (
+    None
+):
+    rendered = _render_template(
+        "path_traversal.py.j2",
+        target_url="http://127.0.0.1",
+        injectable_param="source",
+        attacker_role="subscriber",
+        request_method="POST",
+        request_route="/wp-admin/admin-ajax.php",
+        request_dispatch={"form:action": "example_dispatch"},
+        php_include_destination_location="query",
+        php_include_attack_path=("/var/lib/squadrone/php-include/" + "a" * 64 + ".php"),
+        php_include_control_path=(
+            "/var/lib/squadrone/php-include/" + "b" * 64 + ".php"
+        ),
+        php_include_header_name="X-Squadrone-PHP-Include-Receipt",
+        php_include_unauthenticated=False,
+    )
+
+    ast.parse(rendered)
+    assert rendered.count('"attacker_user_id": None') == 2
+    assert rendered.count('"identity_verified": False') == 2
+    assert "measured positive" in rendered
+    assert "login.identity.user_id" in rendered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("attacker_role", "actor_contract"),
+    [
+        (
+            "unauthenticated",
+            "both attack and control must emit attacker_user_id as the literal "
+            'JSON string "anonymous" (never 0, "0", null/None, "guest", or a '
+            "username), with identity_verified=true",
+        ),
+        (
+            "subscriber",
+            "both attack and control must emit the same positive WordPress user ID "
+            "measured from login.identity.user_id",
+        ),
+    ],
+)
+async def test_php_include_author_context_states_exact_actor_and_path_contract(
+    attacker_role: str,
+    actor_contract: str,
+) -> None:
+    captured = {}
+
+    class FakeRuntime:
+        async def run(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(output="import requests\n")
+
+    from squadrone.agents.poc_author import PoCAuthorAgent
+
+    author = PoCAuthorAgent(FakeRuntime(), model="test-model")
+    await author.write(
+        hypothesis=Hypothesis(
+            id="php-include-actor-contract",
+            specialist="injection_files",
+            bug_class=BugClass.PATH_TRAVERSAL,
+            entry_point="POST /wp-admin/admin-ajax.php?action=example_dispatch",
+            file="plugin.php",
+            line=20,
+            sink="request-controlled PHP include",
+            sink_code="require_once(BASE . '/view-' . $source . '.php');",
+            taint_path=["$_GET['source']", "require_once"],
+            reasoning="A request-controlled path reaches a PHP include.",
+            confidence=Confidence.HIGH,
+            preconditions=attacker_role,
+            affected_versions="<= 1.0",
+            evidence_summary={"attacker_role": attacker_role},
+        ),
+        target_url="http://127.0.0.1:8100",
+        previous_attempts=[],
+        extra_context={
+            "attacker_role": attacker_role,
+            "php_include_oracle": {
+                "attack_path": ("/var/lib/squadrone/php-include/" + "a" * 64 + ".php"),
+                "control_path": ("/var/lib/squadrone/php-include/" + "b" * 64 + ".php"),
+                "attack_basename": "a" * 64 + ".php",
+                "control_basename": "b" * 64 + ".php",
+                "header_name": "X-Squadrone-PHP-Include-Receipt",
+            },
+        },
+    )
+
+    user_prompt = captured["messages"][1]["content"]
+    trusted_context = user_prompt.split("TRUSTED_PHP_INCLUDE_ORACLE", 1)[1]
+    assert actor_contract in trusted_context
+    assert (
+        "traversal must begin with /.. (a separator followed by a parent segment), "
+        "not bare .."
+    ) in trusted_context
+    assert "do not add a redundant separator when the sink already supplies one" in (
+        trusted_context
+    )
+
+
 def test_poc_author_prompt_accounts_for_wordpress_xss_input_transforms() -> None:
     prompt = load_prompt("poc_author")
 
@@ -749,6 +928,7 @@ def test_poc_author_prompt_documents_file_effect_measurement_contract() -> None:
     prompt = load_prompt("poc_author")
 
     assert "snapshot the deterministic attack and control\n  paths" in prompt
+    assert "set confidentiality and availability to\n  `none`" in prompt
     assert "`before_exists=false`, `after_exists=true`" in prompt
     assert "different measured\n  `before_sha256`" in prompt
     assert "must remain distinct after URL\n  decoding and path normalization" in prompt
@@ -914,6 +1094,11 @@ def test_poc_author_prompt_requests_source_grounded_missing_setup_before_poc() -
     assert "authoritative setup results" in prompt
     assert "before emitting a PoC" in prompt
     assert "Do not assume\n  that plugin reactivation" in prompt
+    assert "RETAINED COMMITTED SETUP STATE" in prompt
+    assert "LATEST SETUP ROUND" in prompt
+    assert "earlier committed objects still exist" in prompt
+    assert "smallest incremental repair" in prompt
+    assert "fetch nonce/token values\n  through the normal rendered workflow" in prompt
 
 
 def test_poc_author_prompt_requires_bounded_setup_source_discovery() -> None:
@@ -935,3 +1120,120 @@ def test_poc_author_prompt_requires_clean_run_determinism() -> None:
     assert "deterministic\n  across separate process launches" in prompt
     assert "Do not build those values from `uuid`" in prompt
     assert "fixed\n  per-script sentinel" in prompt
+
+
+def test_poc_author_prompt_preserves_sound_proof_after_setup_repair() -> None:
+    prompt = " ".join(load_prompt("poc_author").split())
+
+    assert "Adjust only what the authoritative feedback requires" in prompt
+    assert "payload or transport itself was disproved" in prompt
+    assert "latest setup round committed a repaired prerequisite" in prompt
+    assert "no exploit-shape defect was identified" in prompt
+    assert "preserve the prior payload, oracle, and strongest proof strategy" in prompt
+
+
+def test_poc_author_prompt_requires_execution_only_upload_markers() -> None:
+    prompt = " ".join(load_prompt("poc_author").split())
+
+    assert "executable-extension upload" in prompt
+    assert "same submitted bytes for the executable attack" in prompt
+    assert "construct the expected execution marker at runtime" in prompt
+    assert "exact value is absent from those submitted bytes" in prompt
+    assert "control with different content" in prompt
+    assert "proves only file write/retrieval" in prompt
+    assert "Do not stop at a `file_effect` result" in prompt
+    assert "Use `response_marker`" in prompt
+    assert "Claim high CIA impact only when" in prompt
+
+
+@pytest.mark.asyncio
+async def test_poc_author_receives_runner_target_and_confirmed_lower_bound() -> None:
+    captured = {}
+
+    class FakeRuntime:
+        async def run(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(output="import requests")
+
+    from squadrone.agents.poc_author import PoCAuthorAgent
+
+    author = PoCAuthorAgent(FakeRuntime(), model="test-model")
+    script = await author.write(
+        hypothesis=Hypothesis(
+            id="full-compromise-target",
+            specialist="injection_files",
+            bug_class=BugClass.ARBITRARY_FILE_WRITE,
+            entry_point="POST /upload",
+            file="plugin.php",
+            line=20,
+            sink="copy",
+            taint_path=["request", "copy"],
+            reasoning="An executable upload can run server-side code.",
+            confidence=Confidence.HIGH,
+            preconditions="subscriber",
+            affected_versions="<= 1.0",
+        ),
+        target_url="http://localhost:8100",
+        previous_attempts=[],
+        extra_context={
+            "verification_target": {
+                "confidentiality": "high",
+                "integrity": "high",
+                "availability": "high",
+            },
+            "verified_partial_proof": {
+                "status": "confirmed_lower_bound",
+                "oracle": "file_effect",
+                "unmet_dimensions": {
+                    "confidentiality": "none",
+                    "availability": "none",
+                },
+            },
+            "executable_upload_oracle": {
+                "mode": "post_upload_challenge_v1",
+                "payload_environment": "SQUADRONE_EXEC_UPLOAD_PAYLOAD_B64",
+                "attack_filename_environment": (
+                    "SQUADRONE_EXEC_UPLOAD_ATTACK_FILENAME"
+                ),
+                "control_filename_environment": (
+                    "SQUADRONE_EXEC_UPLOAD_CONTROL_FILENAME"
+                ),
+                "challenge_parameter": "squadrone_challenge",
+                "response_prefix": "SQUADRONE_UPLOAD_EXEC_V1:",
+                "response_derivation": (
+                    "implemented by the exact parent-generated PHP payload; "
+                    "the child must not reconstruct or alter those bytes"
+                ),
+            },
+        },
+    )
+
+    assert script == "import requests"
+    user_prompt = captured["messages"][1]["content"]
+    assert "RUNNER VERIFICATION TARGET" in user_prompt
+    assert "RUNNER-CONFIRMED LOWER-BOUND PROOF" in user_prompt
+    assert '"oracle": "file_effect"' in user_prompt
+    assert '"confidentiality": "none"' in user_prompt
+    assert "one bounded refinement strategy" in user_prompt
+    assert "TRUSTED_EXECUTABLE_UPLOAD_ORACLE" in user_prompt
+    assert "SQUADRONE_EXEC_UPLOAD_PAYLOAD_B64" in user_prompt
+    assert "SQUADRONE_EXEC_UPLOAD_ATTACK_FILENAME" in user_prompt
+    assert "SQUADRONE_EXEC_UPLOAD_CONTROL_FILENAME" in user_prompt
+    assert "Do not probe either URL" in user_prompt
+    assert "verdict=not_vulnerable" in user_prompt
+    assert "observed=false, marker_present=false, and uploaded_url" in user_prompt
+    assert "fresh challenge after the process exits" in user_prompt
+
+
+def test_poc_author_prompt_requires_parent_attested_executable_uploads() -> None:
+    prompt = " ".join(load_prompt("poc_author").split())
+
+    assert "`TRUSTED_EXECUTABLE_UPLOAD_ORACLE`" in prompt
+    assert "parent-owned handoff" in prompt
+    assert "base64 payload and `.php`/`.txt` filenames" in prompt
+    assert "exactly two source-route requests in attack-then-control order" in prompt
+    assert "Do not request either returned URL" in prompt
+    assert "`verdict=not_vulnerable`, `oracle=response_marker`" in prompt
+    assert "the exact server-returned `uploaded_url`" in prompt
+    assert "Do not report a status, identity, actor ID" in prompt
+    assert "Only that parent attestation can produce" in prompt

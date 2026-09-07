@@ -18,28 +18,38 @@ import base64
 import binascii
 import copy
 import hashlib
+import hmac
 import html
 import json
 import math
 import os
+import posixpath
 import re
 import secrets
 import time
 from collections import Counter
-from collections.abc import Iterable, Mapping, MutableMapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping, MutableMapping
+from dataclasses import dataclass
 from email import policy
 from email.parser import BytesParser
 from http import HTTPStatus
-from typing import Any
-from urllib.parse import parse_qsl, unquote_to_bytes, urlsplit
+from typing import TYPE_CHECKING, Any, Literal, cast
+from urllib.parse import parse_qsl, quote_from_bytes, unquote_to_bytes, urlsplit
 
 import httpx
+
+if TYPE_CHECKING:
+    from .services.php_object_gadget_oracle import PhpObjectGadgetOracle
+    from .services.php_object_oracle import PhpObjectOracle
 
 
 TRACE_TOKEN_HEADER = "X-Squadrone-Trace-Token"
 REQUEST_NONCE_HEADER = "X-Squadrone-Request-Nonce"
 REQUEST_DIGEST_HEADER = "X-Squadrone-Request-Digest"
+REQUEST_BINDING_HEADER = "X-Squadrone-Request-Binding"
 ACTOR_RECEIPT_HEADER = "X-Squadrone-Actor-Receipt"
+PHP_INCLUDE_RECEIPT_HEADER = "X-Squadrone-PHP-Include-Receipt"
+PHP_OBJECT_RECEIPT_HEADER = "X-Squadrone-PHP-Object-Receipt"
 TRACE_VERSION = 1
 
 POC_PROXY_ENV = "SQUADRONE_HTTP_PROXY"
@@ -123,6 +133,37 @@ _CREDENTIAL_FREE_RAW_HEADERS = frozenset(
 )
 _CREDENTIAL_FREE_CONTENT_TYPE = "application/x-www-form-urlencoded"
 _TRACKED_CAPABILITY_LABEL_RE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
+_PHP_INCLUDE_RECEIPT_RE = re.compile(r"SQUADRONE_PHP_INCLUDE_[0-9a-f]{64}\Z")
+_PHP_OBJECT_RECEIPT_RE = re.compile(r"sqpobj1\.[0-9a-f]{64}\.[0-9a-f]{64}\Z")
+_PHP_OBJECT_TOKEN_PREFIX = b"sqpobjt1."
+_PHP_OBJECT_SERIALIZATION_RE = re.compile(
+    rb"(?<![A-Za-z0-9_])(?:O|C):[0-9]{1,10}:(?:\"|\{)"
+)
+_PHP_OBJECT_SAFE_FIELD_RE = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
+_PHP_OBJECT_SAFE_DISPATCH_RE = re.compile(r"[A-Za-z0-9_./:-]{1,256}\Z")
+_PHP_OBJECT_MAX_DISPATCH = 8
+_PHP_OBJECT_MAX_FORM_PAIRS = 2_048
+_PHP_OBJECT_MAX_PREFLIGHT_REQUESTS = 16
+_PHP_OBJECT_NATURAL_MAX_PREFLIGHT_REQUESTS = 1
+_PHP_OBJECT_MAX_NAME_BYTES = 1_024
+_PHP_OBJECT_MAX_VALUE_BYTES = MAX_REQUEST_BODY_BYTES
+_PHP_OBJECT_ARM_PLACEHOLDER = b"sqpobj-arm-placeholder"
+_HEX_BYTES = frozenset(b"0123456789abcdefABCDEF")
+_PHP_OBJECT_PREFLIGHT_REDIRECT_FIELDS = frozenset(
+    {
+        "continue",
+        "destination",
+        "next",
+        "redirect",
+        "redirect_to",
+        "redirect_url",
+        "return",
+        "return_to",
+        "return_url",
+        "target",
+        "url",
+    }
+)
 
 _TOKEN_RE = re.compile(rb"[!#$%&'*+\-.^_`|~0-9A-Za-z]+\Z")
 _HOP_BY_HOP_HEADERS = frozenset(
@@ -162,6 +203,394 @@ _MINIMAL_ENV_NAMES = frozenset(
         "VIRTUAL_ENV",
     }
 )
+
+
+PhpObjectSurfacePhase = Literal["before", "after"]
+PhpObjectArm = Literal["attack", "control"]
+PhpObjectSurfaceAttestor = Callable[
+    [PhpObjectSurfacePhase, PhpObjectArm],
+    Awaitable[None],
+]
+PhpObjectGadgetArmAttestor = Callable[
+    [PhpObjectSurfacePhase, PhpObjectArm],
+    Awaitable[None],
+]
+ExecutableUploadPhase = Literal["before", "after"]
+ExecutableUploadArm = Literal["attack", "control"]
+ExecutableUploadArmAttestor = Callable[
+    [ExecutableUploadPhase, ExecutableUploadArm],
+    Awaitable[None],
+]
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ExecutableUploadPolicy:
+    """Verifier-private request contract for two executable-upload arms."""
+
+    method: str
+    route_kind: Literal["path", "wordpress_rest"]
+    route: str
+    dispatch: tuple[tuple[str, str, str], ...]
+    payload: bytes
+    attack_filename: str
+    control_filename: str
+
+    def __post_init__(self) -> None:
+        if self.method != "POST":
+            raise ValueError("executable-upload policy requires POST")
+        if self.route_kind not in {"path", "wordpress_rest"}:
+            raise ValueError("executable-upload policy route kind is invalid")
+        if (
+            type(self.route) is not str
+            or not self.route.startswith("/")
+            or self.route.startswith("//")
+            or "?" in self.route
+            or "#" in self.route
+            or not self.route.isascii()
+            or len(self.route.encode("ascii")) > MAX_REQUEST_TARGET_BYTES
+        ):
+            raise ValueError("executable-upload policy route is invalid")
+        if type(self.dispatch) is not tuple or len(self.dispatch) > 64:
+            raise ValueError("executable-upload policy dispatch is malformed")
+        identities: set[tuple[str, str]] = set()
+        for entry in self.dispatch:
+            if type(entry) is not tuple or len(entry) != 3:
+                raise ValueError("executable-upload policy dispatch is malformed")
+            location, name, expected = entry
+            identity = (location, name)
+            if (
+                location not in {"query", "form", "json", "multipart"}
+                or type(name) is not str
+                or not name
+                or not name.isascii()
+                or len(name.encode("ascii")) > MAX_TRACE_FIELD_NAME_BYTES
+                or type(expected) is not str
+                or not expected
+                or not expected.isascii()
+                or not expected.isprintable()
+                or len(expected.encode("ascii")) > MAX_REQUEST_TARGET_BYTES
+                or identity in identities
+            ):
+                raise ValueError("executable-upload policy dispatch is malformed")
+            identities.add(identity)
+        if (
+            type(self.payload) is not bytes
+            or not self.payload
+            or len(self.payload) > MAX_REQUEST_BODY_BYTES
+        ):
+            raise ValueError("executable-upload policy payload is invalid")
+        for label, filename, suffix in (
+            ("attack", self.attack_filename, ".php"),
+            ("control", self.control_filename, ".txt"),
+        ):
+            if (
+                type(filename) is not str
+                or not filename.endswith(suffix)
+                or re.fullmatch(r"[A-Za-z0-9._-]{1,255}", filename) is None
+            ):
+                raise ValueError(
+                    f"executable-upload policy {label} filename is invalid"
+                )
+        if self.attack_filename == self.control_filename:
+            raise ValueError("executable-upload policy filenames must differ")
+
+    def __repr__(self) -> str:
+        return "ExecutableUploadPolicy(<redacted>)"
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class PhpObjectRewritePolicy:
+    """Exact model-facing request shape allowed to carry one object-oracle arm."""
+
+    method: str
+    path: str
+    object_location: str
+    object_field: str
+    dispatch: tuple[tuple[str, str, str], ...] = ()
+
+    def __post_init__(self) -> None:
+        try:
+            encoded_method = self.method.encode("ascii", errors="strict")
+        except (AttributeError, UnicodeEncodeError) as exc:
+            raise ValueError(
+                "PHP object policy method must be an uppercase token"
+            ) from exc
+        if (
+            type(self.method) is not str
+            or not self.method
+            or self.method != self.method.upper()
+            or _TOKEN_RE.fullmatch(encoded_method) is None
+        ):
+            raise ValueError("PHP object policy method must be an uppercase token")
+        if type(self.path) is not str:
+            raise ValueError("PHP object policy path must be a string")
+        try:
+            encoded_path = self.path.encode("ascii", errors="strict")
+        except UnicodeEncodeError as exc:
+            raise ValueError("PHP object policy path must be ASCII") from exc
+        if (
+            not self.path.startswith("/")
+            or self.path.startswith("//")
+            or "?" in self.path
+            or "#" in self.path
+            or len(encoded_path) > MAX_REQUEST_TARGET_BYTES
+            or any(byte < 0x21 or byte == 0x7F for byte in encoded_path)
+        ):
+            raise ValueError(
+                "PHP object policy path must be one exact origin-form path"
+            )
+        if self.object_location != "form":
+            raise ValueError("PHP object policy supports only a form destination")
+        if (
+            type(self.object_field) is not str
+            or _PHP_OBJECT_SAFE_FIELD_RE.fullmatch(self.object_field) is None
+        ):
+            raise ValueError("PHP object policy destination field is unsafe")
+        if type(self.dispatch) is not tuple or len(self.dispatch) > (
+            _PHP_OBJECT_MAX_DISPATCH
+        ):
+            raise ValueError("PHP object policy dispatch is malformed")
+
+        protected: set[str] = {_php_field_alias(self.object_field)}
+        identities: set[tuple[str, str]] = set()
+        for entry in self.dispatch:
+            if type(entry) is not tuple or len(entry) != 3:
+                raise ValueError("PHP object policy dispatch is malformed")
+            location, field, expected = entry
+            if location not in {"query", "form"}:
+                raise ValueError("PHP object policy dispatch location is unsupported")
+            if (
+                type(field) is not str
+                or _PHP_OBJECT_SAFE_FIELD_RE.fullmatch(field) is None
+                or type(expected) is not str
+                or _PHP_OBJECT_SAFE_DISPATCH_RE.fullmatch(expected) is None
+            ):
+                raise ValueError("PHP object policy dispatch literal is unsafe")
+            identity = (location, field)
+            alias = _php_field_alias(field)
+            if identity in identities or alias in protected:
+                raise ValueError("PHP object policy protected fields collide")
+            identities.add(identity)
+            protected.add(alias)
+
+    def __repr__(self) -> str:
+        return "PhpObjectRewritePolicy(<redacted>)"
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class PhpObjectProxyObservation:
+    """Take-once verifier-private receipt state used to attest one execution."""
+
+    generation_id: str
+    attack_token: str
+    control_token: str
+    attack_receipt: str
+    control_receipt: None
+    execution_started_monotonic_ns: int
+    execution_finished_monotonic_ns: int
+
+    def __repr__(self) -> str:
+        return "PhpObjectProxyObservation(<redacted>)"
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class PhpObjectGadgetProxyObservation:
+    """Take-once timing state for a parent-attested natural gadget execution."""
+
+    generation_id: str
+    attack_token: str
+    control_token: str
+    execution_started_monotonic_ns: int
+    execution_finished_monotonic_ns: int
+
+    def __repr__(self) -> str:
+        return "PhpObjectGadgetProxyObservation(<redacted>)"
+
+
+@dataclass(frozen=True, slots=True)
+class _UrlEncodedPair:
+    raw_name: bytes
+    raw_value: bytes
+    decoded_name: str
+    decoded_value: bytes
+
+    @property
+    def raw_segment(self) -> bytes:
+        return self.raw_name + b"=" + self.raw_value
+
+
+@dataclass(frozen=True, slots=True)
+class _PhpObjectPreparedRequest:
+    body: bytes
+    arm: str | None
+    original_envelope_sha256: str | None
+    rewritten_body_sha256: str | None
+
+
+class _PhpObjectPolicyError(Exception):
+    def __init__(self, category: str) -> None:
+        super().__init__("PHP object request was rejected")
+        self.category = category
+
+
+class _PhpObjectSurfaceAttestationError(Exception):
+    pass
+
+
+class _PhpObjectGadgetAttestationError(Exception):
+    pass
+
+
+def _php_field_alias(name: str) -> str:
+    """Approximate the collision-relevant part of PHP variable normalization."""
+    base = name.partition("[")[0]
+    return base.replace(".", "_").replace(" ", "_")
+
+
+def _validate_percent_encoding(value: bytes) -> None:
+    offset = 0
+    while True:
+        offset = value.find(b"%", offset)
+        if offset < 0:
+            return
+        if (
+            offset + 2 >= len(value)
+            or value[offset + 1] not in _HEX_BYTES
+            or value[offset + 2] not in _HEX_BYTES
+        ):
+            raise _PhpObjectPolicyError("php_object_malformed_percent_encoding")
+        offset += 3
+
+
+def _decode_www_component(value: bytes) -> bytes:
+    _validate_percent_encoding(value)
+    return unquote_to_bytes(value.replace(b"+", b" "))
+
+
+def _parse_strict_urlencoded(value: bytes) -> list[_UrlEncodedPair]:
+    """Parse without normalizing the raw bytes later forwarded upstream."""
+    if not value:
+        return []
+    raw_pairs = value.split(b"&")
+    if len(raw_pairs) > _PHP_OBJECT_MAX_FORM_PAIRS:
+        raise _PhpObjectPolicyError("php_object_form_pair_limit_exceeded")
+    parsed: list[_UrlEncodedPair] = []
+    for raw_pair in raw_pairs:
+        if not raw_pair or raw_pair.count(b"=") != 1:
+            raise _PhpObjectPolicyError("php_object_malformed_form_pair")
+        raw_name, _separator, raw_value = raw_pair.partition(b"=")
+        if not raw_name:
+            raise _PhpObjectPolicyError("php_object_empty_form_name")
+        decoded_name_bytes = _decode_www_component(raw_name)
+        decoded_value = _decode_www_component(raw_value)
+        if (
+            not decoded_name_bytes
+            or len(decoded_name_bytes) > _PHP_OBJECT_MAX_NAME_BYTES
+            or len(decoded_value) > _PHP_OBJECT_MAX_VALUE_BYTES
+            or b"\0" in decoded_name_bytes
+        ):
+            raise _PhpObjectPolicyError("php_object_form_component_limit")
+        try:
+            decoded_name = decoded_name_bytes.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise _PhpObjectPolicyError("php_object_non_utf8_form_name") from exc
+        parsed.append(
+            _UrlEncodedPair(
+                raw_name=raw_name,
+                raw_value=raw_value,
+                decoded_name=decoded_name,
+                decoded_value=decoded_value,
+            )
+        )
+    return parsed
+
+
+def _iter_bounded_decoded_variants(value: bytes) -> Iterable[bytes]:
+    """Yield bounded URL/base64/hex decoding variants for rejection checks."""
+    pending: list[tuple[bytes, int]] = [(value, 0)]
+    seen: set[bytes] = set()
+    decoded_bytes = 0
+    index = 0
+    while index < len(pending) and index < 256:
+        current, depth = pending[index]
+        index += 1
+        if current in seen:
+            continue
+        seen.add(current)
+        yield current
+        if depth >= 3 or decoded_bytes >= MAX_REQUEST_BODY_BYTES * 2:
+            continue
+
+        variants: list[bytes] = []
+        # This rejection scanner intentionally decodes valid escapes even when
+        # another percent is malformed: upstream stacks differ in how much of
+        # such a value they decode. Arm parsing below remains strictly all-or-
+        # nothing and rejects every malformed percent triplet.
+        url_decoded = unquote_to_bytes(current.replace(b"+", b" "))
+        if url_decoded != current:
+            variants.append(url_decoded)
+
+        candidate_count = 0
+        for match in _BASE64_CANDIDATE_RE.finditer(current):
+            candidate_count += 1
+            if candidate_count > 128:
+                break
+            candidate = match.group(0)
+            padding = b"=" * (-len(candidate) % 4)
+            try:
+                decoded = base64.b64decode(
+                    candidate + padding,
+                    altchars=b"-_",
+                    validate=True,
+                )
+            except (binascii.Error, ValueError):
+                continue
+            variants.append(decoded)
+
+        candidate_count = 0
+        for match in _HEX_CANDIDATE_RE.finditer(current):
+            candidate_count += 1
+            if candidate_count > 128:
+                break
+            candidate = match.group(0)
+            if len(candidate) % 2:
+                continue
+            try:
+                variants.append(bytes.fromhex(candidate.decode("ascii")))
+            except ValueError:
+                continue
+
+        for decoded in variants:
+            if not decoded or decoded in seen:
+                continue
+            decoded_bytes += len(decoded)
+            if decoded_bytes > MAX_REQUEST_BODY_BYTES * 2:
+                break
+            pending.append((decoded, depth + 1))
+
+
+def _contains_php_object_serialization(value: bytes) -> bool:
+    return any(
+        _PHP_OBJECT_SERIALIZATION_RE.search(candidate) is not None
+        for candidate in _iter_bounded_decoded_variants(value)
+    )
+
+
+def _contains_php_object_token_prefix(value: bytes) -> bool:
+    return any(
+        _PHP_OBJECT_TOKEN_PREFIX in candidate
+        for candidate in _iter_bounded_decoded_variants(value)
+    )
+
+
+def _contains_private_php_object_value(
+    value: bytes, needles: tuple[bytes, ...]
+) -> bool:
+    return any(
+        needle in candidate
+        for candidate in _iter_bounded_decoded_variants(value)
+        for needle in needles
+    )
 
 
 def _empty_sentinel_flags() -> dict[str, bool]:
@@ -302,6 +731,13 @@ def salted_scalar_sha256(value: object, salt: bytes) -> str:
     return hashlib.sha256(salt + b"\0" + canonical).hexdigest()
 
 
+def salted_file_content_sha256(value: bytes, salt: bytes) -> str:
+    """Hash multipart file bytes without exposing a reusable raw digest."""
+    return hashlib.sha256(
+        salt + b"\0SQUADRONE-FILE-CONTENT-V1\0" + value
+    ).hexdigest()
+
+
 def _forwarded_child_headers(
     headers: Iterable[tuple[str, str]],
 ) -> list[tuple[str, str]]:
@@ -322,7 +758,10 @@ def _forwarded_child_headers(
         (name, value)
         for name, value in materialized
         if name.casefold() not in blocked
-        and not name.casefold().startswith("x-squadrone-")
+        and not name.casefold()
+        .replace("_", "-")
+        .replace(".", "-")
+        .startswith("x-squadrone-")
     ]
 
 
@@ -399,6 +838,39 @@ def canonical_request_digest(
     ).hexdigest()
 
 
+def canonical_request_binding(
+    secret: bytes,
+    *,
+    method: str,
+    raw_path_and_query: str,
+    request_nonce: str,
+    request_digest: str,
+) -> str:
+    """Authenticate a proxy-owned request digest for PHP multipart ingress."""
+    if type(secret) is not bytes or len(secret) != 32:
+        raise ValueError("request-binding secret must be exactly 32 bytes")
+    if re.fullmatch(r"[0-9a-f]{64}", request_nonce) is None:
+        raise ValueError("request-binding nonce must be lowercase hexadecimal")
+    if re.fullmatch(r"[0-9a-f]{64}", request_digest) is None:
+        raise ValueError("request-binding digest must be lowercase hexadecimal")
+    normalized_method = method.upper().encode("ascii", errors="strict")
+    raw_target = raw_path_and_query.encode("ascii", errors="strict")
+    if not raw_path_and_query.startswith("/"):
+        raise ValueError("request-binding target must use origin form")
+    return hmac.new(
+        secret,
+        b"SQUADRONE-REQUEST-BINDING-V1\0"
+        + normalized_method
+        + b"\0"
+        + raw_target
+        + b"\0"
+        + request_nonce.encode("ascii")
+        + b"\0"
+        + request_digest.encode("ascii"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
 def normalize_trace_origin(url: str) -> str:
     """Return a scheme/host/effective-port origin suitable for exact matching."""
     try:
@@ -456,7 +928,8 @@ def _json_scalar_fields(value: object, name: str = "") -> Iterable[tuple[str, An
 def _multipart_fields(
     content_type: str,
     body: bytes,
-) -> Iterable[tuple[str, object, str]]:
+    salt: bytes,
+) -> Iterable[tuple[str, object, str, str | None]]:
     try:
         raw_prefix = (
             f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode(
@@ -472,11 +945,6 @@ def _multipart_fields(
         name = part.get_param("name", header="content-disposition")
         if not isinstance(name, str) or not name:
             continue
-        filename = part.get_filename()
-        if filename is not None:
-            # Hash the filename, but never retain it or the file contents.
-            yield name, filename, "file"
-            continue
         decoded_payload = part.get_payload(decode=True)
         if decoded_payload is None:
             payload = b""
@@ -484,12 +952,19 @@ def _multipart_fields(
             payload = decoded_payload
         else:
             payload = str(decoded_payload).encode("utf-8", errors="replace")
+        filename = part.get_filename()
+        if filename is not None:
+            # Retain only independent hashes of the filename and uploaded bytes.
+            # The content digest lets parent-owned upload oracles prove that two
+            # multipart arms carried identical verifier-generated payloads.
+            yield name, filename, "file", salted_file_content_sha256(payload, salt)
+            continue
         charset = part.get_content_charset() or "utf-8"
         try:
             value = payload.decode(charset, errors="strict")
         except LookupError:
             value = payload.decode("utf-8", errors="strict")
-        yield name, value, "scalar"
+        yield name, value, "scalar", None
 
 
 def trace_fields_from_wire(
@@ -501,7 +976,7 @@ def trace_fields_from_wire(
     tracked_capabilities: Mapping[str, str] | None = None,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]], str | None]:
     """Extract value digests and a value-free shape from one wire request."""
-    extracted: list[tuple[str, str, object, str]] = []
+    extracted: list[tuple[str, str, object, str, str | None]] = []
     parsed_url = urlsplit(url)
     parse_error: str | None = None
     try:
@@ -514,7 +989,8 @@ def trace_fields_from_wire(
             max_num_fields=10_000,
         )
         extracted.extend(
-            ("query", name, value, "scalar") for name, value in query_pairs
+            ("query", name, value, "scalar", None)
+            for name, value in query_pairs
         )
     except (UnicodeError, ValueError):
         parse_error = "malformed_query"
@@ -532,18 +1008,21 @@ def trace_fields_from_wire(
                     max_num_fields=10_000,
                 )
                 extracted.extend(
-                    ("form", name, value, "scalar") for name, value in pairs
+                    ("form", name, value, "scalar", None)
+                    for name, value in pairs
                 )
             elif media_type == "application/json" or media_type.endswith("+json"):
                 decoded = json.loads(body.decode("utf-8"))
                 extracted.extend(
-                    ("json", name, value, "scalar")
+                    ("json", name, value, "scalar", None)
                     for name, value in _json_scalar_fields(decoded)
                 )
             elif media_type == "multipart/form-data":
                 extracted.extend(
-                    ("multipart", name, value, kind)
-                    for name, value, kind in _multipart_fields(content_type, body)
+                    ("multipart", name, value, kind, content_sha256)
+                    for name, value, kind, content_sha256 in _multipart_fields(
+                        content_type, body, salt
+                    )
                 )
             else:
                 parse_error = "unsupported_body_content_type"
@@ -552,7 +1031,7 @@ def trace_fields_from_wire(
 
     fields: list[dict[str, object]] = []
     retained_name_bytes = 0
-    for location, name, value, kind in extracted:
+    for location, name, value, kind, content_sha256 in extracted:
         encoded_name = name.encode("utf-8", errors="replace")
         if (
             len(fields) >= MAX_TRACE_FIELDS
@@ -578,6 +1057,8 @@ def trace_fields_from_wire(
                 kind != "file" and "SQUADRONE_" in canonical_value
             ),
         }
+        if kind == "file":
+            field["content_sha256"] = content_sha256
         if tracked_capabilities:
             field["tracked_capabilities"] = sorted(
                 label
@@ -709,6 +1190,22 @@ class _UnsupportedContentEncoding(Exception):
     pass
 
 
+class _TrustedResponseHeaderError(Exception):
+    def __init__(self, category: str) -> None:
+        super().__init__(category)
+        self.category = category
+
+
+class _ExecutableUploadPolicyError(Exception):
+    def __init__(self, category: str) -> None:
+        super().__init__(category)
+        self.category = category
+
+
+class _ExecutableUploadAttestationError(Exception):
+    pass
+
+
 class PocProxySupervisor:
     """Async parent-owned, exact-origin HTTP forward proxy and trace recorder."""
 
@@ -728,6 +1225,15 @@ class PocProxySupervisor:
         request_read_timeout: float = REQUEST_READ_TIMEOUT,
         tracked_capabilities: Mapping[str, str] | None = None,
         credential_free: bool = False,
+        capture_php_include_receipt: bool = False,
+        php_object_oracle: PhpObjectOracle | None = None,
+        php_object_gadget_oracle: PhpObjectGadgetOracle | None = None,
+        php_object_policy: PhpObjectRewritePolicy | None = None,
+        php_object_surface_attestor: PhpObjectSurfaceAttestor | None = None,
+        php_object_gadget_arm_attestor: PhpObjectGadgetArmAttestor | None = None,
+        executable_upload_policy: ExecutableUploadPolicy | None = None,
+        executable_upload_arm_attestor: ExecutableUploadArmAttestor | None = None,
+        request_binding_secret: bytes | None = None,
     ) -> None:
         target_origin = normalize_trace_origin(target_url)
         if not target_origin or not target_origin.startswith("http://"):
@@ -753,7 +1259,123 @@ class PocProxySupervisor:
             raise ValueError("PoC proxy request read timeout must be positive")
         if not isinstance(credential_free, bool):
             raise ValueError("credential_free must be a boolean")
+        if not isinstance(capture_php_include_receipt, bool):
+            raise ValueError("capture_php_include_receipt must be a boolean")
+        if request_binding_secret is not None and (
+            type(request_binding_secret) is not bytes
+            or len(request_binding_secret) != 32
+        ):
+            raise ValueError("request_binding_secret must be exactly 32 bytes")
+        if executable_upload_policy is None:
+            if executable_upload_arm_attestor is not None:
+                raise ValueError(
+                    "executable-upload attestor requires an upload policy"
+                )
+            if request_binding_secret is not None:
+                raise ValueError(
+                    "request-binding secret requires executable-upload verification"
+                )
+        else:
+            if type(executable_upload_policy) is not ExecutableUploadPolicy:
+                raise ValueError(
+                    "executable_upload_policy must be an ExecutableUploadPolicy"
+                )
+            if not callable(executable_upload_arm_attestor):
+                raise ValueError("executable-upload arm attestor is required")
+            if request_binding_secret is None:
+                raise ValueError(
+                    "executable-upload policy requires a request-binding secret"
+                )
+        if php_object_oracle is not None and php_object_gadget_oracle is not None:
+            raise ValueError("PHP object oracle modes are mutually exclusive")
+        if executable_upload_policy is not None and (
+            php_object_oracle is not None or php_object_gadget_oracle is not None
+        ):
+            raise ValueError(
+                "executable-upload and PHP object oracle modes are mutually exclusive"
+            )
+        object_oracle = php_object_oracle or php_object_gadget_oracle
+        if (object_oracle is None) != (php_object_policy is None):
+            raise ValueError("PHP object oracle and policy must be configured together")
+        if object_oracle is None:
+            if php_object_surface_attestor is not None:
+                raise ValueError(
+                    "PHP object surface attestor requires object verification"
+                )
+            if php_object_gadget_arm_attestor is not None:
+                raise ValueError(
+                    "PHP object gadget attestor requires gadget verification"
+                )
+        elif not callable(php_object_surface_attestor):
+            raise ValueError("PHP object surface attestor is required")
+        if php_object_gadget_oracle is None:
+            if php_object_gadget_arm_attestor is not None:
+                raise ValueError(
+                    "PHP object gadget attestor requires the natural gadget oracle"
+                )
+        elif not callable(php_object_gadget_arm_attestor):
+            raise ValueError("PHP object gadget arm attestor is required")
+        if object_oracle is not None:
+            from .services.php_object_oracle import (
+                PhpObjectOracle as PhpObjectOracleClass,
+            )
+
+            if php_object_oracle is not None and type(php_object_oracle) is not (
+                PhpObjectOracleClass
+            ):
+                raise ValueError("php_object_oracle must be a PhpObjectOracle")
+            if php_object_gadget_oracle is not None:
+                from .services.php_object_gadget_oracle import (
+                    PhpObjectGadgetOracle as PhpObjectGadgetOracleClass,
+                )
+
+                if type(php_object_gadget_oracle) is not PhpObjectGadgetOracleClass:
+                    raise ValueError(
+                        "php_object_gadget_oracle must be a PhpObjectGadgetOracle"
+                    )
+            if type(php_object_policy) is not PhpObjectRewritePolicy:
+                raise ValueError("php_object_policy must be a PhpObjectRewritePolicy")
+            if credential_free and php_object_gadget_oracle is None:
+                raise ValueError(
+                    "inert PHP object transport cannot use credential-free mode"
+                )
+            try:
+                object_generation_id = object_oracle.generation_id
+                object_context = object_oracle.public_context()
+                object_private_values = object_oracle.private_redaction_values()
+                object_oracle.snapshot()
+            except RuntimeError as exc:
+                if "incomplete or unverified" not in str(exc):
+                    raise ValueError(
+                        "PHP object oracle must have one unfinished generation"
+                    ) from exc
+            else:
+                raise ValueError("PHP object oracle generation is already finalized")
+            if php_object_oracle is not None:
+                object_expected_receipt = php_object_oracle.private_expected_receipt
+                object_private_secret = php_object_oracle.private_receipt_secret
+            else:
+                object_expected_receipt = ""
+                object_private_secret = b""
+        else:
+            object_generation_id = ""
+            object_expected_receipt = ""
+            object_context = {}
+            object_private_values = ()
+            object_private_secret = b""
         capabilities = dict(tracked_capabilities or {})
+        if (
+            php_object_gadget_oracle is not None
+            and php_object_gadget_oracle.uses_ephemeral_path_capability
+        ):
+            target_path = php_object_gadget_oracle.private_target_path
+            supplied_target = capabilities.get("ephemeral_file_path")
+            if supplied_target is not None and not secrets.compare_digest(
+                supplied_target,
+                target_path,
+            ):
+                raise ValueError("natural gadget path capability changed")
+            capabilities["ephemeral_file_path"] = target_path
         if (
             len(capabilities) > 8
             or any(
@@ -782,6 +1404,46 @@ class PocProxySupervisor:
         self._request_read_timeout = request_read_timeout
         self._tracked_capabilities = capabilities
         self._credential_free = credential_free
+        self._capture_php_include_receipt = capture_php_include_receipt
+        self._php_object_oracle = object_oracle
+        self._php_object_gadget_oracle = php_object_gadget_oracle
+        self._php_object_policy = php_object_policy
+        self._php_object_surface_attestor = php_object_surface_attestor
+        self._php_object_gadget_arm_attestor = php_object_gadget_arm_attestor
+        self._executable_upload_policy = executable_upload_policy
+        self._executable_upload_arm_attestor = executable_upload_arm_attestor
+        self._request_binding_secret = request_binding_secret
+        self._php_object_generation_id = object_generation_id
+        self._php_object_expected_receipt = object_expected_receipt
+        self._php_object_attack_token = object_context.get("attack_token", "")
+        self._php_object_control_token = object_context.get("control_token", "")
+        private_values = (*object_private_values, object_generation_id)
+        private_bytes = (
+            *(value.encode("ascii") for value in private_values if value),
+            object_private_secret,
+        )
+        self._php_object_private_values = tuple(
+            dict.fromkeys(value for value in private_bytes if value)
+        )
+        self._php_object_phase = (
+            "awaiting_attack" if object_oracle is not None else "disabled"
+        )
+        self._php_object_envelope_sha256 = ""
+        self._php_object_attack_receipt: str | None = None
+        self._php_object_execution_started_ns = 0
+        self._php_object_observation: PhpObjectProxyObservation | None = None
+        self._php_object_gadget_observation: PhpObjectGadgetProxyObservation | None = (
+            None
+        )
+        self._php_object_observation_taken = False
+        self._php_object_gadget_observation_taken = False
+        self._php_object_preflight_requests = 0
+        self._php_object_login_preflight_seen = False
+        self._executable_upload_phase = (
+            "awaiting_attack"
+            if executable_upload_policy is not None
+            else "disabled"
+        )
         self._server: asyncio.AbstractServer | None = None
         self._proxy_url = ""
         self._records: list[dict[str, object]] = []
@@ -828,6 +1490,48 @@ class PocProxySupervisor:
     def rejection_counts(self) -> dict[str, int]:
         """Return stable, value-free categories for rejected request attempts."""
         return dict(self._rejection_counts)
+
+    @property
+    def php_object_complete(self) -> bool:
+        """Return whether the exact attack/control transport completed safely."""
+        return self._php_object_phase == "complete"
+
+    @property
+    def php_object_gadget_complete(self) -> bool:
+        """Return whether both natural-gadget arms and attestations completed."""
+        return (
+            self._php_object_gadget_oracle is not None
+            and self._php_object_phase == "complete"
+        )
+
+    @property
+    def executable_upload_complete(self) -> bool:
+        """Return whether both upload arms crossed parent-owned boundaries."""
+        return self._executable_upload_phase == "complete"
+
+    def take_php_object_observation(self) -> PhpObjectProxyObservation | None:
+        """Move the verifier-private receipt observation out of the proxy once."""
+        if self._php_object_observation_taken:
+            return None
+        observation = self._php_object_observation
+        if observation is None:
+            return None
+        self._php_object_observation_taken = True
+        self._php_object_observation = None
+        return observation
+
+    def take_php_object_gadget_observation(
+        self,
+    ) -> PhpObjectGadgetProxyObservation | None:
+        """Move natural-gadget timing state out of the proxy exactly once."""
+        if self._php_object_gadget_observation_taken:
+            return None
+        observation = self._php_object_gadget_observation
+        if observation is None:
+            return None
+        self._php_object_gadget_observation_taken = True
+        self._php_object_gadget_observation = None
+        return observation
 
     def child_environment(
         self,
@@ -1122,6 +1826,580 @@ class PocProxySupervisor:
         except Exception:
             return _empty_sentinel_flags(), []
 
+    @staticmethod
+    def _validate_php_object_preflight_names(
+        pairs: list[_UrlEncodedPair],
+        *,
+        reject_redirects: bool,
+    ) -> None:
+        aliases: set[str] = set()
+        for pair in pairs:
+            alias = _php_field_alias(pair.decoded_name)
+            if (
+                _PHP_OBJECT_SAFE_FIELD_RE.fullmatch(pair.decoded_name) is None
+                or alias != pair.decoded_name
+                or alias in aliases
+            ):
+                raise _PhpObjectPolicyError("php_object_preflight_ambiguous_field")
+            if reject_redirects and alias.casefold() in (
+                _PHP_OBJECT_PREFLIGHT_REDIRECT_FIELDS
+            ):
+                raise _PhpObjectPolicyError("php_object_preflight_redirect_rejected")
+            aliases.add(alias)
+
+    def _validate_php_object_login_preflight(
+        self,
+        *,
+        raw_target: str,
+        headers: list[tuple[str, str]],
+        body: bytes,
+    ) -> None:
+        raw_path, query_separator, _raw_query = raw_target.partition("?")
+        if raw_path != "/wp-login.php" or query_separator:
+            raise _PhpObjectPolicyError("php_object_mutating_preflight_rejected")
+        content_types = [
+            value.strip().casefold()
+            for name, value in headers
+            if name.casefold() == "content-type"
+        ]
+        if content_types != [_CREDENTIAL_FREE_CONTENT_TYPE]:
+            raise _PhpObjectPolicyError(
+                "php_object_login_preflight_content_type_mismatch"
+            )
+        pairs = _parse_strict_urlencoded(body)
+        self._validate_php_object_preflight_names(
+            pairs,
+            reject_redirects=False,
+        )
+        fields: dict[str, bytes] = {
+            pair.decoded_name: pair.decoded_value for pair in pairs
+        }
+        expected_names = {"log", "pwd", "wp-submit", "redirect_to", "testcookie"}
+        if len(pairs) != len(expected_names) or set(fields) != expected_names:
+            raise _PhpObjectPolicyError("php_object_login_preflight_shape_mismatch")
+        if (
+            not 1 <= len(fields["log"]) <= 4_096
+            or not 1 <= len(fields["pwd"]) <= 4_096
+            or b"\0" in fields["log"]
+            or b"\0" in fields["pwd"]
+            or fields["wp-submit"] != b"Log In"
+            or fields["testcookie"] != b"1"
+        ):
+            raise _PhpObjectPolicyError("php_object_login_preflight_value_mismatch")
+        try:
+            fields["log"].decode("utf-8", errors="strict")
+            fields["pwd"].decode("utf-8", errors="strict")
+            redirect_value = fields["redirect_to"].decode("ascii", errors="strict")
+            parsed_redirect = urlsplit(redirect_value)
+        except (UnicodeError, ValueError) as exc:
+            raise _PhpObjectPolicyError(
+                "php_object_login_preflight_value_mismatch"
+            ) from exc
+        if (
+            normalize_trace_origin(redirect_value) != self.target_origin
+            or parsed_redirect.username is not None
+            or parsed_redirect.password is not None
+            or parsed_redirect.path != "/wp-admin/"
+            or parsed_redirect.query
+            or parsed_redirect.fragment
+        ):
+            raise _PhpObjectPolicyError("php_object_login_preflight_redirect_rejected")
+
+    def _validate_php_object_preflight(
+        self,
+        *,
+        method: str,
+        raw_target: str,
+        headers: list[tuple[str, str]],
+        body: bytes,
+    ) -> None:
+        """Allow only read-only bootstrap traffic and the standard WP login POST."""
+        natural_credential_free = (
+            self._php_object_gadget_oracle is not None and self._credential_free
+        )
+        preflight_limit = (
+            _PHP_OBJECT_NATURAL_MAX_PREFLIGHT_REQUESTS
+            if natural_credential_free
+            else _PHP_OBJECT_MAX_PREFLIGHT_REQUESTS
+        )
+        if self._php_object_preflight_requests >= preflight_limit:
+            raise _PhpObjectPolicyError("php_object_preflight_request_limit_exceeded")
+        if method in ({"GET"} if natural_credential_free else {"GET", "HEAD"}):
+            if body:
+                raise _PhpObjectPolicyError("php_object_preflight_body_rejected")
+            if any(name.casefold() == "content-type" for name, _value in headers):
+                raise _PhpObjectPolicyError(
+                    "php_object_preflight_content_type_rejected"
+                )
+            _raw_path, query_separator, raw_query = raw_target.partition("?")
+            if query_separator and not raw_query:
+                raise _PhpObjectPolicyError("php_object_preflight_ambiguous_query")
+            try:
+                query_pairs = _parse_strict_urlencoded(
+                    raw_query.encode("ascii", errors="strict")
+                    if query_separator
+                    else b""
+                )
+            except UnicodeEncodeError as exc:
+                raise _PhpObjectPolicyError("php_object_non_ascii_query") from exc
+            self._validate_php_object_preflight_names(
+                query_pairs,
+                reject_redirects=True,
+            )
+            self._php_object_preflight_requests += 1
+            return
+        if method == "POST":
+            if natural_credential_free:
+                raise _PhpObjectPolicyError("php_object_mutating_preflight_rejected")
+            if self._php_object_login_preflight_seen:
+                raise _PhpObjectPolicyError("php_object_login_preflight_replayed")
+            self._validate_php_object_login_preflight(
+                raw_target=raw_target,
+                headers=headers,
+                body=body,
+            )
+            self._php_object_login_preflight_seen = True
+            self._php_object_preflight_requests += 1
+            return
+        raise _PhpObjectPolicyError("php_object_mutating_preflight_rejected")
+
+    def _prepare_php_object_request(
+        self,
+        *,
+        method: str,
+        path: str,
+        raw_target: str,
+        headers: list[tuple[str, str]],
+        body: bytes,
+    ) -> _PhpObjectPreparedRequest:
+        """Validate and parent-rewrite one opaque object-oracle request arm."""
+        policy = self._php_object_policy
+        oracle = self._php_object_oracle
+        if policy is None or oracle is None:
+            return _PhpObjectPreparedRequest(body, None, None, None)
+
+        try:
+            target_bytes = raw_target.encode("ascii", errors="strict")
+            header_bytes = b"\r\n".join(
+                name.encode("ascii", errors="strict")
+                + b":"
+                + value.encode("latin-1", errors="strict")
+                for name, value in headers
+            )
+        except UnicodeError as exc:
+            raise _PhpObjectPolicyError("php_object_non_ascii_envelope") from exc
+        for material in (target_bytes, header_bytes, body):
+            if _contains_php_object_serialization(material):
+                raise _PhpObjectPolicyError("php_object_child_serialization_rejected")
+
+        if self._php_object_phase == "complete":
+            raise _PhpObjectPolicyError("php_object_request_after_control")
+        if self._php_object_phase not in {"awaiting_attack", "awaiting_control"}:
+            raise _PhpObjectPolicyError("php_object_transport_unavailable")
+
+        tokenish = any(
+            _contains_php_object_token_prefix(material)
+            for material in (target_bytes, header_bytes, body)
+        )
+        if not tokenish:
+            if self._php_object_phase == "awaiting_control":
+                raise _PhpObjectPolicyError("php_object_control_not_immediate")
+            self._validate_php_object_preflight(
+                method=method,
+                raw_target=raw_target,
+                headers=headers,
+                body=body,
+            )
+            return _PhpObjectPreparedRequest(body, None, None, None)
+
+        if method != policy.method or path != policy.path:
+            raise _PhpObjectPolicyError("php_object_route_mismatch")
+        raw_path, query_separator, raw_query = raw_target.partition("?")
+        if raw_path != policy.path or raw_path != path:
+            raise _PhpObjectPolicyError("php_object_route_mismatch")
+
+        content_types = [
+            value.strip().casefold()
+            for name, value in headers
+            if name.casefold() == "content-type"
+        ]
+        if content_types != [_CREDENTIAL_FREE_CONTENT_TYPE]:
+            raise _PhpObjectPolicyError("php_object_content_type_mismatch")
+        try:
+            query_pairs = _parse_strict_urlencoded(
+                raw_query.encode("ascii", errors="strict") if query_separator else b""
+            )
+        except UnicodeEncodeError as exc:
+            raise _PhpObjectPolicyError("php_object_non_ascii_query") from exc
+        form_pairs = _parse_strict_urlencoded(body)
+
+        if self._php_object_gadget_oracle is not None and self._credential_free:
+            declared_query_fields = {
+                field
+                for location, field, _expected in policy.dispatch
+                if location == "query"
+            }
+            if (query_separator and not raw_query) or any(
+                pair.decoded_name not in declared_query_fields for pair in query_pairs
+            ):
+                raise _PhpObjectPolicyError("php_object_undeclared_query_field")
+
+        attack_token = self._php_object_attack_token.encode("ascii")
+        control_token = self._php_object_control_token.encode("ascii")
+        if _contains_php_object_token_prefix(header_bytes):
+            raise _PhpObjectPolicyError("php_object_token_outside_destination")
+        if _contains_php_object_token_prefix(raw_path.encode("ascii")):
+            raise _PhpObjectPolicyError("php_object_token_outside_destination")
+        for pair in query_pairs:
+            if _contains_php_object_token_prefix(
+                pair.decoded_name.encode("utf-8")
+            ) or _contains_php_object_token_prefix(pair.decoded_value):
+                raise _PhpObjectPolicyError("php_object_token_outside_destination")
+
+        protected = {
+            _php_field_alias(policy.object_field): ("form", policy.object_field)
+        }
+        for location, field, _expected in policy.dispatch:
+            protected[_php_field_alias(field)] = (location, field)
+        pairs_by_location = {"query": query_pairs, "form": form_pairs}
+        for location, pairs in pairs_by_location.items():
+            for pair in pairs:
+                alias = _php_field_alias(pair.decoded_name)
+                expected_identity = protected.get(alias)
+                if expected_identity is None:
+                    continue
+                expected_location, expected_name = expected_identity
+                if location != expected_location or pair.decoded_name != expected_name:
+                    raise _PhpObjectPolicyError("php_object_protected_field_alias")
+
+        destinations = [
+            (index, pair)
+            for index, pair in enumerate(form_pairs)
+            if pair.decoded_name == policy.object_field
+        ]
+        if len(destinations) != 1:
+            raise _PhpObjectPolicyError("php_object_destination_not_unique")
+        destination_index, destination = destinations[0]
+
+        for index, pair in enumerate(form_pairs):
+            has_token = _contains_php_object_token_prefix(
+                pair.decoded_name.encode("utf-8")
+            ) or _contains_php_object_token_prefix(pair.decoded_value)
+            if has_token and index != destination_index:
+                raise _PhpObjectPolicyError("php_object_token_outside_destination")
+        if destination.decoded_value == attack_token:
+            arm = "attack"
+        elif destination.decoded_value == control_token:
+            arm = "control"
+        else:
+            raise _PhpObjectPolicyError("php_object_stale_or_invalid_token")
+
+        for location, field, expected in policy.dispatch:
+            matches = [
+                pair
+                for pair in pairs_by_location[location]
+                if pair.decoded_name == field
+            ]
+            if len(matches) != 1:
+                raise _PhpObjectPolicyError("php_object_dispatch_not_unique")
+            try:
+                dispatch_value = matches[0].decoded_value.decode(
+                    "utf-8", errors="strict"
+                )
+            except UnicodeDecodeError as exc:
+                raise _PhpObjectPolicyError(
+                    "php_object_dispatch_value_mismatch"
+                ) from exc
+            if dispatch_value != expected:
+                raise _PhpObjectPolicyError("php_object_dispatch_value_mismatch")
+
+        if arm == "attack" and self._php_object_phase != "awaiting_attack":
+            raise _PhpObjectPolicyError("php_object_attack_replayed_or_out_of_order")
+        if arm == "control" and self._php_object_phase != "awaiting_control":
+            raise _PhpObjectPolicyError("php_object_control_out_of_order")
+
+        placeholder_pairs = list(form_pairs)
+        placeholder_pairs[destination_index] = _UrlEncodedPair(
+            raw_name=destination.raw_name,
+            raw_value=quote_from_bytes(
+                _PHP_OBJECT_ARM_PLACEHOLDER,
+                safe="",
+            ).encode("ascii"),
+            decoded_name=destination.decoded_name,
+            decoded_value=_PHP_OBJECT_ARM_PLACEHOLDER,
+        )
+        placeholder_body = b"&".join(pair.raw_segment for pair in placeholder_pairs)
+        header_digest = salted_headers_sha256(headers, self.trace_salt).encode("ascii")
+        envelope_digest = hashlib.sha256(
+            self.trace_salt
+            + b"\0SQUADRONE-PHP-OBJECT-ENVELOPE-V1\0"
+            + method.encode("ascii")
+            + b"\0"
+            + target_bytes
+            + b"\0"
+            + header_digest
+            + b"\0"
+            + placeholder_body
+        ).hexdigest()
+        if arm == "control" and not secrets.compare_digest(
+            envelope_digest,
+            self._php_object_envelope_sha256,
+        ):
+            raise _PhpObjectPolicyError("php_object_arm_envelope_mismatch")
+
+        try:
+            payload = oracle.resolve_payload(
+                generation_id=self._php_object_generation_id,
+                token=destination.decoded_value.decode("ascii", errors="strict"),
+            )
+        except (UnicodeError, ValueError, RuntimeError) as exc:
+            raise _PhpObjectPolicyError("php_object_oracle_resolution_failed") from exc
+        rewritten_pairs = list(form_pairs)
+        rewritten_pairs[destination_index] = _UrlEncodedPair(
+            raw_name=destination.raw_name,
+            raw_value=quote_from_bytes(payload, safe="").encode("ascii"),
+            decoded_name=destination.decoded_name,
+            decoded_value=payload,
+        )
+        rewritten_body = b"&".join(pair.raw_segment for pair in rewritten_pairs)
+        if len(rewritten_body) > MAX_REQUEST_BODY_BYTES:
+            raise _PhpObjectPolicyError("php_object_rewritten_body_too_large")
+        return _PhpObjectPreparedRequest(
+            body=rewritten_body,
+            arm=arm,
+            original_envelope_sha256=envelope_digest,
+            rewritten_body_sha256=hashlib.sha256(rewritten_body).hexdigest(),
+        )
+
+    @staticmethod
+    def _field_value_digests(
+        fields: object,
+        location: str,
+        name: str,
+    ) -> list[str]:
+        if not isinstance(fields, list):
+            return []
+        return [
+            value
+            for field in fields
+            if isinstance(field, dict)
+            and field.get("location") == location
+            and field.get("name") == name
+            and isinstance((value := field.get("value_sha256")), str)
+        ]
+
+    @staticmethod
+    def _executable_upload_dispatch_locations(location: str) -> tuple[str, ...]:
+        """Map a PHP form scalar to its two valid wire encodings."""
+        return ("form", "multipart") if location == "form" else (location,)
+
+    def _matches_executable_upload_transport(
+        self,
+        *,
+        method: str,
+        path: str,
+        fields: object,
+    ) -> bool:
+        policy = self._executable_upload_policy
+        if policy is None or method != policy.method or not isinstance(fields, list):
+            return False
+        normalized_path = posixpath.normpath(path.replace("\\", "/"))
+        if (
+            not path.startswith("/")
+            or path != normalized_path
+            or "\\" in path
+            or "%" in path
+            or "//" in path
+        ):
+            return False
+        if policy.route_kind == "wordpress_rest":
+            direct_path = "/wp-json" + policy.route
+            rest_digests = self._field_value_digests(
+                fields,
+                "query",
+                "rest_route",
+            )
+            if normalized_path == direct_path:
+                if rest_digests:
+                    return False
+            elif normalized_path == "/":
+                if rest_digests != [
+                    salted_scalar_sha256(policy.route, self.trace_salt)
+                ]:
+                    return False
+            else:
+                return False
+        elif normalized_path != policy.route:
+            return False
+        allowed_query_names = {
+            name
+            for location, name, _expected in policy.dispatch
+            if location == "query"
+        }
+        if policy.route_kind == "wordpress_rest" and normalized_path == "/":
+            allowed_query_names.add("rest_route")
+        if any(
+            isinstance(field, dict)
+            and field.get("location") == "query"
+            and field.get("name") not in allowed_query_names
+            for field in fields
+        ):
+            return False
+        if not all(
+            [
+                digest
+                for wire_location in self._executable_upload_dispatch_locations(
+                    location
+                )
+                for digest in self._field_value_digests(
+                    fields,
+                    wire_location,
+                    name,
+                )
+            ]
+            == [salted_scalar_sha256(expected, self.trace_salt)]
+            for location, name, expected in policy.dispatch
+        ):
+            return False
+        expected_identities = {
+            (wire_location, name)
+            for location, name, _expected in policy.dispatch
+            for wire_location in self._executable_upload_dispatch_locations(location)
+        }
+        dispatch_names = {name for _location, name, _expected in policy.dispatch}
+        return all(
+            not self._field_value_digests(fields, location, name)
+            for name in dispatch_names
+            for location in {"query", "form", "json", "multipart"}
+            if (location, name) not in expected_identities
+        )
+
+    def _classify_executable_upload_request(
+        self,
+        *,
+        method: str,
+        path: str,
+        record: dict[str, object],
+        sentinel_categories: list[str],
+    ) -> ExecutableUploadArm | None:
+        policy = self._executable_upload_policy
+        if policy is None:
+            return None
+        del sentinel_categories
+        fields = record.get("fields")
+        if not isinstance(fields, list):
+            raise _ExecutableUploadPolicyError(
+                "executable_upload_trace_fields_unavailable"
+            )
+        payload_b64 = base64.b64encode(policy.payload).decode("ascii")
+        try:
+            payload_text = policy.payload.decode("ascii", errors="strict")
+        except UnicodeDecodeError:
+            payload_text = ""
+        scalar_payload_digests = {
+            salted_scalar_sha256(payload_b64, self.trace_salt),
+        }
+        if payload_text:
+            scalar_payload_digests.add(
+                salted_scalar_sha256(payload_text, self.trace_salt)
+            )
+        file_payload_digest = salted_file_content_sha256(
+            policy.payload,
+            self.trace_salt,
+        )
+        payload_fields = [
+            field
+            for field in fields
+            if isinstance(field, dict)
+            and (
+                field.get("kind") == "scalar"
+                and field.get("value_sha256") in scalar_payload_digests
+                or field.get("kind") == "file"
+                and field.get("content_sha256") == file_payload_digest
+            )
+        ]
+        filename_digests = {
+            "attack": salted_scalar_sha256(
+                policy.attack_filename,
+                self.trace_salt,
+            ),
+            "control": salted_scalar_sha256(
+                policy.control_filename,
+                self.trace_salt,
+            ),
+        }
+        filename_fields = {
+            arm: [
+                field
+                for field in fields
+                if isinstance(field, dict)
+                and field.get("value_sha256") == digest
+            ]
+            for arm, digest in filename_digests.items()
+        }
+        if not payload_fields:
+            if (
+                any(filename_fields.values())
+                or self._executable_upload_phase != "awaiting_attack"
+            ):
+                raise _ExecutableUploadPolicyError(
+                    "executable_upload_unbound_or_out_of_order_request"
+                )
+            return None
+        if len(payload_fields) != 1:
+            raise _ExecutableUploadPolicyError(
+                "executable_upload_payload_not_unique"
+            )
+        if not self._matches_executable_upload_transport(
+            method=method,
+            path=path,
+            fields=fields,
+        ):
+            raise _ExecutableUploadPolicyError(
+                "executable_upload_transport_mismatch"
+            )
+        matched_arms = [
+            cast(ExecutableUploadArm, arm)
+            for arm, matches in filename_fields.items()
+            if len(matches) == 1
+        ]
+        if len(matched_arms) != 1 or any(
+            len(matches) > 1 for matches in filename_fields.values()
+        ):
+            raise _ExecutableUploadPolicyError(
+                "executable_upload_filename_not_unique"
+            )
+        arm = matched_arms[0]
+        expected_phase = f"awaiting_{arm}"
+        if self._executable_upload_phase != expected_phase:
+            raise _ExecutableUploadPolicyError(
+                "executable_upload_arm_replayed_or_out_of_order"
+            )
+        return arm
+
+    async def _attest_executable_upload_arm(
+        self,
+        phase: ExecutableUploadPhase,
+        arm: ExecutableUploadArm,
+    ) -> None:
+        attestor = self._executable_upload_arm_attestor
+        if attestor is None:
+            raise _ExecutableUploadAttestationError
+        try:
+            outcome = await cast(
+                Callable[
+                    [ExecutableUploadPhase, ExecutableUploadArm],
+                    Awaitable[object],
+                ],
+                attestor,
+            )(phase, arm)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise _ExecutableUploadAttestationError from None
+        if outcome is not None:
+            raise _ExecutableUploadAttestationError
+
     async def _execute_accepted_request(
         self,
         *,
@@ -1176,6 +2454,30 @@ class PocProxySupervisor:
         # Appending the bounded shell happens before digest/field construction
         # and, critically, before an upstream request can have a side effect.
         self._records.append(record)
+        try:
+            prepared_object_request = self._prepare_php_object_request(
+                method=method,
+                path=path,
+                raw_target=raw_target,
+                headers=headers,
+                body=body,
+            )
+        except _PhpObjectPolicyError as exc:
+            self._fail_record(record, exc.category)
+            return None, b"", 403, "PHP object request was rejected"
+        body = prepared_object_request.body
+        if self._php_object_policy is not None:
+            record.update(
+                {
+                    "php_object_arm": prepared_object_request.arm,
+                    "php_object_original_envelope_sha256": (
+                        prepared_object_request.original_envelope_sha256
+                    ),
+                    "php_object_rewritten_body_sha256": (
+                        prepared_object_request.rewritten_body_sha256
+                    ),
+                }
+            )
         credential_free_headers: list[tuple[str, str]] | None = None
         if self._credential_free:
             credential_free_headers = _credential_free_headers(headers, body)
@@ -1233,6 +2535,65 @@ class PocProxySupervisor:
         self._trace_metadata_bytes += metadata_size
 
         try:
+            executable_upload_arm = self._classify_executable_upload_request(
+                method=method,
+                path=path,
+                record=record,
+                sentinel_categories=sentinel_categories,
+            )
+        except _ExecutableUploadPolicyError as exc:
+            self._fail_record(record, exc.category)
+            return None, b"", 403, "executable-upload request was rejected"
+        if executable_upload_arm is not None:
+            try:
+                await self._attest_executable_upload_arm(
+                    "before",
+                    executable_upload_arm,
+                )
+            except asyncio.CancelledError:
+                self._fail_record(record, "executable_upload_attestation_failed")
+                raise
+            except _ExecutableUploadAttestationError:
+                self._fail_record(record, "executable_upload_attestation_failed")
+                return None, b"", 502, "executable-upload attestation failed"
+            self._executable_upload_phase = f"{executable_upload_arm}_active"
+            record["executable_upload_arm"] = executable_upload_arm
+            record["executable_upload_before_attested"] = True
+
+        object_arm = prepared_object_request.arm
+        if object_arm is not None:
+            if object_arm == "attack":
+                trusted_arm: PhpObjectArm = "attack"
+            elif object_arm == "control":
+                trusted_arm = "control"
+            else:
+                self._fail_record(record, "invalid_php_object_arm_state")
+                return None, b"", 502, "PHP object request state is invalid"
+            if self._php_object_gadget_oracle is not None:
+                try:
+                    await self._attest_php_object_gadget_arm("before", trusted_arm)
+                except asyncio.CancelledError:
+                    self._fail_record(record, "php_object_gadget_attestation_failed")
+                    raise
+                except _PhpObjectGadgetAttestationError:
+                    self._fail_record(record, "php_object_gadget_attestation_failed")
+                    return None, b"", 502, "PHP object gadget attestation failed"
+            try:
+                await self._attest_php_object_surface("before", trusted_arm)
+            except asyncio.CancelledError:
+                self._fail_record(
+                    record,
+                    "php_object_surface_attestation_failed",
+                )
+                raise
+            except _PhpObjectSurfaceAttestationError:
+                self._fail_record(
+                    record,
+                    "php_object_surface_attestation_failed",
+                )
+                return None, b"", 502, "PHP object surface attestation failed"
+
+        try:
             async with asyncio.timeout(self._upstream_timeout):
                 record["upstream_started_monotonic_ns"] = time.monotonic_ns()
                 response, response_body = await self._forward(
@@ -1268,12 +2629,46 @@ class PocProxySupervisor:
             self._fail_record(record, "upstream_reset")
             return None, b"", 502, "upstream request failed"
 
+        private_object_receipt: str | None = None
+        try:
+            private_object_receipt = self._validate_php_object_response(
+                record,
+                response,
+                response_body,
+            )
+        except _TrustedResponseHeaderError as exc:
+            self._fail_record(record, exc.category)
+            return None, b"", 502, "trusted response header is invalid"
+        except Exception:
+            self._fail_record(record, "trace_construction_error")
+            return None, b"", 502, "response trace construction failed"
+        if object_arm is not None:
+            try:
+                await self._attest_php_object_surface("after", trusted_arm)
+            except asyncio.CancelledError:
+                self._fail_record(record, "php_object_surface_attestation_failed")
+                raise
+            except _PhpObjectSurfaceAttestationError:
+                self._fail_record(record, "php_object_surface_attestation_failed")
+                return None, b"", 502, "PHP object surface attestation failed"
+            if self._php_object_gadget_oracle is not None:
+                try:
+                    await self._attest_php_object_gadget_arm("after", trusted_arm)
+                except asyncio.CancelledError:
+                    self._fail_record(record, "php_object_gadget_attestation_failed")
+                    raise
+                except _PhpObjectGadgetAttestationError:
+                    self._fail_record(record, "php_object_gadget_attestation_failed")
+                    return None, b"", 502, "PHP object gadget attestation failed"
         try:
             capture_fits = self._populate_response_trace(
                 record,
                 response,
                 response_body,
             )
+        except _TrustedResponseHeaderError as exc:
+            self._fail_record(record, exc.category)
+            return None, b"", 502, "trusted response header is invalid"
         except Exception:
             self._fail_record(record, "trace_construction_error")
             return None, b"", 502, "response trace construction failed"
@@ -1281,10 +2676,215 @@ class PocProxySupervisor:
             self._fail_record(record, "trace_capture_limit_exceeded")
             return None, b"", 503, "PoC trace capture limit exceeded"
 
+        if executable_upload_arm is not None:
+            try:
+                await self._attest_executable_upload_arm(
+                    "after",
+                    executable_upload_arm,
+                )
+            except asyncio.CancelledError:
+                self._fail_record(record, "executable_upload_attestation_failed")
+                raise
+            except _ExecutableUploadAttestationError:
+                self._fail_record(record, "executable_upload_attestation_failed")
+                return None, b"", 502, "executable-upload attestation failed"
+            self._executable_upload_phase = (
+                "awaiting_control"
+                if executable_upload_arm == "attack"
+                else "complete"
+            )
+            record["executable_upload_after_attested"] = True
+
         # Commit completion before model-authored code receives status, headers,
         # or body and can run a response hook.
         record["forward_state"] = "completed"
+        if not self._commit_php_object_response(record, private_object_receipt):
+            return None, b"", 502, "PHP object response state is invalid"
         return response, response_body, 0, ""
+
+    async def _attest_php_object_surface(
+        self,
+        phase: PhpObjectSurfacePhase,
+        arm: PhpObjectArm,
+    ) -> None:
+        """Run one verifier-owned surface check without exposing its internals."""
+        attestor = self._php_object_surface_attestor
+        if attestor is None:
+            raise _PhpObjectSurfaceAttestationError
+        try:
+            runtime_attestor = cast(
+                Callable[
+                    [PhpObjectSurfacePhase, PhpObjectArm],
+                    Awaitable[object],
+                ],
+                attestor,
+            )
+            outcome = await runtime_attestor(phase, arm)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise _PhpObjectSurfaceAttestationError from None
+        if outcome is not None:
+            raise _PhpObjectSurfaceAttestationError
+
+    async def _attest_php_object_gadget_arm(
+        self,
+        phase: PhpObjectSurfacePhase,
+        arm: PhpObjectArm,
+    ) -> None:
+        """Run one verifier-owned target/snapshot boundary check."""
+        attestor = self._php_object_gadget_arm_attestor
+        if attestor is None:
+            raise _PhpObjectGadgetAttestationError
+        try:
+            outcome = await cast(
+                Callable[
+                    [PhpObjectSurfacePhase, PhpObjectArm],
+                    Awaitable[object],
+                ],
+                attestor,
+            )(phase, arm)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise _PhpObjectGadgetAttestationError from None
+        if outcome is not None:
+            raise _PhpObjectGadgetAttestationError
+
+    def _validate_php_object_response(
+        self,
+        record: dict[str, object],
+        response: httpx.Response,
+        response_body: bytes,
+    ) -> str | None:
+        """Validate a private receipt without copying it into trace evidence."""
+        if self._php_object_policy is None:
+            return None
+        receipts = [
+            value
+            for name, value in response.headers.multi_items()
+            if name.casefold() == PHP_OBJECT_RECEIPT_HEADER.casefold()
+        ]
+        if len(receipts) > 1:
+            raise _TrustedResponseHeaderError("duplicate_php_object_receipt")
+        receipt = receipts[0] if receipts else None
+
+        reflected_headers = b"\r\n".join(
+            name.encode("latin-1", errors="replace")
+            + b":"
+            + value.encode("latin-1", errors="replace")
+            for name, value in response.headers.multi_items()
+            if name.casefold() != PHP_OBJECT_RECEIPT_HEADER.casefold()
+        )
+        reason = response.reason_phrase.encode("latin-1", errors="replace")
+        if any(
+            _contains_private_php_object_value(
+                material,
+                self._php_object_private_values,
+            )
+            for material in (response_body, reflected_headers, reason)
+        ):
+            raise _TrustedResponseHeaderError("php_object_private_material_reflected")
+
+        arm = record.get("php_object_arm")
+        if arm is None:
+            if receipt is not None:
+                raise _TrustedResponseHeaderError("unexpected_php_object_receipt")
+        elif self._php_object_gadget_oracle is not None:
+            if arm not in {"attack", "control"}:
+                raise _TrustedResponseHeaderError("invalid_php_object_arm_state")
+            if receipt is not None:
+                raise _TrustedResponseHeaderError(
+                    "natural_gadget_php_object_receipt_present"
+                )
+        elif arm == "attack":
+            if receipt is None:
+                raise _TrustedResponseHeaderError("missing_php_object_receipt")
+            if _PHP_OBJECT_RECEIPT_RE.fullmatch(receipt) is None:
+                raise _TrustedResponseHeaderError("malformed_php_object_receipt")
+            if not secrets.compare_digest(
+                receipt,
+                self._php_object_expected_receipt,
+            ):
+                raise _TrustedResponseHeaderError("mismatched_php_object_receipt")
+        elif arm == "control":
+            if receipt is not None:
+                raise _TrustedResponseHeaderError("control_php_object_receipt_present")
+        else:
+            raise _TrustedResponseHeaderError("invalid_php_object_arm_state")
+
+        record["response_php_object_receipt_present"] = receipt is not None
+        record["response_php_object_receipt_sha256"] = (
+            hashlib.sha256(receipt.encode("ascii")).hexdigest()
+            if receipt is not None
+            else None
+        )
+        return receipt
+
+    def _commit_php_object_response(
+        self,
+        record: dict[str, object],
+        receipt: str | None,
+    ) -> bool:
+        """Advance the ordered object arms only after the trace is committed."""
+        if self._php_object_policy is None:
+            return True
+        arm = record.get("php_object_arm")
+        if arm is None:
+            return True
+        started_ns = record.get("upstream_started_monotonic_ns")
+        finished_ns = record.get("upstream_finished_monotonic_ns")
+        envelope_sha256 = record.get("php_object_original_envelope_sha256")
+        if (
+            type(started_ns) is not int
+            or type(finished_ns) is not int
+            or type(envelope_sha256) is not str
+        ):
+            self._fail_record(record, "invalid_php_object_timing_state")
+            return False
+        natural_gadget = self._php_object_gadget_oracle is not None
+        if arm == "attack":
+            if (
+                self._php_object_phase != "awaiting_attack"
+                or (natural_gadget and receipt is not None)
+                or (not natural_gadget and receipt is None)
+            ):
+                self._fail_record(record, "invalid_php_object_attack_state")
+                return False
+            self._php_object_attack_receipt = receipt
+            self._php_object_execution_started_ns = started_ns
+            self._php_object_envelope_sha256 = envelope_sha256
+            self._php_object_phase = "awaiting_control"
+            return True
+        if (
+            arm != "control"
+            or receipt is not None
+            or self._php_object_phase != "awaiting_control"
+            or (not natural_gadget and self._php_object_attack_receipt is None)
+        ):
+            self._fail_record(record, "invalid_php_object_control_state")
+            return False
+        if natural_gadget:
+            self._php_object_gadget_observation = PhpObjectGadgetProxyObservation(
+                generation_id=self._php_object_generation_id,
+                attack_token=self._php_object_attack_token,
+                control_token=self._php_object_control_token,
+                execution_started_monotonic_ns=self._php_object_execution_started_ns,
+                execution_finished_monotonic_ns=finished_ns,
+            )
+        else:
+            assert self._php_object_attack_receipt is not None
+            self._php_object_observation = PhpObjectProxyObservation(
+                generation_id=self._php_object_generation_id,
+                attack_token=self._php_object_attack_token,
+                control_token=self._php_object_control_token,
+                attack_receipt=self._php_object_attack_receipt,
+                control_receipt=None,
+                execution_started_monotonic_ns=self._php_object_execution_started_ns,
+                execution_finished_monotonic_ns=finished_ns,
+            )
+        self._php_object_phase = "complete"
+        return True
 
     def _parse_request(
         self,
@@ -1343,7 +2943,9 @@ class PocProxySupervisor:
         lower_headers: dict[str, list[str]] = {}
         for name, value in headers:
             lower_headers.setdefault(name.casefold(), []).append(value)
-        semantic_header_names = {name.replace("_", "-") for name in lower_headers}
+        semantic_header_names = {
+            name.replace("_", "-").replace(".", "-") for name in lower_headers
+        }
         if _ROUTING_OVERRIDE_HEADERS.intersection(semantic_header_names):
             raise _ProxyRequestError(
                 400,
@@ -1473,6 +3075,23 @@ class PocProxySupervisor:
                     (REQUEST_DIGEST_HEADER, request_digest),
                 ]
             )
+            if self._request_binding_secret is not None:
+                parsed_url = urlsplit(url)
+                raw_target = parsed_url.path or "/"
+                if parsed_url.query:
+                    raw_target += "?" + parsed_url.query
+                forwarded.append(
+                    (
+                        REQUEST_BINDING_HEADER,
+                        canonical_request_binding(
+                            self._request_binding_secret,
+                            method=method,
+                            raw_path_and_query=raw_target,
+                            request_nonce=nonce,
+                            request_digest=request_digest,
+                        ),
+                    )
+                )
         # One client per request gives each exchange a fresh cookie jar and
         # connection pool. No Set-Cookie state can cross child requests.
         async with httpx.AsyncClient(
@@ -1526,7 +3145,7 @@ class PocProxySupervisor:
         # Categories are always derived from the fixed flag shape. Accepting the
         # argument makes the call site explicit while preventing divergence.
         del sentinel_categories
-        return {
+        record: dict[str, object] = {
             "trace_version": TRACE_VERSION,
             "record_type": "request",
             "sequence": sequence,
@@ -1554,6 +3173,22 @@ class PocProxySupervisor:
             "forward_error": None,
             "terminal": False,
         }
+        if self._capture_php_include_receipt:
+            record["response_php_include_receipt"] = None
+        if self._php_object_policy is not None:
+            record.update(
+                {
+                    "php_object_generation_sha256": hashlib.sha256(
+                        self._php_object_generation_id.encode("ascii")
+                    ).hexdigest(),
+                    "php_object_arm": None,
+                    "php_object_original_envelope_sha256": None,
+                    "php_object_rewritten_body_sha256": None,
+                    "response_php_object_receipt_present": False,
+                    "response_php_object_receipt_sha256": None,
+                }
+            )
+        return record
 
     @staticmethod
     def _record_metadata_size(record: dict[str, object]) -> int:
@@ -1593,6 +3228,20 @@ class PocProxySupervisor:
         if receipt_truncated and receipt_text is not None:
             receipt_text = receipt_text[:ACTOR_RECEIPT_LIMIT]
 
+        php_include_receipt: str | None = None
+        if self._capture_php_include_receipt:
+            php_include_receipts = [
+                value
+                for name, value in response.headers.multi_items()
+                if name.casefold() == PHP_INCLUDE_RECEIPT_HEADER.casefold()
+            ]
+            if len(php_include_receipts) > 1:
+                raise _TrustedResponseHeaderError("duplicate_php_include_receipt")
+            if php_include_receipts:
+                php_include_receipt = php_include_receipts[0]
+                if _PHP_INCLUDE_RECEIPT_RE.fullmatch(php_include_receipt) is None:
+                    raise _TrustedResponseHeaderError("malformed_php_include_receipt")
+
         record.update(
             {
                 "status_code": response.status_code,
@@ -1603,6 +3252,8 @@ class PocProxySupervisor:
         capture_size = len(encoded_head) + len(encoded_tail)
         if receipt_text is not None:
             capture_size += len(receipt_text.encode("utf-8", errors="replace"))
+        if php_include_receipt is not None:
+            capture_size += len(php_include_receipt.encode("ascii"))
         if self._trace_capture_bytes + capture_size > self._max_trace_capture_bytes:
             record["response_capture_omitted"] = True
             return False
@@ -1616,6 +3267,8 @@ class PocProxySupervisor:
                 "response_actor_receipt_truncated": receipt_truncated,
             }
         )
+        if self._capture_php_include_receipt:
+            record["response_php_include_receipt"] = php_include_receipt
         self._trace_capture_bytes += capture_size
         return True
 
@@ -1631,6 +3284,13 @@ class PocProxySupervisor:
         if self._fatal_sequence is None or sequence < self._fatal_sequence:
             self._fatal_error = error
             self._fatal_sequence = sequence
+        if self._php_object_policy is not None:
+            self._php_object_phase = "failed"
+            self._php_object_observation = None
+            self._php_object_gadget_observation = None
+            self._php_object_attack_receipt = None
+        if self._executable_upload_policy is not None:
+            self._executable_upload_phase = "failed"
 
     def _increment_rejection(self, error: str) -> None:
         count = self._rejection_counts.get(error, 0)
@@ -1727,7 +3387,13 @@ class PocProxySupervisor:
             (name, value)
             for name, value in response_headers
             if name.casefold() not in blocked
-            and not name.casefold().startswith("x-squadrone-")
+            and (
+                not name.casefold().startswith("x-squadrone-")
+                or (
+                    self._capture_php_include_receipt
+                    and name.casefold() == PHP_INCLUDE_RECEIPT_HEADER.casefold()
+                )
+            )
         ]
         kept_headers.extend(
             [("Content-Length", str(len(body))), ("Connection", "close")]

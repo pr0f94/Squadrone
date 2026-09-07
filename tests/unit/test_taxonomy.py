@@ -11,10 +11,13 @@ from squadrone.agents.poc_author import _select_template
 from squadrone.schemas import BugClass, OracleType
 from squadrone.schemas.hypothesis import root_cause_cwe_for
 from squadrone.schemas.taxonomy import (
+    BASE_CRITIC_EVIDENCE_CONTRACT,
     KNOWN_CWE_REGISTRY,
+    OPEN_CWE_CRITIC_EVIDENCE_CONTRACT,
     OPEN_CWE_POC_TEMPLATE,
     PATCHSTACK_POLICIES,
     WORDFENCE_POLICIES,
+    critic_evidence_contract_for,
     get_known_cwe_profile,
     known_cwe_profile,
 )
@@ -76,7 +79,7 @@ def test_exact_profile_taxonomy_and_review_ownership() -> None:
         BugClass.PHP_OBJECT_INJECTION: (
             "php_object_injection",
             "injection_files",
-            ("deserialization",),
+            ("deserialization", "implicit_deserialization"),
         ),
         BugClass.XSS_REFLECTED: (
             "reflected_cross_site_scripting",
@@ -167,6 +170,32 @@ def test_registry_profiles_have_explicit_grouping_and_delivery_metadata() -> Non
             "none",
         }
         assert profile.template_fit in {"exact", "generic", "narrow", "none"}
+        assert profile.critic_evidence_contract.acceptance_mode in {
+            "source_review",
+            "manual_review_only",
+        }
+
+
+def test_existing_families_keep_base_critic_contract_except_declared_extension() -> None:
+    for bug_class, profile in KNOWN_CWE_REGISTRY.items():
+        if bug_class == BugClass.PHP_OBJECT_INJECTION:
+            continue
+        assert profile.critic_evidence_contract is BASE_CRITIC_EVIDENCE_CONTRACT
+
+
+def test_php_object_critic_contract_requires_exact_source_reviewed_boolean() -> None:
+    contract = critic_evidence_contract_for(BugClass.PHP_OBJECT_INJECTION)
+
+    assert contract.acceptance_mode == "source_review"
+    assert len(contract.required_evidence) == 1
+    requirement = contract.required_evidence[0]
+    assert requirement.path == "evidence_summary.usable_gadget"
+    assert requirement.json_type == "boolean"
+    assert requirement.required_value is True
+    assert "independently reviewed shipped-source chain" in (
+        requirement.source_requirement
+    )
+    assert any("Verifier-owned canaries" in item for item in contract.non_evidence)
 
 
 def test_registry_family_partition_is_explicit_and_disjoint() -> None:
@@ -324,6 +353,11 @@ def test_open_cwe_preserves_exact_id_without_declaring_support() -> None:
     assert unknown.is_known is False
     assert unknown.oracle_key == "CWE-1234"
     assert get_known_cwe_profile(unknown) is None
+    assert critic_evidence_contract_for(unknown) is OPEN_CWE_CRITIC_EVIDENCE_CONTRACT
+    assert (
+        critic_evidence_contract_for(unknown).acceptance_mode
+        == "manual_review_only"
+    )
     assert unknown not in KNOWN_CWE_REGISTRY
     assert len(BugClass) == len(KNOWN_CWE_REGISTRY) == 23
 

@@ -2,10 +2,18 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from squadrone.schemas import BugClass, Confidence, Hypothesis, SecurityOutcome
+from squadrone.schemas import (
+    BugClass,
+    Confidence,
+    DedupStatus,
+    Finding,
+    Hypothesis,
+    PoCStatus,
+    SecurityOutcome,
+)
 from squadrone.schemas.taxonomy import known_cwe_profile
 from squadrone.services import scope as scope_service
-from squadrone.services.scope import preverification_programs
+from squadrone.services.scope import preverification_programs, verified_programs
 
 
 def _hypothesis(**overrides) -> Hypothesis:
@@ -160,6 +168,117 @@ def test_missing_authentication_does_not_bypass_wordfence_outcome_filter():
 
     assert programs == ["patchstack"]
     assert "qualifying security outcome" in reasons["wordfence"]
+
+
+def test_structured_false_gadget_evidence_overrides_negative_keywords():
+    programs, reasons = preverification_programs(
+        _hypothesis(
+            bug_class=BugClass.PHP_OBJECT_INJECTION,
+            reasoning=(
+                "No natural gadget, code execution, file write, or file delete "
+                "effect is established."
+            ),
+            evidence_summary={
+                "attacker_role": "unauthenticated",
+                "usable_gadget": False,
+            },
+        )
+    )
+
+    assert programs == ["patchstack"]
+    assert "qualifying security outcome" in reasons["wordfence"]
+
+
+def test_structured_true_gadget_evidence_routes_wordfence():
+    programs, reasons = preverification_programs(
+        _hypothesis(
+            bug_class=BugClass.PHP_OBJECT_INJECTION,
+            reasoning="Untrusted bytes reach unrestricted deserialization.",
+            evidence_summary={
+                "attacker_role": "unauthenticated",
+                "usable_gadget": True,
+            },
+        )
+    )
+
+    assert programs == ["wordfence", "patchstack"]
+    assert reasons == {}
+
+
+def test_legacy_positive_gadget_wording_keeps_existing_routing():
+    programs, reasons = preverification_programs(
+        _hypothesis(
+            bug_class=BugClass.PHP_OBJECT_INJECTION,
+            reasoning="A reachable shipped gadget deletes a constrained file.",
+            evidence_summary={"attacker_role": "unauthenticated"},
+        )
+    )
+
+    assert programs == ["wordfence", "patchstack"]
+    assert reasons == {}
+
+
+def test_invalid_structured_gadget_evidence_fails_closed():
+    programs, reasons = preverification_programs(
+        _hypothesis(
+            bug_class=BugClass.PHP_OBJECT_INJECTION,
+            reasoning="A reachable shipped gadget deletes a constrained file.",
+            evidence_summary={
+                "attacker_role": "unauthenticated",
+                "usable_gadget": "true",
+            },
+        )
+    )
+
+    assert programs == ["patchstack"]
+    assert "qualifying security outcome" in reasons["wordfence"]
+
+
+def test_verified_cwe502_routing_requires_full_natural_direct_path_proof():
+    hypothesis = _hypothesis(
+        bug_class=BugClass.PHP_OBJECT_INJECTION,
+        reasoning="A reachable shipped gadget deletes a constrained file.",
+        evidence_summary={
+            "attacker_role": "unauthenticated",
+            "usable_gadget": True,
+        },
+    )
+    finding = Finding(
+        id="f-502-primitive-only",
+        hypothesis=hypothesis,
+        poc_status=PoCStatus.SUCCESS,
+        poc_script_path="poc.py",
+        poc_attempts=[],
+        evidence={
+            "clean_state_restored": True,
+            "confirmation_run": {
+                "observation": {
+                    "schema_version": 1,
+                    "verdict": "vulnerable",
+                    "oracle": "object_instantiation",
+                    "attacker_role": "unauthenticated",
+                    "request": {},
+                    "attack": {},
+                    "control": {},
+                    "impact": {
+                        "confidentiality": "none",
+                        "integrity": "low",
+                        "availability": "none",
+                        "description": "Inert object instantiation only.",
+                    },
+                }
+            },
+        },
+        confidence_runs=2,
+        dedup_status=DedupStatus.NOVEL,
+        dedup_matches=[],
+    )
+
+    programs, reasons = verified_programs(finding)
+
+    assert programs == []
+    assert "natural direct-path proof" in reasons["wordfence"]
+    assert "natural direct-path proof" in reasons["patchstack"]
 
 
 def test_unmapped_cwe_has_no_automatic_program_route():

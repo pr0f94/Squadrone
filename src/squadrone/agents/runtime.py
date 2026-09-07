@@ -56,7 +56,9 @@ class AgentRuntime:
 
     @staticmethod
     def _role_for_agent(agent_name: str) -> str:
-        if agent_name.startswith("developer.propose_setup_followup"):
+        if agent_name.startswith(
+            ("developer.propose_setup_followup", "developer.propose_requested_setup")
+        ):
             return "developer_followup"
         base = agent_name.split(".", 1)[0]
         if base in {

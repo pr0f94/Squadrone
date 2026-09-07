@@ -44,6 +44,95 @@ def _tool_response(*calls: tuple[str, str, dict]) -> dict:
 
 
 @pytest.mark.asyncio
+async def test_search_batch_can_finish_with_one_batched_source_read(
+    monkeypatch, tmp_path
+):
+    responses = iter(
+        [
+            _tool_response(
+                *(
+                    (
+                        f"grep-{index}",
+                        "grep_plugin",
+                        {"pattern": f"symbol_{index}"},
+                    )
+                    for index in range(6)
+                )
+            ),
+            _tool_response(
+                (
+                    "ranges-1",
+                    "read_plugin_ranges",
+                    {
+                        "ranges": [
+                            {
+                                "path": "plugin.php",
+                                "start_line": 10,
+                                "end_line": 30,
+                            }
+                        ]
+                    },
+                )
+            ),
+            {
+                "choices": [{"message": {"content": "final setup plan"}}],
+                "usage": {},
+            },
+        ]
+    )
+    requests = []
+
+    async def fake_call_llm(**kwargs):
+        requests.append(kwargs)
+        return next(responses)
+
+    monkeypatch.setattr(
+        "squadrone.agents.transport.litellm_transport.call_llm",
+        fake_call_llm,
+    )
+    dispatched = []
+
+    async def grep_plugin(arguments):
+        dispatched.append(("grep_plugin", arguments))
+        return "plugin.php:10: matching symbol"
+
+    async def read_plugin_ranges(arguments):
+        dispatched.append(("read_plugin_ranges", arguments))
+        return "source range"
+
+    result = await LiteLLMTransport().run_agent(
+        runtime=AgentRuntime(run_dir=str(tmp_path)),
+        agent_name="developer.propose_setup_followup",
+        model="test-model",
+        messages=[{"role": "user", "content": "Inspect source, then plan setup."}],
+        tools=[_tool("grep_plugin"), _tool("read_plugin_ranges")],
+        max_iterations=3,
+        output_schema=None,
+        tool_handlers={
+            "grep_plugin": grep_plugin,
+            "read_plugin_ranges": read_plugin_ranges,
+        },
+        force_finalise_after=6,
+        force_finalise_allowed_tools={"read_plugin_ranges"},
+        max_tokens=100,
+    )
+
+    assert result.output == "final setup plan"
+    assert [name for name, _arguments in dispatched] == [
+        *("grep_plugin" for _index in range(6)),
+        "read_plugin_ranges",
+    ]
+    assert [tool["function"]["name"] for tool in requests[0]["tools"]] == [
+        "grep_plugin",
+        "read_plugin_ranges",
+    ]
+    assert [tool["function"]["name"] for tool in requests[1]["tools"]] == [
+        "read_plugin_ranges"
+    ]
+    assert requests[2]["tools"] == []
+
+
+@pytest.mark.asyncio
 async def test_forced_finalisation_dispatches_only_one_allowlisted_tool(
     monkeypatch, tmp_path
 ):

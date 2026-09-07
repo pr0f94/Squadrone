@@ -12,7 +12,11 @@ from ..schemas.taxonomy import (
     WORDFENCE_POLICIES,
     get_known_cwe_profile,
 )
-from .quality_gate import infer_attacker_role, severity_from_finding
+from .quality_gate import (
+    infer_attacker_role,
+    severity_from_finding,
+    validate_php_object_natural_finding_confirmation,
+)
 from .roles import STANDARD_PROGRAM_ATTACKER_ROLES, normalize_attacker_role
 
 
@@ -32,6 +36,17 @@ def _impact_text(hypothesis: Hypothesis) -> str:
             str((hypothesis.evidence_summary or {}).get("impact") or ""),
             hypothesis.reasoning,
         )
+    )
+
+
+def _has_usable_gadget(hypothesis: Hypothesis, impact: str) -> bool:
+    """Prefer structured gadget evidence while retaining legacy artifacts."""
+    evidence = hypothesis.evidence_summary or {}
+    if "usable_gadget" in evidence:
+        return evidence["usable_gadget"] is True
+    return (
+        re.search(r"gadget|code execution|file (?:write|delete)", impact, re.I)
+        is not None
     )
 
 
@@ -67,8 +82,8 @@ def preverification_programs(
         reasons["wordfence"] = (
             f"unsupported Wordfence routing policy {wordfence_policy!r}"
         )
-    elif wordfence_policy == "usable_gadget" and not re.search(
-        r"gadget|code execution|file (?:write|delete)", impact, re.I
+    elif wordfence_policy == "usable_gadget" and not _has_usable_gadget(
+        hypothesis, impact
     ):
         wordfence_ok = False
     elif wordfence_policy == "qualifying_authorization":
@@ -111,6 +126,10 @@ def preverification_programs(
 
 
 def _observation(finding: Finding) -> dict[str, Any]:
+    if finding.hypothesis.bug_class == BugClass.PHP_OBJECT_INJECTION:
+        accepted, _reason = validate_php_object_natural_finding_confirmation(finding)
+        if not accepted:
+            return {}
     confirmation = (finding.evidence or {}).get("confirmation_run") or {}
     observation = (
         confirmation.get("observation") if isinstance(confirmation, dict) else None
@@ -121,6 +140,13 @@ def _observation(finding: Finding) -> dict[str, Any]:
 def verified_programs(finding: Finding) -> tuple[list[str], dict[str, str]]:
     """Re-route after clean PoC confirmation and CVSS calculation."""
     programs, reasons = preverification_programs(finding.hypothesis)
+    if finding.hypothesis.bug_class == BugClass.PHP_OBJECT_INJECTION:
+        accepted, reason = validate_php_object_natural_finding_confirmation(finding)
+        if not accepted:
+            detail = f"full CWE-502 routing requires natural direct-path proof: {reason}"
+            reasons["wordfence"] = detail
+            reasons["patchstack"] = detail
+            return [], reasons
     observation = _observation(finding)
     severity = severity_from_finding(finding)
     score = severity.get("cvss_estimate")

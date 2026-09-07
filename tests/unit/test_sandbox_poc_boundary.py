@@ -29,7 +29,11 @@ from squadrone.poc_proxy import (
 from squadrone.schemas.config import SandboxConfig
 from squadrone.schemas.observation import CIAImpact, PoCObservation
 from squadrone.schemas.taxonomy import KNOWN_CWE_REGISTRY
-from squadrone.services.sandbox import POC_RESULT_PREFIX, SandboxManager
+from squadrone.services.sandbox import (
+    POC_RESULT_PREFIX,
+    SandboxManager,
+    SandboxRunResult,
+)
 from squadrone.services.ssrf_oracle import SsrfOracleHit, SsrfOracleSnapshot
 
 
@@ -131,6 +135,63 @@ def _response_marker_observation(target_url: str) -> PoCObservation:
             description="The response disclosed the private test marker.",
         ),
     )
+
+
+def test_failed_run_result_separates_and_strips_rejected_child_claim() -> None:
+    observation = _response_marker_observation("http://localhost")
+    child_line = POC_RESULT_PREFIX + observation.model_dump_json()
+
+    result = SandboxRunResult(
+        success=False,
+        output="diagnostic before\n" + child_line + "\ndiagnostic after",
+        response=child_line,
+        error_log="error before\n" + child_line + "\nerror after",
+        elapsed=0,
+        observation=observation,
+        validation_reason="parent callback receipt was absent",
+        evidence={
+            "observation": {"spoofed": "accepted"},
+            "rejected_observation": {"spoofed": "different"},
+            "observation_disposition": "accepted",
+            "stdout_tail": child_line,
+        },
+    )
+
+    assert result.observation is None
+    assert result.rejected_observation == observation
+    assert result.output == "diagnostic before\ndiagnostic after"
+    assert result.response is None
+    assert result.error_log == "error before\nerror after"
+    assert result.evidence["observation"] is None
+    assert result.evidence["rejected_observation"]["verdict"] == "vulnerable"
+    assert result.evidence["observation_disposition"] == "rejected"
+    assert POC_RESULT_PREFIX not in result.evidence["stdout_tail"]
+
+
+def test_failed_run_result_drops_truncated_tail_of_long_child_claim() -> None:
+    observation = _response_marker_observation("http://localhost")
+    child_line = POC_RESULT_PREFIX + json.dumps(
+        {
+            "padding": "x" * 3000,
+            "verdict": "vulnerable",
+            "instantiated": True,
+        }
+    )
+
+    result = SandboxRunResult(
+        success=False,
+        output="safe diagnostic\n" + child_line,
+        response=child_line[-2000:],
+        elapsed=0,
+        observation=observation,
+        validation_reason="trusted parent receipt was absent",
+        evidence={"stdout_tail": child_line[-500:]},
+    )
+
+    assert result.output == "safe diagnostic"
+    assert result.response is None
+    assert result.evidence["stdout_tail"] == "safe diagnostic"
+    assert "vulnerable" not in result.evidence["stdout_tail"]
 
 
 def _cross_object_observation() -> PoCObservation:

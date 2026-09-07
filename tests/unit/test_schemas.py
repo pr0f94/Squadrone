@@ -10,6 +10,7 @@ from pydantic import ValidationError
 from squadrone.agents.prompts_io import load_prompt
 from squadrone.schemas import (
     BugClass,
+    CIAImpact,
     Confidence,
     DedupStatus,
     EntryPoint,
@@ -19,6 +20,7 @@ from squadrone.schemas import (
     IntakeArtifact,
     PipelineConfig,
     PoCAttempt,
+    PoCObservation,
     PoCStatus,
     ReconArtifact,
     Sink,
@@ -60,6 +62,76 @@ def _finding() -> Finding:
         dedup_status=DedupStatus.NOVEL,
         dedup_matches=[],
     )
+
+
+def _reported_observation() -> PoCObservation:
+    return PoCObservation(
+        verdict="vulnerable",
+        oracle="callback",
+        attacker_role="unauthenticated",
+        request={"method": "POST", "url": "http://localhost/test"},
+        attack={"observed": True},
+        control={"observed": False},
+        impact=CIAImpact(integrity="low", description="Child-declared callback."),
+    )
+
+
+def test_failed_attempt_separates_rejected_child_observation() -> None:
+    reported = _reported_observation()
+
+    attempt = PoCAttempt(
+        iteration=1,
+        script_path="/tmp/p.py",
+        result=PoCStatus.FAILED,
+        observation=reported,
+        validation_reason="parent callback receipt was absent",
+    )
+
+    assert attempt.observation is None
+    assert attempt.rejected_observation == reported
+    persisted = attempt.model_dump(mode="json")
+    assert persisted["observation"] is None
+    assert persisted["rejected_observation"]["verdict"] == "vulnerable"
+
+
+def test_later_runner_rejection_moves_accepted_attempt_observation() -> None:
+    reported = _reported_observation()
+    attempt = PoCAttempt(
+        iteration=1,
+        script_path="/tmp/p.py",
+        result=PoCStatus.SUCCESS,
+        response_snippet='before\nSQUADRONE_RESULT={"verdict":"vulnerable"}\nafter',
+        error_log_snippet='SQUADRONE_RESULT={"forged":"error"}',
+        observation=reported,
+    )
+
+    attempt.mark_failed("clean-state control did not reproduce")
+
+    assert attempt.result == PoCStatus.FAILED
+    assert attempt.observation is None
+    assert attempt.rejected_observation == reported
+    assert attempt.response_snippet is None
+    assert attempt.error_log_snippet is None
+    assert attempt.validation_reason == "clean-state control did not reproduce"
+
+
+def test_later_rejection_clears_truncated_success_fragments() -> None:
+    reported = _reported_observation()
+    attempt = PoCAttempt(
+        iteration=1,
+        script_path="/tmp/p.py",
+        result=PoCStatus.SUCCESS,
+        response_snippet='"verdict":"vulnerable","instantiated":true}',
+        error_log_snippet='"effect":"canary instantiated"}',
+        developer_analysis="the canary was proven",
+        observation=reported,
+    )
+
+    attempt.mark_failed("trusted parent receipt was absent")
+
+    assert attempt.response_snippet is None
+    assert attempt.error_log_snippet is None
+    assert attempt.developer_analysis is None
 
 
 def test_intake_round_trip(tmp_path):
@@ -456,7 +528,29 @@ def test_finding_round_trip(tmp_path):
     f = _finding()
     p = tmp_path / "f.json"
     f.to_json_file(str(p))
-    assert Finding.from_json_file(str(p)) == f
+    loaded = Finding.from_json_file(str(p))
+    assert loaded == f
+    assert loaded.poc_attempts[0].proof_kind == "standard"
+
+
+def test_poc_attempt_proof_kind_is_closed_and_backward_compatible():
+    historical = PoCAttempt.model_validate(
+        {"iteration": 1, "script_path": "/tmp/p.py", "result": "failed"}
+    )
+    assert historical.proof_kind == "standard"
+
+    natural = historical.model_copy(update={"proof_kind": "php_object_natural"})
+    assert natural.proof_kind == "php_object_natural"
+
+    with pytest.raises(ValidationError):
+        PoCAttempt.model_validate(
+            {
+                "iteration": 1,
+                "proof_kind": "model_claimed_gadget",
+                "script_path": "/tmp/p.py",
+                "result": "failed",
+            }
+        )
 
 
 def test_invalid_data_raises():
@@ -486,6 +580,46 @@ def test_pipeline_config_loads():
     assert cfg.cost_ceiling_usd > 0
     assert cfg.models.specialists
     assert "wordfence" in cfg.vuln_dbs.model_dump()
+    assert cfg.hypothesis_review_areas == [
+        "authorization_workflows",
+        "injection_files",
+        "xss_lifecycle",
+        "authentication",
+    ]
+    assert cfg.hypothesis_review_item_types is None
+
+
+@pytest.mark.parametrize(
+    "review_areas",
+    [
+        [],
+        ["injection_files", "injection_files"],
+        ["not_a_review_area"],
+    ],
+)
+def test_pipeline_config_rejects_invalid_hypothesis_review_areas(review_areas):
+    payload = PipelineConfig.from_yaml("pipelines/default.yaml").model_dump()
+    payload["hypothesis_review_areas"] = review_areas
+
+    with pytest.raises(ValidationError):
+        PipelineConfig.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "item_types",
+    [
+        [],
+        ["deserialization", "deserialization"],
+        [""],
+        ["   "],
+    ],
+)
+def test_pipeline_config_rejects_invalid_hypothesis_review_item_types(item_types):
+    payload = PipelineConfig.from_yaml("pipelines/default.yaml").model_dump()
+    payload["hypothesis_review_item_types"] = item_types
+
+    with pytest.raises(ValidationError):
+        PipelineConfig.model_validate(payload)
 
 
 def test_pipeline_llm_options_load():

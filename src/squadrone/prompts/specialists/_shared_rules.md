@@ -7,6 +7,8 @@ Return exactly one coverage disposition for every `coverage_targets` item:
 - `candidate`: the item contributes to an emitted hypothesis
 - `reviewed`: the complete reachable path was reviewed and no candidate remains
 - `unreachable`: the registration/operation is dead or cannot be reached in the shipped plugin; cite why
+- `unreviewed`: source or reachability remains unresolved, including when forced
+  finalization occurs before the complete path can be established
 
 Never omit an item. `reason` must name the handler, guard, sanitizer, dead-code
 fact, or source path that supports the disposition. `evidence_locations` must
@@ -18,7 +20,16 @@ When an assigned item has `column` greater than 1 on a minified line, use
 same line does not count as reviewing the item.
 The `reviewer` value must be the exact review area named in your area prompt.
 For `candidate`, `hypothesis_ids` must name the hypotheses supported by that
-item. For `reviewed` and `unreachable`, return an empty `hypothesis_ids` list.
+item. For `reviewed`, `unreachable`, and `unreviewed`, return an empty
+`hypothesis_ids` list. If forced finalization leaves source or reachability
+unresolved, return `unreviewed`; never convert an incomplete trace into
+`reviewed` or `unreachable` merely to finish the batch.
+
+On a retry, `prior_incomplete_review` is non-authoritative progress from the
+first pass, not source evidence. Re-read every cited location used in the final
+decision. Continue its concrete proof gaps and check alternate callers before
+repeating broad searches; do not inherit its conclusions or turn an earlier
+assumption into proof.
 
 ## Source grounding
 
@@ -151,7 +162,7 @@ Output only this JSON shape:
     {
       "item_id": "cov-0001",
       "reviewer": "the exact assigned review area",
-      "status": "candidate | reviewed | unreachable",
+      "status": "candidate | reviewed | unreachable | unreviewed",
       "reason": "source-grounded disposition",
       "evidence_locations": ["assigned/file.php:123", "handler/file.php:456"],
       "hypothesis_ids": ["batch-prefix-001"]

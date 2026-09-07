@@ -15,36 +15,83 @@ import secrets
 import signal
 import shutil
 import socket
+import stat
 import statistics
 import sys
 import tempfile
 import time
 import uuid
+from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Literal, Optional, cast
-from urllib.parse import unquote, urlparse, urlsplit
+from typing import Any, Literal, Optional, cast
+from urllib.parse import parse_qsl, quote, quote_plus, unquote, urlparse, urlsplit
 
 import httpx
 from jinja2 import Template
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, PrivateAttr, ValidationError, model_validator
 
 from ..poc_isolation import (
     CROSS_OBJECT_HTTP_CAPABILITY,
+    DEFAULT_MAX_BUNDLE_FILES,
+    EXECUTABLE_UPLOAD_ATTACK_FILENAME_ENV,
+    EXECUTABLE_UPLOAD_CONTROL_FILENAME_ENV,
+    EXECUTABLE_UPLOAD_PAYLOAD_ENV,
     prepare_poc_isolation,
 )
 from ..poc_proxy import (
+    ExecutableUploadPolicy,
+    PHP_INCLUDE_RECEIPT_HEADER,
+    PhpObjectRewritePolicy,
     PocProxySupervisor,
     normalize_trace_origin,
+    salted_file_content_sha256,
     salted_scalar_sha256,
 )
+from ..schemas.php_object_gadget import (
+    PhpObjectGadgetDirectPathEffectBinding,
+    PhpObjectGadgetRecipe,
+    PhpObjectGadgetSourceAnchor,
+)
 from ..schemas.config import SandboxConfig
-from ..schemas.observation import PoCObservation
+from ..schemas.observation import CIAImpact, PoCObservation
 from ..schemas.taxonomy import (
     BugClass,
     KNOWN_CWE_REGISTRY,
     get_known_cwe_profile,
 )
+from .php_include_oracle import (
+    PHP_INCLUDE_ORACLE_DIRECTORY,
+    PHP_INCLUDE_ORACLE_FILE_MODE,
+    PHP_INCLUDE_ORACLE_HEADER_NAME,
+    PHP_INCLUDE_ORACLE_MODE,
+    PhpIncludeAttestationError,
+    PhpIncludeFilesystemAttestation,
+    PhpIncludeHostFilesystemAttestation,
+    PhpIncludeHostFilesystemMeasurement,
+    PhpIncludeOracle,
+    PhpIncludeOracleSnapshot,
+    PhpIncludeProvisioningAttestation,
+    PhpIncludeVerificationAttestation,
+)
+from .php_object_oracle import (
+    PhpObjectCallsite,
+    PhpObjectOracle,
+    PhpObjectOracleSnapshot,
+)
+from .php_object_gadget_oracle import (
+    PHP_OBJECT_GADGET_DIRECTORY,
+    PHP_OBJECT_GADGET_ORACLE_MODE,
+    PHP_OBJECT_GADGET_ORACLE_SCHEMA_VERSION,
+    PhpObjectGadgetFileMeasurement,
+    PhpObjectGadgetOracle,
+    PhpObjectGadgetOracleSnapshot,
+    PhpObjectGadgetRuntimeBinding,
+    PhpObjectGadgetTransportAttestation,
+    php_object_gadget_recipe_sha256,
+)
 from .roles import UNKNOWN_ATTACKER_ROLE, normalize_attacker_role
+from .setup_http import SetupHttpContext
 from .ssrf_oracle import (
     ALLOWED_ORACLE_METHODS,
     LOCAL_RESOURCE_SSRF_DIRECTORY,
@@ -65,7 +112,152 @@ _PORT_MIN = 8100
 _PORT_MAX = 8200
 _PROJECT_PREFIX = "squadrone"
 _DOCKER_DIR = Path(__file__).resolve().parents[3] / "docker"
+_SANDBOX_DATABASE_NAME = "wordpress"
+_SANDBOX_DATABASE_USER = "wpuser"
+_SANDBOX_DATABASE_PASSWORD = "wppass"
+_SANDBOX_MARIADB_CLIENT_AUTH = (
+    f"-u{_SANDBOX_DATABASE_USER}",
+    f"-p{_SANDBOX_DATABASE_PASSWORD}",
+)
 _ACTOR_RECEIPT_TEMPLATE = _DOCKER_DIR / "squadrone-actor-receipt.php.j2"
+_ACTOR_RECEIPT_BASENAME = "squadrone-actor-receipt.php"
+_MU_PLUGIN_DIRECTORY = "/var/www/html/wp-content/mu-plugins"
+_PHP_OBJECT_CANARY_CLASS_RE = re.compile(r"SquadroneObjectCanary_([0-9a-f]{32})\Z")
+_PHP_OBJECT_CANARY_BASENAME_PREFIX = "squadrone-object-canary-"
+_PHP_OBJECT_REDACTED_VALUE = "<redacted>"
+_PHP_OBJECT_OBSERVATION_FIELDS = frozenset(
+    {
+        "observed",
+        "instantiated",
+        "effect",
+        "attacker_user_id",
+        "identity_verified",
+        "request_fingerprint",
+    }
+)
+_PHP_OBJECT_FINGERPRINT_FIELDS = frozenset(
+    {"method", "route", "object_field", "object_location", "dispatch"}
+)
+_PHP_OBJECT_SURFACE_MANIFEST_PREFIX = "/tmp/squadrone-object-surfaces-"
+_PHP_OBJECT_SURFACE_MANIFEST_RE = re.compile(
+    r"/tmp/squadrone-object-surfaces-[0-9a-f]{32}\.json\Z"
+)
+_CONTAINER_SNAPSHOT_ARCHIVE_RE = re.compile(
+    r"/tmp/squadrone-wordpress-root-[0-9a-f]{32}\.tar\.gz\Z"
+)
+_PHP_OBJECT_SURFACE_ATTESTATION_ORDER = (
+    ("before", "attack"),
+    ("after", "attack"),
+    ("before", "control"),
+    ("after", "control"),
+)
+_PHP_OBJECT_RECEIPT_DIAGNOSTIC_MAX_CHARS = 320
+_PHP_OBJECT_RECEIPT_REJECTION_SPECS = {
+    "missing_php_object_receipt": (
+        "Trusted parent PHP object diagnostic: attack policy accepted; attack "
+        "payload privately rewritten; upstream response received; required attack "
+        "receipt missing; instantiation/control remain unestablished.",
+        "attack",
+        "accepted",
+        "privately_rewritten",
+        "missing",
+    ),
+    "malformed_php_object_receipt": (
+        "Trusted parent PHP object diagnostic: attack policy accepted; attack "
+        "payload privately rewritten; upstream response received; attack receipt "
+        "malformed; instantiation/control remain unestablished.",
+        "attack",
+        "accepted",
+        "privately_rewritten",
+        "malformed",
+    ),
+    "mismatched_php_object_receipt": (
+        "Trusted parent PHP object diagnostic: attack policy accepted; attack "
+        "payload privately rewritten; upstream response received; attack receipt "
+        "mismatched; instantiation/control remain unestablished.",
+        "attack",
+        "accepted",
+        "privately_rewritten",
+        "mismatched",
+    ),
+    "control_php_object_receipt_present": (
+        "Trusted parent PHP object diagnostic: control policy accepted; control "
+        "payload privately rewritten; upstream response received; control receipt "
+        "present where absence was required; instantiation/control remain "
+        "unestablished.",
+        "control",
+        "accepted",
+        "privately_rewritten",
+        "control_present",
+    ),
+    "duplicate_php_object_receipt": (
+        "Trusted parent PHP object diagnostic: upstream response received; duplicate "
+        "PHP object receipt headers present; instantiation/control remain "
+        "unestablished.",
+        "unestablished",
+        "unestablished",
+        "unestablished",
+        "duplicate",
+    ),
+    "unexpected_php_object_receipt": (
+        "Trusted parent PHP object diagnostic: upstream response received; unexpected "
+        "PHP object receipt present; instantiation/control remain unestablished.",
+        "unestablished",
+        "unestablished",
+        "unestablished",
+        "unexpected",
+    ),
+}
+_PHP_OBJECT_GADGET_FORBIDDEN_DIRECTORY_CONSTANTS = frozenset(
+    {
+        "ABSPATH",
+        "AUTH_KEY",
+        "AUTH_SALT",
+        "COOKIEHASH",
+        "DB_CHARSET",
+        "DB_COLLATE",
+        "DB_HOST",
+        "DB_NAME",
+        "DB_PASSWORD",
+        "DB_USER",
+        "DISALLOW_FILE_EDIT",
+        "DISALLOW_FILE_MODS",
+        "DOMAIN_CURRENT_SITE",
+        "FORCE_SSL_ADMIN",
+        "LOGGED_IN_KEY",
+        "LOGGED_IN_SALT",
+        "MULTISITE",
+        "NONCE_KEY",
+        "NONCE_SALT",
+        "PATH_CURRENT_SITE",
+        "SECURE_AUTH_KEY",
+        "SECURE_AUTH_SALT",
+        "SUBDOMAIN_INSTALL",
+        "WP_ACCESSIBLE_HOSTS",
+        "WP_ALLOW_MULTISITE",
+        "WP_CACHE",
+        "WP_CONTENT_DIR",
+        "WP_CONTENT_URL",
+        "WP_DEBUG",
+        "WP_DEBUG_DISPLAY",
+        "WP_DEBUG_LOG",
+        "WP_ENVIRONMENT_TYPE",
+        "WP_HOME",
+        "WP_HTTP_BLOCK_EXTERNAL",
+        "WP_MAX_MEMORY_LIMIT",
+        "WP_MEMORY_LIMIT",
+        "WP_PLUGIN_DIR",
+        "WP_PLUGIN_URL",
+        "WP_SITEURL",
+        "WP_TEMP_DIR",
+        "WPMU_PLUGIN_DIR",
+        "WPMU_PLUGIN_URL",
+    }
+)
+_PHP_OBJECT_GADGET_UNLINK_CALL_RE = re.compile(
+    r"(?<![A-Za-z0-9_\\>:@])@?\\?unlink\s*\(",
+    re.IGNORECASE,
+)
 _PORT_ALLOC_LOCK = asyncio.Lock()
 _PLUGIN_SLUG_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,199}\Z")
 _SHA256_RE = re.compile(r"[0-9a-fA-F]{64}\Z")
@@ -111,6 +303,77 @@ def validate_plugin_slug(plugin_slug: str) -> str:
     return plugin_slug
 
 
+def _fresh_container_snapshot_archive_path() -> str:
+    path = f"/tmp/squadrone-wordpress-root-{secrets.token_hex(16)}.tar.gz"
+    if _CONTAINER_SNAPSHOT_ARCHIVE_RE.fullmatch(path) is None:
+        raise RuntimeError("invalid container snapshot archive identity")
+    return path
+
+
+async def _remove_container_snapshot_archive(
+    container_name: str,
+    archive_path: str,
+) -> None:
+    if (
+        not container_name
+        or _CONTAINER_SNAPSHOT_ARCHIVE_RE.fullmatch(archive_path) is None
+    ):
+        raise RuntimeError("invalid container snapshot cleanup target")
+    rc, _stdout, _stderr = await _run(
+        "docker",
+        "exec",
+        "--user",
+        "root",
+        container_name,
+        "rm",
+        "-f",
+        "--",
+        archive_path,
+        check=False,
+    )
+    if rc != 0:
+        raise RuntimeError("failed to remove private container snapshot archive")
+
+
+@dataclass(frozen=True, slots=True)
+class _PhpObjectSurfaceFreeze:
+    """Opaque handle for one root-owned executable-surface freeze."""
+
+    manifest_path: str
+    entry_count: int
+    original_sha256: str
+    frozen_sha256: str
+    manifest_sha256: str
+
+
+POC_RESULT_PREFIX = "SQUADRONE_RESULT="
+
+
+def _strip_rejected_poc_result_lines(value: str | None) -> str | None:
+    """Remove child machine-result lines after parent validation rejects them."""
+    if value is None:
+        return None
+    return "\n".join(
+        line for line in value.splitlines() if POC_RESULT_PREFIX not in line
+    ).strip()
+
+
+def strip_php_object_gadget_child_claims(result: SandboxRunResult) -> None:
+    """Remove every child machine claim from a natural-gadget run artifact."""
+    result.observation = None
+    result.rejected_observation = None
+    result.output = _strip_rejected_poc_result_lines(result.output) or ""
+    # Derive the response tail again from the cleaned full output.  Sanitizing the
+    # old tail in isolation is unsafe because a long machine-result line can be
+    # truncated before its prefix and leave a JSON fragment behind.
+    result.response = result.output[-2000:] if result.output else None
+    result.error_log = _strip_rejected_poc_result_lines(result.error_log) or None
+    result.evidence["observation"] = None
+    result.evidence["rejected_observation"] = None
+    result.evidence["observation_disposition"] = "parent_attestation_only"
+    result.evidence["stdout_tail"] = result.output[-500:]
+
+
 class SandboxRunResult(BaseModel):
     success: bool
     output: str
@@ -119,11 +382,120 @@ class SandboxRunResult(BaseModel):
     response: Optional[str] = None
     error_log: Optional[str] = None
     evidence: dict = Field(default_factory=dict)
+    # The runner, not the child process, decides whether an emitted observation
+    # is evidence. A rejected child self-report remains available only under an
+    # explicitly non-authoritative field for bounded retry diagnostics.
     observation: Optional[PoCObservation] = None
+    rejected_observation: Optional[PoCObservation] = None
     validation_reason: str = ""
 
+    _trusted_php_include_observation: Optional[PoCObservation] = PrivateAttr(
+        default=None
+    )
+    _trusted_php_object_snapshot: Optional[PhpObjectOracleSnapshot] = PrivateAttr(
+        default=None
+    )
+    _trusted_php_object_gadget_snapshot: Optional[PhpObjectGadgetOracleSnapshot] = (
+        PrivateAttr(default=None)
+    )
 
-POC_RESULT_PREFIX = "SQUADRONE_RESULT="
+    @model_validator(mode="after")
+    def _separate_rejected_observation(self) -> "SandboxRunResult":
+        """Prevent a failed runner verdict from carrying accepted evidence."""
+        if self.success:
+            if self.rejected_observation is not None:
+                raise ValueError(
+                    "successful sandbox run cannot contain a rejected observation"
+                )
+            return self
+
+        self._normalize_rejection()
+        return self
+
+    def _normalize_rejection(self) -> None:
+        self._reject_child_observation()
+        self.output = _strip_rejected_poc_result_lines(self.output) or ""
+        # ``response`` is a tail slice in the real runner, so it may start in
+        # the middle of an overlong SQUADRONE_RESULT line and no longer carry
+        # the prefix needed for safe line filtering.  The full output above is
+        # the only source from which bounded diagnostics may be derived.
+        self.response = (
+            None
+            if self.rejected_observation is not None
+            else _strip_rejected_poc_result_lines(self.response) or None
+        )
+        self.error_log = _strip_rejected_poc_result_lines(self.error_log) or None
+        self.evidence["stdout_tail"] = self.output[-500:]
+        self.evidence["observation"] = None
+        self.evidence["rejected_observation"] = (
+            self.rejected_observation.model_dump(mode="json")
+            if self.rejected_observation is not None
+            else None
+        )
+        self.evidence["observation_disposition"] = (
+            "rejected" if self.rejected_observation is not None else "absent"
+        )
+        if self.validation_reason:
+            self.evidence["validation_reason"] = self.validation_reason
+
+    def _reject_child_observation(self) -> None:
+        if self.observation is None:
+            return
+        if (
+            self.rejected_observation is not None
+            and self.rejected_observation != self.observation
+        ):
+            raise ValueError("sandbox run contains conflicting rejected observations")
+        self.rejected_observation = self.observation
+        self.observation = None
+
+    def reject(self, validation_reason: str) -> None:
+        """Make a later parent-side validation failure authoritative."""
+        self.success = False
+        self.validation_reason = validation_reason
+        self._normalize_rejection()
+
+    def retain_trusted_php_include_observation(
+        self,
+        observation: PoCObservation | None,
+    ) -> None:
+        """Keep one raw PHP marker only in this non-serializing memory slot."""
+        self._trusted_php_include_observation = observation
+
+    def take_trusted_php_include_observation(self) -> PoCObservation | None:
+        """Return and forget the raw PHP observation after confirmation binding."""
+        observation = self._trusted_php_include_observation
+        self._trusted_php_include_observation = None
+        return observation
+
+    def retain_trusted_php_object_snapshot(
+        self,
+        snapshot: PhpObjectOracleSnapshot | None,
+    ) -> None:
+        """Keep trusted object-canary evidence outside every serialized field."""
+        self._trusted_php_object_snapshot = snapshot
+
+    def take_trusted_php_object_snapshot(self) -> PhpObjectOracleSnapshot | None:
+        """Return and forget one parent-attested PHP-object snapshot."""
+        snapshot = self._trusted_php_object_snapshot
+        self._trusted_php_object_snapshot = None
+        return snapshot
+
+    def retain_trusted_php_object_gadget_snapshot(
+        self,
+        snapshot: PhpObjectGadgetOracleSnapshot | None,
+    ) -> None:
+        """Keep natural gadget evidence only in a non-serializing memory slot."""
+        self._trusted_php_object_gadget_snapshot = snapshot
+
+    def take_trusted_php_object_gadget_snapshot(
+        self,
+    ) -> PhpObjectGadgetOracleSnapshot | None:
+        """Return and forget one parent-attested natural gadget snapshot."""
+        snapshot = self._trusted_php_object_gadget_snapshot
+        self._trusted_php_object_gadget_snapshot = None
+        return snapshot
+
 
 _CROSS_OBJECT_ACCESS_TYPES = frozenset({"read", "write"})
 _CROSS_OBJECT_CONTROL_BASES = frozenset(
@@ -189,6 +561,118 @@ _SSRF_REQUEST_FIELDS = (
     "destination_parameter",
     "destination_location",
 )
+_PHP_INCLUDE_MARKER_RE = re.compile(r"SQUADRONE_PHP_INCLUDE_[0-9a-f]{64}\Z")
+_PHP_INCLUDE_REDACTED_MARKER = "<redacted>"
+
+EXECUTABLE_UPLOAD_CHALLENGE_PARAMETER = "squadrone_challenge"
+EXECUTABLE_UPLOAD_RESPONSE_PREFIX = "SQUADRONE_UPLOAD_EXEC_V1:"
+EXECUTABLE_UPLOAD_IMPACT_DESCRIPTION = (
+    "The parent issued a fresh post-upload challenge after the PoC exited and "
+    "measured attack-only PHP execution from the public uploads directory, "
+    "establishing arbitrary server-side code execution in the sandbox."
+)
+_EXECUTABLE_UPLOAD_PATH_PREFIX = "/wp-content/uploads/"
+_EXECUTABLE_UPLOAD_MAX_URL_BYTES = 8192
+_EXECUTABLE_UPLOAD_MAX_RESPONSE_BYTES = 4096
+_EXECUTABLE_UPLOAD_PROBE_TIMEOUT_SECONDS = 15.0
+_EXECUTABLE_UPLOAD_SNAPSHOT_ROOT = "/var/www/html/wp-content/uploads"
+_EXECUTABLE_UPLOAD_SNAPSHOT_MAX_BYTES = 4 * 1024 * 1024
+_EXECUTABLE_UPLOAD_SNAPSHOT_MAX_ENTRIES = 20_000
+_EXECUTABLE_UPLOAD_SNAPSHOT_MAX_PATH_BYTES = 4096
+_EXECUTABLE_UPLOAD_SNAPSHOT_TIMEOUT_SECONDS = 15.0
+_EXECUTABLE_UPLOAD_SNAPSHOT_INNER_TIMEOUT_SECONDS = 13
+_EXECUTABLE_UPLOAD_SNAPSHOT_SCRIPT = r"""
+$root = '/var/www/html/wp-content/uploads';
+$expected_size = isset($argv[1]) ? (int) $argv[1] : -1;
+$max_entries = 20000;
+$max_path_bytes = 4096;
+$max_output_bytes = 4194304;
+$result = array('version' => 1, 'root' => 'absent', 'entries' => array());
+try {
+    if (is_link($root) || (file_exists($root) && ! is_dir($root))) {
+        throw new RuntimeException('invalid_root');
+    }
+    if (is_dir($root)) {
+        $result['root'] = 'directory';
+        $flags = FilesystemIterator::SKIP_DOTS;
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($root, $flags),
+            RecursiveIteratorIterator::SELF_FIRST
+        );
+        foreach ($iterator as $info) {
+            if (count($result['entries']) >= $max_entries) {
+                throw new RuntimeException('entry_limit');
+            }
+            $path = $info->getPathname();
+            $relative = substr($path, strlen($root) + 1);
+            if (! is_string($relative) || $relative === ''
+                || strlen($relative) > $max_path_bytes) {
+                throw new RuntimeException('path_limit');
+            }
+            $before = lstat($path);
+            if (! is_array($before)) {
+                throw new RuntimeException('lstat_failed');
+            }
+            if (is_link($path)) {
+                $kind = 'l';
+            } elseif (is_dir($path)) {
+                $kind = 'd';
+            } elseif (is_file($path)) {
+                $kind = 'f';
+            } else {
+                $kind = 'o';
+            }
+            $digest = null;
+            if ($kind === 'f' && (int) $before['size'] === $expected_size) {
+                $digest = hash_file('sha256', $path);
+                clearstatcache(true, $path);
+                $after = lstat($path);
+                foreach (array('ino', 'mode', 'nlink', 'uid', 'gid', 'size', 'mtime', 'ctime') as $key) {
+                    if (! is_array($after) || $before[$key] !== $after[$key]) {
+                        throw new RuntimeException('unstable_file');
+                    }
+                }
+                if (! is_string($digest) || preg_match('/\A[0-9a-f]{64}\z/D', $digest) !== 1) {
+                    throw new RuntimeException('hash_failed');
+                }
+            }
+            $result['entries'][] = array(
+                'path' => $relative,
+                'kind' => $kind,
+                'inode' => (int) $before['ino'],
+                'mode' => (int) $before['mode'],
+                'links' => (int) $before['nlink'],
+                'uid' => (int) $before['uid'],
+                'gid' => (int) $before['gid'],
+                'size' => (int) $before['size'],
+                'sha256' => $digest,
+            );
+        }
+    }
+    usort($result['entries'], static function ($left, $right) {
+        return strcmp($left['path'], $right['path']);
+    });
+    $encoded = json_encode($result, JSON_UNESCAPED_SLASHES);
+    if (! is_string($encoded) || strlen($encoded) > $max_output_bytes) {
+        throw new RuntimeException('output_limit');
+    }
+    echo $encoded;
+} catch (Throwable $ignored) {
+    fwrite(STDERR, "snapshot_failed\n");
+    exit(2);
+}
+""".strip()
+_EXECUTABLE_UPLOAD_ATTESTATION_ORDER: tuple[
+    tuple[Literal["before", "after"], Literal["attack", "control"]], ...
+] = (
+    ("before", "attack"),
+    ("after", "attack"),
+    ("before", "control"),
+    ("after", "control"),
+)
+_EXECUTABLE_UPLOAD_CANDIDATE_ARM_KEYS = frozenset(
+    {"observed", "marker_present", "uploaded_url"}
+)
 
 _ALLOWED_ORACLES: dict[str, set[str]] = {
     bug_class.name: set(profile.allowed_oracles)
@@ -219,6 +703,11 @@ def _requires_cross_object_isolation(expected_bug_class: str | None) -> bool:
     return "cross_object_access" in (_allowed_oracles_for(expected_bug_class) or set())
 
 
+def _requires_php_object_isolation(expected_bug_class: str | None) -> bool:
+    """Return whether this hypothesis can emit the trusted object oracle."""
+    return "object_instantiation" in (_allowed_oracles_for(expected_bug_class) or set())
+
+
 def _is_ssrf_bug_class(expected_bug_class: str | None) -> bool:
     """Return whether an exact known SSRF identifier was supplied."""
     return expected_bug_class in {BugClass.SSRF.name, BugClass.SSRF.value}
@@ -226,8 +715,77 @@ def _is_ssrf_bug_class(expected_bug_class: str | None) -> bool:
 
 def _requires_trusted_http_isolation(expected_bug_class: str | None) -> bool:
     """Route trace-bound HTTP proofs through the existing strict boundary."""
-    return _is_ssrf_bug_class(expected_bug_class) or _requires_cross_object_isolation(
-        expected_bug_class
+    return (
+        _is_ssrf_bug_class(expected_bug_class)
+        or _requires_cross_object_isolation(expected_bug_class)
+        or _requires_php_object_isolation(expected_bug_class)
+    )
+
+
+def php_object_rewrite_policy_from_transport(
+    transport: dict[str, object] | None,
+) -> PhpObjectRewritePolicy | None:
+    """Build one exact, source-reviewed object destination policy."""
+    if not isinstance(transport, dict):
+        return None
+    method = transport.get("method")
+    route = transport.get("route")
+    object_location = transport.get("object_location")
+    object_field = transport.get("object_field")
+    dispatch_value = transport.get("dispatch", {})
+    if (
+        not isinstance(method, str)
+        or method != method.strip().upper()
+        or not isinstance(route, str)
+        or route != route.strip()
+        or _normalize_request_path(route) != route
+        or not isinstance(object_location, str)
+        or not isinstance(object_field, str)
+        or not isinstance(dispatch_value, dict)
+    ):
+        return None
+    dispatch: list[tuple[str, str, str]] = []
+    for raw_key, raw_value in dispatch_value.items():
+        if not isinstance(raw_key, str) or not isinstance(raw_value, str):
+            return None
+        location, separator, field = raw_key.partition(":")
+        if not separator or not location or not field:
+            return None
+        dispatch.append((location, field, raw_value))
+    try:
+        return PhpObjectRewritePolicy(
+            method=method,
+            path=route,
+            object_location=object_location,
+            object_field=object_field,
+            dispatch=tuple(sorted(dispatch)),
+        )
+    except (UnicodeError, ValueError):
+        return None
+
+
+def _trusted_php_object_receipt_rejection_diagnostic(
+    trace_error: str,
+) -> tuple[str, dict[str, str]] | None:
+    """Project a proxy receipt failure into bounded parent-owned vocabulary."""
+    spec = _PHP_OBJECT_RECEIPT_REJECTION_SPECS.get(trace_error)
+    if spec is None:
+        return None
+    reason, arm, policy_acceptance, payload_rewrite, receipt_outcome = spec
+    if len(reason) > _PHP_OBJECT_RECEIPT_DIAGNOSTIC_MAX_CHARS:
+        raise RuntimeError("PHP object receipt diagnostic exceeds its fixed bound")
+    return (
+        reason,
+        {
+            "source": "trusted_parent_proxy",
+            "arm": arm,
+            "policy_acceptance": policy_acceptance,
+            "payload_rewrite": payload_rewrite,
+            "upstream_response": "received",
+            "receipt_outcome": receipt_outcome,
+            "instantiation": "unestablished",
+            "control": "unestablished",
+        },
     )
 
 
@@ -288,6 +846,259 @@ def _parse_poc_observation(stdout: str) -> tuple[PoCObservation | None, str]:
         return PoCObservation.model_validate(payload), ""
     except ValidationError as exc:
         return None, f"observation schema validation failed: {exc}"
+
+
+def php_include_private_marker_from_observation(
+    observation: PoCObservation | None,
+) -> str | None:
+    """Return a PHP-include marker without matching other response oracles."""
+    if observation is None or observation.oracle != "response_marker":
+        return None
+    if not (
+        isinstance(observation.attack.get("include_path"), str)
+        and isinstance(observation.control.get("include_path"), str)
+    ):
+        return None
+    marker = observation.attack.get("marker")
+    if not isinstance(marker, str) or _PHP_INCLUDE_MARKER_RE.fullmatch(marker) is None:
+        return None
+    return marker
+
+
+def redact_php_include_private_marker(value: Any, private_marker: str) -> Any:
+    """Return a persistence-safe copy with one verifier marker removed.
+
+    This helper is deliberately marker-specific.  It does not rewrite public
+    include paths or affect the response markers used by other oracle families.
+    """
+    if _PHP_INCLUDE_MARKER_RE.fullmatch(private_marker) is None:
+        return value
+    if isinstance(value, str):
+        return value.replace(private_marker, _PHP_INCLUDE_REDACTED_MARKER)
+    if isinstance(value, dict):
+        return {
+            redact_php_include_private_marker(
+                key, private_marker
+            ): redact_php_include_private_marker(item, private_marker)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            redact_php_include_private_marker(item, private_marker) for item in value
+        ]
+    if isinstance(value, tuple):
+        return tuple(
+            redact_php_include_private_marker(item, private_marker) for item in value
+        )
+    return value
+
+
+def redact_php_include_observation(
+    observation: PoCObservation | None,
+    private_marker: str | None = None,
+) -> PoCObservation | None:
+    """Project an observation for persistence without its private marker."""
+    if observation is None:
+        return None
+    marker = private_marker or php_include_private_marker_from_observation(observation)
+    if marker is None or _PHP_INCLUDE_MARKER_RE.fullmatch(marker) is None:
+        return observation.model_copy(deep=True)
+    payload = redact_php_include_private_marker(
+        observation.model_dump(mode="python"),
+        marker,
+    )
+    if not isinstance(payload, dict):  # Defensive: model_dump is always a mapping.
+        return observation.model_copy(deep=True)
+    attack = payload.get("attack")
+    if isinstance(attack, dict):
+        attack["marker_sha256"] = hashlib.sha256(marker.encode("ascii")).hexdigest()
+        attack["marker_redacted"] = True
+    return PoCObservation.model_validate(payload)
+
+
+def redact_php_include_run_result(
+    result: SandboxRunResult,
+    private_marker: str | None,
+) -> None:
+    """Remove a PHP verifier marker from every serializing result field in place."""
+    if (
+        private_marker is None
+        or _PHP_INCLUDE_MARKER_RE.fullmatch(private_marker) is None
+    ):
+        return
+    result.output = cast(
+        str,
+        redact_php_include_private_marker(result.output, private_marker),
+    )
+    result.response = cast(
+        str | None,
+        redact_php_include_private_marker(result.response, private_marker),
+    )
+    result.error_log = cast(
+        str | None,
+        redact_php_include_private_marker(result.error_log, private_marker),
+    )
+    result.validation_reason = cast(
+        str,
+        redact_php_include_private_marker(result.validation_reason, private_marker),
+    )
+    result.evidence = cast(
+        dict,
+        redact_php_include_private_marker(result.evidence, private_marker),
+    )
+    result.observation = redact_php_include_observation(
+        result.observation,
+        private_marker,
+    )
+    result.rejected_observation = redact_php_include_observation(
+        result.rejected_observation,
+        private_marker,
+    )
+    result.evidence["php_include_marker_sha256"] = hashlib.sha256(
+        private_marker.encode("ascii")
+    ).hexdigest()
+    result.evidence["php_include_marker_redacted"] = True
+
+
+def php_object_private_redaction_values(
+    oracle: PhpObjectOracle,
+) -> tuple[str, ...]:
+    """Return bounded raw and transport spellings of all object-oracle secrets."""
+    public = oracle.public_context()
+    base_values = [
+        oracle.private_callsite_path,
+        oracle.private_class_name,
+        oracle.private_canary_class_source.decode("ascii"),
+        oracle.private_receipt_secret.hex(),
+        public["attack_token"],
+        public["control_token"],
+    ]
+    try:
+        base_values = list(oracle.private_redaction_values())
+    except RuntimeError:
+        # A prepared oracle has no generation material until run_poc starts.
+        pass
+
+    expanded: set[str] = set()
+    for value in base_values:
+        if not value:
+            continue
+        raw = value.encode("ascii")
+        expanded.update(
+            {
+                value,
+                quote(value, safe=""),
+                quote_plus(value, safe=""),
+                base64.b64encode(raw).decode("ascii"),
+                base64.urlsafe_b64encode(raw).decode("ascii"),
+                raw.hex(),
+            }
+        )
+    if len(expanded) > 64 or any(len(value) > 32768 for value in expanded):
+        raise RuntimeError("PHP object oracle redaction material is invalid")
+    return tuple(sorted(expanded, key=lambda value: (-len(value), value)))
+
+
+def php_object_gadget_private_redaction_values(
+    oracle: PhpObjectGadgetOracle,
+    primitive: PhpObjectOracle,
+    actor_receipt_secret: bytes | None = None,
+) -> tuple[str, ...]:
+    """Expand both natural and reused primitive secrets for output scrubbing."""
+    if actor_receipt_secret is not None and (
+        type(actor_receipt_secret) is not bytes or len(actor_receipt_secret) != 32
+    ):
+        raise ValueError("actor receipt redaction secret must be 32 bytes")
+    expanded = set(php_object_private_redaction_values(primitive))
+    private_values = oracle.private_redaction_values()
+    if actor_receipt_secret is not None:
+        private_values = (*private_values, actor_receipt_secret.hex())
+    for value in private_values:
+        if not value:
+            continue
+        raw = value.encode("ascii")
+        expanded.update(
+            {
+                value,
+                quote(value, safe=""),
+                quote_plus(value, safe=""),
+                base64.b64encode(raw).decode("ascii"),
+                base64.urlsafe_b64encode(raw).decode("ascii"),
+                raw.hex(),
+            }
+        )
+    if len(expanded) > 128 or any(len(value) > 256 * 1024 for value in expanded):
+        raise RuntimeError("PHP object gadget redaction material is invalid")
+    return tuple(sorted(expanded, key=lambda value: (-len(value), value)))
+
+
+def redact_php_object_private_values(
+    value: Any,
+    private_values: tuple[str, ...],
+) -> Any:
+    """Return a recursive persistence-safe copy without object-oracle material."""
+    if isinstance(value, str):
+        for private_value in private_values:
+            value = value.replace(private_value, _PHP_OBJECT_REDACTED_VALUE)
+        return value
+    if isinstance(value, dict):
+        return {
+            redact_php_object_private_values(key, private_values): (
+                redact_php_object_private_values(item, private_values)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            redact_php_object_private_values(item, private_values) for item in value
+        ]
+    if isinstance(value, tuple):
+        return tuple(
+            redact_php_object_private_values(item, private_values) for item in value
+        )
+    return value
+
+
+def redact_php_object_run_result(
+    result: SandboxRunResult,
+    private_values: tuple[str, ...],
+) -> None:
+    """Remove object-oracle material from every serializing result field in place."""
+    result.output = cast(
+        str,
+        redact_php_object_private_values(result.output, private_values),
+    )
+    result.response = cast(
+        str | None,
+        redact_php_object_private_values(result.response, private_values),
+    )
+    result.error_log = cast(
+        str | None,
+        redact_php_object_private_values(result.error_log, private_values),
+    )
+    result.validation_reason = cast(
+        str,
+        redact_php_object_private_values(result.validation_reason, private_values),
+    )
+    result.evidence = cast(
+        dict,
+        redact_php_object_private_values(result.evidence, private_values),
+    )
+    if result.observation is not None:
+        payload = redact_php_object_private_values(
+            result.observation.model_dump(mode="python"),
+            private_values,
+        )
+        if isinstance(payload, dict):
+            result.observation = PoCObservation.model_validate(payload)
+    if result.rejected_observation is not None:
+        payload = redact_php_object_private_values(
+            result.rejected_observation.model_dump(mode="python"),
+            private_values,
+        )
+        if isinstance(payload, dict):
+            result.rejected_observation = PoCObservation.model_validate(payload)
+    result.evidence["php_object_private_values_redacted"] = True
 
 
 def _claim_identifier(value: object) -> str:
@@ -1286,6 +2097,73 @@ def _ssrf_confirmation_signature(observation: PoCObservation) -> tuple | None:
     )
 
 
+def _php_include_confirmation_signature(
+    observation: PoCObservation,
+) -> tuple | None:
+    """Return the replay-stable include claim bound by each parent run."""
+    if observation.oracle != "response_marker":
+        return None
+    attack = observation.attack
+    control = observation.control
+    attack_request = _ssrf_request_signature(attack.get("request_fingerprint"))
+    control_request = _ssrf_request_signature(control.get("request_fingerprint"))
+    attack_actor = _trace_claimed_user_id(
+        attack.get("attacker_user_id"), observation.attacker_role
+    )
+    control_actor = _trace_claimed_user_id(
+        control.get("attacker_user_id"), observation.attacker_role
+    )
+    values = (
+        attack.get("include_path"),
+        control.get("include_path"),
+        attack.get("destination_value"),
+        control.get("destination_value"),
+    )
+    if (
+        attack_request is None
+        or control_request is None
+        or attack_actor is None
+        or control_actor is None
+        or any(not isinstance(value, str) or not value for value in values)
+    ):
+        return None
+    return (
+        attack_request,
+        control_request,
+        *values,
+        attack_actor,
+        control_actor,
+        attack.get("identity_verified"),
+        control.get("identity_verified"),
+    )
+
+
+def _executable_upload_confirmation_signature(
+    observation: PoCObservation,
+) -> tuple[object, ...] | None:
+    """Return replay-stable facts from one parent-promoted upload proof."""
+    attack = observation.attack
+    control = observation.control
+    if (
+        observation.oracle != "response_marker"
+        or attack.get("parent_attestation") != "executable_upload_v1"
+        or control.get("parent_attestation") != "executable_upload_v1"
+        or attack.get("identity_verified") is not True
+        or control.get("identity_verified") is not True
+        or attack.get("attacker_user_id") != control.get("attacker_user_id")
+        or attack.get("request_fingerprint") != control.get("request_fingerprint")
+    ):
+        return None
+    fingerprint = attack.get("request_fingerprint")
+    if not isinstance(fingerprint, dict):
+        return None
+    return (
+        json.dumps(fingerprint, sort_keys=True, separators=(",", ":")),
+        _claim_identifier(attack.get("attacker_user_id")),
+        normalize_attacker_role(observation.attacker_role),
+    )
+
+
 def validate_confirmation_observations(
     first: PoCObservation,
     confirmation: PoCObservation,
@@ -1350,6 +2228,68 @@ def validate_confirmation_observations(
             return False, (
                 "confirmation did not disclose a fresh private SSRF response marker"
             )
+    first_php_include = first.oracle == "response_marker" and (
+        "include_path" in first.attack or "include_path" in first.control
+    )
+    confirmation_php_include = confirmation.oracle == "response_marker" and (
+        "include_path" in confirmation.attack or "include_path" in confirmation.control
+    )
+    if first_php_include or confirmation_php_include:
+        first_signature = _php_include_confirmation_signature(first)
+        confirmation_signature = _php_include_confirmation_signature(confirmation)
+        if (
+            first_signature is None
+            or confirmation_signature is None
+            or first_signature != confirmation_signature
+        ):
+            return False, (
+                "confirmation changed the PHP include request fingerprint, paths, "
+                "destination values, actors, or identity verification"
+            )
+        first_marker = first.attack.get("marker")
+        confirmation_marker = confirmation.attack.get("marker")
+        if (
+            not isinstance(first_marker, str)
+            or _PHP_INCLUDE_MARKER_RE.fullmatch(first_marker) is None
+            or not isinstance(confirmation_marker, str)
+            or _PHP_INCLUDE_MARKER_RE.fullmatch(confirmation_marker) is None
+            or hmac.compare_digest(first_marker, confirmation_marker)
+        ):
+            return False, (
+                "confirmation did not disclose a fresh private PHP include marker"
+            )
+    first_executable_upload = _executable_upload_confirmation_signature(first)
+    confirmation_executable_upload = _executable_upload_confirmation_signature(
+        confirmation
+    )
+    if first_executable_upload is not None or confirmation_executable_upload is not None:
+        if (
+            first_executable_upload is None
+            or confirmation_executable_upload is None
+            or first_executable_upload != confirmation_executable_upload
+        ):
+            return False, (
+                "confirmation changed the parent-attested executable-upload "
+                "transport or actor"
+            )
+        first_payload = first.attack.get("payload_sha256")
+        confirmation_payload = confirmation.attack.get("payload_sha256")
+        first_marker = first.attack.get("marker")
+        confirmation_marker = confirmation.attack.get("marker")
+        if (
+            not isinstance(first_payload, str)
+            or _SHA256_RE.fullmatch(first_payload) is None
+            or not isinstance(confirmation_payload, str)
+            or _SHA256_RE.fullmatch(confirmation_payload) is None
+            or hmac.compare_digest(first_payload, confirmation_payload)
+            or not isinstance(first_marker, str)
+            or not isinstance(confirmation_marker, str)
+            or hmac.compare_digest(first_marker, confirmation_marker)
+        ):
+            return False, (
+                "confirmation did not use a fresh parent executable-upload "
+                "payload and challenge"
+            )
     return True, "clean rerun reproduced the same oracle, role, request, and CIA impact"
 
 
@@ -1372,6 +2312,1179 @@ def _normalize_file_effect_path(path: str) -> str:
     observed_path = parsed.path or "/"
     decoded_path = unquote(observed_path).replace("\\", "/")
     return posixpath.normpath(re.sub(r"/+", "/", decoded_path))
+
+
+def _validated_executable_upload_url(
+    value: object,
+    *,
+    target_url: str,
+    expected_suffix: Literal[".php", ".txt"],
+) -> tuple[str, str] | tuple[None, str]:
+    """Return one canonical same-origin URL beneath the public uploads tree."""
+    if not isinstance(value, str) or not value or value != value.strip():
+        return None, "executable-upload oracle requires a nonempty absolute URL"
+    if (
+        not value.isascii()
+        or not value.isprintable()
+        or len(value.encode("ascii")) > _EXECUTABLE_UPLOAD_MAX_URL_BYTES
+    ):
+        return None, "executable-upload oracle URL exceeds the parent limit"
+    try:
+        parsed = urlsplit(value)
+        username = parsed.username
+        password = parsed.password
+    except (TypeError, ValueError):
+        return None, "executable-upload oracle URL is malformed"
+    if username is not None or password is not None:
+        return None, "executable-upload oracle URL must not contain credentials"
+    if parsed.query or parsed.fragment:
+        return None, "executable-upload oracle URL must not contain query or fragment"
+    target_origin = normalize_trace_origin(target_url)
+    if not target_origin or normalize_trace_origin(value) != target_origin:
+        return None, "executable-upload oracle URL is outside the exact sandbox origin"
+    path = parsed.path
+    if (
+        not path.startswith(_EXECUTABLE_UPLOAD_PATH_PREFIX)
+        or not path.endswith(expected_suffix)
+        or "%" in path
+        or "\\" in path
+        or "//" in path
+        or posixpath.normpath(path) != path
+        or any(part in {"", ".", ".."} for part in path.split("/")[1:])
+    ):
+        return None, (
+            "executable-upload oracle URL must identify one canonical "
+            f"{expected_suffix} file beneath /wp-content/uploads/"
+        )
+    return value, path
+
+
+@dataclass(frozen=True, slots=True)
+class _ExecutableUploadGeneration:
+    generation: str
+    payload: bytes
+    payload_b64: str
+    payload_sha256: str
+    attack_filename: str
+    control_filename: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ExecutableUploadFilesystemEntry:
+    kind: str
+    inode: int
+    mode: int
+    links: int
+    uid: int
+    gid: int
+    size: int
+    sha256: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _ExecutableUploadFilesystemSnapshot:
+    root: Literal["absent", "directory"]
+    entries: dict[str, _ExecutableUploadFilesystemEntry]
+    manifest_sha256: str
+
+    def evidence(self) -> dict[str, object]:
+        return {
+            "root": self.root,
+            "entry_count": len(self.entries),
+            "manifest_sha256": self.manifest_sha256,
+        }
+
+
+def _new_executable_upload_generation() -> _ExecutableUploadGeneration:
+    """Create exact per-execution bytes that cannot exist in a stale baseline."""
+    generation = secrets.token_hex(32)
+    if re.fullmatch(r"[0-9a-f]{64}", generation) is None:
+        raise RuntimeError("parent executable-upload generation failed")
+    payload = (
+        "<?php $c=isset($_GET['"
+        + EXECUTABLE_UPLOAD_CHALLENGE_PARAMETER
+        + "'])?(string)$_GET['"
+        + EXECUTABLE_UPLOAD_CHALLENGE_PARAMETER
+        + "']:'';echo '"
+        + EXECUTABLE_UPLOAD_RESPONSE_PREFIX
+        + "'.hash('sha256','"
+        + generation
+        + ":'.$c);"
+    ).encode("ascii")
+    stem = f"squadrone-exec-{generation[:32]}"
+    return _ExecutableUploadGeneration(
+        generation=generation,
+        payload=payload,
+        payload_b64=base64.b64encode(payload).decode("ascii"),
+        payload_sha256=hashlib.sha256(payload).hexdigest(),
+        attack_filename=f"{stem}.php",
+        control_filename=f"{stem}.txt",
+    )
+
+
+async def _snapshot_executable_upload_filesystem(
+    *,
+    container_name: str,
+    generation: _ExecutableUploadGeneration,
+) -> _ExecutableUploadFilesystemSnapshot:
+    """Capture one bounded, no-symlink uploads manifest inside WordPress."""
+    if not container_name:
+        raise RuntimeError("executable-upload container is unavailable")
+    try:
+        async with asyncio.timeout(_EXECUTABLE_UPLOAD_SNAPSHOT_TIMEOUT_SECONDS):
+            rc, output, _error = await _run(
+                "docker",
+                "exec",
+                container_name,
+                "timeout",
+                "--signal=TERM",
+                "--kill-after=1",
+                f"{_EXECUTABLE_UPLOAD_SNAPSHOT_INNER_TIMEOUT_SECONDS}s",
+                "php",
+                "-r",
+                _EXECUTABLE_UPLOAD_SNAPSHOT_SCRIPT,
+                "--",
+                str(len(generation.payload)),
+                check=False,
+            )
+    except TimeoutError as exc:
+        raise RuntimeError("executable-upload filesystem snapshot timed out") from exc
+    encoded = output.encode("utf-8", errors="strict")
+    if rc != 0 or not encoded or len(encoded) > _EXECUTABLE_UPLOAD_SNAPSHOT_MAX_BYTES:
+        raise RuntimeError("executable-upload filesystem snapshot failed")
+    try:
+        document = json.loads(output)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("executable-upload filesystem snapshot is malformed") from exc
+    if (
+        not isinstance(document, dict)
+        or set(document) != {"version", "root", "entries"}
+        or document.get("version") != 1
+        or document.get("root") not in {"absent", "directory"}
+        or not isinstance(document.get("entries"), list)
+        or len(document["entries"]) > _EXECUTABLE_UPLOAD_SNAPSHOT_MAX_ENTRIES
+        or (document.get("root") == "absent" and document["entries"])
+    ):
+        raise RuntimeError("executable-upload filesystem snapshot is malformed")
+    entries: dict[str, _ExecutableUploadFilesystemEntry] = {}
+    required = {
+        "path",
+        "kind",
+        "inode",
+        "mode",
+        "links",
+        "uid",
+        "gid",
+        "size",
+        "sha256",
+    }
+    for item in document["entries"]:
+        if not isinstance(item, dict) or set(item) != required:
+            raise RuntimeError("executable-upload snapshot entry is malformed")
+        path = item.get("path")
+        kind = item.get("kind")
+        digest = item.get("sha256")
+        numeric = [
+            item.get("inode"),
+            item.get("mode"),
+            item.get("links"),
+            item.get("uid"),
+            item.get("gid"),
+            item.get("size"),
+        ]
+        if (
+            not isinstance(path, str)
+            or not path
+            or path.startswith("/")
+            or "\\" in path
+            or path != posixpath.normpath(path)
+            or any(part in {"", ".", ".."} for part in path.split("/"))
+            or len(path.encode("utf-8")) > _EXECUTABLE_UPLOAD_SNAPSHOT_MAX_PATH_BYTES
+            or path in entries
+            or kind not in {"f", "d", "l", "o"}
+            or any(
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < 0
+                for value in numeric
+            )
+            or (
+                digest is not None
+                and (
+                    not isinstance(digest, str)
+                    or _SHA256_RE.fullmatch(digest) is None
+                )
+            )
+            or (kind != "f" and digest is not None)
+            or (
+                kind == "f"
+                and item.get("size") == len(generation.payload)
+                and digest is None
+            )
+        ):
+            raise RuntimeError("executable-upload snapshot entry is malformed")
+        entries[path] = _ExecutableUploadFilesystemEntry(
+            kind=cast(str, kind),
+            inode=cast(int, item["inode"]),
+            mode=cast(int, item["mode"]),
+            links=cast(int, item["links"]),
+            uid=cast(int, item["uid"]),
+            gid=cast(int, item["gid"]),
+            size=cast(int, item["size"]),
+            sha256=cast(str | None, digest),
+        )
+    return _ExecutableUploadFilesystemSnapshot(
+        root=cast(Literal["absent", "directory"], document["root"]),
+        entries=entries,
+        manifest_sha256=hashlib.sha256(encoded).hexdigest(),
+    )
+
+
+def _executable_upload_relative_path(url: str) -> str:
+    path = urlsplit(url).path
+    if not path.startswith(_EXECUTABLE_UPLOAD_PATH_PREFIX):
+        return ""
+    relative = path.removeprefix(_EXECUTABLE_UPLOAD_PATH_PREFIX)
+    if (
+        not relative
+        or relative != posixpath.normpath(relative)
+        or any(part in {"", ".", ".."} for part in relative.split("/"))
+    ):
+        return ""
+    return relative
+
+
+def _validate_executable_upload_snapshot_transitions(
+    binding: _ExecutableUploadTraceBinding,
+    *,
+    generation: _ExecutableUploadGeneration,
+    snapshots: dict[
+        tuple[Literal["before", "after"], Literal["attack", "control"]],
+        _ExecutableUploadFilesystemSnapshot,
+    ],
+) -> tuple[bool, str, dict[str, object]]:
+    """Bind each returned URL to the exact file introduced by its request."""
+    order = _EXECUTABLE_UPLOAD_ATTESTATION_ORDER
+    evidence: dict[str, object] = {}
+    for phase, arm in order:
+        snapshot = snapshots.get((phase, arm))
+        if snapshot is not None:
+            evidence[f"{phase}_{arm}"] = snapshot.evidence()
+    if tuple(snapshots) != order:
+        return False, "executable-upload arm snapshots are incomplete", evidence
+    attack_path = _executable_upload_relative_path(binding.attack_url)
+    control_path = _executable_upload_relative_path(binding.control_url)
+    if not attack_path or not control_path or attack_path == control_path:
+        return False, "executable-upload snapshot paths are invalid", evidence
+    before_attack = snapshots[("before", "attack")]
+    after_attack = snapshots[("after", "attack")]
+    before_control = snapshots[("before", "control")]
+    after_control = snapshots[("after", "control")]
+    attack_after = after_attack.entries.get(attack_path)
+    control_after = after_control.entries.get(control_path)
+    if (
+        attack_path in before_attack.entries
+        or control_path in before_attack.entries
+        or attack_after is None
+        or attack_after.kind != "f"
+        or attack_after.links != 1
+        or attack_after.size != len(generation.payload)
+        or attack_after.sha256 != generation.payload_sha256
+    ):
+        return False, "attack upload was not a fresh exact file", evidence
+    if (
+        before_control.entries.get(attack_path) != attack_after
+        or control_path in after_attack.entries
+        or control_path in before_control.entries
+        or control_after is None
+        or control_after.kind != "f"
+        or control_after.links != 1
+        or control_after.size != len(generation.payload)
+        or control_after.sha256 != generation.payload_sha256
+    ):
+        return False, "control upload was not a fresh exact file", evidence
+    if after_control.entries.get(attack_path) != attack_after:
+        return False, "control request changed the attack upload", evidence
+    evidence["attack_path"] = attack_path
+    evidence["control_path"] = control_path
+    evidence["payload_sha256"] = generation.payload_sha256
+    return True, "executable-upload arm snapshot transitions passed", evidence
+
+
+@dataclass(frozen=True, slots=True)
+class _ExecutableUploadTraceBinding:
+    request_url: str
+    attacker_role: str
+    attacker_user_id: int
+    attack_url: str
+    control_url: str
+    attack_status_code: int
+    control_status_code: int
+    attack_sequence: int
+    control_sequence: int
+    request_fingerprint: dict[str, object]
+    evidence: dict[str, object]
+
+
+@dataclass(frozen=True, slots=True)
+class _ExecutableUploadProbeResponse:
+    status_code: int
+    body: bytes
+    overflow: bool
+
+
+async def _read_executable_upload_probe(
+    client: httpx.AsyncClient,
+    url: str,
+    challenge: str,
+) -> _ExecutableUploadProbeResponse:
+    """Read one parent probe response with a fixed in-memory bound."""
+    payload = bytearray()
+    overflow = False
+    async with client.stream(
+        "GET",
+        url,
+        params={EXECUTABLE_UPLOAD_CHALLENGE_PARAMETER: challenge},
+        headers={"Accept-Encoding": "identity"},
+    ) as response:
+        async for chunk in response.aiter_bytes():
+            remaining = _EXECUTABLE_UPLOAD_MAX_RESPONSE_BYTES - len(payload)
+            if len(chunk) > remaining:
+                payload.extend(chunk[:remaining])
+                overflow = True
+                break
+            payload.extend(chunk)
+    return _ExecutableUploadProbeResponse(
+        status_code=response.status_code,
+        body=bytes(payload),
+        overflow=overflow,
+    )
+
+
+def _executable_upload_probe_evidence(
+    response: _ExecutableUploadProbeResponse,
+    *,
+    normalized_path: str,
+) -> dict[str, object]:
+    """Return bounded, value-free evidence for one parent-owned probe."""
+    return {
+        "path": normalized_path,
+        "status_code": response.status_code,
+        "response_complete": not response.overflow,
+        "response_size_bytes": len(response.body) if not response.overflow else None,
+        "response_sha256": (
+            hashlib.sha256(response.body).hexdigest() if not response.overflow else None
+        ),
+    }
+
+
+async def _attest_executable_upload_response_marker(
+    binding: _ExecutableUploadTraceBinding,
+    *,
+    target_url: str,
+    generation: _ExecutableUploadGeneration,
+) -> tuple[bool, str, dict[str, object]]:
+    """Prove exact uploaded bytes with a fresh post-process parent challenge."""
+    attack_url, attack_value = _validated_executable_upload_url(
+        binding.attack_url,
+        target_url=target_url,
+        expected_suffix=".php",
+    )
+    if attack_url is None:
+        return False, f"attack {attack_value}", {}
+    control_url, control_value = _validated_executable_upload_url(
+        binding.control_url,
+        target_url=target_url,
+        expected_suffix=".txt",
+    )
+    if control_url is None:
+        return False, f"control {control_value}", {}
+    attack_path = attack_value
+    control_path = control_value
+    if attack_path == control_path:
+        return (
+            False,
+            "executable-upload oracle requires distinct normalized attack/control paths",
+            {},
+        )
+
+    challenge = secrets.token_hex(32)
+    if re.fullmatch(r"[0-9a-f]{64}", challenge) is None:
+        return False, "parent executable-upload challenge generation failed", {}
+    challenge_digest = hashlib.sha256(challenge.encode("ascii")).hexdigest()
+    execution_digest = hashlib.sha256(
+        f"{generation.generation}:{challenge}".encode("ascii")
+    ).hexdigest()
+    expected_body = (
+        EXECUTABLE_UPLOAD_RESPONSE_PREFIX + execution_digest
+    ).encode("ascii")
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=False,
+            trust_env=False,
+            timeout=_EXECUTABLE_UPLOAD_PROBE_TIMEOUT_SECONDS,
+        ) as client:
+            attack_response = await _read_executable_upload_probe(
+                client,
+                attack_url,
+                challenge,
+            )
+            control_response = await _read_executable_upload_probe(
+                client,
+                control_url,
+                challenge,
+            )
+    except (httpx.HTTPError, OSError):
+        return False, "parent executable-upload HTTP probe failed", {}
+
+    evidence: dict[str, object] = {
+        "oracle": "executable_upload_response_marker",
+        "challenge_sha256": challenge_digest,
+        "payload_sha256": generation.payload_sha256,
+        "response_marker": expected_body.decode("ascii"),
+        "attack": _executable_upload_probe_evidence(
+            attack_response,
+            normalized_path=attack_path,
+        ),
+        "control": _executable_upload_probe_evidence(
+            control_response,
+            normalized_path=control_path,
+        ),
+    }
+    if (
+        attack_response.status_code != 200
+        or attack_response.overflow
+        or not hmac.compare_digest(attack_response.body, expected_body)
+    ):
+        return (
+            False,
+            "parent executable-upload attack challenge did not execute",
+            evidence,
+        )
+    if (
+        control_response.status_code != 200
+        or control_response.overflow
+        or not hmac.compare_digest(control_response.body, generation.payload)
+    ):
+        return (
+            False,
+            "parent executable-upload control did not preserve the exact inert bytes",
+            evidence,
+        )
+    return True, "parent executable-upload challenge attestation passed", evidence
+
+
+def _candidate_request_transport(
+    request: object,
+    *,
+    target_url: str,
+) -> tuple[
+    tuple[str, str, str, tuple[tuple[str, str], ...]] | None,
+    str,
+    str,
+]:
+    """Canonicalize the child's inert request pointer without trusting it."""
+    if not isinstance(request, dict) or set(request) != {"method", "url"}:
+        return None, "", "candidate request must contain only method and url"
+    method = request.get("method")
+    value = request.get("url")
+    if not isinstance(method, str) or not isinstance(value, str):
+        return None, "", "candidate request method and url must be strings"
+    if method != "POST":
+        return None, "", "candidate request method must be exact POST"
+    try:
+        parsed = urlsplit(value)
+        pairs = parse_qsl(
+            parsed.query,
+            keep_blank_values=True,
+            strict_parsing=True,
+            max_num_fields=64,
+        )
+    except (TypeError, ValueError):
+        return None, "", "candidate request URL is malformed"
+    raw_path = parsed.path or "/"
+    normalized_path = _normalize_request_path(raw_path)
+    if (
+        value != value.strip()
+        or not value.isascii()
+        or len(value.encode("ascii")) > _EXECUTABLE_UPLOAD_MAX_URL_BYTES
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+        or raw_path != normalized_path
+        or "%" in raw_path
+        or "\\" in raw_path
+        or "//" in raw_path
+        or re.search(r"%(?![0-9A-Fa-f]{2})", parsed.query) is not None
+        or normalize_trace_origin(value) != normalize_trace_origin(target_url)
+        or len({name for name, _item in pairs}) != len(pairs)
+        or any(not name or not item for name, item in pairs)
+    ):
+        return None, "", "candidate request URL is not an exact sandbox URL"
+    dispatch = {f"query:{name}": item for name, item in pairs}
+    signature = _canonical_http_transport(method, raw_path, dispatch)
+    if signature is None:
+        return None, "", "candidate request transport is malformed"
+    return signature, value, ""
+
+
+def _expected_executable_upload_transport(
+    value: object,
+) -> tuple[str, str, str, tuple[tuple[str, str], ...]] | None:
+    """Accept only one source-derived method, route, and dispatch contract."""
+    if not isinstance(value, dict) or set(value) != {"method", "route", "dispatch"}:
+        return None
+    signature = _canonical_http_transport(
+        value.get("method"),
+        value.get("route"),
+        value.get("dispatch"),
+    )
+    if (
+        signature is None
+        or signature[0] != "POST"
+        or (
+            signature[1] == "path"
+            and signature[2] in _CROSS_OBJECT_SHARED_ROUTES
+            and not signature[3]
+        )
+    ):
+        return None
+    return signature
+
+
+def _executable_upload_policy(
+    value: object,
+    generation: _ExecutableUploadGeneration,
+) -> ExecutableUploadPolicy | None:
+    """Build the proxy-private policy from one canonical source transport."""
+    signature = _expected_executable_upload_transport(value)
+    if signature is None:
+        return None
+    method, route_kind, route, dispatch = signature
+    policy_dispatch: list[tuple[str, str, str]] = []
+    for key, expected in dispatch:
+        location, separator, name = key.partition(":")
+        if not separator:
+            return None
+        policy_dispatch.append((location, name, expected))
+    try:
+        return ExecutableUploadPolicy(
+            method=method,
+            route_kind=cast(Literal["path", "wordpress_rest"], route_kind),
+            route=route,
+            dispatch=tuple(policy_dispatch),
+            payload=generation.payload,
+            attack_filename=generation.attack_filename,
+            control_filename=generation.control_filename,
+        )
+    except ValueError:
+        return None
+
+
+def _candidate_matches_executable_upload_transport(
+    candidate: tuple[str, str, str, tuple[tuple[str, str], ...]],
+    expected: tuple[str, str, str, tuple[tuple[str, str], ...]],
+) -> bool:
+    """Compare only the method/route/query facts representable in a URL."""
+    if candidate[:3] != expected[:3]:
+        return False
+    expected_query_dispatch = tuple(
+        (key, value)
+        for key, value in expected[3]
+        if key.startswith("query:")
+    )
+    return candidate[3] == expected_query_dispatch
+
+
+def _trace_matches_executable_upload_transport(
+    record: dict,
+    signature: tuple[str, str, str, tuple[tuple[str, str], ...]],
+    *,
+    trace_salt: bytes,
+    target_url: str,
+) -> bool:
+    """Bind one completed proxy record to the parent-derived upload route."""
+    method, route_kind, route_value, dispatch = signature
+    if (
+        record.get("trace_version") != 1
+        or record.get("record_type") != "request"
+        or record.get("forward_state") != "completed"
+        or record.get("forward_error") is not None
+        or record.get("terminal") is not False
+        or record.get("request_body_parse_error") is not None
+        or record.get("request_metadata_omitted") is not None
+        or record.get("response_capture_omitted") is not None
+        or record.get("origin") != normalize_trace_origin(target_url)
+        or str(record.get("method") or "").upper() != method
+    ):
+        return False
+    raw_path = str(record.get("path") or "")
+    path = _normalize_request_path(raw_path)
+    if (
+        raw_path != path
+        or "%" in raw_path
+        or "\\" in raw_path
+        or "//" in raw_path
+    ):
+        return False
+    rest_alias = False
+    if route_kind == "wordpress_rest":
+        direct_path = "/wp-json" + route_value
+        rest_digests = _trace_field_digests(record, "query", "rest_route")
+        if path == direct_path:
+            if rest_digests != []:
+                return False
+        elif path == "/":
+            rest_alias = True
+            if rest_digests != [salted_scalar_sha256(route_value, trace_salt)]:
+                return False
+        else:
+            return False
+    elif route_kind == "path":
+        if path != route_value:
+            return False
+    else:
+        return False
+    fields = record.get("fields")
+    if not isinstance(fields, list):
+        return False
+    allowed_query_names = {
+        key.split(":", 1)[1]
+        for key, _expected in dispatch
+        if key.startswith("query:")
+    }
+    if rest_alias:
+        allowed_query_names.add("rest_route")
+    if any(
+        isinstance(field, dict)
+        and field.get("location") == "query"
+        and field.get("name") not in allowed_query_names
+        for field in fields
+    ):
+        return False
+    def dispatch_locations(location: str) -> tuple[str, ...]:
+        return ("form", "multipart") if location == "form" else (location,)
+
+    if not all(
+        [
+            digest
+            for wire_location in dispatch_locations(key.split(":", 1)[0])
+            for digest in _trace_field_digests(
+                record,
+                wire_location,
+                key.split(":", 1)[1],
+            )
+        ]
+        == [salted_scalar_sha256(expected, trace_salt)]
+        for key, expected in dispatch
+    ):
+        return False
+    expected_identities = {
+        (wire_location, key.split(":", 1)[1])
+        for key, _expected in dispatch
+        for wire_location in dispatch_locations(key.split(":", 1)[0])
+    }
+    dispatch_names = {key.split(":", 1)[1] for key, _expected in dispatch}
+    return all(
+        not _trace_field_digests(record, location, name)
+        for name in dispatch_names
+        for location in _CROSS_OBJECT_FIELD_LOCATIONS
+        if (location, name) not in expected_identities
+    )
+
+
+def _trace_json_contains_exact_string(record: dict, expected: str) -> bool:
+    """Find one exact JSON string leaf in a complete parent-captured response."""
+    parts = _trace_body_parts(record)
+    if parts is None:
+        return False
+    head, tail, truncated = parts
+    if truncated or tail:
+        return False
+    try:
+        document = json.loads(head.decode("utf-8", errors="strict"))
+    except (UnicodeDecodeError, ValueError, TypeError):
+        return False
+    stack = [document]
+    visited = 0
+    matches = 0
+    while stack:
+        visited += 1
+        if visited > 10_000:
+            return False
+        item = stack.pop()
+        if isinstance(item, str):
+            matches += int(item == expected)
+        elif isinstance(item, dict):
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
+    return matches == 1
+
+
+def _executable_upload_trace_fields(
+    record: dict,
+) -> tuple[tuple[object, ...], ...] | None:
+    """Return a fully validated digest-only request-field signature."""
+    fields = record.get("fields")
+    if not isinstance(fields, list):
+        return None
+    normalized: list[tuple[object, ...]] = []
+    for field in fields:
+        if not isinstance(field, dict):
+            return None
+        location = field.get("location")
+        name = field.get("name")
+        kind = field.get("kind")
+        value_sha256 = field.get("value_sha256")
+        content_sha256 = field.get("content_sha256")
+        if (
+            location not in _CROSS_OBJECT_FIELD_LOCATIONS
+            or not isinstance(name, str)
+            or not name
+            or kind not in {"scalar", "file"}
+            or not isinstance(value_sha256, str)
+            or _SHA256_RE.fullmatch(value_sha256) is None
+            or (
+                kind == "file"
+                and (
+                    not isinstance(content_sha256, str)
+                    or _SHA256_RE.fullmatch(content_sha256) is None
+                )
+            )
+            or (kind == "scalar" and content_sha256 is not None)
+        ):
+            return None
+        normalized.append(
+            (location, name, kind, value_sha256, content_sha256 or "")
+        )
+    return tuple(sorted(normalized))
+
+
+def _upload_payload_fields(
+    fields: tuple[tuple[object, ...], ...],
+    *,
+    generation: _ExecutableUploadGeneration,
+    trace_salt: bytes,
+) -> tuple[tuple[object, ...], ...]:
+    raw_payload = generation.payload.decode("ascii")
+    scalar_digests = {
+        salted_scalar_sha256(generation.payload_b64, trace_salt),
+        salted_scalar_sha256(raw_payload, trace_salt),
+    }
+    return tuple(
+        field
+        for field in fields
+        if (
+            field[2] == "scalar"
+            and field[3] in scalar_digests
+            or field[2] == "file"
+            and field[4]
+            == salted_file_content_sha256(generation.payload, trace_salt)
+        )
+    )
+
+
+def _upload_filename_fields(
+    fields: tuple[tuple[object, ...], ...],
+    *,
+    filename: str,
+    trace_salt: bytes,
+) -> tuple[tuple[object, ...], ...]:
+    filename_digest = salted_scalar_sha256(filename, trace_salt)
+    return tuple(field for field in fields if field[3] == filename_digest)
+
+
+def _parent_actor_from_upload_record(
+    record: dict,
+    *,
+    expected_attacker_role: str,
+    receipt_secret: bytes,
+    trace_token: str,
+) -> tuple[dict | None, str]:
+    actor, reason = _decode_actor_receipt(
+        record,
+        receipt_secret=receipt_secret,
+        trace_token=trace_token,
+    )
+    if actor is None:
+        return None, reason
+    if not _receipt_has_only_expected_privileges(actor, expected_attacker_role):
+        return None, "upload trace actor did not have only the expected privileges"
+    return actor, ""
+
+
+def _prepare_executable_upload_candidate(
+    observation: PoCObservation,
+    *,
+    trace_records: list[dict],
+    trace_salt: bytes,
+    target_url: str,
+    expected_http_transport: dict[str, object] | None,
+    expected_attacker_role: str | None,
+    receipt_secret: bytes,
+    trace_token: str,
+    generation: _ExecutableUploadGeneration,
+) -> tuple[_ExecutableUploadTraceBinding | None, str]:
+    """Bind a claim-free child handoff to parent-owned upload trace facts."""
+    if (
+        len(trace_salt) < 16
+        or len(receipt_secret) < 16
+        or not trace_token
+        or normalize_attacker_role(expected_attacker_role) == UNKNOWN_ATTACKER_ROLE
+    ):
+        return None, "executable-upload parent trace context is unavailable"
+    if observation.oracle != "response_marker":
+        return None, "executable-upload candidate requires response_marker"
+    if observation.verdict != "not_vulnerable":
+        return None, (
+            "executable-upload candidate must defer the vulnerable verdict to the "
+            "parent challenge"
+        )
+    if any(
+        getattr(observation.impact, dimension) != "none"
+        for dimension in ("confidentiality", "integrity", "availability")
+    ):
+        return None, (
+            "executable-upload candidate must defer CIA impact to the parent challenge"
+        )
+    if normalize_attacker_role(observation.attacker_role) != normalize_attacker_role(
+        expected_attacker_role
+    ):
+        return None, "executable-upload candidate used the wrong attacker role"
+    for arm_name, arm in (("attack", observation.attack), ("control", observation.control)):
+        if set(arm) != _EXECUTABLE_UPLOAD_CANDIDATE_ARM_KEYS:
+            return None, (
+                f"executable-upload {arm_name} candidate must contain only "
+                "observed, marker_present, and uploaded_url"
+            )
+        if arm.get("observed") is not False or arm.get("marker_present") is not False:
+            return None, (
+                "executable-upload candidate must leave both proof arms unobserved"
+            )
+
+    expected_transport = _expected_executable_upload_transport(expected_http_transport)
+    if expected_transport is None:
+        return None, "executable-upload source transport is unavailable"
+    candidate_transport, request_url, request_error = _candidate_request_transport(
+        observation.request,
+        target_url=target_url,
+    )
+    if candidate_transport is None:
+        return None, request_error
+    if not _candidate_matches_executable_upload_transport(
+        candidate_transport,
+        expected_transport,
+    ):
+        return None, "executable-upload candidate changed the source-derived transport"
+
+    attack_url, attack_path = _validated_executable_upload_url(
+        observation.attack.get("uploaded_url"),
+        target_url=target_url,
+        expected_suffix=".php",
+    )
+    if attack_url is None:
+        return None, f"attack {attack_path}"
+    control_url, control_path = _validated_executable_upload_url(
+        observation.control.get("uploaded_url"),
+        target_url=target_url,
+        expected_suffix=".txt",
+    )
+    if control_url is None:
+        return None, f"control {control_path}"
+    if attack_path == control_path:
+        return None, "executable-upload candidate returned one path for both arms"
+
+    payload_records: list[
+        tuple[dict, tuple[tuple[object, ...], ...], tuple[tuple[object, ...], ...]]
+    ] = []
+    for record in trace_records:
+        if not isinstance(record, dict):
+            return None, "executable-upload HTTP trace contains a malformed record"
+        fields = _executable_upload_trace_fields(record)
+        if fields is None:
+            continue
+        payload_fields = _upload_payload_fields(
+            fields,
+            generation=generation,
+            trace_salt=trace_salt,
+        )
+        if not payload_fields:
+            continue
+        if len(payload_fields) != 1:
+            return None, "executable-upload request has an ambiguous payload carrier"
+        if not _trace_matches_executable_upload_transport(
+            record,
+            expected_transport,
+            trace_salt=trace_salt,
+            target_url=target_url,
+        ):
+            return None, "exact executable-upload payload used an unexpected transport"
+        payload_records.append((record, fields, payload_fields))
+    if len(payload_records) != 2:
+        return None, "executable-upload proof requires exactly two payload requests"
+
+    matched: dict[
+        str,
+        tuple[dict, tuple[tuple[object, ...], ...], dict],
+    ] = {}
+    for label, filename, uploaded_url in (
+        ("attack", generation.attack_filename, attack_url),
+        ("control", generation.control_filename, control_url),
+    ):
+        candidates: list[tuple[dict, tuple[tuple[object, ...], ...], dict]] = []
+        for record, fields, _payload_fields in payload_records:
+            filename_fields = _upload_filename_fields(
+                fields,
+                filename=filename,
+                trace_salt=trace_salt,
+            )
+            if len(filename_fields) != 1:
+                continue
+            status = record.get("status_code")
+            if (
+                not isinstance(status, int)
+                or isinstance(status, bool)
+                or not 200 <= status < 300
+                or not _trace_json_contains_exact_string(record, uploaded_url)
+            ):
+                continue
+            actor, actor_reason = _parent_actor_from_upload_record(
+                record,
+                expected_attacker_role=expected_attacker_role or "",
+                receipt_secret=receipt_secret,
+                trace_token=trace_token,
+            )
+            if actor is None:
+                return None, f"{label} {actor_reason}"
+            candidates.append((record, fields, actor))
+        if len(candidates) != 1:
+            return None, (
+                f"executable-upload trace did not uniquely bind the {label} response"
+            )
+        matched[label] = candidates[0]
+
+    attack_record, attack_fields, attack_actor = matched["attack"]
+    control_record, control_fields, control_actor = matched["control"]
+    if attack_record is control_record:
+        return None, "one executable-upload request matched both proof arms"
+    attack_sequence = attack_record.get("sequence")
+    control_sequence = control_record.get("sequence")
+    if (
+        not isinstance(attack_sequence, int)
+        or isinstance(attack_sequence, bool)
+        or not isinstance(control_sequence, int)
+        or isinstance(control_sequence, bool)
+        or control_sequence != attack_sequence + 1
+    ):
+        return None, "executable-upload attack/control request order changed"
+    if attack_actor.get("user_id") != control_actor.get("user_id"):
+        return None, "executable-upload arms used different signed actors"
+    for field_name in ("request_nonce", "request_digest"):
+        attack_value = attack_record.get(field_name)
+        control_value = control_record.get(field_name)
+        if (
+            not isinstance(attack_value, str)
+            or _SHA256_RE.fullmatch(attack_value) is None
+            or not isinstance(control_value, str)
+            or _SHA256_RE.fullmatch(control_value) is None
+            or hmac.compare_digest(attack_value, control_value)
+        ):
+            return None, (
+                "executable-upload arms lack distinct parent request bindings"
+            )
+
+    login_records = 0
+    for record in trace_records:
+        if not isinstance(record, dict):
+            return None, "executable-upload HTTP trace contains a malformed record"
+        method = str(record.get("method") or "").upper()
+        if method not in {"POST", "PUT", "PATCH", "DELETE"}:
+            continue
+        if record is attack_record or record is control_record:
+            continue
+        if (
+            method == "POST"
+            and _normalize_request_path(str(record.get("path") or ""))
+            == "/wp-login.php"
+            and isinstance(record.get("sequence"), int)
+            and not isinstance(record.get("sequence"), bool)
+            and cast(int, record["sequence"]) < attack_sequence
+            and record.get("forward_state") == "completed"
+            and record.get("forward_error") is None
+        ):
+            login_records += 1
+            continue
+        return None, (
+            "executable-upload proof used an additional mutating HTTP request"
+        )
+    if login_records > 1 or (
+        normalize_attacker_role(expected_attacker_role) == "unauthenticated"
+        and login_records
+    ):
+        return None, "executable-upload proof used an unexpected login sequence"
+
+    attack_filename_fields = set(
+        _upload_filename_fields(
+            attack_fields,
+            filename=generation.attack_filename,
+            trace_salt=trace_salt,
+        )
+    )
+    control_filename_fields = set(
+        _upload_filename_fields(
+            control_fields,
+            filename=generation.control_filename,
+            trace_salt=trace_salt,
+        )
+    )
+    if (
+        tuple(field for field in attack_fields if field not in attack_filename_fields)
+        != tuple(field for field in control_fields if field not in control_filename_fields)
+        or _trace_parameter_shape(attack_record) != _trace_parameter_shape(control_record)
+    ):
+        return None, "executable-upload arms changed fields beyond the filename"
+
+    actor_id = attack_actor.get("user_id")
+    if not isinstance(actor_id, int) or isinstance(actor_id, bool) or actor_id < 0:
+        return None, "executable-upload trace actor is malformed"
+    request_fingerprint: dict[str, object] = {
+        "method": expected_transport[0],
+        "route_kind": expected_transport[1],
+        "route": expected_transport[2],
+        "dispatch": dict(expected_transport[3]),
+    }
+    evidence: dict[str, object] = {
+        "oracle": "executable_upload_http_trace",
+        "payload_sha256": generation.payload_sha256,
+        "request_fingerprint": request_fingerprint,
+        "attack": {
+            "sequence": attack_sequence,
+            "path": attack_record.get("path"),
+            "status_code": attack_record.get("status_code"),
+            "actor_user_id": actor_id,
+            "actor_roles": attack_actor.get("roles"),
+            "uploaded_path": attack_path,
+        },
+        "control": {
+            "sequence": control_sequence,
+            "path": control_record.get("path"),
+            "status_code": control_record.get("status_code"),
+            "actor_user_id": actor_id,
+            "actor_roles": control_actor.get("roles"),
+            "uploaded_path": control_path,
+        },
+    }
+    return (
+        _ExecutableUploadTraceBinding(
+            request_url=request_url,
+            attacker_role=normalize_attacker_role(expected_attacker_role),
+            attacker_user_id=actor_id,
+            attack_url=attack_url,
+            control_url=control_url,
+            attack_status_code=cast(int, attack_record["status_code"]),
+            control_status_code=cast(int, control_record["status_code"]),
+            attack_sequence=attack_sequence,
+            control_sequence=control_sequence,
+            request_fingerprint=request_fingerprint,
+            evidence=evidence,
+        ),
+        "executable-upload candidate is bound to two signed upload requests",
+    )
+
+
+def _parent_executable_upload_observation(
+    binding: _ExecutableUploadTraceBinding,
+    *,
+    generation: _ExecutableUploadGeneration,
+    response_marker: str,
+) -> PoCObservation:
+    """Construct the final observation exclusively from parent-validated facts."""
+    actor: int | str = binding.attacker_user_id
+    if binding.attacker_role == "unauthenticated":
+        actor = "anonymous"
+    common = {
+        "attacker_user_id": actor,
+        "identity_verified": True,
+        "upload_accepted": True,
+        "payload_sha256": generation.payload_sha256,
+        "parent_attestation": "executable_upload_v1",
+        "request_fingerprint": binding.request_fingerprint,
+    }
+    return PoCObservation(
+        verdict="vulnerable",
+        oracle="response_marker",
+        attacker_role=binding.attacker_role,
+        request={"method": "POST", "url": binding.request_url},
+        attack={
+            **common,
+            "observed": True,
+            "marker": response_marker,
+            "marker_present": True,
+            "uploaded_url": binding.attack_url,
+            "status_code": binding.attack_status_code,
+            "upload_filename": generation.attack_filename,
+        },
+        control={
+            **common,
+            "observed": False,
+            "marker_present": False,
+            "uploaded_url": binding.control_url,
+            "status_code": binding.control_status_code,
+            "upload_filename": generation.control_filename,
+        },
+        impact=CIAImpact(
+            confidentiality="high",
+            integrity="high",
+            availability="high",
+            description=EXECUTABLE_UPLOAD_IMPACT_DESCRIPTION,
+        ),
+    )
+
+
+async def _attest_executable_upload_filesystem(
+    binding: _ExecutableUploadTraceBinding,
+    *,
+    container_name: str,
+    generation: _ExecutableUploadGeneration,
+) -> tuple[bool, str, dict[str, object]]:
+    """Re-measure the two exact files through the bounded PHP manifest."""
+    try:
+        snapshot = await _snapshot_executable_upload_filesystem(
+            container_name=container_name,
+            generation=generation,
+        )
+    except RuntimeError:
+        return False, "parent executable-upload filesystem is unavailable", {}
+    measurements: dict[str, object] = {}
+    for label, url in (("attack", binding.attack_url), ("control", binding.control_url)):
+        path = _executable_upload_relative_path(url)
+        entry = snapshot.entries.get(path)
+        if (
+            not path
+            or entry is None
+            or entry.kind != "f"
+            or entry.links != 1
+            or entry.size != len(generation.payload)
+            or entry.sha256 != generation.payload_sha256
+        ):
+            return (
+                False,
+                f"parent executable-upload {label} filesystem metadata mismatch",
+                measurements,
+            )
+        measurements[label] = {
+            "path": urlsplit(url).path,
+            "file_type": "regular",
+            "link_count": entry.links,
+            "owner_uid": entry.uid,
+            "owner_gid": entry.gid,
+            "mode": entry.mode,
+            "size_bytes": entry.size,
+            "sha256": entry.sha256,
+            "inode": entry.inode,
+        }
+    return True, "parent executable-upload filesystem attestation passed", measurements
 
 
 def _validate_cross_object_observation(
@@ -3654,6 +5767,1452 @@ def validate_ssrf_response_marker_http_trace(
     return True, success_reason, evidence
 
 
+def _php_include_attestation_scalar_shape_is_valid(
+    snapshot: PhpIncludeOracleSnapshot,
+    provisioning: PhpIncludeProvisioningAttestation,
+    verification: PhpIncludeVerificationAttestation,
+    filesystems: tuple[
+        PhpIncludeFilesystemAttestation,
+        PhpIncludeFilesystemAttestation,
+        PhpIncludeFilesystemAttestation,
+    ],
+    host_filesystems: tuple[
+        PhpIncludeHostFilesystemAttestation,
+        PhpIncludeHostFilesystemAttestation,
+        PhpIncludeHostFilesystemAttestation,
+    ],
+) -> bool:
+    """Reject object-level attestation corruption before typed comparisons."""
+    try:
+        string_values = (
+            snapshot.mode,
+            snapshot.generation_id,
+            provisioning.generation_id,
+            provisioning.attack_basename_sha256,
+            provisioning.control_basename_sha256,
+            provisioning.header_name_sha256,
+            provisioning.marker_sha256,
+            verification.generation_id,
+            *(
+                value
+                for filesystem in filesystems
+                for value in (
+                    filesystem.attack_path_sha256,
+                    filesystem.control_path_sha256,
+                    filesystem.attack_content_sha256,
+                )
+            ),
+            *(
+                value
+                for filesystem in host_filesystems
+                for value in (
+                    filesystem.host_identity_sha256,
+                    filesystem.attack_content_sha256,
+                )
+            ),
+        )
+        integer_values = (
+            snapshot.schema_version,
+            provisioning.schema_version,
+            provisioning.started_monotonic_ns,
+            verification.schema_version,
+            verification.execution_started_monotonic_ns,
+            verification.execution_finished_monotonic_ns,
+            *(
+                value
+                for filesystem in filesystems
+                for value in (
+                    filesystem.schema_version,
+                    filesystem.attack_content_size_bytes,
+                    filesystem.attack_owner_uid,
+                    filesystem.attack_owner_gid,
+                    filesystem.attack_file_mode,
+                    filesystem.attack_link_count,
+                    filesystem.measured_monotonic_ns,
+                )
+            ),
+            *(
+                value
+                for filesystem in host_filesystems
+                for value in (
+                    filesystem.schema_version,
+                    filesystem.attack_content_size_bytes,
+                    filesystem.attack_file_mode,
+                    filesystem.attack_link_count,
+                    filesystem.measured_monotonic_ns,
+                )
+            ),
+        )
+        boolean_values = (
+            *(
+                value
+                for filesystem in filesystems
+                for value in (
+                    filesystem.attack_is_regular_file,
+                    filesystem.attack_is_symlink,
+                    filesystem.control_lstat_exists,
+                )
+            ),
+            *(
+                value
+                for filesystem in host_filesystems
+                for value in (
+                    filesystem.attack_owner_matches_verifier,
+                    filesystem.attack_is_regular_file,
+                    filesystem.attack_is_symlink,
+                    filesystem.control_lstat_exists,
+                )
+            ),
+        )
+    except AttributeError:
+        return False
+    return (
+        all(type(value) is str for value in string_values)
+        and all(type(value) is int for value in integer_values)
+        and all(type(value) is bool for value in boolean_values)
+    )
+
+
+def _validate_php_include_oracle_snapshot(
+    snapshot: object,
+    *,
+    marker: str,
+    expected_generation_id: str,
+    attack_path: str,
+    control_path: str,
+    attack_record: dict,
+    control_record: dict,
+) -> tuple[bool, str, dict[str, object]]:
+    """Bind immutable canary state to the two supervised HTTP requests."""
+    if type(snapshot) is not PhpIncludeOracleSnapshot:
+        return False, "PHP include snapshot has an invalid type", {}
+    try:
+        provisioning = snapshot.provisioning
+        verification = snapshot.verification
+        provisioning_filesystem = provisioning.filesystem
+        provisioning_host_filesystem = provisioning.host_filesystem
+        verification_before = verification.before
+        verification_host_before = verification.host_before
+        verification_after = verification.after
+        verification_host_after = verification.host_after
+    except AttributeError:
+        return False, "PHP include attestation shape is invalid", {}
+    if (
+        type(provisioning) is not PhpIncludeProvisioningAttestation
+        or type(verification) is not PhpIncludeVerificationAttestation
+        or type(provisioning_filesystem) is not PhpIncludeFilesystemAttestation
+        or type(verification_before) is not PhpIncludeFilesystemAttestation
+        or type(verification_after) is not PhpIncludeFilesystemAttestation
+        or type(provisioning_host_filesystem) is not PhpIncludeHostFilesystemAttestation
+        or type(verification_host_before) is not PhpIncludeHostFilesystemAttestation
+        or type(verification_host_after) is not PhpIncludeHostFilesystemAttestation
+    ):
+        return False, "PHP include attestation shape is invalid", {}
+
+    attack_interval = _ssrf_upstream_interval(attack_record)
+    control_interval = _ssrf_upstream_interval(control_record)
+    if attack_interval is None or control_interval is None:
+        return False, "PHP include parent intervals are invalid", {}
+    if (
+        type(marker) is not str
+        or _PHP_INCLUDE_MARKER_RE.fullmatch(marker) is None
+        or type(expected_generation_id) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", expected_generation_id) is None
+        or type(attack_path) is not str
+        or type(control_path) is not str
+    ):
+        return False, "PHP include oracle values are invalid", {}
+    try:
+        marker_bytes = marker.encode("ascii", errors="strict")
+        attack_bytes = attack_path.encode("ascii", errors="strict")
+        control_bytes = control_path.encode("ascii", errors="strict")
+    except UnicodeEncodeError:
+        return False, "PHP include oracle values are invalid", {}
+    expected_content = (
+        f"<?php\nheader('{PHP_INCLUDE_ORACLE_HEADER_NAME}: {marker}');\nreturn;\n"
+    ).encode("ascii")
+    marker_sha256 = hashlib.sha256(marker_bytes).hexdigest()
+    attack_path_sha256 = hashlib.sha256(attack_bytes).hexdigest()
+    control_path_sha256 = hashlib.sha256(control_bytes).hexdigest()
+    attack_basename_sha256 = hashlib.sha256(
+        PurePosixPath(attack_path).name.encode("ascii")
+    ).hexdigest()
+    control_basename_sha256 = hashlib.sha256(
+        PurePosixPath(control_path).name.encode("ascii")
+    ).hexdigest()
+    header_sha256 = hashlib.sha256(
+        PHP_INCLUDE_ORACLE_HEADER_NAME.encode("ascii")
+    ).hexdigest()
+    content_sha256 = hashlib.sha256(expected_content).hexdigest()
+    filesystems = (
+        provisioning_filesystem,
+        verification_before,
+        verification_after,
+    )
+    host_filesystems = (
+        provisioning_host_filesystem,
+        verification_host_before,
+        verification_host_after,
+    )
+    if not _php_include_attestation_scalar_shape_is_valid(
+        snapshot,
+        provisioning,
+        verification,
+        filesystems,
+        host_filesystems,
+    ):
+        return False, "PHP include attestation scalar shape is invalid", {}
+    now_monotonic_ns = time.monotonic_ns()
+    stable_filesystem_fields = {
+        "schema_version",
+        "attack_path_sha256",
+        "control_path_sha256",
+        "attack_content_sha256",
+        "attack_content_size_bytes",
+        "attack_file_mode",
+        "attack_link_count",
+        "attack_is_regular_file",
+        "attack_is_symlink",
+        "control_lstat_exists",
+    }
+    stable_host_filesystem_fields = {
+        "schema_version",
+        "host_identity_sha256",
+        "attack_content_sha256",
+        "attack_content_size_bytes",
+        "attack_owner_matches_verifier",
+        "attack_file_mode",
+        "attack_link_count",
+        "attack_is_regular_file",
+        "attack_is_symlink",
+        "control_lstat_exists",
+    }
+    try:
+        stable_states = [
+            {
+                key: value
+                for key, value in filesystem.as_dict().items()
+                if key in stable_filesystem_fields
+            }
+            for filesystem in filesystems
+        ]
+        stable_host_states = [
+            {
+                key: value
+                for key, value in filesystem.as_dict().items()
+                if key in stable_host_filesystem_fields
+            }
+            for filesystem in host_filesystems
+        ]
+    except AttributeError:
+        return False, "PHP include attestation scalar shape is invalid", {}
+    if (
+        PHP_INCLUDE_RECEIPT_HEADER != PHP_INCLUDE_ORACLE_HEADER_NAME
+        or snapshot.schema_version != 1
+        or snapshot.mode != PHP_INCLUDE_ORACLE_MODE
+        or re.fullmatch(r"[0-9a-f]{64}", snapshot.generation_id) is None
+        or not hmac.compare_digest(snapshot.generation_id, expected_generation_id)
+        or provisioning.schema_version != 1
+        or re.fullmatch(r"[0-9a-f]{64}", provisioning.generation_id) is None
+        or not hmac.compare_digest(provisioning.generation_id, expected_generation_id)
+        or verification.schema_version != 1
+        or re.fullmatch(r"[0-9a-f]{64}", verification.generation_id) is None
+        or not hmac.compare_digest(verification.generation_id, expected_generation_id)
+        or re.fullmatch(r"[0-9a-f]{64}", provisioning.attack_basename_sha256) is None
+        or not hmac.compare_digest(
+            provisioning.attack_basename_sha256, attack_basename_sha256
+        )
+        or re.fullmatch(r"[0-9a-f]{64}", provisioning.control_basename_sha256) is None
+        or not hmac.compare_digest(
+            provisioning.control_basename_sha256, control_basename_sha256
+        )
+        or re.fullmatch(r"[0-9a-f]{64}", provisioning.header_name_sha256) is None
+        or not hmac.compare_digest(provisioning.header_name_sha256, header_sha256)
+        or re.fullmatch(r"[0-9a-f]{64}", provisioning.marker_sha256) is None
+        or not hmac.compare_digest(provisioning.marker_sha256, marker_sha256)
+        or verification.before != provisioning.filesystem
+        or verification.host_before != provisioning.host_filesystem
+        or stable_states[0] != stable_states[1]
+        or stable_states[1] != stable_states[2]
+        or stable_host_states[0] != stable_host_states[1]
+        or stable_host_states[1] != stable_host_states[2]
+        or any(
+            filesystem.schema_version != 1
+            or re.fullmatch(r"[0-9a-f]{64}", filesystem.attack_path_sha256) is None
+            or not hmac.compare_digest(
+                filesystem.attack_path_sha256, attack_path_sha256
+            )
+            or re.fullmatch(r"[0-9a-f]{64}", filesystem.control_path_sha256) is None
+            or not hmac.compare_digest(
+                filesystem.control_path_sha256, control_path_sha256
+            )
+            or re.fullmatch(r"[0-9a-f]{64}", filesystem.attack_content_sha256) is None
+            or not hmac.compare_digest(filesystem.attack_content_sha256, content_sha256)
+            or filesystem.attack_content_size_bytes != len(expected_content)
+            or filesystem.attack_owner_uid < 0
+            or filesystem.attack_owner_gid < 0
+            or filesystem.attack_file_mode != PHP_INCLUDE_ORACLE_FILE_MODE
+            or filesystem.attack_link_count != 1
+            or filesystem.attack_is_regular_file is not True
+            or filesystem.attack_is_symlink is not False
+            or filesystem.control_lstat_exists is not False
+            or filesystem.measured_monotonic_ns < 1
+            or filesystem.measured_monotonic_ns > now_monotonic_ns
+            for filesystem in filesystems
+        )
+        or any(
+            filesystem.schema_version != 1
+            or re.fullmatch(r"[0-9a-f]{64}", filesystem.host_identity_sha256) is None
+            or not hmac.compare_digest(
+                filesystem.host_identity_sha256,
+                provisioning_host_filesystem.host_identity_sha256,
+            )
+            or re.fullmatch(r"[0-9a-f]{64}", filesystem.attack_content_sha256) is None
+            or not hmac.compare_digest(
+                filesystem.attack_content_sha256,
+                content_sha256,
+            )
+            or filesystem.attack_content_size_bytes != len(expected_content)
+            or filesystem.attack_owner_matches_verifier is not True
+            or filesystem.attack_file_mode != PHP_INCLUDE_ORACLE_FILE_MODE
+            or filesystem.attack_link_count != 1
+            or filesystem.attack_is_regular_file is not True
+            or filesystem.attack_is_symlink is not False
+            or filesystem.control_lstat_exists is not False
+            or filesystem.measured_monotonic_ns < 1
+            or filesystem.measured_monotonic_ns > now_monotonic_ns
+            for filesystem in host_filesystems
+        )
+        or any(
+            not hmac.compare_digest(
+                filesystem.attack_content_sha256,
+                host_filesystem.attack_content_sha256,
+            )
+            or filesystem.attack_content_size_bytes
+            != host_filesystem.attack_content_size_bytes
+            or filesystem.attack_file_mode != host_filesystem.attack_file_mode
+            or filesystem.attack_link_count != host_filesystem.attack_link_count
+            or filesystem.attack_is_regular_file
+            is not host_filesystem.attack_is_regular_file
+            or filesystem.attack_is_symlink is not host_filesystem.attack_is_symlink
+            or filesystem.control_lstat_exists
+            is not host_filesystem.control_lstat_exists
+            for filesystem, host_filesystem in zip(filesystems, host_filesystems)
+        )
+        or provisioning.started_monotonic_ns < 1
+        or provisioning.started_monotonic_ns > now_monotonic_ns
+        or provisioning.filesystem.measured_monotonic_ns
+        < provisioning.started_monotonic_ns
+        or provisioning.host_filesystem.measured_monotonic_ns
+        < provisioning.started_monotonic_ns
+        or provisioning.host_filesystem.measured_monotonic_ns
+        > provisioning.filesystem.measured_monotonic_ns
+        or verification.execution_started_monotonic_ns
+        < provisioning.filesystem.measured_monotonic_ns
+        or verification.execution_started_monotonic_ns
+        < provisioning.host_filesystem.measured_monotonic_ns
+        or verification.execution_started_monotonic_ns > now_monotonic_ns
+        or attack_interval[0] < verification.execution_started_monotonic_ns
+        or attack_interval[1] > control_interval[0]
+        or control_interval[1] > verification.execution_finished_monotonic_ns
+        or verification.execution_finished_monotonic_ns
+        < verification.execution_started_monotonic_ns
+        or verification.execution_finished_monotonic_ns > now_monotonic_ns
+        or control_interval[1] > now_monotonic_ns
+        or verification.after.measured_monotonic_ns
+        < verification.execution_finished_monotonic_ns
+        or verification.host_after.measured_monotonic_ns
+        < verification.execution_finished_monotonic_ns
+        or verification.host_after.measured_monotonic_ns
+        > verification.after.measured_monotonic_ns
+    ):
+        return False, "PHP include attestation is invalid or non-causal", {}
+    return (
+        True,
+        "PHP include canary attestation passed",
+        {
+            "mode": PHP_INCLUDE_ORACLE_MODE,
+            "generation_id_sha256": hashlib.sha256(
+                expected_generation_id.encode("ascii")
+            ).hexdigest(),
+            "attack_path_sha256": attack_path_sha256,
+            "control_path_sha256": control_path_sha256,
+            "marker_sha256": marker_sha256,
+            "file_mode": provisioning.host_filesystem.attack_file_mode,
+            "host_identity_sha256": (provisioning.host_filesystem.host_identity_sha256),
+            "host_identity_stable": True,
+            "host_owner_verified": True,
+            "control_lstat_exists": False,
+        },
+    )
+
+
+def validate_php_include_response_marker_http_trace(
+    observation: PoCObservation,
+    trace_records: list[dict],
+    *,
+    trace_salt: bytes,
+    target_url: str,
+    receipt_secret: bytes,
+    trace_token: str,
+    oracle_attack_path: str,
+    oracle_control_path: str,
+    oracle_marker: str,
+    oracle_snapshot: object,
+    oracle_generation_id: str,
+    expected_http_transport: dict[str, object] | None = None,
+    trace_error: str = "",
+) -> tuple[bool, str, dict]:
+    """Prove one request-selected PHP include using a private parent canary."""
+    if trace_error:
+        return False, f"PHP include HTTP trace failed: {trace_error}", {}
+    if (
+        type(oracle_marker) is not str
+        or _PHP_INCLUDE_MARKER_RE.fullmatch(oracle_marker) is None
+        or type(oracle_attack_path) is not str
+        or re.fullmatch(
+            re.escape(PHP_INCLUDE_ORACLE_DIRECTORY) + r"/[0-9a-f]{64}\.php",
+            oracle_attack_path,
+        )
+        is None
+        or type(oracle_control_path) is not str
+        or re.fullmatch(
+            re.escape(PHP_INCLUDE_ORACLE_DIRECTORY) + r"/[0-9a-f]{64}\.php",
+            oracle_control_path,
+        )
+        is None
+        or hmac.compare_digest(oracle_attack_path, oracle_control_path)
+    ):
+        return False, "PHP include parent oracle contract is invalid", {}
+
+    attack = observation.attack
+    control = observation.control
+    marker = attack.get("marker")
+    if not isinstance(marker, str) or not hmac.compare_digest(marker, oracle_marker):
+        return False, "PHP include marker does not match the private canary", {}
+    if observation.impact.confidentiality != "low":
+        return False, "PHP include canary evidence requires confidentiality=low", {}
+    if (
+        observation.impact.integrity != "none"
+        or observation.impact.availability != "none"
+    ):
+        return False, "PHP include canary proves confidentiality only", {}
+    if (
+        attack.get("identity_verified") is not True
+        or control.get("identity_verified") is not True
+    ):
+        return False, "PHP include proof lacks verified arm identities", {}
+    if attack.get("include_path") != oracle_attack_path:
+        return False, "PHP include attack path does not match the parent canary", {}
+    if control.get("include_path") != oracle_control_path:
+        return False, "PHP include control path does not match the absent sibling", {}
+    attack_value = attack.get("destination_value")
+    control_value = control.get("destination_value")
+    if (
+        not isinstance(attack_value, str)
+        or not attack_value
+        or not isinstance(control_value, str)
+        or not control_value
+        or hmac.compare_digest(attack_value, control_value)
+    ):
+        return False, "PHP include destination values are missing or identical", {}
+    attack_stem = PurePosixPath(oracle_attack_path).stem
+    control_stem = PurePosixPath(oracle_control_path).stem
+    if (
+        attack_value.count(attack_stem) != 1
+        or control_value.count(control_stem) != 1
+        or control_stem in attack_value
+        or attack_stem in control_value
+        or attack_value.replace(attack_stem, "{php_include_path}")
+        != control_value.replace(control_stem, "{php_include_path}")
+    ):
+        return (
+            False,
+            "PHP include attack/control destinations change more than the path token",
+            {},
+        )
+
+    attack_signature = _ssrf_request_signature(attack.get("request_fingerprint"))
+    control_signature = _ssrf_request_signature(control.get("request_fingerprint"))
+    if attack_signature is None or control_signature is None:
+        return False, "PHP include request fingerprint is invalid", {}
+    if attack_signature != control_signature:
+        return False, "PHP include attack/control request fingerprints differ", {}
+    expected_transports = _expected_http_transport_signatures(expected_http_transport)
+    if not expected_transports:
+        return False, "PHP include hypothesis HTTP transport is missing or invalid", {}
+    observed_transport = _canonical_http_transport(
+        attack_signature[0],
+        attack_signature[1],
+        dict(cast(tuple[tuple[str, str], ...], attack_signature[4])),
+    )
+    if (
+        observed_transport is None
+        or (
+            *observed_transport,
+            str(attack_signature[2]),
+            str(attack_signature[3]),
+        )
+        not in expected_transports
+    ):
+        return (
+            False,
+            "PHP include request transport does not match the hypothesis entry point",
+            {},
+        )
+
+    method, route = str(attack_signature[0]), str(attack_signature[1])
+    request_method = str(observation.request.get("method") or "").strip().upper()
+    request_url = str(observation.request.get("url") or "").strip()
+    target_origin = normalize_trace_origin(target_url)
+    if (
+        not target_origin
+        or normalize_trace_origin(request_url) != target_origin
+        or request_method != method
+        or _normalize_request_path(urlsplit(request_url).path) != route
+        or urlsplit(request_url).query
+        or urlsplit(request_url).fragment
+    ):
+        return (
+            False,
+            "PHP include reported request does not match its fingerprint or sandbox",
+            {},
+        )
+    attack_user_id = _trace_claimed_user_id(
+        attack.get("attacker_user_id"), observation.attacker_role
+    )
+    control_user_id = _trace_claimed_user_id(
+        control.get("attacker_user_id"), observation.attacker_role
+    )
+    if attack_user_id is None or attack_user_id != control_user_id:
+        return False, "PHP include attack/control actor is invalid or changed", {}
+
+    target_records = [
+        record
+        for record in trace_records
+        if isinstance(record, dict) and record.get("origin") == target_origin
+    ]
+    if len(target_records) != len(trace_records):
+        return False, "PHP include HTTP trace contains an invalid-origin record", {}
+    if [record.get("sequence") for record in target_records] != list(
+        range(1, len(target_records) + 1)
+    ):
+        return False, "PHP include HTTP trace is incomplete or unordered", {}
+    if any(_record_has_request_sentinel(record) for record in target_records):
+        return False, "PHP include HTTP trace contains a sentinel-bearing request", {}
+
+    common = {
+        "trace_salt": trace_salt,
+        "target_origin": target_origin,
+        "receipt_secret": receipt_secret,
+        "trace_token": trace_token,
+    }
+    trace_signature = _ssrf_trace_signature(attack_signature)
+    allow_credential_free = _allows_credential_free_direct_ssrf(
+        expected_http_transport,
+        observation.attacker_role,
+    )
+    attack_matches = _matching_trace_requests(
+        trace_records,
+        trace_signature,
+        object_id=attack_value,
+        expected_user_id=attack_user_id,
+        expected_role=observation.attacker_role,
+        allow_credential_free_unauthenticated=allow_credential_free,
+        **common,
+    )
+    control_matches = _matching_trace_requests(
+        trace_records,
+        trace_signature,
+        object_id=control_value,
+        expected_user_id=control_user_id,
+        expected_role=observation.attacker_role,
+        allow_credential_free_unauthenticated=allow_credential_free,
+        **common,
+    )
+    attack_binding, reason = _one_trace_match(attack_matches, "PHP include attack")
+    if attack_binding is None:
+        return False, reason, {}
+    control_binding, reason = _one_trace_match(control_matches, "PHP include control")
+    if control_binding is None:
+        return False, reason, {}
+    if attack_binding["sequence"] >= control_binding["sequence"]:
+        return False, "PHP include attack request must precede its control", {}
+    causal_sequences = {
+        record.get("sequence")
+        for record in target_records
+        if attack_binding["sequence"]
+        <= int(record.get("sequence") or 0)
+        <= control_binding["sequence"]
+    }
+    if causal_sequences != {
+        attack_binding["sequence"],
+        control_binding["sequence"],
+    } or control_binding["sequence"] != len(target_records):
+        return False, "PHP include proof contains extra causal target traffic", {}
+    if attack_binding["parameter_shape"] != control_binding["parameter_shape"]:
+        return False, "PHP include attack/control parameter shapes differ", {}
+    if attack_binding["actor"].get("user_id") != control_binding["actor"].get(
+        "user_id"
+    ) or attack_binding["actor"].get("roles") != control_binding["actor"].get("roles"):
+        return False, "PHP include signed attack/control actors differ", {}
+    attack_provenance = attack_binding["actor"].get("provenance")
+    control_provenance = control_binding["actor"].get("provenance")
+    if (
+        attack_provenance not in {"signed_receipt", "credential_free_transport"}
+        or attack_provenance != control_provenance
+        or not _receipt_has_only_expected_privileges(
+            attack_binding["actor"], observation.attacker_role
+        )
+        or not _receipt_has_only_expected_privileges(
+            control_binding["actor"], observation.attacker_role
+        )
+    ):
+        return False, "PHP include actors exceed or change the expected role", {}
+
+    if attack_provenance == "credential_free_transport":
+        if (
+            not allow_credential_free
+            or len(target_records) != 2
+            or [record.get("sequence") for record in target_records] != [1, 2]
+            or cast(tuple[tuple[str, str], ...], attack_signature[5])
+        ):
+            return False, "credential-free PHP include proof has extra traffic", {}
+        expected_fields = {
+            (str(attack_signature[3]), str(attack_signature[2])),
+            *(
+                tuple(str(key).split(":", 1))
+                for key, _value in cast(
+                    tuple[tuple[str, str], ...],
+                    attack_signature[4],
+                )
+            ),
+        }
+        for binding in (attack_binding, control_binding):
+            fields = tuple(binding["field_signature"])
+            observed_fields = [(str(field[0]), str(field[1])) for field in fields]
+            if (
+                len(fields) != len(expected_fields)
+                or len(observed_fields) != len(set(observed_fields))
+                or set(observed_fields) != expected_fields
+                or any(field[2] != "scalar" for field in fields)
+            ):
+                return (
+                    False,
+                    "credential-free PHP include request contains undeclared fields",
+                    {},
+                )
+
+    for record in target_records:
+        sequence = int(record.get("sequence") or 0)
+        if "response_php_include_receipt" not in record:
+            return False, "PHP include receipt trace field is missing", {}
+        if (
+            sequence != attack_binding["sequence"]
+            and record.get("response_php_include_receipt") is not None
+        ):
+            return False, "PHP include receipt appeared outside the attack arm", {}
+        if sequence >= attack_binding["sequence"]:
+            continue
+        if record.get("response_actor_receipt") is None:
+            continue
+        preproof_actor, _actor_reason = _decode_actor_receipt(
+            record,
+            receipt_secret=receipt_secret,
+            trace_token=trace_token,
+        )
+        if preproof_actor is None:
+            return False, "PHP include pre-proof actor receipt is untrusted", {}
+        if preproof_actor.get("user_id") == 0 and not preproof_actor.get("roles"):
+            continue
+        if preproof_actor.get(
+            "user_id"
+        ) != attack_user_id or not _receipt_has_only_expected_privileges(
+            preproof_actor,
+            observation.attacker_role,
+        ):
+            return False, "PHP include pre-proof traffic used an elevated actor", {}
+
+    if attack_provenance == "signed_receipt":
+        if attack_binding["actor"].get("nonce") == control_binding["actor"].get(
+            "nonce"
+        ) or attack_binding["actor"].get("request_nonce") == control_binding[
+            "actor"
+        ].get("request_nonce"):
+            return False, "PHP include HTTP trace reused a signed request nonce", {}
+    else:
+        attack_nonce = attack_binding["record"].get("request_nonce")
+        control_nonce = control_binding["record"].get("request_nonce")
+        attack_digest = attack_binding["record"].get("request_digest")
+        control_digest = control_binding["record"].get("request_digest")
+        if (
+            not isinstance(attack_nonce, str)
+            or re.fullmatch(r"[0-9a-f]{64}", attack_nonce) is None
+            or not isinstance(control_nonce, str)
+            or re.fullmatch(r"[0-9a-f]{64}", control_nonce) is None
+            or hmac.compare_digest(attack_nonce, control_nonce)
+            or not isinstance(attack_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", attack_digest) is None
+            or not isinstance(control_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", control_digest) is None
+            or hmac.compare_digest(attack_digest, control_digest)
+        ):
+            return False, "credential-free PHP include binding is invalid", {}
+
+    labels = frozenset({"php_include_attack_path", "php_include_control_path"})
+    occurrences: list[tuple[int, str, str, str]] = []
+    for record in target_records:
+        tracked = _trace_tracked_capability_fields(
+            record,
+            allowed_labels=labels,
+        )
+        if tracked is None:
+            return False, "PHP include capability trace is malformed", {}
+        sequence = int(record.get("sequence") or 0)
+        occurrences.extend(
+            (sequence, location, name, label) for location, name, label in tracked
+        )
+    destination_location = str(attack_signature[3])
+    destination_parameter = str(attack_signature[2])
+    expected_occurrences = [
+        (
+            attack_binding["sequence"],
+            destination_location,
+            destination_parameter,
+            "php_include_attack_path",
+        ),
+        (
+            control_binding["sequence"],
+            destination_location,
+            destination_parameter,
+            "php_include_control_path",
+        ),
+    ]
+    if occurrences != expected_occurrences:
+        return (
+            False,
+            "PHP include path capability appears outside its exact destination arm",
+            {},
+        )
+
+    values_ok, values_reason = _ssrf_request_values_match(
+        attack_binding,
+        control_binding,
+        attack_signature,
+        attack_url=attack_value,
+        control_url=control_value,
+        trace_salt=trace_salt,
+    )
+    if not values_ok:
+        return False, values_reason.replace("SSRF", "PHP include"), {}
+    attack_header_digest = attack_binding["record"].get("request_headers_sha256")
+    control_header_digest = control_binding["record"].get("request_headers_sha256")
+    if (
+        not isinstance(attack_header_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", attack_header_digest) is None
+        or not isinstance(control_header_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", control_header_digest) is None
+        or not hmac.compare_digest(attack_header_digest, control_header_digest)
+    ):
+        return False, "PHP include attack/control request headers differ", {}
+    if attack_binding["record"].get("response_php_include_receipt") != oracle_marker:
+        return False, "PHP include attack response lacks the private receipt", {}
+    if control_binding["record"].get("response_php_include_receipt") is not None:
+        return False, "PHP include control response contains a receipt", {}
+
+    snapshot_ok, snapshot_reason, snapshot_evidence = (
+        _validate_php_include_oracle_snapshot(
+            oracle_snapshot,
+            marker=oracle_marker,
+            expected_generation_id=oracle_generation_id,
+            attack_path=oracle_attack_path,
+            control_path=oracle_control_path,
+            attack_record=attack_binding["record"],
+            control_record=control_binding["record"],
+        )
+    )
+    if not snapshot_ok:
+        return False, snapshot_reason, {}
+    return (
+        True,
+        "PHP include receipt, HTTP trace, actor, control, and attestation passed",
+        {
+            "oracle": "php_include_response_marker",
+            "destination_field": {
+                "location": destination_location,
+                "name": destination_parameter,
+            },
+            "attack_request": _sanitized_trace_binding(attack_binding),
+            "control_request": _sanitized_trace_binding(control_binding),
+            "php_include_attestation": snapshot_evidence,
+        },
+    )
+
+
+def _php_object_request_signature(value: object) -> tuple[object, ...] | None:
+    """Canonicalize the model-visible request identity for both oracle arms."""
+    if not isinstance(value, dict) or set(value) != _PHP_OBJECT_FINGERPRINT_FIELDS:
+        return None
+    method = value.get("method")
+    route_value = value.get("route")
+    object_field = value.get("object_field")
+    object_location = value.get("object_location")
+    if (
+        not isinstance(method, str)
+        or not method.strip()
+        or not isinstance(route_value, str)
+        or not route_value.strip()
+        or not isinstance(object_field, str)
+        or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", object_field) is None
+        or object_location != "form"
+    ):
+        return None
+    route = _normalize_request_path(route_value)
+    if (
+        not route
+        or route != route_value
+        or urlparse(route_value).query
+        or urlparse(route_value).fragment
+    ):
+        return None
+    dispatch = _cross_object_dispatch_signature(value.get("dispatch"))
+    if dispatch is None:
+        return None
+    if any(key == f"form:{object_field}" for key, _expected in dispatch):
+        return None
+    return method.strip().upper(), route, object_field, "form", dispatch
+
+
+def _validate_php_object_observation(
+    observation: PoCObservation,
+) -> tuple[bool, str]:
+    """Validate only the inert object-instantiation primitive claimed by a PoC."""
+    attack = observation.attack
+    control = observation.control
+    if set(observation.request) != {"method", "url"}:
+        return False, "object request contains unsupported claims"
+    if (
+        set(attack) != _PHP_OBJECT_OBSERVATION_FIELDS
+        or set(control) != _PHP_OBJECT_OBSERVATION_FIELDS
+    ):
+        return False, "object attack/control contains unsupported claims"
+    if attack.get("instantiated") is not True:
+        return False, "object attack did not report instantiated=true"
+    if control.get("instantiated") is not False:
+        return False, "object control did not report instantiated=false"
+    if (
+        attack.get("effect") != "verifier_inert_canary_wakeup"
+        or control.get("effect") != "verifier_inert_canary_wakeup"
+    ):
+        return False, "object attack/control effect exceeds the inert canary"
+    if (
+        attack.get("identity_verified") is not True
+        or control.get("identity_verified") is not True
+    ):
+        return False, "object attack/control identity is not verified"
+    attack_actor = _trace_claimed_user_id(
+        attack.get("attacker_user_id"), observation.attacker_role
+    )
+    control_actor = _trace_claimed_user_id(
+        control.get("attacker_user_id"), observation.attacker_role
+    )
+    if attack_actor is None or control_actor is None or attack_actor != control_actor:
+        return False, "object attack/control actor is invalid or changed"
+    attack_request = _php_object_request_signature(attack.get("request_fingerprint"))
+    control_request = _php_object_request_signature(control.get("request_fingerprint"))
+    if attack_request is None or control_request is None:
+        return False, "object attack/control request fingerprint is invalid"
+    if attack_request != control_request:
+        return False, "object attack/control request fingerprints differ"
+    top_level_method = str(observation.request.get("method") or "").strip().upper()
+    top_level_path = _normalize_request_path(
+        urlparse(str(observation.request.get("url") or "")).path
+    )
+    if attack_request[0] != top_level_method or attack_request[1] != top_level_path:
+        return False, "object request fingerprint does not match request"
+    if (
+        observation.impact.confidentiality != "none"
+        or observation.impact.integrity != "low"
+        or observation.impact.availability != "none"
+    ):
+        return False, (
+            "the inert object canary proves only integrity=low object lifecycle "
+            "invocation"
+        )
+    return True, "object-instantiation observation shape passed"
+
+
+def validate_php_object_http_trace(
+    observation: PoCObservation,
+    trace_records: list[dict],
+    *,
+    target_url: str,
+    receipt_secret: bytes,
+    trace_token: str,
+    policy: PhpObjectRewritePolicy,
+    snapshot: PhpObjectOracleSnapshot,
+    expected_attacker_role: str,
+    trace_error: str,
+) -> tuple[bool, str, dict]:
+    """Bind the model claim to two parent-rewritten, server-signed requests."""
+    if trace_error:
+        return False, "PHP object HTTP trace is incomplete", {}
+    signature = _php_object_request_signature(
+        observation.attack.get("request_fingerprint")
+    )
+    control_signature = _php_object_request_signature(
+        observation.control.get("request_fingerprint")
+    )
+    expected_dispatch = tuple(
+        sorted(
+            (f"{location}:{field}", expected)
+            for location, field, expected in policy.dispatch
+        )
+    )
+    expected_signature = (
+        policy.method,
+        policy.path,
+        policy.object_field,
+        policy.object_location,
+        expected_dispatch,
+    )
+    if signature != expected_signature or control_signature != expected_signature:
+        return False, "PHP object claim does not match its reviewed transport", {}
+
+    expected_user_id = _trace_claimed_user_id(
+        observation.attack.get("attacker_user_id"),
+        expected_attacker_role,
+    )
+    control_user_id = _trace_claimed_user_id(
+        observation.control.get("attacker_user_id"),
+        expected_attacker_role,
+    )
+    if (
+        expected_user_id is None
+        or control_user_id is None
+        or expected_user_id != control_user_id
+    ):
+        return False, "PHP object claimed actor is invalid or changed", {}
+
+    arm_records: dict[str, list[dict]] = {"attack": [], "control": []}
+    for record in trace_records:
+        if not isinstance(record, dict):
+            continue
+        arm = record.get("php_object_arm")
+        if arm in arm_records:
+            arm_records[cast(str, arm)].append(record)
+    if any(len(records) != 1 for records in arm_records.values()):
+        return False, "PHP object trace has missing or duplicate oracle arms", {}
+
+    target_origin = normalize_trace_origin(target_url)
+    actors: dict[str, dict] = {}
+    envelopes: dict[str, str] = {}
+    rewritten: dict[str, str] = {}
+    sequences: dict[str, int] = {}
+    statuses: dict[str, int] = {}
+    for arm in ("attack", "control"):
+        record = arm_records[arm][0]
+        sequence = record.get("sequence")
+        status = record.get("status_code")
+        envelope = record.get("php_object_original_envelope_sha256")
+        rewritten_digest = record.get("php_object_rewritten_body_sha256")
+        if (
+            record.get("trace_version") != 1
+            or record.get("record_type") != "request"
+            or record.get("forward_state") != "completed"
+            or record.get("forward_error") is not None
+            or record.get("terminal") is not False
+            or record.get("origin") != target_origin
+            or str(record.get("method") or "").upper() != policy.method
+            or _normalize_request_path(str(record.get("path") or "")) != policy.path
+            or not isinstance(sequence, int)
+            or isinstance(sequence, bool)
+            or sequence < 1
+            or not isinstance(status, int)
+            or isinstance(status, bool)
+            or not 100 <= status <= 599
+            or not isinstance(envelope, str)
+            or _SHA256_RE.fullmatch(envelope) is None
+            or not isinstance(rewritten_digest, str)
+            or _SHA256_RE.fullmatch(rewritten_digest) is None
+        ):
+            return False, f"PHP object {arm} trace record is malformed", {}
+        actor, _reason = _decode_actor_receipt(
+            record,
+            receipt_secret=receipt_secret,
+            trace_token=trace_token,
+        )
+        if (
+            actor is None
+            or actor.get("user_id") != expected_user_id
+            or not _receipt_has_only_expected_privileges(actor, expected_attacker_role)
+        ):
+            return False, f"PHP object {arm} actor receipt is untrusted", {}
+        actors[arm] = actor
+        envelopes[arm] = envelope
+        rewritten[arm] = rewritten_digest
+        sequences[arm] = sequence
+        statuses[arm] = status
+
+    if actors["attack"].get("roles") != actors["control"].get("roles"):
+        return False, "PHP object attack/control signed actors differ", {}
+    if actors["attack"].get("nonce") == actors["control"].get("nonce") or actors[
+        "attack"
+    ].get("request_nonce") == actors["control"].get("request_nonce"):
+        return False, "PHP object attack/control actor receipts were reused", {}
+    if sequences["attack"] >= sequences["control"]:
+        return False, "PHP object attack/control request order is invalid", {}
+    if envelopes["attack"] != envelopes["control"]:
+        return False, "PHP object attack/control envelopes differ", {}
+    if rewritten["attack"] == rewritten["control"]:
+        return False, "PHP object attack/control rewritten bodies are identical", {}
+
+    attack_record = arm_records["attack"][0]
+    control_record = arm_records["control"][0]
+    expected_receipt_sha256 = snapshot.execution.expected_receipt_sha256
+    if (
+        attack_record.get("response_php_object_receipt_present") is not True
+        or attack_record.get("response_php_object_receipt_sha256")
+        != expected_receipt_sha256
+        or control_record.get("response_php_object_receipt_present") is not False
+        or control_record.get("response_php_object_receipt_sha256") is not None
+        or snapshot.execution.attack_receipt_matched is not True
+        or snapshot.execution.control_receipt_absent is not True
+    ):
+        return False, "PHP object trusted receipt differential is invalid", {}
+
+    return (
+        True,
+        "PHP object receipt, HTTP trace, actor, control, and attestation passed",
+        {
+            "oracle": "object_instantiation",
+            "attack_request": {
+                "sequence": sequences["attack"],
+                "method": policy.method,
+                "path": policy.path,
+                "status_code": statuses["attack"],
+                "actor_user_id": expected_user_id,
+                "actor_roles": actors["attack"].get("roles"),
+            },
+            "control_request": {
+                "sequence": sequences["control"],
+                "method": policy.method,
+                "path": policy.path,
+                "status_code": statuses["control"],
+                "actor_user_id": expected_user_id,
+                "actor_roles": actors["control"].get("roles"),
+            },
+        },
+    )
+
+
+def validate_php_object_gadget_http_trace(
+    trace_records: list[dict],
+    *,
+    target_url: str,
+    receipt_secret: bytes,
+    trace_token: str,
+    policy: PhpObjectRewritePolicy,
+    oracle: PhpObjectGadgetOracle,
+    script_sha256: str,
+    poc_bundle_manifest_sha256: str,
+    poc_bundle_source_file_count: int,
+    expected_attacker_role: str,
+    surface_attestations: tuple[tuple[str, str], ...],
+    trace_error: str,
+) -> tuple[bool, str, PhpObjectGadgetTransportAttestation | None, dict]:
+    """Bind an unauthenticated natural effect to two credential-free HTTP arms.
+
+    Actor identity is derived only from the parent proxy's removal of every
+    credential-capable header.  Natural promotion deliberately does not decode
+    or trust the in-process actor receipt, whose signing code shares the target
+    PHP runtime with the plugin under test.
+    """
+    if trace_error or len(trace_records) not in {2, 3}:
+        return False, "PHP object gadget HTTP trace is incomplete", None, {}
+    if (
+        _SHA256_RE.fullmatch(script_sha256) is None
+        or _SHA256_RE.fullmatch(poc_bundle_manifest_sha256) is None
+        or type(poc_bundle_source_file_count) is not int
+        or not 1 <= poc_bundle_source_file_count <= DEFAULT_MAX_BUNDLE_FILES
+    ):
+        return False, "PHP object gadget PoC bundle identity is invalid", None, {}
+    if surface_attestations != _PHP_OBJECT_SURFACE_ATTESTATION_ORDER:
+        return False, "PHP object gadget surface binding is incomplete", None, {}
+    normalized_attacker_role = normalize_attacker_role(expected_attacker_role)
+    if normalized_attacker_role != "unauthenticated":
+        return (
+            False,
+            "PHP object gadget natural proof requires an unauthenticated actor",
+            None,
+            {},
+        )
+
+    target_origin = normalize_trace_origin(target_url)
+    generation_sha256 = hashlib.sha256(oracle.generation_id.encode("ascii")).hexdigest()
+    if any(type(record) is not dict for record in trace_records):
+        return False, "PHP object gadget trace record is malformed", None, {}
+    sequences_in_order = [record.get("sequence") for record in trace_records]
+    if sequences_in_order != list(range(1, len(trace_records) + 1)):
+        return False, "PHP object gadget HTTP trace is incomplete", None, {}
+    arm_trace_records = trace_records[-2:]
+    if [record.get("php_object_arm") for record in arm_trace_records] != [
+        "attack",
+        "control",
+    ]:
+        return False, "PHP object gadget HTTP trace is incomplete", None, {}
+    arm_records = {
+        "attack": arm_trace_records[0],
+        "control": arm_trace_records[1],
+    }
+
+    if len(trace_records) == 3:
+        preflight = trace_records[0]
+        preflight_status = preflight.get("status_code")
+        preflight_fields = preflight.get("fields")
+        if (
+            preflight.get("trace_version") != 1
+            or preflight.get("record_type") != "request"
+            or preflight.get("forward_state") != "completed"
+            or preflight.get("forward_error") is not None
+            or preflight.get("terminal") is not False
+            or preflight.get("origin") != target_origin
+            or preflight.get("method") != "GET"
+            or preflight.get("php_object_arm") is not None
+            or preflight.get("php_object_generation_sha256") != generation_sha256
+            or type(preflight_status) is not int
+            or not 100 <= preflight_status <= 599
+            or 300 <= preflight_status <= 399
+            or preflight.get("php_object_original_envelope_sha256") is not None
+            or preflight.get("php_object_rewritten_body_sha256") is not None
+            or preflight.get("credential_free_transport") is not True
+            or preflight.get("response_php_object_receipt_present") is not False
+            or preflight.get("response_php_object_receipt_sha256") is not None
+            or not isinstance(preflight_fields, list)
+            or "request_body_parse_error" in preflight
+            or preflight.get("request_metadata_omitted") is True
+            or preflight.get("request_tracked_capabilities_in_headers") != []
+        ):
+            return False, "PHP object gadget preflight is malformed", None, {}
+        preflight_shape_counts: Counter[tuple[str, str, str]] = Counter()
+        for field in preflight_fields:
+            if (
+                type(field) is not dict
+                or set(field)
+                != {
+                    "location",
+                    "name",
+                    "kind",
+                    "value_sha256",
+                    "contains_squadrone_sentinel",
+                    "tracked_capabilities",
+                }
+                or field.get("location") != "query"
+                or not isinstance(field.get("name"), str)
+                or field.get("kind") != "scalar"
+                or not isinstance(field.get("value_sha256"), str)
+                or _SHA256_RE.fullmatch(cast(str, field["value_sha256"])) is None
+                or type(field.get("contains_squadrone_sentinel")) is not bool
+                or field.get("tracked_capabilities") != []
+            ):
+                return False, "PHP object gadget preflight is malformed", None, {}
+            preflight_shape_counts[("query", cast(str, field["name"]), "scalar")] += 1
+        expected_preflight_shape = [
+            {
+                "location": location,
+                "name": name,
+                "kind": kind,
+                "count": count,
+            }
+            for (location, name, kind), count in sorted(preflight_shape_counts.items())
+        ]
+        if preflight.get("parameter_shape") != expected_preflight_shape:
+            return False, "PHP object gadget preflight is malformed", None, {}
+
+    actors: dict[str, dict] = {}
+    envelopes: dict[str, str] = {}
+    rewritten: dict[str, str] = {}
+    sequences: dict[str, int] = {}
+    statuses: dict[str, int] = {}
+    parameter_shapes: dict[str, list[dict[str, object]]] = {}
+    field_signatures: dict[str, list[tuple[object, ...]]] = {}
+    trace_identities: list[dict[str, object]] = []
+    required_field_identities = {
+        (policy.object_location, policy.object_field),
+        *((location, name) for location, name, _value in policy.dispatch),
+    }
+    declared_query_identities = {
+        (location, name)
+        for location, name, _value in policy.dispatch
+        if location == "query"
+    }
+    for arm in ("attack", "control"):
+        record = arm_records[arm]
+        sequence = record.get("sequence")
+        status = record.get("status_code")
+        envelope = record.get("php_object_original_envelope_sha256")
+        rewritten_digest = record.get("php_object_rewritten_body_sha256")
+        request_nonce = record.get("request_nonce")
+        request_digest = record.get("request_digest")
+        if (
+            record.get("trace_version") != 1
+            or record.get("record_type") != "request"
+            or record.get("forward_state") != "completed"
+            or record.get("forward_error") is not None
+            or record.get("terminal") is not False
+            or record.get("origin") != target_origin
+            or record.get("method") != policy.method
+            or _normalize_request_path(str(record.get("path") or "")) != policy.path
+            or record.get("php_object_generation_sha256") != generation_sha256
+            or type(sequence) is not int
+            or sequence < 1
+            or type(status) is not int
+            or not 100 <= status <= 599
+            or not isinstance(envelope, str)
+            or _SHA256_RE.fullmatch(envelope) is None
+            or not isinstance(rewritten_digest, str)
+            or _SHA256_RE.fullmatch(rewritten_digest) is None
+            or not isinstance(request_nonce, str)
+            or _SHA256_RE.fullmatch(request_nonce) is None
+            or not isinstance(request_digest, str)
+            or _SHA256_RE.fullmatch(request_digest) is None
+            or record.get("credential_free_transport") is not True
+            or record.get("response_php_object_receipt_present") is not False
+            or record.get("response_php_object_receipt_sha256") is not None
+        ):
+            return False, f"PHP object gadget {arm} trace is malformed", None, {}
+        actor = {
+            "user_id": 0,
+            "roles": [],
+            "nonce": request_nonce,
+            "request_nonce": request_nonce,
+            "provenance": "credential_free_transport",
+        }
+
+        capability_fields = []
+        fields = record.get("fields")
+        if not isinstance(fields, list):
+            return False, f"PHP object gadget {arm} fields are malformed", None, {}
+        observed_field_identities: list[tuple[str, str]] = []
+        arm_field_signatures: list[tuple[object, ...]] = []
+        for field in fields:
+            if (
+                type(field) is not dict
+                or set(field)
+                != {
+                    "location",
+                    "name",
+                    "kind",
+                    "value_sha256",
+                    "contains_squadrone_sentinel",
+                    "tracked_capabilities",
+                }
+                or field.get("location") not in {"query", "form"}
+                or not isinstance(field.get("name"), str)
+                or field.get("kind") != "scalar"
+                or not isinstance(field.get("value_sha256"), str)
+                or _SHA256_RE.fullmatch(cast(str, field["value_sha256"])) is None
+                or type(field.get("contains_squadrone_sentinel")) is not bool
+            ):
+                return False, f"PHP object gadget {arm} fields are malformed", None, {}
+            observed_field_identities.append(
+                (cast(str, field["location"]), cast(str, field["name"]))
+            )
+            identity = observed_field_identities[-1]
+            if identity[0] == "query" and identity not in declared_query_identities:
+                return (
+                    False,
+                    f"PHP object gadget {arm} has an undeclared query field",
+                    None,
+                    {},
+                )
+            labels = field.get("tracked_capabilities", [])
+            if not isinstance(labels, list) or any(
+                type(label) is not str for label in labels
+            ):
+                return (
+                    False,
+                    f"PHP object gadget {arm} capability trace is invalid",
+                    None,
+                    {},
+                )
+            if "ephemeral_file_path" in labels:
+                capability_fields.append(field)
+            if any(label != "ephemeral_file_path" for label in labels):
+                return (
+                    False,
+                    f"PHP object gadget {arm} has an unknown capability",
+                    None,
+                    {},
+                )
+            if labels and identity != (policy.object_location, policy.object_field):
+                return (
+                    False,
+                    f"PHP object gadget {arm} path escaped its field",
+                    None,
+                    {},
+                )
+            if identity != (policy.object_location, policy.object_field):
+                arm_field_signatures.append(
+                    (
+                        field["location"],
+                        field["name"],
+                        field["kind"],
+                        field["value_sha256"],
+                        field["contains_squadrone_sentinel"],
+                        tuple(cast(list[str], labels)),
+                    )
+                )
+        parameter_shape = record.get("parameter_shape")
+        shape_counts = Counter(observed_field_identities)
+        expected_parameter_shape: list[dict[str, object]] = [
+            {
+                "location": location,
+                "name": name,
+                "kind": "scalar",
+                "count": count,
+            }
+            for (location, name), count in sorted(shape_counts.items())
+        ]
+        if (
+            any(
+                observed_field_identities.count(identity) != 1
+                for identity in required_field_identities
+            )
+            or parameter_shape != expected_parameter_shape
+            or "request_body_parse_error" in record
+            or record.get("request_metadata_omitted") is True
+        ):
+            return (
+                False,
+                f"PHP object gadget {arm} request field shape is not exact",
+                None,
+                {},
+            )
+        if oracle.uses_ephemeral_path_capability:
+            if (
+                len(capability_fields) != 1
+                or capability_fields[0].get("location") != "form"
+                or capability_fields[0].get("name") != policy.object_field
+                or capability_fields[0].get("tracked_capabilities")
+                != ["ephemeral_file_path"]
+                or record.get("request_tracked_capabilities_in_headers") != []
+            ):
+                return (
+                    False,
+                    f"PHP object gadget {arm} path escaped its field",
+                    None,
+                    {},
+                )
+        elif capability_fields or record.get(
+            "request_tracked_capabilities_in_headers", []
+        ):
+            return False, f"PHP object gadget {arm} has an unexpected path", None, {}
+
+        actors[arm] = actor
+        envelopes[arm] = cast(str, envelope)
+        rewritten[arm] = cast(str, rewritten_digest)
+        sequences[arm] = sequence
+        statuses[arm] = status
+        parameter_shapes[arm] = expected_parameter_shape
+        field_signatures[arm] = sorted(arm_field_signatures)
+        trace_identities.append(
+            {
+                "arm": arm,
+                "sequence": sequence,
+                "request_nonce": record.get("request_nonce"),
+                "request_digest": record.get("request_digest"),
+                "rewritten_body_sha256": rewritten_digest,
+                "actor_nonce": actor.get("nonce"),
+            }
+        )
+
+    if (
+        actors["attack"].get("user_id") != actors["control"].get("user_id")
+        or actors["attack"].get("roles") != actors["control"].get("roles")
+        or actors["attack"].get("nonce") == actors["control"].get("nonce")
+        or actors["attack"].get("request_nonce")
+        == actors["control"].get("request_nonce")
+        or sequences["control"] != sequences["attack"] + 1
+        or envelopes["attack"] != envelopes["control"]
+        or rewritten["attack"] == rewritten["control"]
+        or parameter_shapes["attack"] != parameter_shapes["control"]
+        or field_signatures["attack"] != field_signatures["control"]
+    ):
+        return False, "PHP object gadget attack/control binding is invalid", None, {}
+
+    actor_identity = {
+        "user_id": actors["attack"].get("user_id"),
+        "roles": actors["attack"].get("roles"),
+    }
+    actor_identity_sha256 = hashlib.sha256(
+        json.dumps(
+            actor_identity,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    transport_contract_sha256 = hashlib.sha256(
+        json.dumps(
+            {
+                "method": policy.method,
+                "path": policy.path,
+                "object_location": policy.object_location,
+                "object_field": policy.object_field,
+                "dispatch": policy.dispatch,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+    ).hexdigest()
+    trace_binding_sha256 = hashlib.sha256(
+        json.dumps(
+            trace_identities,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+    ).hexdigest()
+    transport = PhpObjectGadgetTransportAttestation(
+        schema_version=PHP_OBJECT_GADGET_ORACLE_SCHEMA_VERSION,
+        mode=PHP_OBJECT_GADGET_ORACLE_MODE,
+        effect="file_delete",
+        effect_binding_kind=oracle.runtime_binding.effect_binding_kind,
+        script_sha256=script_sha256,
+        poc_bundle_manifest_sha256=poc_bundle_manifest_sha256,
+        poc_bundle_source_file_count=poc_bundle_source_file_count,
+        transport_contract_sha256=transport_contract_sha256,
+        trace_binding_sha256=trace_binding_sha256,
+        actor_identity_sha256=actor_identity_sha256,
+        actor_role=normalized_attacker_role,
+        attack_payload_sha256=hashlib.sha256(oracle.private_attack_payload).hexdigest(),
+        control_payload_sha256=hashlib.sha256(
+            oracle.private_control_payload
+        ).hexdigest(),
+        attack_payload_size_bytes=len(oracle.private_attack_payload),
+        control_payload_size_bytes=len(oracle.private_control_payload),
+        attack_sequence=sequences["attack"],
+        control_sequence=sequences["control"],
+        attack_status_code=statuses["attack"],
+        control_status_code=statuses["control"],
+        attack_control_envelopes_equal=True,
+        rewritten_payloads_differ=True,
+        ephemeral_path_capability_exact=True,
+        executable_surface_bound=True,
+    )
+    return (
+        True,
+        "PHP object gadget HTTP, actor, transport, and surface binding passed",
+        transport,
+        {
+            "oracle": "php_object_gadget_file_delete",
+            "poc_bundle_manifest_sha256": poc_bundle_manifest_sha256,
+            "poc_bundle_source_file_count": poc_bundle_source_file_count,
+            "transport_contract_sha256": transport_contract_sha256,
+            "actor_identity_sha256": actor_identity_sha256,
+        },
+    )
+
+
 def validate_poc_observation(
     observation: PoCObservation,
     expected_bug_class: str | None = None,
@@ -3768,6 +7327,10 @@ def validate_poc_observation(
         accepted, reason = _validate_cross_object_observation(observation)
         if not accepted:
             return False, reason
+    elif oracle == "object_instantiation":
+        accepted, reason = _validate_php_object_observation(observation)
+        if not accepted:
+            return False, reason
     elif oracle == "callback":
         if (
             int(attack.get("hit_count") or 0) < 1
@@ -3789,6 +7352,14 @@ def validate_poc_observation(
                 "browser oracle did not observe attack-only JavaScript execution",
             )
     elif oracle == "file_effect":
+        if (
+            observation.impact.confidentiality != "none"
+            or observation.impact.availability != "none"
+        ):
+            return False, (
+                "file-effect oracle proves only file creation or overwrite integrity; "
+                "confidentiality and availability require separate measured oracles"
+            )
         path = str(attack.get("path") or "")
         control_path = str(control.get("path") or "")
         attack_before_exists = attack.get("before_exists")
@@ -3893,7 +7464,25 @@ async def _run(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await proc.communicate()
+    try:
+        stdout, stderr = await proc.communicate()
+    except BaseException:
+        if proc.returncode is None:
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
+            try:
+                async with asyncio.timeout(2.0):
+                    await proc.wait()
+            except TimeoutError:
+                if proc.returncode is None:
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                await proc.wait()
+        raise
     out = stdout.decode("utf-8", errors="replace")
     err = stderr.decode("utf-8", errors="replace")
     if check and proc.returncode != 0:
@@ -4201,8 +7790,1860 @@ async def _probe_ssrf_local_mount(
         )
 
 
+def _php_include_resource_basename(resource_path: str) -> str:
+    """Return one validated opaque PHP oracle basename."""
+    container_directory = PurePosixPath(PHP_INCLUDE_ORACLE_DIRECTORY)
+    path = PurePosixPath(resource_path)
+    try:
+        relative = path.relative_to(container_directory)
+    except ValueError as exc:
+        raise RuntimeError("PHP include path escaped its mount") from exc
+    if (
+        len(relative.parts) != 1
+        or re.fullmatch(r"[0-9a-f]{64}\.php", relative.name) is None
+    ):
+        raise RuntimeError("PHP include path is malformed")
+    return relative.name
+
+
+def _php_include_host_path(host_directory: Path, resource_path: str) -> Path:
+    """Resolve one opaque PHP oracle path inside its private host mount."""
+    basename = _php_include_resource_basename(resource_path)
+    root = host_directory.resolve(strict=True)
+    # The basename parser has already excluded traversal.  Do not resolve the
+    # leaf: provisioning and cleanup must replace/unlink an exact-path symlink,
+    # never follow it to an attacker-selected target.
+    target = root / basename
+    if target.parent != root:
+        raise RuntimeError("PHP include host path escaped its mount")
+    return target
+
+
+def _provision_php_include_oracle(
+    host_directory: Path,
+    oracle: PhpIncludeOracle,
+) -> Path:
+    """Atomically install one read-only attack canary; control stays absent."""
+    attack = _php_include_host_path(host_directory, oracle.attack_path)
+    control = _php_include_host_path(host_directory, oracle.control_path)
+    if control.exists() or control.is_symlink():
+        raise RuntimeError("PHP include control path unexpectedly exists")
+    content = oracle.private_attack_content
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=".squadrone-php-include-",
+        dir=os.fspath(attack.parent),
+    )
+    temporary = Path(temporary_name)
+    try:
+        view = memoryview(content)
+        while view:
+            written = os.write(fd, view)
+            if written < 1:
+                raise RuntimeError("failed to write PHP include canary")
+            view = view[written:]
+        os.fsync(fd)
+        os.fchmod(fd, PHP_INCLUDE_ORACLE_FILE_MODE)
+        os.close(fd)
+        fd = -1
+        os.replace(temporary, attack)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        temporary.unlink(missing_ok=True)
+    return attack
+
+
+def _remove_php_include_canary(
+    host_directory: Path | None,
+    oracle: PhpIncludeOracle | None,
+) -> None:
+    """Remove only the exact issued attack canary from the private mount."""
+    if host_directory is None or oracle is None:
+        return
+    _php_include_host_path(host_directory, oracle.attack_path).unlink(missing_ok=True)
+
+
+_PHP_INCLUDE_HOST_READ_CHUNK_BYTES = 64 * 1024
+_PHP_INCLUDE_HOST_MAX_CONTENT_BYTES = 4 * 1024
+
+
+def _php_include_host_stat_signature(metadata: os.stat_result) -> tuple[int, ...]:
+    """Return fields that must not change around one streamed host read."""
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _php_include_host_directory_signature(
+    metadata: os.stat_result,
+) -> tuple[int, ...]:
+    """Bind the open directory descriptor to the supplied private host path."""
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _php_include_lstat_at(
+    directory_fd: int,
+    basename: str,
+) -> os.stat_result | None:
+    """Perform one no-follow lookup relative to the already-open directory."""
+    try:
+        return os.stat(
+            basename,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return None
+
+
+def _measure_php_include_host_filesystem(
+    host_directory: Path,
+    attack_path: str,
+    control_path: str,
+) -> PhpIncludeHostFilesystemMeasurement:
+    """Measure the parent-owned canary without following or racing path links."""
+    try:
+        return _measure_php_include_host_filesystem_checked(
+            host_directory,
+            attack_path,
+            control_path,
+        )
+    except Exception:
+        # Path names, host identities, and low-level errors are deliberately not
+        # propagated into logs or persisted run evidence.
+        raise RuntimeError("PHP include host measurement failed") from None
+
+
+def _measure_php_include_host_filesystem_checked(
+    host_directory: Path,
+    attack_path: str,
+    control_path: str,
+) -> PhpIncludeHostFilesystemMeasurement:
+    """Implement the no-follow host measurement behind a value-free boundary."""
+    attack_basename = _php_include_resource_basename(attack_path)
+    control_basename = _php_include_resource_basename(control_path)
+    if attack_basename == control_basename:
+        raise RuntimeError("invalid PHP include host measurement contract")
+
+    required_flags = tuple(
+        getattr(os, name, 0) for name in ("O_DIRECTORY", "O_NOFOLLOW", "O_CLOEXEC")
+    )
+    if any(type(flag) is not int or flag == 0 for flag in required_flags):
+        raise RuntimeError("unsupported PHP include host measurement platform")
+    if (
+        os.open not in os.supports_dir_fd
+        or os.stat not in os.supports_dir_fd
+        or os.stat not in os.supports_follow_symlinks
+    ):
+        raise RuntimeError("unsupported PHP include host measurement platform")
+
+    get_effective_uid = getattr(os, "geteuid", None)
+    get_effective_gid = getattr(os, "getegid", None)
+    if not callable(get_effective_uid) or not callable(get_effective_gid):
+        raise RuntimeError("unsupported PHP include host measurement platform")
+    verifier_uid = get_effective_uid()
+    verifier_gid = get_effective_gid()
+    if (
+        type(verifier_uid) is not int
+        or verifier_uid < 0
+        or type(verifier_gid) is not int
+        or verifier_gid < 0
+    ):
+        raise RuntimeError("invalid PHP include verifier identity")
+
+    directory_flags = (
+        os.O_RDONLY | required_flags[0] | required_flags[1] | required_flags[2]
+    )
+    directory_path_before = os.stat(host_directory, follow_symlinks=False)
+    directory_fd = os.open(os.fspath(host_directory), directory_flags)
+    try:
+        os.set_inheritable(directory_fd, False)
+        directory_fd_before = os.fstat(directory_fd)
+        directory_signature = _php_include_host_directory_signature(directory_fd_before)
+        if (
+            _php_include_host_directory_signature(directory_path_before)
+            != directory_signature
+            or not stat.S_ISDIR(directory_fd_before.st_mode)
+            or directory_fd_before.st_uid != verifier_uid
+            or directory_fd_before.st_gid != verifier_gid
+            or stat.S_IMODE(directory_fd_before.st_mode) & 0o022
+            or os.get_inheritable(directory_fd)
+        ):
+            raise RuntimeError("unsafe PHP include host directory")
+
+        control_before = _php_include_lstat_at(directory_fd, control_basename)
+        attack_path_before = _php_include_lstat_at(directory_fd, attack_basename)
+        if attack_path_before is None:
+            raise RuntimeError("missing PHP include attack canary")
+
+        file_flags = os.O_RDONLY | required_flags[1] | required_flags[2]
+        file_flags |= getattr(os, "O_NONBLOCK", 0)
+        attack_fd = os.open(attack_basename, file_flags, dir_fd=directory_fd)
+        try:
+            os.set_inheritable(attack_fd, False)
+            attack_fd_before = os.fstat(attack_fd)
+            attack_signature = _php_include_host_stat_signature(attack_fd_before)
+            if (
+                _php_include_host_stat_signature(attack_path_before) != attack_signature
+                or not stat.S_ISREG(attack_path_before.st_mode)
+                or stat.S_ISLNK(attack_path_before.st_mode)
+                or attack_fd_before.st_uid != verifier_uid
+                or attack_fd_before.st_gid != verifier_gid
+                or stat.S_IMODE(attack_fd_before.st_mode)
+                != PHP_INCLUDE_ORACLE_FILE_MODE
+                or attack_fd_before.st_nlink != 1
+                or attack_fd_before.st_size < 1
+                or attack_fd_before.st_size > _PHP_INCLUDE_HOST_MAX_CONTENT_BYTES
+                or attack_fd_before.st_dev < 0
+                or attack_fd_before.st_ino <= 0
+                or os.get_inheritable(attack_fd)
+            ):
+                raise RuntimeError("unsafe PHP include attack canary")
+
+            digest = hashlib.sha256()
+            content_size = 0
+            while True:
+                chunk = os.read(attack_fd, _PHP_INCLUDE_HOST_READ_CHUNK_BYTES)
+                if not chunk:
+                    break
+                content_size += len(chunk)
+                if content_size > _PHP_INCLUDE_HOST_MAX_CONTENT_BYTES:
+                    raise RuntimeError("oversized PHP include attack canary")
+                digest.update(chunk)
+            attack_fd_after = os.fstat(attack_fd)
+        finally:
+            os.close(attack_fd)
+
+        attack_path_after = _php_include_lstat_at(directory_fd, attack_basename)
+        control_after = _php_include_lstat_at(directory_fd, control_basename)
+        directory_fd_after = os.fstat(directory_fd)
+        directory_path_after = os.stat(host_directory, follow_symlinks=False)
+        if (
+            attack_path_after is None
+            or _php_include_host_stat_signature(attack_fd_after) != attack_signature
+            or _php_include_host_stat_signature(attack_path_after) != attack_signature
+            or content_size != attack_fd_after.st_size
+            or _php_include_host_directory_signature(directory_fd_after)
+            != directory_signature
+            or _php_include_host_directory_signature(directory_path_after)
+            != directory_signature
+        ):
+            raise RuntimeError("raced PHP include host measurement")
+
+        return PhpIncludeHostFilesystemMeasurement(
+            attack_content_sha256=digest.hexdigest(),
+            attack_content_size_bytes=content_size,
+            attack_owner_uid=attack_fd_after.st_uid,
+            attack_owner_gid=attack_fd_after.st_gid,
+            attack_file_mode=stat.S_IMODE(attack_fd_after.st_mode),
+            attack_link_count=attack_fd_after.st_nlink,
+            attack_is_regular_file=stat.S_ISREG(attack_fd_after.st_mode),
+            attack_is_symlink=stat.S_ISLNK(attack_path_after.st_mode),
+            control_lstat_exists=control_before is not None
+            or control_after is not None,
+            attack_device=attack_fd_after.st_dev,
+            attack_inode=attack_fd_after.st_ino,
+            measured_monotonic_ns=time.monotonic_ns(),
+        )
+    finally:
+        os.close(directory_fd)
+
+
+_PHP_INCLUDE_INSPECTION_FAILURES = frozenset(
+    {
+        "communication_failed",
+        "contract_rejected",
+        "empty_output",
+        "invalid_shape",
+        "invalid_values",
+        "launch_failed",
+        "malformed_output",
+        "oversized_output",
+        "process_failed",
+        "resource_unavailable",
+        "stderr_output",
+        "timeout",
+        "unexpected_failure",
+    }
+)
+_PHP_INCLUDE_RETRIABLE_INSPECTION_FAILURES = frozenset(
+    {
+        "communication_failed",
+        "empty_output",
+        "launch_failed",
+        "resource_unavailable",
+        "timeout",
+    }
+)
+_PHP_INCLUDE_INSPECTION_RETRY_DELAY_S = 0.025
+_PHP_INCLUDE_INSPECTOR_REAP_TIMEOUT_S = 0.25
+
+
+class _PhpIncludeInspectionError(RuntimeError):
+    """Carry one fixed, value-free inspection category to the parent."""
+
+    def __init__(self, reason: str, *, retries: int = 0) -> None:
+        if reason not in _PHP_INCLUDE_INSPECTION_FAILURES:
+            raise ValueError("invalid PHP include inspection failure category")
+        if type(retries) is not int or retries not in {0, 1}:
+            raise ValueError("invalid PHP include inspection retry count")
+        self.reason = reason
+        self.retries = retries
+        super().__init__("PHP include canary inspection failed")
+
+
+def _consume_php_include_inspector_wait(task: asyncio.Task[int]) -> None:
+    """Retrieve a detached inspector-wait result without surfacing its details."""
+    try:
+        task.result()
+    except BaseException:
+        pass
+
+
+async def _terminate_and_reap_php_include_inspector(
+    proc: asyncio.subprocess.Process,
+) -> None:
+    """Bound best-effort reaping; suppress operations, not task cancellation."""
+    if proc.returncode is None:
+        try:
+            proc.kill()
+        except asyncio.CancelledError:
+            raise
+        except BaseException:
+            try:
+                proc.terminate()
+            except asyncio.CancelledError:
+                raise
+            except BaseException:
+                pass
+    try:
+        wait_task = asyncio.ensure_future(proc.wait())
+    except asyncio.CancelledError:
+        raise
+    except BaseException:
+        return
+    wait_task.add_done_callback(_consume_php_include_inspector_wait)
+    try:
+        done, _pending = await asyncio.wait(
+            {wait_task},
+            timeout=_PHP_INCLUDE_INSPECTOR_REAP_TIMEOUT_S,
+        )
+    except asyncio.CancelledError:
+        wait_task.cancel()
+        raise
+    except BaseException:
+        wait_task.cancel()
+        return
+    if wait_task not in done:
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except asyncio.CancelledError:
+                wait_task.cancel()
+                raise
+            except BaseException:
+                pass
+        wait_task.cancel()
+
+
+async def _inspect_php_include_oracle(
+    container_name: str,
+    attack_path: str,
+    control_path: str,
+) -> dict[str, object]:
+    """Measure both mounted oracle paths without returning canary contents."""
+    php = (
+        "$j=stream_get_contents(STDIN);$v=json_decode($j,true);"
+        "if(!is_array($v)||array_keys($v)!==['attack','control']){exit(70);}"
+        "$a=$v['attack'];$c=$v['control'];"
+        "$re='#^/var/lib/squadrone/php-include/[0-9a-f]{64}\\.php$#D';"
+        "if(!is_string($a)||!is_string($c)||$a===$c||"
+        "!preg_match($re,$a)||!preg_match($re,$c)){exit(71);}"
+        "$s=@lstat($a);$r=@realpath($a);$h=@hash_file('sha256',$a);"
+        "$cs=@lstat($c);"
+        "if(!is_array($s)||!is_string($r)||!is_string($h)){exit(72);}"
+        "$o=['attack_resource_path'=>$r,'control_resource_path'=>$c,"
+        "'attack_content_sha256'=>$h,'attack_content_size_bytes'=>(int)$s['size'],"
+        "'attack_owner_uid'=>(int)$s['uid'],'attack_owner_gid'=>(int)$s['gid'],"
+        "'attack_file_mode'=>((int)$s['mode']&0777),"
+        "'attack_link_count'=>(int)$s['nlink'],"
+        "'attack_is_regular_file'=>is_file($a),"
+        "'attack_is_symlink'=>is_link($a),"
+        "'control_lstat_exists'=>is_array($cs)];"
+        "fwrite(STDOUT,json_encode($o,JSON_UNESCAPED_SLASHES));"
+    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "docker",
+            "exec",
+            "-i",
+            container_name,
+            "php",
+            "-r",
+            php,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except Exception as exc:
+        raise _PhpIncludeInspectionError("launch_failed") from exc
+    payload_bytes = json.dumps(
+        {"attack": attack_path, "control": control_path},
+        separators=(",", ":"),
+    ).encode("ascii")
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(payload_bytes),
+            timeout=6.0,
+        )
+    except TimeoutError as exc:
+        try:
+            await _terminate_and_reap_php_include_inspector(proc)
+        except asyncio.CancelledError:
+            raise
+        except BaseException:
+            pass
+        raise _PhpIncludeInspectionError("timeout") from exc
+    except BaseException as exc:
+        if not isinstance(exc, Exception):
+            try:
+                await _terminate_and_reap_php_include_inspector(proc)
+            except BaseException:
+                pass
+            raise
+        try:
+            await _terminate_and_reap_php_include_inspector(proc)
+        except asyncio.CancelledError:
+            raise
+        except BaseException:
+            pass
+        raise _PhpIncludeInspectionError("communication_failed") from exc
+    if proc.returncode in {70, 71}:
+        raise _PhpIncludeInspectionError("contract_rejected")
+    if proc.returncode == 72:
+        raise _PhpIncludeInspectionError("resource_unavailable")
+    if proc.returncode != 0:
+        raise _PhpIncludeInspectionError("process_failed")
+    if stderr:
+        raise _PhpIncludeInspectionError("stderr_output")
+    if not stdout:
+        raise _PhpIncludeInspectionError("empty_output")
+    if len(stdout) > 4096:
+        raise _PhpIncludeInspectionError("oversized_output")
+    try:
+        payload = json.loads(stdout.decode("ascii"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise _PhpIncludeInspectionError("malformed_output") from exc
+    required = {
+        "attack_resource_path",
+        "control_resource_path",
+        "attack_content_sha256",
+        "attack_content_size_bytes",
+        "attack_owner_uid",
+        "attack_owner_gid",
+        "attack_file_mode",
+        "attack_link_count",
+        "attack_is_regular_file",
+        "attack_is_symlink",
+        "control_lstat_exists",
+    }
+    if not isinstance(payload, dict) or set(payload) != required:
+        raise _PhpIncludeInspectionError("invalid_shape")
+    if (
+        payload["attack_resource_path"] != attack_path
+        or payload["control_resource_path"] != control_path
+        or not isinstance(payload["attack_content_sha256"], str)
+        or re.fullmatch(r"[0-9a-f]{64}", payload["attack_content_sha256"]) is None
+        or any(
+            type(payload[key]) is not int
+            for key in (
+                "attack_content_size_bytes",
+                "attack_owner_uid",
+                "attack_owner_gid",
+                "attack_file_mode",
+                "attack_link_count",
+            )
+        )
+        or type(payload["attack_is_regular_file"]) is not bool
+        or type(payload["attack_is_symlink"]) is not bool
+        or type(payload["control_lstat_exists"]) is not bool
+    ):
+        raise _PhpIncludeInspectionError("invalid_values")
+    return payload
+
+
+async def _inspect_php_include_oracle_bounded_retry(
+    container_name: str,
+    attack_path: str,
+    control_path: str,
+) -> tuple[dict[str, object], int]:
+    """Retry one transport-like failure; never retry rejected state evidence."""
+    try:
+        return (
+            await _inspect_php_include_oracle(
+                container_name,
+                attack_path,
+                control_path,
+            ),
+            0,
+        )
+    except _PhpIncludeInspectionError as exc:
+        if exc.reason not in _PHP_INCLUDE_RETRIABLE_INSPECTION_FAILURES:
+            raise
+        logger.warning(
+            "retrying PHP include oracle inspection after %s",
+            exc.reason,
+        )
+    await asyncio.sleep(_PHP_INCLUDE_INSPECTION_RETRY_DELAY_S)
+    try:
+        measured = await _inspect_php_include_oracle(
+            container_name,
+            attack_path,
+            control_path,
+        )
+    except _PhpIncludeInspectionError as exc:
+        raise _PhpIncludeInspectionError(exc.reason, retries=1) from exc
+    except Exception as exc:
+        raise _PhpIncludeInspectionError(
+            "unexpected_failure",
+            retries=1,
+        ) from exc
+    return measured, 1
+
+
+async def _probe_php_include_mount(
+    container_name: str,
+    host_directory: Path,
+) -> None:
+    """Require the exact verifier-owned directory as a read-only bind mount."""
+    _code, stdout, stderr = await _run(
+        "docker",
+        "inspect",
+        "--format",
+        "{{json .Mounts}}",
+        container_name,
+    )
+    if stderr or len(stdout) > 64 * 1024:
+        raise RuntimeError("PHP include mount inspection failed")
+    try:
+        mounts = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("PHP include mount inspection is malformed") from exc
+    expected_source = os.fspath(host_directory.resolve(strict=True))
+    matches = [
+        mount
+        for mount in mounts
+        if isinstance(mount, dict)
+        and mount.get("Destination") == PHP_INCLUDE_ORACLE_DIRECTORY
+    ]
+    if len(matches) != 1:
+        raise RuntimeError("PHP include mount is missing or ambiguous")
+    mount = matches[0]
+    observed_source = mount.get("Source")
+    if (
+        mount.get("Type") != "bind"
+        or mount.get("RW") is not False
+        or not isinstance(observed_source, str)
+        or observed_source not in _accepted_ssrf_bind_sources(expected_source)
+    ):
+        raise RuntimeError("PHP include mount is not the expected read-only bind")
+
+
+_PHP_OBJECT_CALLSITE_INSPECT_SCRIPT = r"""
+$path = isset($argv[1]) && is_string($argv[1]) ? $argv[1] : '';
+try {
+    if (
+        $path === ''
+        || strlen($path) > 2048
+        || strpos($path, '/var/www/html/wp-content/plugins/') !== 0
+        || @realpath($path) !== $path
+        || is_link($path)
+    ) {
+        throw new RuntimeException('path');
+    }
+    $metadata = @lstat($path);
+    if (
+        ! is_array($metadata)
+        || ((((int) $metadata['mode']) & 0170000) !== 0100000)
+        || (int) $metadata['nlink'] !== 1
+        || (int) $metadata['size'] < 1
+        || (int) $metadata['size'] > 33554432
+    ) {
+        throw new RuntimeException('metadata');
+    }
+    $source = @file_get_contents($path);
+    $digest = is_string($source) ? hash('sha256', $source) : false;
+    if (
+        ! is_string($source)
+        || strlen($source) !== (int) $metadata['size']
+        || ! is_string($digest)
+        || strlen($digest) !== 64
+    ) {
+        throw new RuntimeException('source');
+    }
+    $line_count = substr_count($source, "\n");
+    if ($source !== '' && substr($source, -1) !== "\n") {
+        ++$line_count;
+    }
+    $output = json_encode(
+        array(
+            'source_sha256' => $digest,
+            'source_size_bytes' => strlen($source),
+            'line_count' => $line_count,
+        ),
+        JSON_UNESCAPED_SLASHES
+    );
+    if (! is_string($output) || $output === '') {
+        throw new RuntimeException('json');
+    }
+    fwrite(STDOUT, $output);
+    exit(0);
+} catch (Throwable $error) {
+    fwrite(STDERR, 'callsite_inspection_failed');
+    exit(70);
+}
+"""
+
+
+_PHP_OBJECT_GADGET_FILESYSTEM_SCRIPT = r"""
+function sq_fail() { fwrite(STDERR, 'gadget_filesystem_failed'); exit(70); }
+function sq_remove_tree($path, $root) {
+    if (strpos($path, $root . '/') !== 0) { throw new RuntimeException('path'); }
+    $metadata = @lstat($path);
+    if (! is_array($metadata)) { return; }
+    $kind = ((int) $metadata['mode']) & 0170000;
+    if ($kind === 0040000 && ! is_link($path)) {
+        $children = @scandir($path, SCANDIR_SORT_ASCENDING);
+        if (! is_array($children)) { throw new RuntimeException('scan'); }
+        foreach ($children as $name) {
+            if ($name !== '.' && $name !== '..') { sq_remove_tree($path . '/' . $name, $root); }
+        }
+        if (! @rmdir($path)) { throw new RuntimeException('rmdir'); }
+        return;
+    }
+    if (! @unlink($path)) { throw new RuntimeException('unlink'); }
+}
+try {
+    $operation = isset($argv[1]) ? $argv[1] : '';
+    $target = isset($argv[2]) ? $argv[2] : '';
+    $content = isset($argv[3]) ? base64_decode($argv[3], true) : false;
+    $require_empty = isset($argv[4]) && $argv[4] === '1';
+    $root = '/var/lib/squadrone/php-object-gadget';
+    $root_metadata = @lstat($root);
+    if (@realpath($root) !== $root || is_link($root) || ! is_dir($root)
+        || ! is_array($root_metadata)
+        || ((((int) $root_metadata['mode']) & 0170000) !== 0040000)
+        || (((int) $root_metadata['mode']) & 07777) !== 0770
+        || (int) $root_metadata['uid'] !== 0
+        || (int) $root_metadata['gid'] !== 33) {
+        throw new RuntimeException('root');
+    }
+    $children = @scandir($root, SCANDIR_SORT_ASCENDING);
+    if (! is_array($children)) { throw new RuntimeException('scan'); }
+    $children = array_values(array_diff($children, array('.', '..')));
+    if (count($children) > 1024) { throw new RuntimeException('entries'); }
+    if ($operation === 'cleanup') {
+        if ($require_empty && count($children) !== 0) { throw new RuntimeException('not_empty'); }
+        foreach ($children as $name) { sq_remove_tree($root . '/' . $name, $root); }
+        $result = array('operation' => 'cleanup', 'directory_entry_count' => 0);
+    } elseif ($operation === 'provision') {
+        if (count($children) !== 0 || ! is_string($content)) { throw new RuntimeException('state'); }
+        if (! preg_match('#\A/var/lib/squadrone/php-object-gadget/[A-Za-z0-9_.-]{1,320}\z#D', $target)
+            || strpos(basename($target), '..') !== false) {
+            throw new RuntimeException('target');
+        }
+        $handle = @fopen($target, 'x+b');
+        if (! is_resource($handle)) { throw new RuntimeException('create'); }
+        $written = @fwrite($handle, $content);
+        $flushed = @fflush($handle);
+        @fclose($handle);
+        if ($written !== strlen($content) || ! $flushed || ! @chmod($target, 0600)
+            || ! @chown($target, 'www-data') || ! @chgrp($target, 'www-data')) {
+            throw new RuntimeException('protect');
+        }
+        clearstatcache(true, $target);
+        $metadata = @lstat($target);
+        if (! is_array($metadata) || (int) $metadata['nlink'] !== 1) {
+            throw new RuntimeException('metadata');
+        }
+        $result = array('operation' => 'provision', 'directory_entry_count' => 1);
+    } elseif ($operation === 'measure') {
+        if ($target === '' || dirname($target) !== $root) { throw new RuntimeException('target'); }
+        $inventory = array();
+        foreach ($children as $name) {
+            $path = $root . '/' . $name;
+            $metadata = @lstat($path);
+            if (! is_array($metadata)) { throw new RuntimeException('lstat'); }
+            $kind = ((int) $metadata['mode']) & 0170000;
+            $digest = $kind === 0100000 ? @hash_file('sha256', $path) : null;
+            $inventory[] = array(
+                'name' => $name,
+                'kind' => $kind,
+                'mode' => ((int) $metadata['mode']) & 07777,
+                'uid' => (int) $metadata['uid'],
+                'gid' => (int) $metadata['gid'],
+                'nlink' => (int) $metadata['nlink'],
+                'size' => (int) $metadata['size'],
+                'sha256' => $digest,
+            );
+        }
+        $metadata = @lstat($target);
+        $exists = is_array($metadata);
+        $kind = $exists ? (((int) $metadata['mode']) & 0170000) : 0;
+        $result = array(
+            'operation' => 'measure',
+            'target_path_sha256' => hash('sha256', $target),
+            'target_exists' => $exists,
+            'target_regular' => $exists && $kind === 0100000,
+            'target_symlink' => $exists && is_link($target),
+            'target_content_sha256' => $exists && $kind === 0100000 ? @hash_file('sha256', $target) : null,
+            'target_size_bytes' => $exists ? (int) $metadata['size'] : null,
+            'target_uid' => $exists ? (int) $metadata['uid'] : null,
+            'target_gid' => $exists ? (int) $metadata['gid'] : null,
+            'target_mode' => $exists ? (((int) $metadata['mode']) & 07777) : null,
+            'target_inode' => $exists ? (int) $metadata['ino'] : null,
+            'target_link_count' => $exists ? (int) $metadata['nlink'] : null,
+            'directory_entry_count' => count($children),
+            'directory_inventory_sha256' => hash('sha256', json_encode($inventory, JSON_UNESCAPED_SLASHES)),
+            'directory_uid' => (int) $root_metadata['uid'],
+            'directory_gid' => (int) $root_metadata['gid'],
+            'directory_mode' => ((int) $root_metadata['mode']) & 07777,
+        );
+    } else { throw new RuntimeException('operation'); }
+    $encoded = json_encode($result, JSON_UNESCAPED_SLASHES);
+    if (! is_string($encoded) || strlen($encoded) > 8192) { throw new RuntimeException('json'); }
+    fwrite(STDOUT, $encoded);
+    exit(0);
+} catch (Throwable $error) { sq_fail(); }
+"""
+
+
+_PHP_OBJECT_GADGET_SOURCE_SCRIPT = r"""
+function sq_source_fail() { fwrite(STDERR, 'gadget_source_failed'); exit(70); }
+function sq_source_lines($value) {
+    return explode("\n", str_replace(array("\r\n", "\r"), "\n", $value));
+}
+function sq_source_anchors($value, &$anchors) {
+    if (! is_array($value)) { return; }
+    if (isset($value['file'], $value['line'], $value['source_code'])
+        && is_string($value['file']) && is_int($value['line'])
+        && is_string($value['source_code'])) {
+        $anchors[] = $value;
+    }
+    foreach ($value as $child) { sq_source_anchors($child, $anchors); }
+}
+try {
+    $slug = isset($argv[1]) ? $argv[1] : '';
+    $decoded = isset($argv[2]) ? base64_decode($argv[2], true) : false;
+    $recipe = is_string($decoded) ? json_decode($decoded, true) : null;
+    $root = '/var/www/html/wp-content/plugins/' . $slug;
+    if (! preg_match('/\A[a-z0-9][a-z0-9_-]{0,199}\z/D', $slug)
+        || ! is_array($recipe) || @realpath($root) !== $root || is_link($root)) {
+        throw new RuntimeException('input');
+    }
+    $anchors = array(); sq_source_anchors($recipe, $anchors);
+    if (count($anchors) < 3 || count($anchors) > 256) {
+        throw new RuntimeException('anchors');
+    }
+    $files = array();
+    foreach ($anchors as $anchor) {
+        $relative = $anchor['file']; $path = $root . '/' . $relative;
+        $real = @realpath($path); $metadata = @lstat($path);
+        if (! is_string($real) || $real !== $path || strpos($real, $root . '/') !== 0
+            || is_link($path) || ! is_array($metadata)
+            || ((((int) $metadata['mode']) & 0170000) !== 0100000)
+            || (int) $metadata['nlink'] !== 1 || (int) $metadata['size'] < 1
+            || (int) $metadata['size'] > 33554432) {
+            throw new RuntimeException('source_file');
+        }
+        $source = @file_get_contents($path);
+        if (! is_string($source) || strlen($source) !== (int) $metadata['size']) {
+            throw new RuntimeException('source_read');
+        }
+        $source_lines = sq_source_lines($source);
+        $quote_lines = sq_source_lines($anchor['source_code']);
+        $offset = $anchor['line'] - 1;
+        if ($offset < 0 || $offset + count($quote_lines) > count($source_lines)) {
+            throw new RuntimeException('source_range');
+        }
+        foreach ($quote_lines as $index => $quote) {
+            if (trim($source_lines[$offset + $index]) !== trim($quote)) {
+                throw new RuntimeException('source_quote');
+            }
+        }
+        $files[$relative] = hash('sha256', $source);
+    }
+    ksort($files, SORT_STRING);
+    if (count($files) < 1 || count($files) > 64) {
+        throw new RuntimeException('files');
+    }
+    $result = array(
+        'source_inventory_sha256' => hash(
+            'sha256',
+            json_encode($files, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)
+        ),
+        'source_file_count' => count($files),
+        'source_anchor_count' => count($anchors),
+    );
+    $encoded = json_encode($result, JSON_UNESCAPED_SLASHES);
+    if (! is_string($encoded) || strlen($encoded) > 1024) {
+        throw new RuntimeException('json');
+    }
+    fwrite(STDOUT, $encoded); exit(0);
+} catch (Throwable $error) { sq_source_fail(); }
+"""
+
+
+_PHP_OBJECT_GADGET_RUNTIME_SCRIPT = r"""
+function sq_runtime_fail() { fwrite(STDERR, 'gadget_runtime_failed'); exit(70); }
+function sq_lines($value) {
+    return explode("\n", str_replace(array("\r\n", "\r"), "\n", $value));
+}
+function sq_collect_anchors($value, &$anchors, &$constants) {
+    if (! is_array($value)) { return; }
+    if (isset($value['file'], $value['line'], $value['source_code'])
+        && is_string($value['file']) && is_int($value['line']) && is_string($value['source_code'])) {
+        $anchors[] = $value;
+    }
+    if (isset($value['directory_constant']) && is_string($value['directory_constant'])) {
+        $constants[$value['directory_constant']] = true;
+    }
+    foreach ($value as $child) { sq_collect_anchors($child, $anchors, $constants); }
+}
+function sq_method_identity($method) {
+    $file = $method->getFileName();
+    return array(
+        'name' => $method->getName(),
+        'declaring_class' => $method->getDeclaringClass()->getName(),
+        'file' => is_string($file) ? $file : '',
+        'start' => $method->getStartLine(),
+        'end' => $method->getEndLine(),
+        'static' => $method->isStatic(),
+        'public' => $method->isPublic(),
+    );
+}
+function sq_require_trait_free_hierarchy($class) {
+    $current = $class;
+    while ($current) {
+        if ($current->isTrait() || count($current->getTraitNames()) !== 0) {
+            throw new RuntimeException('trait');
+        }
+        $current = $current->getParentClass();
+    }
+}
+function sq_attest_static_array_markers($class, $source, $opaque_properties, &$identities) {
+    foreach (sq_lines($source) as $line) {
+        $broad_count = preg_match_all(
+            '/\b(?:self|static)::\$[A-Za-z_][A-Za-z0-9_]*\s*\[[^\]\r\n]+\]\s*=\s*true\s*;/i',
+            $line,
+            $broad_matches
+        );
+        if ($broad_count === false) { throw new RuntimeException('static_marker_parse'); }
+        if ($broad_count === 0) { continue; }
+        $match = array();
+        if ($broad_count !== 1 || preg_match(
+            '/\A\s*self::\$([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*\$this\s*->\s*'
+            . '([A-Za-z_][A-Za-z0-9_]*)\s*\]\s*=\s*true\s*;\s*\z/i',
+            $line,
+            $match
+        ) !== 1) {
+            throw new RuntimeException('static_marker_shape');
+        }
+        $name = $match[1]; $opaque_property = $match[2];
+        if (! isset($opaque_properties[$opaque_property]) || ! $class->hasProperty($name)) {
+            throw new RuntimeException('static_marker_missing');
+        }
+        $property = $class->getProperty($name);
+        $declaring = $property->getDeclaringClass();
+        $defaults = $declaring->getDefaultProperties();
+        if ($declaring->getName() !== $class->getName() || ! $property->isStatic()
+            || ! array_key_exists($name, $defaults)
+            || ! is_array($defaults[$name]) || ! is_array($property->getValue())) {
+            throw new RuntimeException('static_marker_type');
+        }
+        $identity = array(
+            'name' => $name,
+            'opaque_property' => $opaque_property,
+            'declaring_class' => $declaring->getName(),
+            'native_array' => true,
+        );
+        $identity_key = $name . "\0" . $opaque_property;
+        if (isset($identities[$identity_key])) {
+            throw new RuntimeException('static_marker_duplicate');
+        }
+        $identities[$identity_key] = $identity;
+    }
+}
+try {
+    $slug = isset($argv[1]) ? $argv[1] : '';
+    $decoded = isset($argv[2]) ? base64_decode($argv[2], true) : false;
+    $recipe = is_string($decoded) ? json_decode($decoded, true) : null;
+    $root = '/var/www/html/wp-content/plugins/' . $slug;
+    if (! preg_match('/\A[a-z0-9][a-z0-9_-]{0,199}\z/D', $slug)
+        || ! is_array($recipe) || @realpath($root) !== $root || is_link($root)) {
+        throw new RuntimeException('input');
+    }
+    $anchors = array(); $constants = array();
+    sq_collect_anchors($recipe, $anchors, $constants);
+    if (count($anchors) < 3 || count($anchors) > 256) { throw new RuntimeException('anchors'); }
+    $files = array();
+    foreach ($anchors as $anchor) {
+        $relative = $anchor['file'];
+        $path = $root . '/' . $relative;
+        $real = @realpath($path);
+        $metadata = @lstat($path);
+        if (! is_string($real) || $real !== $path || strpos($real, $root . '/') !== 0
+            || is_link($path) || ! is_array($metadata)
+            || ((((int) $metadata['mode']) & 0170000) !== 0100000)
+            || (int) $metadata['nlink'] !== 1 || (int) $metadata['size'] < 1
+            || (int) $metadata['size'] > 33554432) {
+            throw new RuntimeException('source_file');
+        }
+        $source = @file_get_contents($path);
+        if (! is_string($source) || strlen($source) !== (int) $metadata['size']) {
+            throw new RuntimeException('source_read');
+        }
+        $source_lines = sq_lines($source); $quote_lines = sq_lines($anchor['source_code']);
+        $offset = $anchor['line'] - 1;
+        if ($offset < 0 || $offset + count($quote_lines) > count($source_lines)) {
+            throw new RuntimeException('source_range');
+        }
+        foreach ($quote_lines as $index => $quote) {
+            if (trim($source_lines[$offset + $index]) !== trim($quote)) {
+                throw new RuntimeException('source_quote');
+            }
+        }
+        $files[$relative] = hash('sha256', $source);
+    }
+    ksort($files, SORT_STRING);
+    if (count($files) < 1 || count($files) > 64) { throw new RuntimeException('files'); }
+    $source_inventory = hash('sha256', json_encode($files, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+
+    ob_start(); require '/var/www/html/wp-load.php'; ob_end_clean();
+    if (sys_get_temp_dir() !== '/var/lib/squadrone/php-object-gadget') {
+        throw new RuntimeException('tmpdir');
+    }
+    foreach (array_keys($constants) as $constant_name) {
+        if (! defined($constant_name)
+            || constant($constant_name) !== '/var/lib/squadrone/php-object-gadget/') {
+            throw new RuntimeException('constant');
+        }
+    }
+
+    $object = $recipe['gadget_object']; $class_name = $object['class_name'];
+    if (! is_string($class_name) || ! class_exists($class_name, true)) {
+        throw new RuntimeException('class');
+    }
+    $class = new ReflectionClass($class_name);
+    $class_file = $class->getFileName();
+    $class_expected_file = $root . '/' . $object['class_anchor']['file'];
+    if ($class->getName() !== $class_name || ! is_string($class_file)
+        || @realpath($class_file) !== $class_expected_file || $class->isInternal()
+        || $class->getStartLine() !== $object['class_anchor']['line']
+        || $class->isInterface() || $class->isTrait()
+        || (method_exists($class, 'isEnum') && $class->isEnum())
+        || count($class->getTraitNames()) !== 0
+        || $class->implementsInterface('Serializable')) {
+        throw new RuntimeException('class_identity');
+    }
+    $ancestor = $class->getParentClass();
+    while ($ancestor) {
+        if (count($ancestor->getTraitNames()) !== 0) {
+            throw new RuntimeException('ancestor_trait');
+        }
+        $ancestor = $ancestor->getParentClass();
+    }
+    $trigger_name = $object['trigger'];
+    foreach ($class->getMethods() as $candidate_method) {
+        $candidate_name = strtolower($candidate_method->getName());
+        if (strpos($candidate_name, '__') === 0
+            && $candidate_name !== '__construct'
+            && $candidate_name !== strtolower($trigger_name)) {
+            throw new RuntimeException('magic');
+        }
+    }
+    if (! $class->hasMethod($trigger_name)) { throw new RuntimeException('trigger'); }
+    $trigger = $class->getMethod($trigger_name);
+    $trigger_anchor = $object['trigger_anchor'];
+    $trigger_file = $root . '/' . $trigger_anchor['file'];
+    $trigger_line_count = count(sq_lines($trigger_anchor['source_code']));
+    if ($trigger->getName() !== $trigger_name
+        || $trigger->getDeclaringClass()->getName() !== $object['trigger_declaring_class']
+        || @realpath($trigger->getFileName()) !== $trigger_file
+        || $trigger->getStartLine() !== $trigger_anchor['line']
+        || $trigger->getEndLine() !== $trigger_anchor['line'] + $trigger_line_count - 1) {
+        throw new RuntimeException('trigger_identity');
+    }
+
+    $opaque_properties = array();
+    foreach ($object['properties'] as $property) {
+        if (isset($property['value']['kind'])
+            && $property['value']['kind'] === 'opaque_generation_id') {
+            $opaque_properties[$property['name']] = true;
+        }
+    }
+    $reflection = array(
+        'class' => array(
+            'name' => $class->getName(), 'file' => $class_file,
+            'start' => $class->getStartLine(), 'end' => $class->getEndLine(),
+            'parent' => ($class->getParentClass() ? $class->getParentClass()->getName() : null),
+        ),
+        'trigger' => sq_method_identity($trigger), 'properties' => array(),
+        'helpers' => array(), 'static_array_markers' => array(),
+    );
+    sq_attest_static_array_markers(
+        $class,
+        $trigger_anchor['source_code'],
+        $opaque_properties,
+        $reflection['static_array_markers']
+    );
+    foreach ($object['properties'] as $property) {
+        $declaring = $property['declaring_class']; $name = $property['name'];
+        if (! class_exists($declaring, true)) { throw new RuntimeException('property_class'); }
+        $declaring_class = new ReflectionClass($declaring);
+        if ($declaring_class->getName() !== $declaring
+            || ($declaring !== $class_name && ! is_subclass_of($class_name, $declaring, true))
+            || ! $declaring_class->hasProperty($name)) {
+            throw new RuntimeException('property_missing');
+        }
+        $reflected = $declaring_class->getProperty($name);
+        $visibility = $reflected->isPrivate() ? 'private' : ($reflected->isProtected() ? 'protected' : 'public');
+        if ($reflected->getDeclaringClass()->getName() !== $declaring
+            || $visibility !== $property['visibility'] || $reflected->isStatic()) {
+            throw new RuntimeException('property_identity');
+        }
+        $declaring_file = $declaring_class->getFileName();
+        $declaring_real = is_string($declaring_file) ? @realpath($declaring_file) : false;
+        $declaring_metadata = is_string($declaring_real) ? @lstat($declaring_real) : false;
+        $declaring_digest = is_string($declaring_real) ? @hash_file('sha256', $declaring_real) : false;
+        if (! is_string($declaring_real) || strpos($declaring_real, $root . '/') !== 0
+            || is_link($declaring_real) || ! is_array($declaring_metadata)
+            || ((((int) $declaring_metadata['mode']) & 0170000) !== 0100000)
+            || (int) $declaring_metadata['nlink'] !== 1
+            || ! is_string($declaring_digest) || strlen($declaring_digest) !== 64) {
+            throw new RuntimeException('property_source');
+        }
+        $defaults = $declaring_class->getDefaultProperties();
+        $default_present = array_key_exists($name, $defaults);
+        $default_json = $default_present ? json_encode($defaults[$name], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) : '';
+        if ($default_present && ! is_string($default_json)) { throw new RuntimeException('property_default'); }
+        $type = $reflected->getType();
+        if ($type instanceof ReflectionUnionType || $type instanceof ReflectionIntersectionType) {
+            throw new RuntimeException('property_type');
+        }
+        $reflection['properties'][] = array(
+            'name' => $name, 'declaring_class' => $declaring, 'visibility' => $visibility,
+            'type' => $type ? (string) $type : '', 'default_present' => $default_present,
+            'default_sha256' => hash('sha256', $default_json), 'file' => $declaring_real,
+            'source_sha256' => $declaring_digest,
+        );
+    }
+    foreach ($recipe['helper_anchors'] as $helper) {
+        $symbol = $helper['symbol']; $anchor = $helper['anchor'];
+        if (strpos($symbol, '::') !== false) {
+            list($helper_class, $helper_method) = explode('::', $symbol, 2);
+            if (! class_exists($helper_class, true)) { throw new RuntimeException('helper_class'); }
+            $reflected = new ReflectionMethod($helper_class, $helper_method);
+            if ($reflected->getName() !== $helper_method
+                || $reflected->getDeclaringClass()->getName() !== $helper_class) {
+                throw new RuntimeException('helper_declaring');
+            }
+            sq_require_trait_free_hierarchy($reflected->getDeclaringClass());
+            $identity = sq_method_identity($reflected);
+            $namespace = $reflected->getDeclaringClass()->getNamespaceName();
+            sq_attest_static_array_markers(
+                $class,
+                $anchor['source_code'],
+                $opaque_properties,
+                $reflection['static_array_markers']
+            );
+        } else {
+            if (! function_exists($symbol)) { throw new RuntimeException('helper_function'); }
+            $reflected = new ReflectionFunction($symbol);
+            if ($reflected->getName() !== $symbol) {
+                throw new RuntimeException('helper_function_identity');
+            }
+            $file = $reflected->getFileName();
+            $identity = array('name' => $reflected->getName(), 'declaring_class' => '',
+                'file' => is_string($file) ? $file : '', 'start' => $reflected->getStartLine(),
+                'end' => $reflected->getEndLine(), 'static' => false, 'public' => true);
+            $namespace = $reflected->getNamespaceName();
+        }
+        $expected_file = $root . '/' . $anchor['file'];
+        $line_count = count(sq_lines($anchor['source_code']));
+        if (@realpath($identity['file']) !== $expected_file
+            || $identity['start'] !== $anchor['line']
+            || $identity['end'] !== $anchor['line'] + $line_count - 1) {
+            throw new RuntimeException('helper_identity');
+        }
+        if ($namespace !== '' && (function_exists($namespace . '\\unlink')
+            || function_exists($namespace . '\\file_exists')
+            || function_exists($namespace . '\\strpos')
+            || function_exists($namespace . '\\preg_match'))) {
+            throw new RuntimeException('builtin_shadow');
+        }
+        $reflection['helpers'][] = $identity;
+    }
+    $namespace = $class->getNamespaceName();
+    if ($namespace !== '' && (function_exists($namespace . '\\unlink')
+        || function_exists($namespace . '\\file_exists')
+        || function_exists($namespace . '\\strpos')
+        || function_exists($namespace . '\\preg_match'))) {
+        throw new RuntimeException('builtin_shadow');
+    }
+    ksort($reflection['static_array_markers'], SORT_STRING);
+    $reflection['static_array_markers'] = array_values($reflection['static_array_markers']);
+    $reflection_sha256 = hash('sha256', json_encode($reflection, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+    $result = array(
+        'source_inventory_sha256' => $source_inventory,
+        'reflection_sha256' => $reflection_sha256,
+        'source_file_count' => count($files),
+        'source_anchor_count' => count($anchors),
+        'property_count' => count($object['properties']),
+    );
+    $encoded = json_encode($result, JSON_UNESCAPED_SLASHES);
+    if (! is_string($encoded) || strlen($encoded) > 4096) { throw new RuntimeException('json'); }
+    fwrite(STDOUT, $encoded); exit(0);
+} catch (Throwable $error) { if (ob_get_level()) { ob_end_clean(); } sq_runtime_fail(); }
+"""
+
+
+async def _inspect_php_object_gadget_runtime(
+    container_name: str,
+    plugin_slug: str,
+    recipe: PhpObjectGadgetRecipe,
+) -> dict[str, object]:
+    encoded_recipe = base64.b64encode(recipe.model_dump_json().encode("utf-8")).decode(
+        "ascii"
+    )
+    if len(encoded_recipe) > 512 * 1024:
+        raise RuntimeError("PHP object gadget runtime recipe is too large")
+    trusted_source_before = await _inspect_php_object_gadget_source(
+        container_name,
+        plugin_slug,
+        encoded_recipe,
+    )
+    try:
+        rc, stdout, _stderr = await _run(
+            "docker",
+            "exec",
+            "--user",
+            WORDPRESS_WEB_USER,
+            container_name,
+            "php",
+            "-r",
+            _PHP_OBJECT_GADGET_RUNTIME_SCRIPT,
+            plugin_slug,
+            encoded_recipe,
+            check=False,
+        )
+    finally:
+        trusted_source_after = await _inspect_php_object_gadget_source(
+            container_name,
+            plugin_slug,
+            encoded_recipe,
+        )
+    if trusted_source_before != trusted_source_after:
+        raise RuntimeError("PHP object gadget source changed during runtime inspection")
+    try:
+        payload = json.loads(stdout) if len(stdout) <= 4096 else None
+    except (json.JSONDecodeError, TypeError, ValueError):
+        payload = None
+    if (
+        rc != 0
+        or type(payload) is not dict
+        or any(
+            payload.get(key) != trusted_source_before[key]
+            for key in (
+                "source_inventory_sha256",
+                "source_file_count",
+                "source_anchor_count",
+            )
+        )
+    ):
+        raise RuntimeError("PHP object gadget runtime attestation failed")
+    return cast(dict[str, object], payload)
+
+
+async def _inspect_php_object_gadget_source(
+    container_name: str,
+    plugin_slug: str,
+    encoded_recipe: str,
+) -> dict[str, object]:
+    """Measure reviewed source in a root-owned process that never loads the plugin."""
+    rc, stdout, _stderr = await _run(
+        "docker",
+        "exec",
+        "--user",
+        "root",
+        container_name,
+        "php",
+        "-r",
+        _PHP_OBJECT_GADGET_SOURCE_SCRIPT,
+        plugin_slug,
+        encoded_recipe,
+        check=False,
+    )
+    try:
+        payload = json.loads(stdout) if len(stdout) <= 1024 else None
+    except (json.JSONDecodeError, TypeError, ValueError):
+        payload = None
+    required = {
+        "source_inventory_sha256",
+        "source_file_count",
+        "source_anchor_count",
+    }
+    if (
+        rc != 0
+        or type(payload) is not dict
+        or set(payload) != required
+        or not isinstance(payload.get("source_inventory_sha256"), str)
+        or _SHA256_RE.fullmatch(cast(str, payload["source_inventory_sha256"])) is None
+        or type(payload.get("source_file_count")) is not int
+        or not 1 <= cast(int, payload["source_file_count"]) <= 64
+        or type(payload.get("source_anchor_count")) is not int
+        or not 3 <= cast(int, payload["source_anchor_count"]) <= 256
+    ):
+        raise RuntimeError("PHP object gadget trusted source inspection failed")
+    return cast(dict[str, object], payload)
+
+
+def _validate_php_object_gadget_runtime_payload(
+    payload: object,
+    *,
+    recipe: PhpObjectGadgetRecipe,
+    effect_binding_kind: object,
+) -> PhpObjectGadgetRuntimeBinding:
+    required = {
+        "source_inventory_sha256",
+        "reflection_sha256",
+        "source_file_count",
+        "source_anchor_count",
+        "property_count",
+    }
+    if (
+        type(payload) is not dict
+        or set(payload) != required
+        or effect_binding_kind not in {"direct_path", "guarded_opaque_prefix"}
+        or not _php_object_gadget_effect_sinks_accounted(recipe)
+    ):
+        raise RuntimeError("PHP object gadget runtime attestation is malformed")
+    values = cast(dict[str, object], payload)
+    try:
+        return PhpObjectGadgetRuntimeBinding(
+            schema_version=PHP_OBJECT_GADGET_ORACLE_SCHEMA_VERSION,
+            mode=PHP_OBJECT_GADGET_ORACLE_MODE,
+            effect="file_delete",
+            effect_binding_kind=cast(
+                Literal["direct_path", "guarded_opaque_prefix"],
+                effect_binding_kind,
+            ),
+            recipe_sha256=php_object_gadget_recipe_sha256(recipe),
+            source_inventory_sha256=cast(str, values["source_inventory_sha256"]),
+            reflection_sha256=cast(str, values["reflection_sha256"]),
+            source_file_count=cast(int, values["source_file_count"]),
+            source_anchor_count=cast(int, values["source_anchor_count"]),
+            property_count=cast(int, values["property_count"]),
+            all_effect_sinks_accounted=True,
+        )
+    except (TypeError, ValueError):
+        raise RuntimeError("PHP object gadget runtime attestation is unsafe") from None
+
+
+def _php_object_gadget_recipe_directory_constants(
+    recipe: PhpObjectGadgetRecipe,
+) -> tuple[str, ...]:
+    """Return the exact reviewed constants that must map to the private tmpfs."""
+    constants = {
+        guarded.directory_constant for guarded in recipe.guarded_effect_anchors
+    }
+    binding = recipe.effect_binding
+    if isinstance(binding, PhpObjectGadgetDirectPathEffectBinding):
+        if binding.local_path_check is not None:
+            constants.add(binding.local_path_check.directory_constant)
+    else:
+        constants.add(binding.effect.directory_constant)
+    return tuple(sorted(constants))
+
+
+def _php_object_gadget_effect_sinks_accounted(
+    recipe: PhpObjectGadgetRecipe,
+) -> bool:
+    """Require every builtin unlink in a complete reviewed body to be declared."""
+
+    def lines(anchor: PhpObjectGadgetSourceAnchor) -> list[str]:
+        return anchor.source_code.splitlines() or [anchor.source_code]
+
+    def identity(anchor: PhpObjectGadgetSourceAnchor) -> tuple[str, int, str] | None:
+        anchor_lines = lines(anchor)
+        if (
+            len(anchor_lines) != 1
+            or len(_PHP_OBJECT_GADGET_UNLINK_CALL_RE.findall(anchor_lines[0])) != 1
+        ):
+            return None
+        return (anchor.file, anchor.line, anchor_lines[0].strip())
+
+    def contains(
+        parent: PhpObjectGadgetSourceAnchor,
+        child: PhpObjectGadgetSourceAnchor,
+    ) -> bool:
+        if parent.file != child.file or child.line < parent.line:
+            return False
+        parent_lines = lines(parent)
+        child_lines = lines(child)
+        offset = child.line - parent.line
+        return offset + len(child_lines) <= len(parent_lines) and [
+            line.strip() for line in parent_lines[offset : offset + len(child_lines)]
+        ] == [line.strip() for line in child_lines]
+
+    bodies = (
+        recipe.gadget_object.trigger_anchor,
+        *(helper.anchor for helper in recipe.helper_anchors),
+    )
+    binding = recipe.effect_binding
+    declared_anchors: tuple[PhpObjectGadgetSourceAnchor, ...]
+    if isinstance(binding, PhpObjectGadgetDirectPathEffectBinding):
+        declared_anchors = (
+            binding.effect_anchor,
+            *(guarded.anchor for guarded in recipe.guarded_effect_anchors),
+        )
+    else:
+        declared_anchors = (
+            binding.effect.anchor,
+            *(guarded.anchor for guarded in recipe.guarded_effect_anchors),
+        )
+
+    declared: set[tuple[str, int, str]] = set()
+    for anchor in declared_anchors:
+        sink = identity(anchor)
+        if sink is None or sum(contains(body, anchor) for body in bodies) != 1:
+            return False
+        declared.add(sink)
+    if len(declared) != len(declared_anchors):
+        return False
+
+    observed: set[tuple[str, int, str]] = set()
+    for body in bodies:
+        for offset, source_line in enumerate(lines(body)):
+            count = len(_PHP_OBJECT_GADGET_UNLINK_CALL_RE.findall(source_line))
+            if count > 1:
+                return False
+            if count == 1:
+                sink = (body.file, body.line + offset, source_line.strip())
+                if sink in observed:
+                    return False
+                observed.add(sink)
+    return observed == declared
+
+
+async def _php_object_gadget_filesystem_operation(
+    container_name: str,
+    *,
+    operation: Literal["cleanup", "provision", "measure"],
+    target_path: str,
+    content: bytes,
+    require_empty: bool,
+) -> dict[str, object]:
+    rc, filesystem_type, _stderr = await _run(
+        "docker",
+        "exec",
+        "--user",
+        "root",
+        container_name,
+        "stat",
+        "-f",
+        "-c",
+        "%T",
+        PHP_OBJECT_GADGET_DIRECTORY,
+        check=False,
+    )
+    if rc != 0 or filesystem_type.strip() != "tmpfs":
+        raise RuntimeError("PHP object gadget directory is not its dedicated tmpfs")
+    rc, stdout, _stderr = await _run(
+        "docker",
+        "exec",
+        "--user",
+        "root",
+        container_name,
+        "php",
+        "-r",
+        _PHP_OBJECT_GADGET_FILESYSTEM_SCRIPT,
+        operation,
+        target_path,
+        base64.b64encode(content).decode("ascii"),
+        "1" if require_empty else "0",
+        check=False,
+    )
+    try:
+        payload = json.loads(stdout) if len(stdout) <= 8192 else None
+    except (json.JSONDecodeError, TypeError, ValueError):
+        payload = None
+    if rc != 0 or type(payload) is not dict:
+        raise RuntimeError("PHP object gadget filesystem operation failed")
+    return cast(dict[str, object], payload)
+
+
+def _validate_php_object_gadget_measurement_payload(
+    payload: object,
+    *,
+    target_path: str,
+) -> PhpObjectGadgetFileMeasurement:
+    required = {
+        "operation",
+        "target_path_sha256",
+        "target_exists",
+        "target_regular",
+        "target_symlink",
+        "target_content_sha256",
+        "target_size_bytes",
+        "target_uid",
+        "target_gid",
+        "target_mode",
+        "target_inode",
+        "target_link_count",
+        "directory_entry_count",
+        "directory_inventory_sha256",
+        "directory_uid",
+        "directory_gid",
+        "directory_mode",
+    }
+    if type(payload) is not dict or set(payload) != required:
+        raise RuntimeError("PHP object gadget measurement has an invalid shape")
+    values = cast(dict[str, object], payload)
+    if (
+        values["operation"] != "measure"
+        or values["target_path_sha256"]
+        != hashlib.sha256(target_path.encode("ascii")).hexdigest()
+    ):
+        raise RuntimeError("PHP object gadget measurement changed its target")
+    try:
+        return PhpObjectGadgetFileMeasurement(
+            **{key: value for key, value in values.items() if key != "operation"},
+            directory_is_tmpfs=True,
+        )
+    except (TypeError, ValueError):
+        raise RuntimeError("PHP object gadget measurement is unsafe") from None
+
+
+_PHP_OBJECT_SURFACE_GUARD_SCRIPT = r"""
+function sq_guard_fail($reason) {
+    fwrite(STDERR, "surface_guard_" . $reason);
+    exit(70);
+}
+
+function sq_guard_json($value) {
+    $encoded = json_encode($value, JSON_UNESCAPED_SLASHES);
+    if (! is_string($encoded) || $encoded === '') {
+        throw new RuntimeException('json');
+    }
+    return $encoded;
+}
+
+function sq_guard_collect($slug) {
+    $root = '/var/www/html';
+    $content = $root . '/wp-content';
+    $plugins = $content . '/plugins';
+    $themes = $content . '/themes';
+    $mu_plugins = $content . '/mu-plugins';
+    $target = $plugins . '/' . $slug;
+    $target_stat = @lstat($target);
+    if (
+        ! is_array($target_stat)
+        || (((int) $target_stat['mode']) & 0170000) !== 0040000
+        || is_link($target)
+    ) {
+        throw new RuntimeException('target');
+    }
+
+    // Root and wp-content entry sets protect config/drop-in and directory
+    // replacement. Plugins, themes, and MU-plugins are protected recursively.
+    $scopes = array(
+        array($root, 1),
+        array($content, 1),
+        array($root . '/wp-admin', -1),
+        array($root . '/wp-includes', -1),
+        array($plugins, -1),
+        array($themes, -1),
+        array($mu_plugins, -1),
+    );
+    $entries = array();
+    $seen = array();
+    foreach ($scopes as $scope) {
+        $stack = array(array($scope[0], 0));
+        while ($stack) {
+            $current = array_pop($stack);
+            $path = $current[0];
+            $depth = $current[1];
+            if (
+                ! is_string($path)
+                || strlen($path) > 8192
+                || ($path !== $root && strpos($path, $root . '/') !== 0)
+            ) {
+                throw new RuntimeException('path');
+            }
+            $metadata = @lstat($path);
+            if (! is_array($metadata) || is_link($path)) {
+                throw new RuntimeException('link');
+            }
+            $kind_bits = ((int) $metadata['mode']) & 0170000;
+            if ($kind_bits === 0040000) {
+                $kind = 'd';
+            } elseif ($kind_bits === 0100000) {
+                $kind = 'f';
+                if ((int) $metadata['nlink'] !== 1) {
+                    throw new RuntimeException('hardlink');
+                }
+            } else {
+                throw new RuntimeException('special');
+            }
+
+            if (! isset($seen[$path])) {
+                $seen[$path] = true;
+                $digest = '';
+                $size = 0;
+                if ($kind === 'f') {
+                    $digest = @hash_file('sha256', $path);
+                    if (! is_string($digest) || strlen($digest) !== 64) {
+                        throw new RuntimeException('hash');
+                    }
+                    $size = (int) $metadata['size'];
+                    if ($size < 0) {
+                        throw new RuntimeException('size');
+                    }
+                }
+                $entries[] = array(
+                    'path' => $path,
+                    'kind' => $kind,
+                    'mode' => ((int) $metadata['mode']) & 07777,
+                    'uid' => (int) $metadata['uid'],
+                    'gid' => (int) $metadata['gid'],
+                    'nlink' => (int) $metadata['nlink'],
+                    'size' => $size,
+                    'sha256' => $digest,
+                );
+                if (count($entries) > 30000) {
+                    throw new RuntimeException('entries');
+                }
+            }
+
+            if ($kind === 'd' && ($scope[1] < 0 || $depth < $scope[1])) {
+                $children = @scandir($path, SCANDIR_SORT_ASCENDING);
+                if (! is_array($children)) {
+                    throw new RuntimeException('scan');
+                }
+                for ($index = count($children) - 1; $index >= 0; --$index) {
+                    $name = $children[$index];
+                    if ($name === '.' || $name === '..') {
+                        continue;
+                    }
+                    if (! is_string($name) || preg_match('//u', $name) !== 1) {
+                        throw new RuntimeException('name');
+                    }
+                    $stack[] = array($path . '/' . $name, $depth + 1);
+                }
+            }
+        }
+    }
+    usort(
+        $entries,
+        static function ($left, $right) {
+            return strcmp($left['path'], $right['path']);
+        }
+    );
+    return $entries;
+}
+
+function sq_guard_expected_frozen($entries) {
+    $expected = array();
+    foreach ($entries as $entry) {
+        $entry['mode'] = ((int) $entry['mode']) & ~0222;
+        $entry['uid'] = 0;
+        $entry['gid'] = 0;
+        $expected[] = $entry;
+    }
+    return $expected;
+}
+
+function sq_guard_restore_modes($entries) {
+    $restored = true;
+    for ($index = count($entries) - 1; $index >= 0; --$index) {
+        $entry = $entries[$index];
+        if (
+            ! is_array($entry)
+            || array_keys($entry) !== array(
+                'path', 'kind', 'mode', 'uid', 'gid', 'nlink', 'size', 'sha256'
+            )
+            || ! is_string($entry['path'])
+            || ! is_string($entry['kind'])
+            || ! is_int($entry['mode'])
+            || ! is_int($entry['uid'])
+            || ! is_int($entry['gid'])
+        ) {
+            $restored = false;
+            continue;
+        }
+        $metadata = @lstat($entry['path']);
+        if (! is_array($metadata) || is_link($entry['path'])) {
+            $restored = false;
+            continue;
+        }
+        $kind_bits = ((int) $metadata['mode']) & 0170000;
+        $actual_kind = $kind_bits === 0040000 ? 'd' : (
+            $kind_bits === 0100000 ? 'f' : ''
+        );
+        if ($actual_kind !== $entry['kind']) {
+            $restored = false;
+            continue;
+        }
+        if (
+            ! @chown($entry['path'], $entry['uid'])
+            || ! @chgrp($entry['path'], $entry['gid'])
+            || ! @chmod($entry['path'], $entry['mode'])
+        ) {
+            $restored = false;
+        }
+    }
+    return $restored;
+}
+
+function sq_guard_read_manifest($manifest, $slug) {
+    $metadata = @lstat($manifest);
+    if (
+        ! is_array($metadata)
+        || is_link($manifest)
+        || ((((int) $metadata['mode']) & 0170000) !== 0100000)
+        || (((int) $metadata['mode']) & 0777) !== 0600
+        || (int) $metadata['uid'] !== 0
+        || (int) $metadata['nlink'] !== 1
+        || (int) $metadata['size'] <= 0
+        || (int) $metadata['size'] > 16777216
+    ) {
+        throw new RuntimeException('manifest_stat');
+    }
+    $raw = @file_get_contents($manifest);
+    if (! is_string($raw) || $raw === '') {
+        throw new RuntimeException('manifest_read');
+    }
+    $decoded = json_decode($raw, true);
+    if (
+        ! is_array($decoded)
+        || array_keys($decoded) !== array('schema', 'slug', 'entries')
+        || $decoded['schema'] !== 1
+        || $decoded['slug'] !== $slug
+        || ! is_array($decoded['entries'])
+        || count($decoded['entries']) < 1
+        || count($decoded['entries']) > 30000
+    ) {
+        throw new RuntimeException('manifest_shape');
+    }
+    return array($raw, $decoded['entries']);
+}
+
+$operation = isset($argv[1]) && is_string($argv[1]) ? $argv[1] : '';
+$slug = isset($argv[2]) && is_string($argv[2]) ? $argv[2] : '';
+$manifest = isset($argv[3]) && is_string($argv[3]) ? $argv[3] : '';
+if (
+    preg_match('/\A[a-z0-9][a-z0-9_-]{0,199}\z/D', $slug) !== 1
+    || preg_match(
+        '/\A\/tmp\/squadrone-object-surfaces-[0-9a-f]{32}\.json\z/D',
+        $manifest
+    ) !== 1
+) {
+    sq_guard_fail('arguments');
+}
+
+try {
+    if ($operation === 'freeze') {
+        if (@lstat($manifest) !== false) {
+            throw new RuntimeException('manifest_collision');
+        }
+        $original = sq_guard_collect($slug);
+        $manifest_value = array(
+            'schema' => 1,
+            'slug' => $slug,
+            'entries' => $original,
+        );
+        $manifest_json = sq_guard_json($manifest_value);
+        $handle = @fopen($manifest, 'x');
+        if ($handle === false) {
+            throw new RuntimeException('manifest_create');
+        }
+        $manifest_owned = true;
+        try {
+            $offset = 0;
+            $length = strlen($manifest_json);
+            while ($offset < $length) {
+                $written = fwrite($handle, substr($manifest_json, $offset));
+                if (! is_int($written) || $written <= 0) {
+                    throw new RuntimeException('manifest_write');
+                }
+                $offset += $written;
+            }
+            if (! fflush($handle)) {
+                throw new RuntimeException('manifest_flush');
+            }
+        } finally {
+            fclose($handle);
+        }
+        if (! @chmod($manifest, 0600)) {
+            throw new RuntimeException('manifest_mode');
+        }
+        foreach ($original as $entry) {
+            if (
+                ! @chown($entry['path'], 0)
+                || ! @chgrp($entry['path'], 0)
+                || ! @chmod($entry['path'], ((int) $entry['mode']) & ~0222)
+            ) {
+                throw new RuntimeException('freeze_mode');
+            }
+        }
+        $frozen = sq_guard_collect($slug);
+        $expected_frozen = sq_guard_expected_frozen($original);
+        if ($frozen !== $expected_frozen) {
+            throw new RuntimeException('freeze_drift');
+        }
+        $output = array(
+            'operation' => 'freeze',
+            'entry_count' => count($original),
+            'original_sha256' => hash('sha256', sq_guard_json($original)),
+            'frozen_sha256' => hash('sha256', sq_guard_json($frozen)),
+            'manifest_sha256' => hash('sha256', $manifest_json),
+        );
+        fwrite(STDOUT, sq_guard_json($output));
+        exit(0);
+    }
+
+    list($manifest_json, $original) = sq_guard_read_manifest($manifest, $slug);
+    $expected_frozen = sq_guard_expected_frozen($original);
+    $current = sq_guard_collect($slug);
+    $drifted = $current !== $expected_frozen;
+    if ($operation === 'attest') {
+        if ($drifted) {
+            throw new RuntimeException('attestation_drift');
+        }
+        $output = array(
+            'operation' => 'attest',
+            'entry_count' => count($original),
+            'original_sha256' => hash('sha256', sq_guard_json($original)),
+            'frozen_sha256' => hash('sha256', sq_guard_json($current)),
+            'manifest_sha256' => hash('sha256', $manifest_json),
+        );
+        fwrite(STDOUT, sq_guard_json($output));
+        exit(0);
+    }
+    if ($operation !== 'restore') {
+        throw new RuntimeException('operation');
+    }
+
+    $modes_restored = sq_guard_restore_modes($original);
+    $restored = false;
+    try {
+        $after = sq_guard_collect($slug);
+        $restored = $modes_restored && $after === $original;
+    } catch (Throwable $ignored) {
+        $restored = false;
+    }
+    $unlinked = @unlink($manifest) && @lstat($manifest) === false;
+    $output = array(
+        'operation' => 'restore',
+        'entry_count' => count($original),
+        'original_sha256' => hash('sha256', sq_guard_json($original)),
+        'drift_before_restore' => $drifted,
+        'restored' => $restored,
+        'manifest_removed' => $unlinked,
+    );
+    fwrite(STDOUT, sq_guard_json($output));
+    exit(($drifted || ! $restored || ! $unlinked) ? 71 : 0);
+} catch (Throwable $error) {
+    if (
+        isset($operation)
+        && $operation === 'freeze'
+        && isset($original)
+        && is_array($original)
+    ) {
+        sq_guard_restore_modes($original);
+    }
+    if (isset($manifest_owned) && $manifest_owned === true) {
+        @unlink($manifest);
+    }
+    sq_guard_fail('failed');
+}
+"""
+
+
+def _validate_php_object_surface_summary(
+    value: object,
+    *,
+    operation: Literal["freeze", "attest"],
+) -> dict[str, object]:
+    """Validate one compact, secret-free response from the root guard."""
+    required = {
+        "operation",
+        "entry_count",
+        "original_sha256",
+        "frozen_sha256",
+        "manifest_sha256",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise RuntimeError("PHP object executable-surface guard returned invalid data")
+    entry_count = value.get("entry_count")
+    if (
+        value.get("operation") != operation
+        or type(entry_count) is not int
+        or not 1 <= entry_count <= 30000
+        or any(
+            not isinstance(value.get(field), str)
+            or _SHA256_RE.fullmatch(cast(str, value.get(field))) is None
+            for field in (
+                "original_sha256",
+                "frozen_sha256",
+                "manifest_sha256",
+            )
+        )
+    ):
+        raise RuntimeError("PHP object executable-surface guard returned invalid data")
+    return value
+
+
 class SandboxManager:
     """Boots a fresh WordPress + MariaDB stack and tears it down on exit."""
+
+    # Docker publishes the container's port 80 on a dynamic host port for PoCs.
+    # WP-CLI setup runs inside this same container, so its HTTP postconditions
+    # must use the fixed container-local listener instead of ``target_url``.
+    INTERNAL_WORDPRESS_ORIGIN = "http://127.0.0.1:80"
+
+    def setup_http_context(self) -> SetupHttpContext:
+        """Return the container connect address and WordPress's canonical Host.
+
+        The host-facing URL is deliberately reduced to its HTTP authority so setup
+        code cannot accidentally use a host-published port as an in-container
+        destination.
+        """
+        if not self.target_url:
+            raise RuntimeError("sandbox target URL is unavailable for setup HTTP")
+        return SetupHttpContext.from_wordpress_origins(
+            internal_connect_origin=self.INTERNAL_WORDPRESS_ORIGIN,
+            canonical_wordpress_origin=self.target_url,
+        )
 
     def __init__(
         self,
@@ -4211,10 +9652,44 @@ class SandboxManager:
         poc_timeout_s: int = 120,
         *,
         ssrf_oracle_modes: frozenset[Literal["http", "local_resource"]] = frozenset(),
+        php_include_oracle_enabled: bool = False,
+        php_object_oracle_enabled: bool = False,
+        php_object_gadget_oracle_enabled: bool = False,
+        php_object_gadget_directory_constants: frozenset[str] = frozenset(),
     ):
         unknown_ssrf_modes = set(ssrf_oracle_modes).difference(_SSRF_ORACLE_MODES)
         if unknown_ssrf_modes:
             raise ValueError("sandbox received an unsupported SSRF oracle mode")
+        if not isinstance(php_include_oracle_enabled, bool):
+            raise ValueError("PHP include oracle flag must be a boolean")
+        if not isinstance(php_object_oracle_enabled, bool):
+            raise ValueError("PHP object oracle flag must be a boolean")
+        if not isinstance(php_object_gadget_oracle_enabled, bool):
+            raise ValueError("PHP object gadget oracle flag must be a boolean")
+        if (
+            type(php_object_gadget_directory_constants) is not frozenset
+            or len(php_object_gadget_directory_constants) > 17
+            or any(
+                type(name) is not str
+                or re.fullmatch(r"[A-Z_][A-Z0-9_]{0,127}", name) is None
+                or name in _PHP_OBJECT_GADGET_FORBIDDEN_DIRECTORY_CONSTANTS
+                for name in php_object_gadget_directory_constants
+            )
+        ):
+            raise ValueError(
+                "PHP object gadget directory constants must be a bounded "
+                "frozenset of uppercase identifiers"
+            )
+        if php_object_gadget_oracle_enabled and not php_object_oracle_enabled:
+            raise ValueError(
+                "PHP object gadget oracle requires the primitive object oracle"
+            )
+        if php_object_gadget_directory_constants and not (
+            php_object_gadget_oracle_enabled
+        ):
+            raise ValueError(
+                "PHP object gadget directory constants require the gadget oracle"
+            )
         self.config = config
         self.boot_timeout_s = boot_timeout_s
         self.poc_timeout_s = poc_timeout_s
@@ -4230,6 +9705,25 @@ class SandboxManager:
         self._ssrf_oracle: SsrfOracleServer | None = None
         self._ssrf_local_oracle: LocalResourceSsrfOracle | None = None
         self._ssrf_local_host_dir: Path | None = None
+        self._php_include_oracle_enabled = php_include_oracle_enabled
+        self._php_include_oracle: PhpIncludeOracle | None = None
+        self._php_include_host_dir: Path | None = None
+        self._php_object_oracle_enabled = php_object_oracle_enabled
+        self._php_object_oracle: PhpObjectOracle | None = None
+        self._php_object_gadget_oracle_enabled = php_object_gadget_oracle_enabled
+        self._php_object_gadget_directory_constants = tuple(
+            sorted(php_object_gadget_directory_constants)
+        )
+        self._php_object_gadget_oracle: PhpObjectGadgetOracle | None = None
+        self._php_object_callsite: PhpObjectCallsite | None = None
+        self._installed_plugin_slug: str | None = None
+        self._php_object_surface_poisoned = False
+        # Snapshot archives can contain wp-config.php and therefore remain
+        # sandbox-owned sensitive state even when a caller is interrupted before
+        # its normal rmtree. Track every completed snapshot so teardown is the
+        # final cleanup boundary, including snapshots intentionally retained after
+        # a failed restore for in-lifetime recovery.
+        self._snapshot_dirs: set[Path] = set()
         self._ssrf_operation_lock = asyncio.Lock()
         self._booted = False
         self._baseline_accounts: list[dict] | None = None
@@ -4330,11 +9824,170 @@ class SandboxManager:
         except (OSError, RuntimeError):
             logger.warning("failed to remove local-resource SSRF canary")
 
+    async def prepare_php_include_oracle(self) -> dict[str, str]:
+        """Create stable opaque paths for one authored PHP include attempt."""
+        async with self._ssrf_operation_lock:
+            if not self._php_include_oracle_enabled:
+                raise RuntimeError(
+                    "PHP include oracle was not enabled for this sandbox"
+                )
+            self._clear_php_include_oracle_locked()
+            if (
+                not self._booted
+                or not self.container_name
+                or self._php_include_host_dir is None
+            ):
+                raise RuntimeError(
+                    "sandbox is unavailable for PHP include oracle preparation"
+                )
+            await _probe_php_include_mount(
+                self.container_name,
+                self._php_include_host_dir,
+            )
+            oracle = PhpIncludeOracle()
+            self._php_include_oracle = oracle
+            return oracle.public_context()
+
+    def _clear_php_include_oracle_locked(self) -> None:
+        oracle = self._php_include_oracle
+        if oracle is None:
+            return
+        if self._php_include_host_dir is None:
+            raise RuntimeError(
+                "cannot clear the PHP include oracle without its host directory"
+            )
+        try:
+            _remove_php_include_canary(self._php_include_host_dir, oracle)
+        except (OSError, RuntimeError) as exc:
+            logger.warning("failed to remove PHP include canary")
+            # Retain the exact oracle/path capability.  Preparation must fail
+            # and retry this removal instead of orphaning an executable sibling
+            # and issuing a new path into the same persistent mount.
+            raise RuntimeError("failed to clear the PHP include oracle") from exc
+        self._php_include_oracle = None
+
+    async def prepare_php_object_oracle(
+        self,
+        callsite: PhpObjectCallsite,
+    ) -> dict[str, str]:
+        """Install one verifier-owned inert class and return opaque arm tokens."""
+        async with self._ssrf_operation_lock:
+            if not self._php_object_oracle_enabled:
+                raise RuntimeError("PHP object oracle was not enabled for this sandbox")
+            await self._clear_php_object_oracle_locked()
+            if not self._booted or not self.container_name:
+                raise RuntimeError(
+                    "sandbox is unavailable for PHP object oracle preparation"
+                )
+
+            callsite_path = await self._attest_php_object_callsite(callsite)
+            oracle = PhpObjectOracle(
+                callsite_path=callsite_path,
+                callsite_start_line=callsite.start_line,
+                callsite_end_line=callsite.end_line,
+                callsite_source_sha256=callsite.source_sha256,
+            )
+            self._php_object_oracle = oracle
+            self._php_object_callsite = callsite
+            try:
+                await self._install_php_object_oracle_plugin(oracle)
+            except BaseException as exc:
+                cleanup_failed = False
+                try:
+                    await self._remove_php_object_oracle_plugin(oracle)
+                    await self._install_actor_receipt_plugin()
+                except Exception:
+                    cleanup_failed = True
+                    logger.warning("failed to clean a rejected PHP object oracle")
+                if not cleanup_failed:
+                    self._php_object_oracle = None
+                    self._php_object_callsite = None
+                if not isinstance(exc, Exception):
+                    raise
+                raise RuntimeError("failed to prepare the PHP object oracle") from None
+            return oracle.public_context()
+
+    async def _clear_php_object_oracle_locked(self) -> None:
+        """Remove only the exact issued class and detach its receipt bridge."""
+        oracle = self._php_object_oracle
+        if oracle is None:
+            self._php_object_gadget_oracle = None
+            self._php_object_callsite = None
+            return
+        try:
+            generation_id = oracle.generation_id
+        except RuntimeError:
+            generation_id = ""
+        if generation_id:
+            try:
+                oracle.snapshot()
+            except RuntimeError:
+                oracle.abort_generation(generation_id=generation_id)
+        try:
+            await self._remove_php_object_oracle_plugin(oracle)
+            await self._install_actor_receipt_plugin()
+        except Exception:
+            logger.warning("failed to clear PHP object oracle")
+            raise RuntimeError("failed to clear the PHP object oracle") from None
+        self._php_object_oracle = None
+        self._php_object_gadget_oracle = None
+        self._php_object_callsite = None
+
+    async def prepare_php_object_gadget_oracle(
+        self,
+        recipe: PhpObjectGadgetRecipe,
+    ) -> dict[str, str]:
+        """Bind one typed natural gadget to the completed inert primitive."""
+        async with self._ssrf_operation_lock:
+            if not self._php_object_gadget_oracle_enabled:
+                raise RuntimeError(
+                    "PHP object gadget oracle was not enabled for this sandbox"
+                )
+            if type(recipe) is not PhpObjectGadgetRecipe:
+                raise ValueError("PHP object gadget recipe has an invalid type")
+            primitive = self._php_object_oracle
+            callsite = self._php_object_callsite
+            if (
+                not self._booted
+                or not self.container_name
+                or primitive is None
+                or callsite is None
+                or self._installed_plugin_slug is None
+            ):
+                raise RuntimeError(
+                    "sandbox primitive is unavailable for gadget preparation"
+                )
+            primitive_snapshot = primitive.snapshot()
+            await self._attest_php_object_oracle_plugin(primitive)
+            callsite_path = await self._attest_php_object_callsite(callsite)
+            if not hmac.compare_digest(callsite_path, primitive.private_callsite_path):
+                raise RuntimeError("PHP object primitive callsite mapping changed")
+            runtime_binding = await self._attest_php_object_gadget_recipe(recipe)
+            context = primitive.public_context()
+            gadget = PhpObjectGadgetOracle(
+                recipe=recipe,
+                primitive_snapshot=primitive_snapshot,
+                attack_token=context["attack_token"],
+                control_token=context["control_token"],
+                runtime_binding=runtime_binding,
+            )
+            if (
+                gadget.public_context()["attack_token"] != context["attack_token"]
+                or gadget.public_context()["control_token"] != context["control_token"]
+            ):
+                raise RuntimeError("PHP object gadget changed the authored arm tokens")
+            self._php_object_gadget_oracle = gadget
+            return gadget.public_context()
+
     async def boot(self) -> None:
         if self._booted:
             return
         self._baseline_accounts = None
         self._pre_plugin_role_capabilities = None
+        self._installed_plugin_slug = None
+        self._php_object_surface_poisoned = False
+        self._php_object_callsite = None
+        self._php_object_gadget_oracle = None
         async with _PORT_ALLOC_LOCK:
             self.port = _alloc_port()
             self.project = f"{_PROJECT_PREFIX}-{uuid.uuid4().hex[:8]}"
@@ -4347,6 +10000,12 @@ class SandboxManager:
                 self._ssrf_local_host_dir.chmod(0o755)
             else:
                 self._ssrf_local_host_dir = None
+            if self._php_include_oracle_enabled:
+                self._php_include_host_dir = self.workdir / "php-include"
+                self._php_include_host_dir.mkdir(mode=0o755)
+                self._php_include_host_dir.chmod(0o755)
+            else:
+                self._php_include_host_dir = None
 
             template = Template((_DOCKER_DIR / "docker-compose.yml.j2").read_text())
             rendered = template.render(
@@ -4356,6 +10015,9 @@ class SandboxManager:
                 wp_admin_user=self.config.wp_admin_user,
                 wp_admin_pass=self.config.wp_admin_pass,
                 wp_admin_email=self.config.wp_admin_email,
+                database_name=_SANDBOX_DATABASE_NAME,
+                database_user=_SANDBOX_DATABASE_USER,
+                database_password=_SANDBOX_DATABASE_PASSWORD,
                 enable_http_ssrf="http" in self._ssrf_oracle_modes,
                 enable_local_resource_ssrf=(
                     "local_resource" in self._ssrf_oracle_modes
@@ -4363,6 +10025,18 @@ class SandboxManager:
                 ssrf_local_host_dir=(
                     os.fspath(self._ssrf_local_host_dir)
                     if self._ssrf_local_host_dir is not None
+                    else ""
+                ),
+                enable_php_include_oracle=self._php_include_oracle_enabled,
+                enable_php_object_gadget_oracle=(
+                    self._php_object_gadget_oracle_enabled
+                ),
+                php_object_gadget_directory_constants=(
+                    self._php_object_gadget_directory_constants
+                ),
+                php_include_host_dir=(
+                    os.fspath(self._php_include_host_dir)
+                    if self._php_include_host_dir is not None
                     else ""
                 ),
             )
@@ -4400,8 +10074,14 @@ class SandboxManager:
             if oracle is not None:
                 await oracle.close()
             self._clear_ssrf_local_oracle_locked()
+            self._clear_php_include_oracle_locked()
+            await self._clear_php_object_oracle_locked()
         finally:
             try:
+                try:
+                    await self._remove_actor_receipt_plugin()
+                except Exception:
+                    logger.warning("failed to remove sandbox actor receipt plugin")
                 if self.project:
                     logger.info("sandbox teardown project=%s", self.project)
                     await _run(
@@ -4417,8 +10097,23 @@ class SandboxManager:
             finally:
                 if self.workdir and self.workdir.exists():
                     shutil.rmtree(self.workdir, ignore_errors=True)
+                for snapshot_dir in self._snapshot_dirs:
+                    shutil.rmtree(snapshot_dir, ignore_errors=True)
+                self._snapshot_dirs.clear()
                 self._booted = False
                 self._ssrf_local_host_dir = None
+                self._php_object_oracle = None
+                self._php_object_gadget_oracle = None
+                self._php_object_callsite = None
+                self._installed_plugin_slug = None
+                self._php_object_surface_poisoned = False
+                if (
+                    self._php_include_oracle is None
+                    or self._php_include_host_dir is None
+                    or not self._php_include_host_dir.exists()
+                ):
+                    self._php_include_oracle = None
+                    self._php_include_host_dir = None
                 self._baseline_accounts = None
                 self._pre_plugin_role_capabilities = None
 
@@ -4429,103 +10124,190 @@ class SandboxManager:
         return f"{self.project}-db-1"
 
     async def snapshot(self) -> Path:
-        """Capture DB + wp-content to a temp directory. Returns the snapshot path.
+        """Capture the DB and complete WordPress volume to a temp directory.
 
-        Capturing all of wp-content prevents a failed or successful PoC from
-        contaminating a later attempt through files outside uploads.
+        Setup and PoC code can mutate root-level WordPress files such as
+        ``.htaccess`` or create new entries beside ``wp-content``. Archiving the
+        complete ``/var/www/html`` volume makes those changes recoverable too;
+        trusted oracle mounts live under ``/var/lib/squadrone`` and remain outside
+        this snapshot by design.
         """
         if not self._booted:
             raise RuntimeError("snapshot called before sandbox booted")
         snap_dir = Path(tempfile.mkdtemp(prefix=f"{self.project}-snap-"))
-        # DB dump
-        rc, dump, err = await _run(
-            "docker",
-            "exec",
-            self.db_container_name,
-            "mariadb-dump",
-            "-uwpuser",
-            "-pwppass",
-            "--add-drop-database",
-            "--databases",
-            "wordpress",
-            check=False,
-        )
-        if rc != 0 or not dump.strip():
-            shutil.rmtree(snap_dir, ignore_errors=True)
-            raise RuntimeError(
-                f"snapshot database dump failed (rc={rc}): {err.strip()[:200]}"
+        try:
+            # DB dump
+            rc, dump, err = await _run(
+                "docker",
+                "exec",
+                self.db_container_name,
+                "mariadb-dump",
+                *_SANDBOX_MARIADB_CLIENT_AUTH,
+                "--add-drop-database",
+                "--databases",
+                _SANDBOX_DATABASE_NAME,
+                check=False,
             )
-        (snap_dir / "db.sql").write_text(dump)
-        # Full wp-content archive, including the installed plugin and uploads.
-        await _run(
-            "docker",
-            "exec",
-            self.container_name,
-            "sh",
-            "-c",
-            "mkdir -p /var/www/html/wp-content && "
-            "tar czf /tmp/squadrone_wp_content.tar.gz -C /var/www/html wp-content",
-        )
-        await _run(
-            "docker",
-            "cp",
-            f"{self.container_name}:/tmp/squadrone_wp_content.tar.gz",
-            str(snap_dir / "wp-content.tar.gz"),
-        )
-        content_tar = snap_dir / "wp-content.tar.gz"
-        if not content_tar.exists() or content_tar.stat().st_size == 0:
+            if rc != 0 or not dump.strip():
+                raise RuntimeError(
+                    f"snapshot database dump failed (rc={rc}): {err.strip()[:200]}"
+                )
+            database_archive = snap_dir / "db.sql"
+            database_archive.write_text(dump)
+            database_archive.chmod(0o600)
+            # Complete named WordPress volume, including hidden/root-level entries,
+            # core, wp-config.php, the installed plugin, and uploads. ``-C ... .`` is
+            # intentional: archiving ``*`` would silently omit files such as .htaccess.
+            container_archive = _fresh_container_snapshot_archive_path()
+            try:
+                await _run(
+                    "docker",
+                    "exec",
+                    "--user",
+                    "root",
+                    self.container_name,
+                    "sh",
+                    "-c",
+                    'set -eu; archive=$1; umask 077; rm -f -- "$archive"; '
+                    "test -f /var/www/html/wp-config.php; "
+                    "test -d /var/www/html/wp-content; "
+                    'tar czf "$archive" -C /var/www/html .; '
+                    'chown 0:0 "$archive"; chmod 0600 "$archive"; '
+                    'test -f "$archive"; test ! -L "$archive"',
+                    "squadrone-snapshot",
+                    container_archive,
+                )
+                await _run(
+                    "docker",
+                    "cp",
+                    f"{self.container_name}:{container_archive}",
+                    str(snap_dir / "wordpress-root.tar.gz"),
+                )
+            finally:
+                await _remove_container_snapshot_archive(
+                    self.container_name,
+                    container_archive,
+                )
+            root_tar = snap_dir / "wordpress-root.tar.gz"
+            root_stat = root_tar.lstat() if root_tar.exists() else None
+            if (
+                root_stat is None
+                or not stat.S_ISREG(root_stat.st_mode)
+                or stat.S_ISLNK(root_stat.st_mode)
+                or root_stat.st_nlink != 1
+                or root_stat.st_size == 0
+            ):
+                raise RuntimeError(
+                    "snapshot WordPress root archive is missing or empty"
+                )
+            root_tar.chmod(0o600)
+        except BaseException:
             shutil.rmtree(snap_dir, ignore_errors=True)
-            raise RuntimeError("snapshot wp-content archive is missing or empty")
+            raise
+        self._snapshot_dirs.add(snap_dir)
         logger.info("sandbox snapshot → %s (db=%d bytes)", snap_dir, len(dump))
         return snap_dir
 
     async def restore(self, snap_dir: Path) -> None:
-        """Restore DB and all of wp-content from a previous snapshot."""
+        """Restore the DB and complete ``/var/www/html`` volume from a snapshot."""
         if not self._booted:
             raise RuntimeError("restore called before sandbox booted")
         db_sql_path = snap_dir / "db.sql"
-        if not db_sql_path.exists() or db_sql_path.stat().st_size == 0:
+        try:
+            db_stat = db_sql_path.lstat()
+        except OSError:
+            db_stat = None
+        if (
+            db_stat is None
+            or not stat.S_ISREG(db_stat.st_mode)
+            or stat.S_ISLNK(db_stat.st_mode)
+            or db_stat.st_nlink != 1
+            or db_stat.st_size == 0
+        ):
             raise RuntimeError(f"restore snapshot has no database dump: {snap_dir}")
+        root_tar = snap_dir / "wordpress-root.tar.gz"
+        try:
+            root_stat = root_tar.lstat()
+        except OSError:
+            root_stat = None
+        if (
+            root_stat is None
+            or not stat.S_ISREG(root_stat.st_mode)
+            or stat.S_ISLNK(root_stat.st_mode)
+            or root_stat.st_nlink != 1
+            or root_stat.st_size == 0
+        ):
+            raise RuntimeError(
+                f"restore snapshot has no WordPress root archive: {snap_dir}"
+            )
         sql_bytes = db_sql_path.read_bytes()
-        proc = await asyncio.create_subprocess_exec(
-            "docker",
-            "exec",
-            "-i",
-            self.db_container_name,
-            "mariadb",
-            "-uwpuser",
-            "-pwppass",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _stdout, _stderr = await proc.communicate(sql_bytes)
-        if proc.returncode != 0:
-            raise RuntimeError(
-                "restore database import failed: "
-                + (_stderr.decode(errors="replace") or "")[:200]
+        container_archive = _fresh_container_snapshot_archive_path()
+        # Stage and validate the trusted archive before changing either restored
+        # surface. A corrupt archive therefore cannot leave a restored database
+        # paired with the previous webroot. The random root-only staging file is
+        # removed on every exit before untrusted code can run again.
+        try:
+            await _run(
+                "docker",
+                "cp",
+                str(root_tar),
+                f"{self.container_name}:{container_archive}",
             )
+            await _run(
+                "docker",
+                "exec",
+                "--user",
+                "root",
+                self.container_name,
+                "sh",
+                "-c",
+                'set -eu; archive=$1; chown 0:0 "$archive"; '
+                'chmod 0600 "$archive"; test -f "$archive"; '
+                'test ! -L "$archive"; tar tzf "$archive" >/dev/null',
+                "squadrone-restore",
+                container_archive,
+            )
+            proc = await asyncio.create_subprocess_exec(
+                "docker",
+                "exec",
+                "-i",
+                self.db_container_name,
+                "mariadb",
+                *_SANDBOX_MARIADB_CLIENT_AUTH,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _stdout, _stderr = await proc.communicate(sql_bytes)
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    "restore database import failed: "
+                    + (_stderr.decode(errors="replace") or "")[:200]
+                )
 
-        content_tar = snap_dir / "wp-content.tar.gz"
-        if not content_tar.exists() or content_tar.stat().st_size == 0:
-            raise RuntimeError(
-                f"restore snapshot has no wp-content archive: {snap_dir}"
+            await _run(
+                "docker",
+                "exec",
+                "--user",
+                "root",
+                self.container_name,
+                "sh",
+                "-c",
+                "set -eu; archive=$1; "
+                "find /var/www/html -mindepth 1 -maxdepth 1 "
+                "-exec rm -rf -- {} +; "
+                'tar xzf "$archive" -C /var/www/html; '
+                "test -f /var/www/html/wp-config.php; "
+                "test -d /var/www/html/wp-content",
+                "squadrone-restore",
+                container_archive,
             )
-        await _run(
-            "docker",
-            "cp",
-            str(content_tar),
-            f"{self.container_name}:/tmp/squadrone_wp_content.tar.gz",
-        )
-        await _run(
-            "docker",
-            "exec",
-            self.container_name,
-            "sh",
-            "-c",
-            "rm -rf /var/www/html/wp-content && "
-            "tar xzf /tmp/squadrone_wp_content.tar.gz -C /var/www/html",
-        )
+        finally:
+            await _remove_container_snapshot_archive(
+                self.container_name,
+                container_archive,
+            )
+        self._php_object_surface_poisoned = False
         logger.info("sandbox restore from %s — done", snap_dir)
 
     async def restart_wordpress_runtime(self) -> None:
@@ -4538,6 +10320,11 @@ class SandboxManager:
             await _probe_ssrf_local_mount(
                 self.container_name,
                 self._ssrf_local_host_dir,
+            )
+        if self._php_include_host_dir is not None:
+            await _probe_php_include_mount(
+                self.container_name,
+                self._php_include_host_dir,
             )
 
     # ── helpers ─────────────────────────────────────────────────
@@ -4645,22 +10432,69 @@ class SandboxManager:
             "sandbox upload path ready as %s: %s", WORDPRESS_WEB_USER, out.strip()
         )
 
-    async def _install_actor_receipt_plugin(self) -> None:
-        """Install the verifier-owned MU-plugin that signs observed WP identities."""
+    async def _install_actor_receipt_plugin(
+        self,
+        php_object_canary_class: str = "",
+    ) -> None:
+        """Install and protect the verifier-owned actor-receipt MU-plugin.
+
+        WordPress plugins may legitimately create sibling MU-plugin files as the
+        managed web identity. Give that identity directory-level creation
+        rights through its primary group. Sticky directory semantics and protected
+        ownership/mode metadata prevent direct replacement or unlinking of
+        Squadrone's root-owned receipt entry within that directory.
+        """
         if self.workdir is None:
             raise RuntimeError("sandbox workdir is unavailable for actor receipt setup")
         if not _ACTOR_RECEIPT_TEMPLATE.is_file():
             raise RuntimeError(
                 f"actor receipt template is missing: {_ACTOR_RECEIPT_TEMPLATE}"
             )
+        if php_object_canary_class and (
+            _PHP_OBJECT_CANARY_CLASS_RE.fullmatch(php_object_canary_class) is None
+        ):
+            raise RuntimeError("invalid PHP object canary class for receipt bridge")
         rendered = Template(_ACTOR_RECEIPT_TEMPLATE.read_text()).render(
             trace_token=self._trace_token,
             receipt_secret=self._receipt_secret.hex(),
+            php_object_canary_class=php_object_canary_class,
         )
-        local_path = self.workdir / "squadrone-actor-receipt.php"
+        local_path = self.workdir / _ACTOR_RECEIPT_BASENAME
         local_path.write_text(rendered)
-        destination_dir = "/var/www/html/wp-content/mu-plugins"
-        destination = f"{destination_dir}/squadrone-actor-receipt.php"
+        destination_dir = _MU_PLUGIN_DIRECTORY
+        destination = f"{destination_dir}/{_ACTOR_RECEIPT_BASENAME}"
+        rc, uid, err = await _run(
+            "docker",
+            "exec",
+            self.container_name,
+            "id",
+            "-u",
+            WORDPRESS_WEB_USER,
+            check=False,
+        )
+        normalized_uid = uid.strip()
+        if rc != 0 or not normalized_uid.isdecimal() or normalized_uid == "0":
+            detail = (err or uid).strip()[:200]
+            raise RuntimeError(
+                "sandbox WordPress web identity must resolve to a non-root UID"
+                + (f": {detail}" if detail else "")
+            )
+        rc, gid, err = await _run(
+            "docker",
+            "exec",
+            self.container_name,
+            "id",
+            "-g",
+            WORDPRESS_WEB_USER,
+            check=False,
+        )
+        web_gid = gid.strip()
+        if rc != 0 or not web_gid.isdecimal():
+            detail = (err or gid).strip()[:200]
+            raise RuntimeError(
+                "sandbox WordPress web identity has no safe primary group"
+                + (f": {detail}" if detail else "")
+            )
         await _run(
             "docker",
             "exec",
@@ -4671,10 +10505,63 @@ class SandboxManager:
         )
         await _run(
             "docker",
+            "exec",
+            self.container_name,
+            "chown",
+            f"root:{web_gid}",
+            destination_dir,
+        )
+        await _run(
+            "docker",
+            "exec",
+            self.container_name,
+            "chmod",
+            "1775",
+            destination_dir,
+        )
+        await _run(
+            "docker",
             "cp",
             str(local_path),
             f"{self.container_name}:{destination}",
         )
+        await _run(
+            "docker",
+            "exec",
+            self.container_name,
+            "chown",
+            "root:root",
+            destination,
+        )
+        await _run(
+            "docker",
+            "exec",
+            self.container_name,
+            "chmod",
+            "0444",
+            destination,
+        )
+        rc, metadata, err = await _run(
+            "docker",
+            "exec",
+            self.container_name,
+            "stat",
+            "-c",
+            "%u:%g:%a",
+            destination_dir,
+            destination,
+            check=False,
+        )
+        expected_metadata = [
+            f"0:{web_gid}:1775",
+            "0:0:444",
+        ]
+        if rc != 0 or metadata.splitlines() != expected_metadata:
+            detail = (err or metadata).strip()[:300]
+            raise RuntimeError(
+                "sandbox actor receipt filesystem protections are invalid"
+                + (f": {detail}" if detail else "")
+            )
         rc, _out, err = await _run(
             "docker",
             "exec",
@@ -4688,6 +10575,638 @@ class SandboxManager:
             raise RuntimeError(
                 "sandbox actor receipt plugin failed PHP lint: " + err.strip()[:300]
             )
+
+    async def _install_php_object_oracle_plugin(
+        self,
+        oracle: PhpObjectOracle,
+    ) -> None:
+        """Install and attest one exact verifier-owned inert canary class."""
+        if self.workdir is None or self.wp_cli is None:
+            raise RuntimeError("sandbox is unavailable for PHP object setup")
+        class_name = oracle.private_class_name
+        match = _PHP_OBJECT_CANARY_CLASS_RE.fullmatch(class_name)
+        if match is None:
+            raise RuntimeError("invalid PHP object canary class")
+        basename = f"{_PHP_OBJECT_CANARY_BASENAME_PREFIX}{match.group(1)}.php"
+        destination = f"{_MU_PLUGIN_DIRECTORY}/{basename}"
+        class_literal = json.dumps(class_name)
+        collision_check = (
+            f"$name = {class_literal}; "
+            "if (class_exists($name, false) || interface_exists($name, false) "
+            "|| trait_exists($name, false) || (function_exists('enum_exists') "
+            "&& enum_exists($name, false))) { "
+            "WP_CLI::error('PHP object canary class collision.'); }"
+        )
+        rc, out, err = await self.wp_cli._exec_result("eval", collision_check)
+        if rc != 0:
+            raise RuntimeError("PHP object canary class collision check failed")
+
+        for file_test in ("-e", "-L"):
+            rc, _out, err = await _run(
+                "docker",
+                "exec",
+                self.container_name,
+                "test",
+                "!",
+                file_test,
+                destination,
+                check=False,
+            )
+            if rc != 0:
+                raise RuntimeError("PHP object canary destination already exists")
+
+        source = oracle.private_canary_class_source
+        expected_sha256 = hashlib.sha256(source).hexdigest()
+        local_path = self.workdir / basename
+        local_path.write_bytes(source)
+        try:
+            rc, _out, _err = await _run(
+                "docker",
+                "cp",
+                str(local_path),
+                f"{self.container_name}:{destination}",
+                check=False,
+            )
+            if rc != 0:
+                raise RuntimeError("failed to copy PHP object canary")
+        finally:
+            local_path.unlink(missing_ok=True)
+        rc, _out, _err = await _run(
+            "docker",
+            "exec",
+            self.container_name,
+            "chown",
+            "root:root",
+            destination,
+            check=False,
+        )
+        if rc != 0:
+            raise RuntimeError("failed to protect PHP object canary ownership")
+        rc, _out, _err = await _run(
+            "docker",
+            "exec",
+            self.container_name,
+            "chmod",
+            "0444",
+            destination,
+            check=False,
+        )
+        if rc != 0:
+            raise RuntimeError("failed to protect PHP object canary mode")
+        rc, metadata, err = await _run(
+            "docker",
+            "exec",
+            self.container_name,
+            "stat",
+            "-c",
+            "%u:%g:%a:%s",
+            destination,
+            check=False,
+        )
+        if rc != 0 or metadata.strip() != f"0:0:444:{len(source)}":
+            raise RuntimeError("PHP object canary filesystem protections are invalid")
+        rc, digest, err = await _run(
+            "docker",
+            "exec",
+            self.container_name,
+            "sha256sum",
+            destination,
+            check=False,
+        )
+        if rc != 0 or digest.split(maxsplit=1)[0] != expected_sha256:
+            raise RuntimeError("PHP object canary source attestation failed")
+        rc, out, err = await _run(
+            "docker",
+            "exec",
+            self.container_name,
+            "php",
+            "-l",
+            destination,
+            check=False,
+        )
+        if rc != 0:
+            raise RuntimeError("PHP object canary failed PHP lint")
+
+        await self._install_actor_receipt_plugin(class_name)
+        await self._attest_php_object_oracle_plugin(oracle)
+
+    async def _attest_php_object_callsite(
+        self,
+        callsite: PhpObjectCallsite,
+    ) -> str:
+        """Map and hash one verifier-derived source span inside the target plugin."""
+        if (
+            type(callsite) is not PhpObjectCallsite
+            or not self.container_name
+            or self._installed_plugin_slug is None
+        ):
+            raise RuntimeError("PHP object callsite is unavailable")
+        slug = validate_plugin_slug(self._installed_plugin_slug)
+        relative = PurePosixPath(callsite.relative_path)
+        if (
+            relative.is_absolute()
+            or relative.as_posix() != callsite.relative_path
+            or relative.suffix.casefold() != ".php"
+            or any(part in {"", ".", ".."} for part in relative.parts)
+            or "\\" in callsite.relative_path
+            or any(
+                ord(character) < 32 or ord(character) > 126
+                for character in callsite.relative_path
+            )
+        ):
+            raise RuntimeError("PHP object callsite path is invalid")
+        plugin_root = PurePosixPath(f"/var/www/html/wp-content/plugins/{slug}")
+        callsite_path = (plugin_root / relative).as_posix()
+        if not callsite_path.startswith(plugin_root.as_posix() + "/"):
+            raise RuntimeError("PHP object callsite path escapes the target plugin")
+        rc, stdout, _stderr = await _run(
+            "docker",
+            "exec",
+            "--user",
+            "root",
+            self.container_name,
+            "php",
+            "-r",
+            _PHP_OBJECT_CALLSITE_INSPECT_SCRIPT,
+            callsite_path,
+            check=False,
+        )
+        try:
+            payload = json.loads(stdout) if len(stdout) <= 1024 else None
+        except (json.JSONDecodeError, TypeError, ValueError):
+            payload = None
+        if (
+            rc != 0
+            or not isinstance(payload, dict)
+            or set(payload) != {"source_sha256", "source_size_bytes", "line_count"}
+            or payload.get("source_sha256") != callsite.source_sha256
+            or type(payload.get("source_size_bytes")) is not int
+            or cast(int, payload.get("source_size_bytes")) < 1
+            or type(payload.get("line_count")) is not int
+            or cast(int, payload.get("line_count")) < callsite.end_line
+        ):
+            raise RuntimeError("PHP object callsite source attestation failed")
+        return callsite_path
+
+    async def _freeze_php_object_executable_surfaces(
+        self,
+    ) -> _PhpObjectSurfaceFreeze:
+        """Make WordPress executable surfaces immutable for one object proof."""
+        if (
+            self._php_object_surface_poisoned
+            or not self.container_name
+            or self._installed_plugin_slug is None
+        ):
+            raise RuntimeError("PHP object executable surfaces are unavailable")
+        slug = validate_plugin_slug(self._installed_plugin_slug)
+        manifest_path = (
+            _PHP_OBJECT_SURFACE_MANIFEST_PREFIX + secrets.token_hex(16) + ".json"
+        )
+        rc, stdout, _stderr = await _run(
+            "docker",
+            "exec",
+            "--user",
+            "root",
+            self.container_name,
+            "php",
+            "-r",
+            _PHP_OBJECT_SURFACE_GUARD_SCRIPT,
+            "freeze",
+            slug,
+            manifest_path,
+            check=False,
+        )
+        try:
+            payload = json.loads(stdout) if len(stdout) <= 4096 else None
+            summary = _validate_php_object_surface_summary(
+                payload,
+                operation="freeze",
+            )
+        except (json.JSONDecodeError, RuntimeError, TypeError, ValueError):
+            self._php_object_surface_poisoned = True
+            raise RuntimeError(
+                "failed to freeze PHP object executable surfaces"
+            ) from None
+        if rc != 0:
+            self._php_object_surface_poisoned = True
+            raise RuntimeError("failed to freeze PHP object executable surfaces")
+        return _PhpObjectSurfaceFreeze(
+            manifest_path=manifest_path,
+            entry_count=cast(int, summary["entry_count"]),
+            original_sha256=cast(str, summary["original_sha256"]),
+            frozen_sha256=cast(str, summary["frozen_sha256"]),
+            manifest_sha256=cast(str, summary["manifest_sha256"]),
+        )
+
+    async def _attest_php_object_executable_surfaces(
+        self,
+        frozen: _PhpObjectSurfaceFreeze,
+    ) -> None:
+        """Recompute the exact frozen inventory without exposing its paths."""
+        if (
+            self._php_object_surface_poisoned
+            or self._installed_plugin_slug is None
+            or _PHP_OBJECT_SURFACE_MANIFEST_RE.fullmatch(frozen.manifest_path) is None
+        ):
+            raise RuntimeError("PHP object executable-surface attestation failed")
+        rc, stdout, _stderr = await _run(
+            "docker",
+            "exec",
+            "--user",
+            "root",
+            self.container_name,
+            "php",
+            "-r",
+            _PHP_OBJECT_SURFACE_GUARD_SCRIPT,
+            "attest",
+            validate_plugin_slug(self._installed_plugin_slug),
+            frozen.manifest_path,
+            check=False,
+        )
+        try:
+            payload = json.loads(stdout) if len(stdout) <= 4096 else None
+            summary = _validate_php_object_surface_summary(
+                payload,
+                operation="attest",
+            )
+        except (json.JSONDecodeError, RuntimeError, TypeError, ValueError):
+            raise RuntimeError(
+                "PHP object executable-surface attestation failed"
+            ) from None
+        if (
+            rc != 0
+            or summary["entry_count"] != frozen.entry_count
+            or summary["original_sha256"] != frozen.original_sha256
+            or summary["frozen_sha256"] != frozen.frozen_sha256
+            or summary["manifest_sha256"] != frozen.manifest_sha256
+        ):
+            raise RuntimeError("PHP object executable-surface attestation failed")
+
+    async def _restore_php_object_executable_surfaces(
+        self,
+        frozen: _PhpObjectSurfaceFreeze,
+    ) -> None:
+        """Restore exact pre-proof modes and reject any transient surface drift."""
+        if (
+            self._installed_plugin_slug is None
+            or _PHP_OBJECT_SURFACE_MANIFEST_RE.fullmatch(frozen.manifest_path) is None
+        ):
+            self._php_object_surface_poisoned = True
+            raise RuntimeError("PHP object executable-surface restoration failed")
+        rc, stdout, _stderr = await _run(
+            "docker",
+            "exec",
+            "--user",
+            "root",
+            self.container_name,
+            "php",
+            "-r",
+            _PHP_OBJECT_SURFACE_GUARD_SCRIPT,
+            "restore",
+            validate_plugin_slug(self._installed_plugin_slug),
+            frozen.manifest_path,
+            check=False,
+        )
+        try:
+            payload = json.loads(stdout) if len(stdout) <= 4096 else None
+        except (json.JSONDecodeError, TypeError, ValueError):
+            payload = None
+        valid_shape = (
+            isinstance(payload, dict)
+            and set(payload)
+            == {
+                "operation",
+                "entry_count",
+                "original_sha256",
+                "drift_before_restore",
+                "restored",
+                "manifest_removed",
+            }
+            and payload.get("operation") == "restore"
+            and payload.get("entry_count") == frozen.entry_count
+            and payload.get("original_sha256") == frozen.original_sha256
+            and type(payload.get("drift_before_restore")) is bool
+            and type(payload.get("restored")) is bool
+            and type(payload.get("manifest_removed")) is bool
+        )
+        if not valid_shape:
+            self._php_object_surface_poisoned = True
+            raise RuntimeError("PHP object executable-surface restoration failed")
+        assert isinstance(payload, dict)
+        restored = payload["restored"] is True
+        manifest_removed = payload["manifest_removed"] is True
+        drifted = payload["drift_before_restore"] is True
+        if not restored or not manifest_removed:
+            self._php_object_surface_poisoned = True
+            raise RuntimeError("PHP object executable-surface restoration failed")
+        if rc != 0 or drifted:
+            raise RuntimeError("PHP object executable-surface drift was detected")
+
+    async def _attest_php_object_oracle_plugin(
+        self,
+        oracle: PhpObjectOracle,
+    ) -> None:
+        """Reprove exact immutable MU files before each object execution."""
+        if self.wp_cli is None:
+            raise RuntimeError("sandbox is unavailable for PHP object attestation")
+        class_name = oracle.private_class_name
+        match = _PHP_OBJECT_CANARY_CLASS_RE.fullmatch(class_name)
+        if match is None:
+            raise RuntimeError("invalid PHP object canary attestation identity")
+        basename = f"{_PHP_OBJECT_CANARY_BASENAME_PREFIX}{match.group(1)}.php"
+        canary_destination = f"{_MU_PLUGIN_DIRECTORY}/{basename}"
+        actor_destination = f"{_MU_PLUGIN_DIRECTORY}/{_ACTOR_RECEIPT_BASENAME}"
+        actor_source = (
+            Template(_ACTOR_RECEIPT_TEMPLATE.read_text())
+            .render(
+                trace_token=self._trace_token,
+                receipt_secret=self._receipt_secret.hex(),
+                php_object_canary_class=class_name,
+            )
+            .encode()
+        )
+        canary_source = oracle.private_canary_class_source
+
+        rc, web_gid, err = await _run(
+            "docker",
+            "exec",
+            self.container_name,
+            "id",
+            "-g",
+            WORDPRESS_WEB_USER,
+            check=False,
+        )
+        normalized_gid = web_gid.strip()
+        if rc != 0 or not normalized_gid.isdecimal():
+            raise RuntimeError("PHP object MU-plugin group attestation failed")
+        rc, metadata, err = await _run(
+            "docker",
+            "exec",
+            self.container_name,
+            "stat",
+            "-c",
+            "%u:%g:%a:%s",
+            _MU_PLUGIN_DIRECTORY,
+            actor_destination,
+            canary_destination,
+            check=False,
+        )
+        expected_file_metadata = [
+            f"0:0:444:{len(actor_source)}",
+            f"0:0:444:{len(canary_source)}",
+        ]
+        observed_metadata = metadata.splitlines()
+        # Directory size is filesystem-specific.  Keep the exact protection
+        # fields while accepting only a positive decimal size in that slot.
+        directory_fields = observed_metadata[0].split(":") if observed_metadata else []
+        if (
+            rc != 0
+            or len(observed_metadata) != 3
+            or len(directory_fields) != 4
+            or directory_fields[:3] != ["0", normalized_gid, "1775"]
+            or not directory_fields[3].isdecimal()
+            or int(directory_fields[3]) <= 0
+            or observed_metadata[1:] != expected_file_metadata
+        ):
+            raise RuntimeError("PHP object MU-plugin filesystem attestation failed")
+
+        rc, digests, err = await _run(
+            "docker",
+            "exec",
+            self.container_name,
+            "sha256sum",
+            actor_destination,
+            canary_destination,
+            check=False,
+        )
+        digest_lines = digests.splitlines()
+        observed_digests = [
+            line.split(maxsplit=1)[0] for line in digest_lines if line.strip()
+        ]
+        expected_digests = [
+            hashlib.sha256(actor_source).hexdigest(),
+            hashlib.sha256(canary_source).hexdigest(),
+        ]
+        if rc != 0 or observed_digests != expected_digests:
+            raise RuntimeError("PHP object MU-plugin source attestation failed")
+
+        class_literal = json.dumps(class_name)
+        loaded_check = (
+            f"$name = {class_literal}; "
+            "if (!class_exists($name, false) "
+            "|| !is_callable(array($name, 'consumeReceipt')) "
+            "|| !is_callable(array($name, 'resetReceipt'))) { "
+            "WP_CLI::error('PHP object canary did not load exactly.'); }"
+        )
+        rc, out, err = await self.wp_cli._exec_result("eval", loaded_check)
+        if rc != 0:
+            raise RuntimeError("PHP object canary runtime attestation failed")
+
+    async def _attest_php_object_gadget_recipe(
+        self,
+        recipe: PhpObjectGadgetRecipe,
+    ) -> PhpObjectGadgetRuntimeBinding:
+        """Bind exact installed source and Reflection metadata without an object."""
+        if (
+            type(recipe) is not PhpObjectGadgetRecipe
+            or not self.container_name
+            or self._installed_plugin_slug is None
+        ):
+            raise RuntimeError("PHP object gadget source is unavailable")
+        if _php_object_gadget_recipe_directory_constants(recipe) != (
+            self._php_object_gadget_directory_constants
+        ):
+            raise RuntimeError(
+                "PHP object gadget directory-constant configuration changed"
+            )
+        payload = await _inspect_php_object_gadget_runtime(
+            self.container_name,
+            validate_plugin_slug(self._installed_plugin_slug),
+            recipe,
+        )
+        effect_binding = getattr(recipe, "effect_binding", None)
+        effect_binding_kind = getattr(effect_binding, "kind", "direct_path")
+        return _validate_php_object_gadget_runtime_payload(
+            payload,
+            recipe=recipe,
+            effect_binding_kind=effect_binding_kind,
+        )
+
+    async def _cleanup_php_object_gadget_directory(
+        self,
+        *,
+        require_empty: bool,
+    ) -> None:
+        if not self.container_name:
+            raise RuntimeError("PHP object gadget tmpfs is unavailable")
+        payload = await _php_object_gadget_filesystem_operation(
+            self.container_name,
+            operation="cleanup",
+            target_path="",
+            content=b"",
+            require_empty=require_empty,
+        )
+        if payload != {"operation": "cleanup", "directory_entry_count": 0}:
+            raise RuntimeError("PHP object gadget tmpfs cleanup failed")
+
+    async def _provision_php_object_gadget_target(
+        self,
+        oracle: PhpObjectGadgetOracle,
+    ) -> None:
+        payload = await _php_object_gadget_filesystem_operation(
+            self.container_name,
+            operation="provision",
+            target_path=oracle.private_target_path,
+            content=oracle.private_target_content,
+            require_empty=True,
+        )
+        if payload != {"operation": "provision", "directory_entry_count": 1}:
+            raise RuntimeError("PHP object gadget target provisioning failed")
+
+    async def _measure_php_object_gadget_target(
+        self,
+        oracle: PhpObjectGadgetOracle,
+    ) -> PhpObjectGadgetFileMeasurement:
+        payload = await _php_object_gadget_filesystem_operation(
+            self.container_name,
+            operation="measure",
+            target_path=oracle.private_target_path,
+            content=b"",
+            require_empty=False,
+        )
+        return _validate_php_object_gadget_measurement_payload(
+            payload,
+            target_path=oracle.private_target_path,
+        )
+
+    async def _restore_php_object_gadget_clean_state(
+        self,
+        snapshot_dir: Path,
+        oracle: PhpObjectGadgetOracle,
+        *,
+        require_empty_tmpfs: bool,
+    ) -> None:
+        """Apply the identical restore/restart/runtime sequence for each arm."""
+        await self.restore(snapshot_dir)
+        await self.restart_wordpress_runtime()
+        if (
+            await self._attest_php_object_gadget_recipe(oracle.recipe)
+            != oracle.runtime_binding
+        ):
+            raise RuntimeError("PHP object gadget runtime binding changed")
+        await self._cleanup_php_object_gadget_directory(
+            require_empty=require_empty_tmpfs
+        )
+
+    async def _recover_and_discard_php_object_gadget_snapshot(
+        self,
+        snapshot_dir: Path,
+        oracle: PhpObjectGadgetOracle,
+    ) -> None:
+        """Discard a sensitive snapshot only after complete clean-state recovery."""
+        await self._restore_php_object_gadget_clean_state(
+            snapshot_dir,
+            oracle,
+            require_empty_tmpfs=False,
+        )
+        self._discard_php_object_gadget_snapshot(snapshot_dir)
+
+    def _discard_php_object_gadget_snapshot(self, snapshot_dir: Path) -> None:
+        if snapshot_dir not in self._snapshot_dirs:
+            raise RuntimeError("PHP object gadget snapshot identity changed")
+        shutil.rmtree(snapshot_dir, ignore_errors=False)
+        self._snapshot_dirs.remove(snapshot_dir)
+
+    async def _remove_php_object_oracle_plugin(
+        self,
+        oracle: PhpObjectOracle,
+    ) -> None:
+        """Remove only the random canary file derived from this exact oracle."""
+        if not self.container_name:
+            return
+        match = _PHP_OBJECT_CANARY_CLASS_RE.fullmatch(oracle.private_class_name)
+        if match is None:
+            raise RuntimeError("invalid PHP object canary cleanup identity")
+        basename = f"{_PHP_OBJECT_CANARY_BASENAME_PREFIX}{match.group(1)}.php"
+        destination = f"{_MU_PLUGIN_DIRECTORY}/{basename}"
+        rc, _out, _err = await _run(
+            "docker",
+            "exec",
+            self.container_name,
+            "test",
+            "!",
+            "-L",
+            destination,
+            check=False,
+        )
+        if rc != 0:
+            raise RuntimeError("refusing to remove a PHP object canary symlink")
+        rc, digest, err = await _run(
+            "docker",
+            "exec",
+            self.container_name,
+            "sha256sum",
+            destination,
+            check=False,
+        )
+        if rc != 0:
+            rc, _out, _err = await _run(
+                "docker",
+                "exec",
+                self.container_name,
+                "test",
+                "!",
+                "-e",
+                destination,
+                check=False,
+            )
+            if rc == 0:
+                return
+            raise RuntimeError("cannot attest PHP object canary before cleanup")
+        expected_digest = hashlib.sha256(oracle.private_canary_class_source).hexdigest()
+        if digest.split(maxsplit=1)[0] != expected_digest:
+            raise RuntimeError("refusing to remove an unrecognized canary collision")
+        rc, _out, err = await _run(
+            "docker",
+            "exec",
+            self.container_name,
+            "rm",
+            "-f",
+            "--",
+            destination,
+            check=False,
+        )
+        if rc != 0:
+            raise RuntimeError("failed to remove PHP object canary")
+        for file_test in ("-e", "-L"):
+            rc, _out, _err = await _run(
+                "docker",
+                "exec",
+                self.container_name,
+                "test",
+                "!",
+                file_test,
+                destination,
+                check=False,
+            )
+            if rc != 0:
+                raise RuntimeError("PHP object canary cleanup attestation failed")
+
+    async def _remove_actor_receipt_plugin(self) -> None:
+        """Remove the one fixed verifier-owned receipt bridge during teardown."""
+        if not self.container_name:
+            return
+        destination = f"{_MU_PLUGIN_DIRECTORY}/{_ACTOR_RECEIPT_BASENAME}"
+        await _run(
+            "docker",
+            "exec",
+            self.container_name,
+            "rm",
+            "-f",
+            "--",
+            destination,
+            check=False,
+        )
 
     # ── operations ──────────────────────────────────────────────
 
@@ -4727,6 +11246,7 @@ class SandboxManager:
             user=WORDPRESS_WEB_USER,
             wp_user=self.config.wp_admin_email,
         )
+        self._installed_plugin_slug = slug
         await self._fire_admin_init()
 
     async def _fire_admin_init(self) -> bool:
@@ -5065,10 +11585,13 @@ class SandboxManager:
             "$active = array_values((array) get_option('active_plugins', [])); "
             "sort($active); $network = array_keys((array) "
             "get_site_option('active_sitewide_plugins', [])); sort($network); "
+            "$canonical_urls = ['home' => (string) get_option('home', ''), "
+            "'siteurl' => (string) get_option('siteurl', '')]; "
             "echo 'SQUADRONE_SETUP_SECURITY_STATE=' . wp_json_encode(["
             "'users' => $users, 'active_plugins' => $active, "
             "'active_sitewide_plugins' => $network, "
-            "'privileged_users' => $privileged]);"
+            "'privileged_users' => $privileged, "
+            "'canonical_urls' => $canonical_urls]);"
         )
         rc, out, err = await self.wp_cli._exec_result(
             "eval",
@@ -5097,9 +11620,25 @@ class SandboxManager:
             not isinstance(state, dict)
             or not isinstance(state.get("users"), dict)
             or not isinstance(state.get("privileged_users"), dict)
+            or not isinstance(state.get("canonical_urls"), dict)
+            or set(state["canonical_urls"]) != {"home", "siteurl"}
+            or not all(
+                isinstance(value, str) and value
+                for value in state["canonical_urls"].values()
+            )
             or set(state["users"]) != set(protected_accounts)
         ):
             raise RuntimeError("managed setup-state query returned an invalid shape")
+
+        expected_url = self.target_url.rstrip("/")
+        if not expected_url or any(
+            value.rstrip("/") != expected_url
+            for value in state["canonical_urls"].values()
+        ):
+            raise RuntimeError(
+                "managed setup-state WordPress home/siteurl do not match "
+                "the sandbox target URL"
+            )
 
         for login, expected_id in protected_accounts.items():
             user = state["users"].get(login)
@@ -5174,6 +11713,11 @@ class SandboxManager:
         expected_bug_class: str | None = None,
         expected_attacker_role: str | None = None,
         expected_http_transport: dict[str, object] | None = None,
+        expected_php_include: bool = False,
+        expected_php_object: bool = False,
+        expected_php_object_gadget: bool = False,
+        expected_php_object_transport: dict[str, object] | None = None,
+        expected_executable_upload: bool = False,
     ) -> SandboxRunResult:
         async with self._ssrf_operation_lock:
             return await self._run_poc_locked(
@@ -5181,6 +11725,11 @@ class SandboxManager:
                 expected_bug_class=expected_bug_class,
                 expected_attacker_role=expected_attacker_role,
                 expected_http_transport=expected_http_transport,
+                expected_php_include=expected_php_include,
+                expected_php_object=expected_php_object,
+                expected_php_object_gadget=expected_php_object_gadget,
+                expected_php_object_transport=expected_php_object_transport,
+                expected_executable_upload=expected_executable_upload,
             )
 
     async def _run_poc_locked(
@@ -5190,23 +11739,39 @@ class SandboxManager:
         expected_bug_class: str | None = None,
         expected_attacker_role: str | None = None,
         expected_http_transport: dict[str, object] | None = None,
+        expected_php_include: bool = False,
+        expected_php_object: bool = False,
+        expected_php_object_gadget: bool = False,
+        expected_php_object_transport: dict[str, object] | None = None,
+        expected_executable_upload: bool = False,
     ) -> SandboxRunResult:
         start = time.time()
         trace_records: list[dict] = []
         trace_error = ""
         rejection_counts: dict[str, int] = {}
         ssrf_expected = _is_ssrf_bug_class(expected_bug_class)
-        strict_isolation = _requires_trusted_http_isolation(expected_bug_class)
+        php_include_expected = expected_php_include is True
+        php_object_expected = expected_php_object is True
+        php_object_gadget_expected = expected_php_object_gadget is True
+        strict_isolation = (
+            _requires_trusted_http_isolation(expected_bug_class)
+            or php_include_expected
+            or php_object_expected
+            or php_object_gadget_expected
+            or expected_executable_upload
+        )
         isolation_capability = (
             CROSS_OBJECT_HTTP_CAPABILITY if strict_isolation else "compatibility"
         )
         proc: asyncio.subprocess.Process | None = None
+        proxy: PocProxySupervisor | None = None
         stdout = b""
         stderr = b""
         timed_out = False
         trace_salt = b""
         oracle_service: SsrfOracleServer | None = None
         local_oracle: LocalResourceSsrfOracle | None = None
+        php_include_oracle: PhpIncludeOracle | None = None
         oracle_mode = ""
         oracle_snapshot: object = None
         oracle_generation_id = ""
@@ -5214,6 +11779,38 @@ class SandboxManager:
         oracle_attack_url = ""
         oracle_control_url = ""
         oracle_error = ""
+        php_include_snapshot: object = None
+        php_include_generation_id = ""
+        php_include_marker = ""
+        php_include_attack_path = ""
+        php_include_control_path = ""
+        php_include_error = ""
+        php_include_failure_reason = ""
+        php_include_cleanup_error = ""
+        php_include_inspection_retries = 0
+        php_include_before: dict[str, object] | None = None
+        php_include_host_before: PhpIncludeHostFilesystemMeasurement | None = None
+        php_object_oracle: PhpObjectOracle | None = None
+        php_object_policy: PhpObjectRewritePolicy | None = None
+        php_object_snapshot: PhpObjectOracleSnapshot | None = None
+        php_object_generation_id = ""
+        php_object_error = ""
+        php_object_failure_reason = ""
+        php_object_private_values: tuple[str, ...] = ()
+        php_object_surface_freeze: _PhpObjectSurfaceFreeze | None = None
+        php_object_surface_attestations: list[tuple[str, str]] = []
+        php_object_surface_error = ""
+        php_object_gadget_oracle: PhpObjectGadgetOracle | None = None
+        php_object_gadget_snapshot: PhpObjectGadgetOracleSnapshot | None = None
+        php_object_gadget_arm_attestations: list[tuple[str, str]] = []
+        php_object_gadget_effect_measurements: dict[
+            tuple[str, str], PhpObjectGadgetFileMeasurement
+        ] = {}
+        php_object_gadget_state_snapshot: Path | None = None
+        php_object_gadget_error = ""
+        php_object_gadget_script_sha256 = ""
+        php_object_gadget_bundle_manifest_sha256 = ""
+        php_object_gadget_bundle_source_file_count = 0
         local_before_sha256 = ""
         local_before_monotonic_ns = 0
         execution_started_monotonic_ns = 0
@@ -5221,6 +11818,13 @@ class SandboxManager:
         credential_free_direct = False
         tracked_capabilities: dict[str, str] = {}
         execution_error: Exception | None = None
+        executable_upload_generation: _ExecutableUploadGeneration | None = None
+        executable_upload_proxy_policy: ExecutableUploadPolicy | None = None
+        executable_upload_snapshots: dict[
+            tuple[Literal["before", "after"], Literal["attack", "control"]],
+            _ExecutableUploadFilesystemSnapshot,
+        ] = {}
+        executable_upload_promoted = False
 
         async def execute_child(
             command: tuple[str, ...],
@@ -5245,6 +11849,79 @@ class SandboxManager:
                 )
             finally:
                 await _kill_poc_process_group(proc)
+
+        if not isinstance(expected_php_include, bool):
+            raise ValueError("expected_php_include must be a boolean")
+        if not isinstance(expected_php_object, bool):
+            raise ValueError("expected_php_object must be a boolean")
+        if not isinstance(expected_php_object_gadget, bool):
+            raise ValueError("expected_php_object_gadget must be a boolean")
+        if not isinstance(expected_executable_upload, bool):
+            raise ValueError("expected_executable_upload must be a boolean")
+        if expected_executable_upload and expected_bug_class not in {
+            BugClass.ARBITRARY_FILE_WRITE.name,
+            BugClass.ARBITRARY_FILE_WRITE.value,
+        }:
+            raise ValueError("expected_executable_upload requires exact CWE-434 mode")
+        enabled_trusted_modes = sum(
+            (
+                ssrf_expected,
+                php_include_expected,
+                php_object_expected,
+                php_object_gadget_expected,
+                expected_executable_upload,
+            )
+        )
+        if enabled_trusted_modes > 1:
+            raise ValueError("trusted HTTP oracle modes are mutually exclusive")
+        if expected_executable_upload and _expected_executable_upload_transport(
+            expected_http_transport
+        ) is None:
+            raise ValueError(
+                "expected_executable_upload requires one exact source transport"
+            )
+        if expected_executable_upload:
+            executable_upload_generation = _new_executable_upload_generation()
+            executable_upload_proxy_policy = _executable_upload_policy(
+                expected_http_transport,
+                executable_upload_generation,
+            )
+            if executable_upload_proxy_policy is None:
+                raise ValueError(
+                    "expected_executable_upload requires a valid proxy policy"
+                )
+        if (
+            not (php_object_expected or php_object_gadget_expected)
+            and expected_php_object_transport is not None
+        ):
+            raise ValueError("expected_php_object_transport requires a PHP object mode")
+        if (
+            php_object_gadget_expected
+            and normalize_attacker_role(expected_attacker_role) != "unauthenticated"
+        ):
+            return SandboxRunResult(
+                success=False,
+                output="",
+                elapsed=time.time() - start,
+                error_log=(
+                    "PoC exec failed: natural PHP object gadget proof requires "
+                    "an unauthenticated transport"
+                ),
+                validation_reason=(
+                    "PHP object natural gadget promotion is limited to the exact "
+                    "unauthenticated attacker role"
+                ),
+                evidence={
+                    "http_trace_records": 0,
+                    "http_trace_error": None,
+                    "http_trace_rejections": {},
+                    "php_object_oracle_error": "authenticated_transport_rejected",
+                    "php_object_oracle_failure_reason": (
+                        "php_object_gadget_requires_unauthenticated_transport"
+                    ),
+                    "poc_isolation": isolation_capability,
+                },
+            )
 
         if ssrf_expected:
             oracle_service = self._ssrf_oracle
@@ -5374,9 +12051,551 @@ class SandboxManager:
                     },
                 )
 
+        if php_include_expected:
+            php_include_oracle = self._php_include_oracle
+            if (
+                not self._php_include_oracle_enabled
+                or php_include_oracle is None
+                or self._php_include_host_dir is None
+            ):
+                return SandboxRunResult(
+                    success=False,
+                    output="",
+                    elapsed=time.time() - start,
+                    error_log="PoC exec failed: PHP include oracle is not prepared",
+                    validation_reason="PHP include oracle is not prepared",
+                    evidence={
+                        "http_trace_records": 0,
+                        "http_trace_error": None,
+                        "http_trace_rejections": {},
+                        "php_include_oracle_error": "unprepared",
+                        "php_include_oracle_failure_reason": "unprepared",
+                        "php_include_oracle_cleanup_error": None,
+                        "php_include_oracle_inspection_retries": 0,
+                        "poc_isolation": isolation_capability,
+                    },
+                )
+            php_include_stage = "generation_begin"
+            try:
+                php_include_attack_path = php_include_oracle.attack_path
+                php_include_control_path = php_include_oracle.control_path
+                php_include_generation_id = php_include_oracle.begin_generation()
+                php_include_marker = php_include_oracle.private_marker
+                provisioning_started = time.monotonic_ns()
+                php_include_stage = "provisioning_write"
+                _provision_php_include_oracle(
+                    self._php_include_host_dir,
+                    php_include_oracle,
+                )
+                php_include_stage = "provisioning_host_measurement"
+                php_include_host_before = _measure_php_include_host_filesystem(
+                    self._php_include_host_dir,
+                    php_include_attack_path,
+                    php_include_control_path,
+                )
+                php_include_stage = "provisioning_inspection"
+                (
+                    php_include_before,
+                    inspection_retries,
+                ) = await _inspect_php_include_oracle_bounded_retry(
+                    self.container_name,
+                    php_include_attack_path,
+                    php_include_control_path,
+                )
+                php_include_inspection_retries += inspection_retries
+                provisioning_finished = time.monotonic_ns()
+                php_include_stage = "provisioning_attestation"
+                php_include_oracle.attest_provisioning(
+                    generation_id=php_include_generation_id,
+                    attack_resource_path=cast(
+                        str,
+                        php_include_before["attack_resource_path"],
+                    ),
+                    control_resource_path=cast(
+                        str,
+                        php_include_before["control_resource_path"],
+                    ),
+                    attack_content_sha256=cast(
+                        str,
+                        php_include_before["attack_content_sha256"],
+                    ),
+                    attack_content_size_bytes=cast(
+                        int,
+                        php_include_before["attack_content_size_bytes"],
+                    ),
+                    attack_owner_uid=cast(
+                        int,
+                        php_include_before["attack_owner_uid"],
+                    ),
+                    attack_owner_gid=cast(
+                        int,
+                        php_include_before["attack_owner_gid"],
+                    ),
+                    attack_file_mode=cast(
+                        int,
+                        php_include_before["attack_file_mode"],
+                    ),
+                    attack_link_count=cast(
+                        int,
+                        php_include_before["attack_link_count"],
+                    ),
+                    attack_is_regular_file=cast(
+                        bool,
+                        php_include_before["attack_is_regular_file"],
+                    ),
+                    attack_is_symlink=cast(
+                        bool,
+                        php_include_before["attack_is_symlink"],
+                    ),
+                    control_lstat_exists=cast(
+                        bool,
+                        php_include_before["control_lstat_exists"],
+                    ),
+                    host_measurement=php_include_host_before,
+                    started_monotonic_ns=provisioning_started,
+                    finished_monotonic_ns=provisioning_finished,
+                )
+                credential_free_direct = _allows_credential_free_direct_ssrf(
+                    expected_http_transport,
+                    expected_attacker_role,
+                )
+                tracked_capabilities = {
+                    "php_include_attack_path": PurePosixPath(
+                        php_include_attack_path
+                    ).stem,
+                    "php_include_control_path": PurePosixPath(
+                        php_include_control_path
+                    ).stem,
+                }
+                php_include_stage = "public_contract"
+                public_context = php_include_oracle.public_context()
+                if (
+                    self._php_include_oracle is not php_include_oracle
+                    or public_context.get("attack_path") != php_include_attack_path
+                    or public_context.get("control_path") != php_include_control_path
+                    or re.fullmatch(r"[0-9a-f]{64}", php_include_generation_id) is None
+                    or _PHP_INCLUDE_MARKER_RE.fullmatch(php_include_marker) is None
+                ):
+                    raise RuntimeError("invalid PHP include oracle generation")
+            except BaseException as exc:
+                if isinstance(exc, _PhpIncludeInspectionError):
+                    php_include_inspection_retries += exc.retries
+                    php_include_failure_reason = f"{php_include_stage}_{exc.reason}"
+                elif isinstance(exc, PhpIncludeAttestationError):
+                    php_include_failure_reason = f"{php_include_stage}_{exc.reason}"
+                else:
+                    php_include_failure_reason = f"{php_include_stage}_failed"
+                logger.warning(
+                    "PHP include oracle generation failed: %s",
+                    php_include_failure_reason,
+                )
+                try:
+                    _remove_php_include_canary(
+                        self._php_include_host_dir,
+                        php_include_oracle,
+                    )
+                except Exception:
+                    php_include_cleanup_error = "cleanup_failed"
+                    logger.warning("failed to clean a rejected PHP include canary")
+                if not isinstance(exc, Exception):
+                    raise
+                return SandboxRunResult(
+                    success=False,
+                    output="",
+                    elapsed=time.time() - start,
+                    error_log="PoC exec failed: PHP include oracle generation failed",
+                    validation_reason=(
+                        "PHP include oracle generation failed "
+                        f"({php_include_failure_reason})"
+                    ),
+                    evidence={
+                        "http_trace_records": 0,
+                        "http_trace_error": None,
+                        "http_trace_rejections": {},
+                        "php_include_oracle_error": "generation_failed",
+                        "php_include_oracle_failure_reason": (
+                            php_include_failure_reason
+                        ),
+                        "php_include_oracle_cleanup_error": (
+                            php_include_cleanup_error or None
+                        ),
+                        "php_include_oracle_inspection_retries": (
+                            php_include_inspection_retries
+                        ),
+                        "poc_isolation": isolation_capability,
+                    },
+                )
+
+        if php_object_gadget_expected:
+            php_object_gadget_oracle = self._php_object_gadget_oracle
+            php_object_policy = php_object_rewrite_policy_from_transport(
+                expected_php_object_transport
+            )
+            if (
+                not self._php_object_gadget_oracle_enabled
+                or php_object_gadget_oracle is None
+                or php_object_policy is None
+                or self._php_object_oracle is None
+                or self._php_object_callsite is None
+            ):
+                return SandboxRunResult(
+                    success=False,
+                    output="",
+                    elapsed=time.time() - start,
+                    error_log="PoC exec failed: PHP object gadget oracle is not prepared",
+                    validation_reason=(
+                        "PHP object gadget oracle or source-reviewed transport "
+                        "is not prepared"
+                    ),
+                    evidence={
+                        "http_trace_records": 0,
+                        "http_trace_error": None,
+                        "http_trace_rejections": {},
+                        "php_object_oracle_error": "unprepared",
+                        "php_object_oracle_failure_reason": (
+                            "php_object_gadget_unprepared"
+                        ),
+                        "poc_isolation": isolation_capability,
+                    },
+                )
+            php_object_stage = "gadget_source_attestation"
+            try:
+                primitive = self._php_object_oracle
+                callsite = self._php_object_callsite
+                await self._attest_php_object_oracle_plugin(primitive)
+                await self._attest_php_object_callsite(callsite)
+                runtime_binding = await self._attest_php_object_gadget_recipe(
+                    php_object_gadget_oracle.recipe
+                )
+                if runtime_binding != php_object_gadget_oracle.runtime_binding:
+                    raise RuntimeError("PHP object gadget runtime binding changed")
+                php_object_stage = "generation"
+                php_object_generation_id = php_object_gadget_oracle.begin_generation()
+                php_object_private_values = php_object_gadget_private_redaction_values(
+                    php_object_gadget_oracle,
+                    primitive,
+                    self._receipt_secret,
+                )
+                php_object_stage = "surface_freeze"
+                php_object_surface_freeze = (
+                    await self._freeze_php_object_executable_surfaces()
+                )
+            except BaseException as exc:
+                php_object_failure_reason = f"{php_object_stage}_failed"
+                if php_object_generation_id:
+                    try:
+                        php_object_gadget_oracle.abort_generation(
+                            generation_id=php_object_generation_id
+                        )
+                    except Exception:
+                        php_object_failure_reason = "generation_abort_failed"
+                if php_object_surface_freeze is not None:
+                    try:
+                        await self._restore_php_object_executable_surfaces(
+                            php_object_surface_freeze
+                        )
+                    except Exception:
+                        php_object_failure_reason = "surface_restoration_failed"
+                    php_object_surface_freeze = None
+                if not isinstance(exc, Exception):
+                    raise
+                failed = SandboxRunResult(
+                    success=False,
+                    output="",
+                    elapsed=time.time() - start,
+                    error_log="PoC exec failed: PHP object gadget generation failed",
+                    validation_reason=(
+                        "PHP object gadget generation failed "
+                        f"({php_object_failure_reason})"
+                    ),
+                    evidence={
+                        "http_trace_records": 0,
+                        "http_trace_error": None,
+                        "http_trace_rejections": {},
+                        "php_object_oracle_error": "generation_failed",
+                        "php_object_oracle_failure_reason": (php_object_failure_reason),
+                        "poc_isolation": isolation_capability,
+                    },
+                )
+                if php_object_private_values:
+                    redact_php_object_run_result(
+                        failed,
+                        php_object_private_values,
+                    )
+                return failed
+
+        if php_object_expected:
+            php_object_oracle = self._php_object_oracle
+            php_object_policy = php_object_rewrite_policy_from_transport(
+                expected_php_object_transport
+            )
+            if (
+                not self._php_object_oracle_enabled
+                or php_object_oracle is None
+                or php_object_policy is None
+            ):
+                unprepared = SandboxRunResult(
+                    success=False,
+                    output="",
+                    elapsed=time.time() - start,
+                    error_log="PoC exec failed: PHP object oracle is not prepared",
+                    validation_reason=(
+                        "PHP object oracle or source-reviewed transport is not prepared"
+                    ),
+                    evidence={
+                        "http_trace_records": 0,
+                        "http_trace_error": None,
+                        "http_trace_rejections": {},
+                        "php_object_oracle_error": "unprepared",
+                        "php_object_oracle_failure_reason": "unprepared",
+                        "poc_isolation": isolation_capability,
+                    },
+                )
+                if php_object_oracle is not None:
+                    redact_php_object_run_result(
+                        unprepared,
+                        php_object_private_redaction_values(php_object_oracle),
+                    )
+                return unprepared
+            php_object_stage = "callsite_attestation"
+            try:
+                callsite = self._php_object_callsite
+                if callsite is None:
+                    raise RuntimeError("PHP object callsite is not prepared")
+                callsite_path = await self._attest_php_object_callsite(callsite)
+                if not hmac.compare_digest(
+                    callsite_path,
+                    php_object_oracle.private_callsite_path,
+                ):
+                    raise RuntimeError("PHP object callsite mapping changed")
+                php_object_stage = "oracle_attestation"
+                await self._attest_php_object_oracle_plugin(php_object_oracle)
+                php_object_stage = "generation"
+                php_object_generation_id = php_object_oracle.begin_generation()
+                php_object_private_values = php_object_private_redaction_values(
+                    php_object_oracle
+                )
+                if (
+                    self._php_object_oracle is not php_object_oracle
+                    or php_object_generation_id != php_object_oracle.generation_id
+                    or re.fullmatch(r"[0-9a-f]{64}", php_object_generation_id) is None
+                    or not strict_isolation
+                    or credential_free_direct
+                ):
+                    raise RuntimeError("invalid PHP object oracle generation")
+                php_object_stage = "surface_freeze"
+                php_object_surface_freeze = (
+                    await self._freeze_php_object_executable_surfaces()
+                )
+                php_object_stage = "frozen_callsite_attestation"
+                frozen_callsite_path = await self._attest_php_object_callsite(callsite)
+                if not hmac.compare_digest(callsite_path, frozen_callsite_path):
+                    raise RuntimeError("PHP object callsite changed during freeze")
+            except BaseException as exc:
+                php_object_failure_reason = f"{php_object_stage}_failed"
+                if php_object_generation_id:
+                    try:
+                        php_object_oracle.abort_generation(
+                            generation_id=php_object_generation_id
+                        )
+                    except Exception:
+                        php_object_failure_reason = "generation_abort_failed"
+                if php_object_surface_freeze is not None:
+                    try:
+                        await self._restore_php_object_executable_surfaces(
+                            php_object_surface_freeze
+                        )
+                    except Exception:
+                        php_object_failure_reason = "surface_restoration_failed"
+                    php_object_surface_freeze = None
+                if php_object_stage == "frozen_callsite_attestation":
+                    self._php_object_surface_poisoned = True
+                if not php_object_private_values:
+                    php_object_private_values = php_object_private_redaction_values(
+                        php_object_oracle
+                    )
+                if not isinstance(exc, Exception):
+                    raise
+                failed = SandboxRunResult(
+                    success=False,
+                    output="",
+                    elapsed=time.time() - start,
+                    error_log="PoC exec failed: PHP object oracle generation failed",
+                    validation_reason=(
+                        "PHP object oracle generation failed "
+                        f"({php_object_failure_reason})"
+                    ),
+                    evidence={
+                        "http_trace_records": 0,
+                        "http_trace_error": None,
+                        "http_trace_rejections": {},
+                        "php_object_oracle_error": "generation_failed",
+                        "php_object_oracle_failure_reason": (php_object_failure_reason),
+                        "poc_isolation": isolation_capability,
+                    },
+                )
+                redact_php_object_run_result(failed, php_object_private_values)
+                return failed
+
+        async def attest_php_object_surface(
+            phase: Literal["before", "after"],
+            arm: Literal["attack", "control"],
+        ) -> None:
+            """Bind proxy arm boundaries to the exact root-owned freeze."""
+            nonlocal php_object_surface_error
+            frozen = php_object_surface_freeze
+            current = (phase, arm)
+            if frozen is None:
+                raise RuntimeError("PHP object executable surface is not frozen")
+            try:
+                await self._attest_php_object_executable_surfaces(frozen)
+            except Exception:
+                php_object_surface_error = "attestation_failed"
+                raise
+            php_object_surface_attestations.append(current)
+
+        async def attest_php_object_gadget_arm(
+            phase: Literal["before", "after"],
+            arm: Literal["attack", "control"],
+        ) -> None:
+            """Provision/measure each arm around one identical restored state."""
+            nonlocal php_object_gadget_state_snapshot
+            oracle = php_object_gadget_oracle
+            if oracle is None:
+                raise RuntimeError("PHP object gadget oracle is unavailable")
+            current = (phase, arm)
+            expected = _PHP_OBJECT_SURFACE_ATTESTATION_ORDER[
+                len(php_object_gadget_arm_attestations)
+            ]
+            if current != expected:
+                raise RuntimeError("PHP object gadget arm order changed")
+            if current == ("before", "attack"):
+                if php_object_gadget_state_snapshot is not None:
+                    raise RuntimeError("PHP object gadget state snapshot was reused")
+                php_object_gadget_state_snapshot = await self.snapshot()
+                # Start both arms from the exact archived application state and
+                # run the same restart + runtime-attestation sequence.  Taking
+                # the archive before this common setup avoids giving the attack
+                # arm a warmer/differently bootstrapped state than the control.
+                await self._restore_php_object_gadget_clean_state(
+                    php_object_gadget_state_snapshot,
+                    oracle,
+                    require_empty_tmpfs=True,
+                )
+                await self._provision_php_object_gadget_target(oracle)
+            elif current == ("after", "attack"):
+                pass
+            elif current == ("before", "control"):
+                snapshot_dir = php_object_gadget_state_snapshot
+                if snapshot_dir is None:
+                    raise RuntimeError("PHP object gadget state snapshot is missing")
+                await self._restore_php_object_gadget_clean_state(
+                    snapshot_dir,
+                    oracle,
+                    require_empty_tmpfs=True,
+                )
+                await self._provision_php_object_gadget_target(oracle)
+            elif current != ("after", "control"):
+                raise RuntimeError("invalid PHP object gadget arm boundary")
+
+            measurement = await self._measure_php_object_gadget_target(oracle)
+            php_object_gadget_effect_measurements[current] = measurement
+
+            if current == ("after", "control"):
+                snapshot_dir = php_object_gadget_state_snapshot
+                if snapshot_dir is None:
+                    raise RuntimeError("PHP object gadget state snapshot is missing")
+                await self._restore_php_object_gadget_clean_state(
+                    snapshot_dir,
+                    oracle,
+                    require_empty_tmpfs=False,
+                )
+                oracle.attest_effect(
+                    attack_before=php_object_gadget_effect_measurements[
+                        ("before", "attack")
+                    ],
+                    attack_after=php_object_gadget_effect_measurements[
+                        ("after", "attack")
+                    ],
+                    control_before=php_object_gadget_effect_measurements[
+                        ("before", "control")
+                    ],
+                    control_after=measurement,
+                    state_restored_before_control=True,
+                    runtime_restarted_before_control=True,
+                    state_restored_after_control=True,
+                    runtime_restarted_after_control=True,
+                )
+                self._discard_php_object_gadget_snapshot(snapshot_dir)
+                php_object_gadget_state_snapshot = None
+            php_object_gadget_arm_attestations.append(current)
+
+        async def attest_executable_upload_arm(
+            phase: Literal["before", "after"],
+            arm: Literal["attack", "control"],
+        ) -> None:
+            """Capture the uploads namespace at each serialized request edge."""
+            generation = executable_upload_generation
+            if generation is None:
+                raise RuntimeError("executable-upload generation is unavailable")
+            current = (phase, arm)
+            index = len(executable_upload_snapshots)
+            if (
+                index >= len(_EXECUTABLE_UPLOAD_ATTESTATION_ORDER)
+                or current != _EXECUTABLE_UPLOAD_ATTESTATION_ORDER[index]
+                or current in executable_upload_snapshots
+            ):
+                raise RuntimeError("executable-upload arm boundary order changed")
+            executable_upload_snapshots[current] = (
+                await _snapshot_executable_upload_filesystem(
+                    container_name=self.container_name,
+                    generation=generation,
+                )
+            )
+
         try:
             if strict_isolation:
-                if credential_free_direct:
+                if expected_executable_upload:
+                    if executable_upload_proxy_policy is None:
+                        raise RuntimeError(
+                            "executable-upload proxy policy is unavailable"
+                        )
+                    proxy = PocProxySupervisor(
+                        self.target_url,
+                        trace_token=self._trace_token,
+                        executable_upload_policy=executable_upload_proxy_policy,
+                        executable_upload_arm_attestor=(
+                            attest_executable_upload_arm
+                        ),
+                        request_binding_secret=self._receipt_secret,
+                    )
+                elif php_object_gadget_expected:
+                    proxy = PocProxySupervisor(
+                        self.target_url,
+                        trace_token=self._trace_token,
+                        php_object_gadget_oracle=php_object_gadget_oracle,
+                        php_object_policy=php_object_policy,
+                        php_object_surface_attestor=attest_php_object_surface,
+                        php_object_gadget_arm_attestor=(attest_php_object_gadget_arm),
+                        credential_free=True,
+                    )
+                elif php_object_expected:
+                    proxy = PocProxySupervisor(
+                        self.target_url,
+                        trace_token=self._trace_token,
+                        php_object_oracle=php_object_oracle,
+                        php_object_policy=php_object_policy,
+                        php_object_surface_attestor=attest_php_object_surface,
+                    )
+                elif php_include_expected:
+                    proxy = PocProxySupervisor(
+                        self.target_url,
+                        trace_token=self._trace_token,
+                        tracked_capabilities=tracked_capabilities,
+                        credential_free=credential_free_direct,
+                        capture_php_include_receipt=True,
+                    )
+                elif credential_free_direct:
                     proxy = PocProxySupervisor(
                         self.target_url,
                         trace_token=self._trace_token,
@@ -5405,17 +12624,47 @@ class SandboxManager:
                             protected_paths=_poc_protected_paths(self.workdir),
                             capability=CROSS_OBJECT_HTTP_CAPABILITY,
                         ) as isolation:
+                            if php_object_gadget_expected:
+                                # This is the executable identity: hash the safely
+                                # copied main script, all sibling helpers, and the
+                                # trusted bootstrap inside the private bundle at
+                                # the last parent-owned boundary before launch.
+                                bundle_manifest = isolation.attest_bundle()
+                                php_object_gadget_script_sha256 = (
+                                    bundle_manifest.script_sha256
+                                )
+                                php_object_gadget_bundle_manifest_sha256 = (
+                                    bundle_manifest.manifest_sha256
+                                )
+                                php_object_gadget_bundle_source_file_count = (
+                                    bundle_manifest.source_file_count
+                                )
                             execution_started_monotonic_ns = time.monotonic_ns()
                             try:
+                                child_environment = isolation.child_environment(
+                                    proxy.proxy_url
+                                )
+                                if executable_upload_generation is not None:
+                                    child_environment.update(
+                                        {
+                                            EXECUTABLE_UPLOAD_PAYLOAD_ENV: (
+                                                executable_upload_generation.payload_b64
+                                            ),
+                                            EXECUTABLE_UPLOAD_ATTACK_FILENAME_ENV: (
+                                                executable_upload_generation.attack_filename
+                                            ),
+                                            EXECUTABLE_UPLOAD_CONTROL_FILENAME_ENV: (
+                                                executable_upload_generation.control_filename
+                                            ),
+                                        }
+                                    )
                                 stdout, stderr = await execute_child(
                                     isolation.python_command(
                                         isolation.runner_path,
                                         isolation.script_path,
                                     ),
                                     cwd=isolation.cwd,
-                                    environment=isolation.child_environment(
-                                        proxy.proxy_url
-                                    ),
+                                    environment=child_environment,
                                 )
                             finally:
                                 execution_finished_monotonic_ns = time.monotonic_ns()
@@ -5434,8 +12683,212 @@ class SandboxManager:
                     )
                 except TimeoutError:
                     timed_out = True
-        except Exception as e:
-            execution_error = e
+        except BaseException as exc:
+            if isinstance(exc, Exception):
+                execution_error = exc
+            else:
+                if php_include_expected:
+                    try:
+                        _remove_php_include_canary(
+                            self._php_include_host_dir,
+                            php_include_oracle,
+                        )
+                    except Exception:
+                        logger.warning("failed to clean a cancelled PHP include canary")
+                if php_object_expected and php_object_generation_id:
+                    try:
+                        cast(PhpObjectOracle, php_object_oracle).abort_generation(
+                            generation_id=php_object_generation_id
+                        )
+                    except Exception:
+                        logger.warning(
+                            "failed to abort a cancelled PHP object generation"
+                        )
+                if php_object_gadget_expected and php_object_generation_id:
+                    try:
+                        cast(
+                            PhpObjectGadgetOracle,
+                            php_object_gadget_oracle,
+                        ).abort_generation(generation_id=php_object_generation_id)
+                    except Exception:
+                        logger.warning(
+                            "failed to abort a cancelled PHP object gadget generation"
+                        )
+                raise
+        finally:
+            if php_object_gadget_expected:
+                try:
+                    if php_object_gadget_state_snapshot is not None:
+                        recovery_oracle = cast(
+                            PhpObjectGadgetOracle,
+                            php_object_gadget_oracle,
+                        )
+                        await self._recover_and_discard_php_object_gadget_snapshot(
+                            php_object_gadget_state_snapshot,
+                            recovery_oracle,
+                        )
+                        php_object_gadget_state_snapshot = None
+                    else:
+                        await self._cleanup_php_object_gadget_directory(
+                            require_empty=False
+                        )
+                except Exception:
+                    php_object_gadget_error = "state_restoration_failed"
+            if php_object_surface_freeze is not None:
+                try:
+                    try:
+                        await self._attest_php_object_executable_surfaces(
+                            php_object_surface_freeze
+                        )
+                    except Exception:
+                        php_object_surface_error = "attestation_failed"
+                finally:
+                    try:
+                        await self._restore_php_object_executable_surfaces(
+                            php_object_surface_freeze
+                        )
+                    except Exception:
+                        if not php_object_surface_error:
+                            php_object_surface_error = "restoration_failed"
+
+        if php_object_expected:
+            transport_complete = (
+                tuple(php_object_surface_attestations)
+                == _PHP_OBJECT_SURFACE_ATTESTATION_ORDER
+                and proxy is not None
+                and php_object_oracle is not None
+                and proxy.php_object_complete
+            )
+            if php_object_surface_error:
+                php_object_error = f"surface_{php_object_surface_error}"
+                php_object_failure_reason = php_object_error
+            elif not transport_complete:
+                # A child can fail during login or rendered-form preflight before
+                # either trusted arm reaches the proxy.  Missing arm callbacks are
+                # a transport diagnostic, not evidence that the frozen executable
+                # surface drifted.  The final root-owned surface check above remains
+                # authoritative for that separate integrity property.
+                php_object_error = "transport_incomplete"
+                php_object_failure_reason = "php_object_transport_incomplete"
+            else:
+                trusted_proxy = cast(PocProxySupervisor, proxy)
+                trusted_php_object_oracle = cast(
+                    PhpObjectOracle,
+                    php_object_oracle,
+                )
+                try:
+                    private_observation = trusted_proxy.take_php_object_observation()
+                    if private_observation is None:
+                        raise RuntimeError("PHP object receipt observation is missing")
+                    php_object_snapshot = trusted_php_object_oracle.attest_execution(
+                        generation_id=private_observation.generation_id,
+                        attack_token=private_observation.attack_token,
+                        control_token=private_observation.control_token,
+                        attack_receipt=private_observation.attack_receipt,
+                        control_receipt=private_observation.control_receipt,
+                        execution_started_monotonic_ns=(
+                            private_observation.execution_started_monotonic_ns
+                        ),
+                        execution_finished_monotonic_ns=(
+                            private_observation.execution_finished_monotonic_ns
+                        ),
+                        attested_monotonic_ns=time.monotonic_ns(),
+                    )
+                except Exception:
+                    php_object_error = "attestation_failed"
+                    php_object_failure_reason = "execution_attestation_failed"
+            if php_object_error:
+                if php_object_oracle is not None and php_object_generation_id:
+                    try:
+                        php_object_oracle.abort_generation(
+                            generation_id=php_object_generation_id
+                        )
+                    except Exception:
+                        php_object_failure_reason = "generation_abort_failed"
+
+        if php_object_gadget_expected:
+            transport_complete = (
+                tuple(php_object_surface_attestations)
+                == _PHP_OBJECT_SURFACE_ATTESTATION_ORDER
+                and tuple(php_object_gadget_arm_attestations)
+                == _PHP_OBJECT_SURFACE_ATTESTATION_ORDER
+                and proxy is not None
+                and php_object_gadget_oracle is not None
+                and proxy.php_object_gadget_complete
+            )
+            if php_object_surface_error:
+                php_object_gadget_error = f"surface_{php_object_surface_error}"
+            elif php_object_gadget_error:
+                pass
+            elif trace_error == "php_object_gadget_attestation_failed":
+                php_object_gadget_error = "attestation_failed"
+            elif not transport_complete:
+                php_object_gadget_error = "transport_incomplete"
+            else:
+                trusted_proxy = cast(PocProxySupervisor, proxy)
+                trusted_oracle = cast(
+                    PhpObjectGadgetOracle,
+                    php_object_gadget_oracle,
+                )
+                try:
+                    private_observation = (
+                        trusted_proxy.take_php_object_gadget_observation()
+                    )
+                    if private_observation is None:
+                        raise RuntimeError("PHP object gadget timing is missing")
+                    (
+                        trace_ok,
+                        trace_reason,
+                        transport_attestation,
+                        trace_evidence,
+                    ) = validate_php_object_gadget_http_trace(
+                        trace_records,
+                        target_url=self.target_url,
+                        receipt_secret=self._receipt_secret,
+                        trace_token=self._trace_token,
+                        policy=cast(PhpObjectRewritePolicy, php_object_policy),
+                        oracle=trusted_oracle,
+                        script_sha256=php_object_gadget_script_sha256,
+                        poc_bundle_manifest_sha256=(
+                            php_object_gadget_bundle_manifest_sha256
+                        ),
+                        poc_bundle_source_file_count=(
+                            php_object_gadget_bundle_source_file_count
+                        ),
+                        expected_attacker_role=(expected_attacker_role or ""),
+                        surface_attestations=tuple(php_object_surface_attestations),
+                        trace_error=trace_error,
+                    )
+                    if not trace_ok or transport_attestation is None:
+                        raise RuntimeError(trace_reason)
+                    php_object_gadget_snapshot = trusted_oracle.attest_execution(
+                        generation_id=private_observation.generation_id,
+                        attack_token=private_observation.attack_token,
+                        control_token=private_observation.control_token,
+                        execution_started_monotonic_ns=(
+                            private_observation.execution_started_monotonic_ns
+                        ),
+                        execution_finished_monotonic_ns=(
+                            private_observation.execution_finished_monotonic_ns
+                        ),
+                        attested_monotonic_ns=time.monotonic_ns(),
+                        runtime_binding=trusted_oracle.runtime_binding,
+                        transport_attestation=transport_attestation,
+                    )
+                except Exception:
+                    php_object_gadget_error = "execution_attestation_failed"
+            if php_object_gadget_error:
+                php_object_error = php_object_gadget_error
+                php_object_failure_reason = (
+                    "php_object_gadget_" + php_object_gadget_error
+                )
+                if php_object_gadget_oracle is not None and php_object_generation_id:
+                    try:
+                        php_object_gadget_oracle.abort_generation(
+                            generation_id=php_object_generation_id
+                        )
+                    except Exception:
+                        php_object_failure_reason = "generation_abort_failed"
 
         if ssrf_expected:
             try:
@@ -5482,63 +12935,425 @@ class SandboxManager:
             except Exception:
                 oracle_error = "snapshot_failed"
 
+        if php_include_expected:
+            php_include_stage = "post_execution_state"
+            try:
+                php_include_host_directory = self._php_include_host_dir
+                if (
+                    self._php_include_oracle is not php_include_oracle
+                    or php_include_oracle is None
+                    or php_include_before is None
+                    or php_include_host_before is None
+                    or php_include_host_directory is None
+                    or execution_started_monotonic_ns < 1
+                    or execution_finished_monotonic_ns < execution_started_monotonic_ns
+                ):
+                    raise RuntimeError("PHP include oracle was replaced")
+                php_include_stage = "post_execution_host_measurement"
+                php_include_host_after = _measure_php_include_host_filesystem(
+                    php_include_host_directory,
+                    php_include_attack_path,
+                    php_include_control_path,
+                )
+                php_include_stage = "post_execution_inspection"
+                (
+                    measured_after,
+                    inspection_retries,
+                ) = await _inspect_php_include_oracle_bounded_retry(
+                    self.container_name,
+                    php_include_attack_path,
+                    php_include_control_path,
+                )
+                php_include_inspection_retries += inspection_retries
+                after_monotonic_ns = time.monotonic_ns()
+                php_include_stage = "verification_attestation"
+                php_include_snapshot = php_include_oracle.attest_verification(
+                    generation_id=php_include_generation_id,
+                    attack_resource_path=cast(
+                        str,
+                        measured_after["attack_resource_path"],
+                    ),
+                    control_resource_path=cast(
+                        str,
+                        measured_after["control_resource_path"],
+                    ),
+                    after_attack_content_sha256=cast(
+                        str,
+                        measured_after["attack_content_sha256"],
+                    ),
+                    after_attack_content_size_bytes=cast(
+                        int,
+                        measured_after["attack_content_size_bytes"],
+                    ),
+                    after_attack_owner_uid=cast(
+                        int,
+                        measured_after["attack_owner_uid"],
+                    ),
+                    after_attack_owner_gid=cast(
+                        int,
+                        measured_after["attack_owner_gid"],
+                    ),
+                    after_attack_file_mode=cast(
+                        int,
+                        measured_after["attack_file_mode"],
+                    ),
+                    after_attack_link_count=cast(
+                        int,
+                        measured_after["attack_link_count"],
+                    ),
+                    after_attack_is_regular_file=cast(
+                        bool,
+                        measured_after["attack_is_regular_file"],
+                    ),
+                    after_attack_is_symlink=cast(
+                        bool,
+                        measured_after["attack_is_symlink"],
+                    ),
+                    after_control_lstat_exists=cast(
+                        bool,
+                        measured_after["control_lstat_exists"],
+                    ),
+                    after_host_measurement=php_include_host_after,
+                    execution_started_monotonic_ns=execution_started_monotonic_ns,
+                    execution_finished_monotonic_ns=execution_finished_monotonic_ns,
+                    after_monotonic_ns=after_monotonic_ns,
+                )
+            except Exception as exc:
+                php_include_error = "snapshot_failed"
+                if isinstance(exc, _PhpIncludeInspectionError):
+                    php_include_inspection_retries += exc.retries
+                    php_include_failure_reason = f"{php_include_stage}_{exc.reason}"
+                elif isinstance(exc, PhpIncludeAttestationError):
+                    php_include_failure_reason = f"{php_include_stage}_{exc.reason}"
+                else:
+                    php_include_failure_reason = f"{php_include_stage}_failed"
+                logger.warning(
+                    "PHP include oracle snapshot failed: %s",
+                    php_include_failure_reason,
+                )
+            finally:
+                try:
+                    _remove_php_include_canary(
+                        self._php_include_host_dir,
+                        php_include_oracle,
+                    )
+                except (OSError, RuntimeError):
+                    php_include_cleanup_error = "cleanup_failed"
+                    logger.warning("failed to clean a completed PHP include canary")
+                    if not php_include_error:
+                        php_include_error = "cleanup_failed"
+                        php_include_failure_reason = "cleanup_failed"
+
+        php_object_receipt_diagnostic = (
+            _trusted_php_object_receipt_rejection_diagnostic(trace_error)
+            if (
+                php_object_expected
+                and not php_object_gadget_expected
+                and php_object_error == "transport_incomplete"
+            )
+            else None
+        )
+
         if execution_error is not None:
-            return SandboxRunResult(
+            failed_result = SandboxRunResult(
                 success=False,
                 output="",
                 elapsed=time.time() - start,
                 error_log=f"PoC exec failed: {execution_error}",
-                validation_reason="PoC execution failed",
+                validation_reason=(
+                    php_object_receipt_diagnostic[0]
+                    if php_object_receipt_diagnostic is not None
+                    else "PoC execution failed"
+                ),
                 evidence={
                     "http_trace_records": len(trace_records),
                     "http_trace_error": trace_error or None,
                     "http_trace_rejections": rejection_counts,
                     "ssrf_oracle_error": oracle_error or None,
+                    "php_include_oracle_error": php_include_error or None,
+                    "php_include_oracle_failure_reason": (
+                        php_include_failure_reason or None
+                    ),
+                    "php_include_oracle_cleanup_error": (
+                        php_include_cleanup_error or None
+                    ),
+                    "php_include_oracle_inspection_retries": (
+                        php_include_inspection_retries
+                    ),
+                    "php_object_oracle_error": php_object_error or None,
+                    "php_object_oracle_failure_reason": (
+                        php_object_failure_reason or None
+                    ),
                     "poc_isolation": isolation_capability,
                 },
             )
+            if php_object_receipt_diagnostic is not None:
+                failed_result.evidence["php_object_trusted_parent_diagnostic"] = (
+                    php_object_receipt_diagnostic[1]
+                )
+            if php_include_expected:
+                redact_php_include_run_result(failed_result, php_include_marker)
+            if php_object_expected or php_object_gadget_expected:
+                redact_php_object_run_result(
+                    failed_result,
+                    php_object_private_values,
+                )
+            return failed_result
         if timed_out:
-            return SandboxRunResult(
+            timed_out_result = SandboxRunResult(
                 success=False,
                 output="",
                 elapsed=time.time() - start,
                 error_log=f"PoC timed out after {self.poc_timeout_s}s",
-                validation_reason="PoC execution timed out",
+                validation_reason=(
+                    php_object_receipt_diagnostic[0]
+                    if php_object_receipt_diagnostic is not None
+                    else "PoC execution timed out"
+                ),
                 evidence={
                     "http_trace_records": len(trace_records),
                     "http_trace_error": trace_error or None,
                     "http_trace_rejections": rejection_counts,
                     "ssrf_oracle_error": oracle_error or None,
+                    "php_include_oracle_error": php_include_error or None,
+                    "php_include_oracle_failure_reason": (
+                        php_include_failure_reason or None
+                    ),
+                    "php_include_oracle_cleanup_error": (
+                        php_include_cleanup_error or None
+                    ),
+                    "php_include_oracle_inspection_retries": (
+                        php_include_inspection_retries
+                    ),
+                    "php_object_oracle_error": php_object_error or None,
+                    "php_object_oracle_failure_reason": (
+                        php_object_failure_reason or None
+                    ),
                     "poc_isolation": isolation_capability,
                 },
             )
+            if php_object_receipt_diagnostic is not None:
+                timed_out_result.evidence["php_object_trusted_parent_diagnostic"] = (
+                    php_object_receipt_diagnostic[1]
+                )
+            if php_include_expected:
+                redact_php_include_run_result(timed_out_result, php_include_marker)
+            if php_object_expected or php_object_gadget_expected:
+                redact_php_object_run_result(
+                    timed_out_result,
+                    php_object_private_values,
+                )
+            return timed_out_result
 
         elapsed = time.time() - start
         out = stdout.decode("utf-8", errors="replace")
         err = stderr.decode("utf-8", errors="replace")
         observation, parse_reason = _parse_poc_observation(out)
+        if php_object_gadget_expected:
+            # Natural evidence is exclusively the non-serializing parent snapshot.
+            # The reused child may still emit its old inert-canary report; it is
+            # neither accepted nor retained as rejected natural evidence.
+            observation = None
+            parse_reason = "child report intentionally ignored for natural gadget"
         trace_evidence: dict = {}
+        probe_evidence: dict[str, object] = {}
         if proc is None:
             success = False
             validation_reason = "PoC process did not start"
-        elif trace_error:
+        elif php_object_receipt_diagnostic is not None:
+            success = False
+            validation_reason = php_object_receipt_diagnostic[0]
+        elif trace_error and not (
+            (php_object_gadget_expected and php_object_error)
+            or (
+                php_object_expected
+                and php_object_error
+                and php_object_error != "transport_incomplete"
+            )
+        ):
             success = False
             validation_reason = f"PoC HTTP supervision failed: {trace_error}"
         elif ssrf_expected and oracle_error:
             success = False
             validation_reason = f"SSRF oracle snapshot failed: {oracle_error}"
+        elif php_include_expected and php_include_error:
+            success = False
+            php_include_failure_details = (
+                [php_include_failure_reason] if php_include_failure_reason else []
+            )
+            if (
+                php_include_cleanup_error
+                and php_include_cleanup_error != php_include_failure_reason
+            ):
+                php_include_failure_details.append(php_include_cleanup_error)
+            php_include_failure_suffix = (
+                " (" + "; ".join(php_include_failure_details) + ")"
+                if php_include_failure_details
+                else ""
+            )
+            validation_reason = (
+                f"PHP include oracle snapshot failed: {php_include_error}"
+                f"{php_include_failure_suffix}"
+            )
+        elif (
+            php_object_expected
+            and php_object_error == "transport_incomplete"
+            and proc.returncode != 0
+        ):
+            success = False
+            validation_reason = (
+                f"PoC process exited {proc.returncode} before PHP object "
+                "transport completed"
+            )
+        elif php_object_expected and php_object_error:
+            success = False
+            if php_object_error == "transport_incomplete":
+                validation_reason = "PHP object attack/control transport incomplete"
+            elif php_object_error == "surface_attestation_failed":
+                validation_reason = "PHP object executable-surface attestation failed"
+            elif php_object_error == "surface_restoration_failed":
+                validation_reason = "PHP object executable-surface restoration failed"
+            else:
+                validation_reason = "PHP object oracle attestation failed" + (
+                    f" ({php_object_failure_reason})"
+                    if php_object_failure_reason
+                    else ""
+                )
+        elif php_object_gadget_expected and php_object_error:
+            success = False
+            validation_reason = "PHP object gadget oracle attestation failed" + (
+                f" ({php_object_failure_reason})" if php_object_failure_reason else ""
+            )
         elif proc.returncode != 0:
             success = False
             validation_reason = f"PoC process exited {proc.returncode}"
+        elif php_object_gadget_expected:
+            success = php_object_gadget_snapshot is not None
+            validation_reason = (
+                "PHP object natural file-delete proof passed"
+                if success
+                else "PHP object natural gadget snapshot is missing"
+            )
         elif observation is None:
             success = False
             validation_reason = parse_reason
         else:
-            success, validation_reason = validate_poc_observation(
-                observation,
-                expected_bug_class=expected_bug_class,
-                expected_attacker_role=expected_attacker_role,
-            )
+            if expected_executable_upload and observation.oracle == "response_marker":
+                generation = executable_upload_generation
+                if generation is None:
+                    raise RuntimeError(
+                        "executable-upload generation disappeared before validation"
+                    )
+                if (
+                    proxy is None
+                    or not proxy.executable_upload_complete
+                    or trace_error
+                ):
+                    binding = None
+                    validation_reason = (
+                        "executable-upload proxy did not complete both attested arms"
+                    )
+                else:
+                    binding, validation_reason = (
+                        _prepare_executable_upload_candidate(
+                            observation,
+                            trace_records=trace_records,
+                            trace_salt=trace_salt,
+                            target_url=self.target_url,
+                            expected_http_transport=expected_http_transport,
+                            expected_attacker_role=expected_attacker_role,
+                            receipt_secret=self._receipt_secret,
+                            trace_token=self._trace_token,
+                            generation=generation,
+                        )
+                    )
+                success = binding is not None
+                if binding is not None:
+                    trace_evidence = {
+                        "oracle": "executable_upload_parent_attestation",
+                        "upload_trace": binding.evidence,
+                    }
+                    (
+                        success,
+                        validation_reason,
+                        snapshot_evidence,
+                    ) = _validate_executable_upload_snapshot_transitions(
+                        binding,
+                        generation=generation,
+                        snapshots=executable_upload_snapshots,
+                    )
+                    trace_evidence["arm_filesystem"] = snapshot_evidence
+                if success and binding is not None:
+                    (
+                        success,
+                        validation_reason,
+                        filesystem_evidence,
+                    ) = await _attest_executable_upload_filesystem(
+                        binding,
+                        container_name=self.container_name,
+                        generation=generation,
+                    )
+                    trace_evidence["filesystem"] = filesystem_evidence
+                if success and binding is not None:
+                    (
+                        success,
+                        validation_reason,
+                        probe_evidence,
+                    ) = await _attest_executable_upload_response_marker(
+                        binding,
+                        target_url=self.target_url,
+                        generation=generation,
+                    )
+                    trace_evidence["post_exit_probe"] = probe_evidence
+                if success and binding is not None:
+                    (
+                        success,
+                        validation_reason,
+                        filesystem_after_evidence,
+                    ) = await _attest_executable_upload_filesystem(
+                        binding,
+                        container_name=self.container_name,
+                        generation=generation,
+                    )
+                    trace_evidence["filesystem_after_probe"] = (
+                        filesystem_after_evidence
+                    )
+                    if success and filesystem_after_evidence != filesystem_evidence:
+                        success = False
+                        validation_reason = (
+                            "parent executable-upload files changed during probing"
+                        )
+                if success and binding is not None:
+                    response_marker = probe_evidence.get("response_marker")
+                    if (
+                        not isinstance(response_marker, str)
+                        or re.fullmatch(
+                            re.escape(EXECUTABLE_UPLOAD_RESPONSE_PREFIX)
+                            + r"[0-9a-f]{64}",
+                            response_marker,
+                        )
+                        is None
+                    ):
+                        raise RuntimeError(
+                            "parent executable-upload response marker is malformed"
+                        )
+                    observation = _parent_executable_upload_observation(
+                        binding,
+                        generation=generation,
+                        response_marker=response_marker,
+                    )
+                    success, validation_reason = validate_poc_observation(
+                        observation,
+                        expected_bug_class=expected_bug_class,
+                        expected_attacker_role=expected_attacker_role,
+                    )
+                    executable_upload_promoted = success
+            else:
+                success, validation_reason = validate_poc_observation(
+                    observation,
+                    expected_bug_class=expected_bug_class,
+                    expected_attacker_role=expected_attacker_role,
+                )
             if success and ssrf_expected and observation.oracle != "response_marker":
                 success = False
                 validation_reason = (
@@ -5574,6 +13389,86 @@ class SandboxManager:
                             ),
                         )
                     )
+            if (
+                success
+                and php_include_expected
+                and observation.oracle != "response_marker"
+            ):
+                success = False
+                validation_reason = (
+                    "PHP include automatic verification requires the trusted "
+                    "response_marker boundary"
+                )
+            if (
+                success
+                and php_include_expected
+                and observation.oracle == "response_marker"
+            ):
+                if not strict_isolation:
+                    success = False
+                    validation_reason = (
+                        "PHP include proof requires the strict parent-proxy "
+                        "isolation boundary"
+                    )
+                else:
+                    success, validation_reason, trace_evidence = (
+                        validate_php_include_response_marker_http_trace(
+                            observation,
+                            trace_records,
+                            trace_salt=trace_salt,
+                            target_url=self.target_url,
+                            receipt_secret=self._receipt_secret,
+                            trace_token=self._trace_token,
+                            oracle_attack_path=php_include_attack_path,
+                            oracle_control_path=php_include_control_path,
+                            oracle_marker=php_include_marker,
+                            oracle_snapshot=php_include_snapshot,
+                            oracle_generation_id=php_include_generation_id,
+                            expected_http_transport=expected_http_transport,
+                            trace_error=trace_error,
+                        )
+                    )
+            if (
+                success
+                and php_object_expected
+                and observation.oracle != "object_instantiation"
+            ):
+                success = False
+                validation_reason = (
+                    "PHP object automatic verification requires the trusted "
+                    "object_instantiation boundary"
+                )
+            if success and observation.oracle == "object_instantiation":
+                if not php_object_expected:
+                    success = False
+                    validation_reason = (
+                        "object-instantiation proof requires an explicitly prepared "
+                        "trusted PHP object oracle"
+                    )
+                elif (
+                    not strict_isolation
+                    or php_object_policy is None
+                    or php_object_snapshot is None
+                ):
+                    success = False
+                    validation_reason = (
+                        "PHP object proof requires the strict parent-proxy isolation "
+                        "and trusted receipt attestation"
+                    )
+                else:
+                    success, validation_reason, trace_evidence = (
+                        validate_php_object_http_trace(
+                            observation,
+                            trace_records,
+                            target_url=self.target_url,
+                            receipt_secret=self._receipt_secret,
+                            trace_token=self._trace_token,
+                            policy=php_object_policy,
+                            snapshot=php_object_snapshot,
+                            expected_attacker_role=(expected_attacker_role or ""),
+                            trace_error=trace_error,
+                        )
+                    )
             if success and observation.oracle == "cross_object_access":
                 if not strict_isolation:
                     success = False
@@ -5593,7 +13488,6 @@ class SandboxManager:
                             trace_error=trace_error,
                         )
                     )
-
         http_status = None
         m = re.search(r"\bstatus[=:]\s*(\d{3})\b", out, re.IGNORECASE)
         if m:
@@ -5610,19 +13504,32 @@ class SandboxManager:
         if wp_error_log:
             error_log = (error_log + "\n--- wp debug.log ---\n" + wp_error_log).strip()
 
-        return SandboxRunResult(
+        run_result = SandboxRunResult(
             success=success,
             output=out,
             elapsed=elapsed,
             http_status=http_status,
             response=out[-2000:] if out else None,
             error_log=error_log or None,
-            observation=observation,
+            observation=observation if success else None,
+            rejected_observation=observation if not success else None,
             validation_reason=validation_reason,
             evidence={
                 "observation": observation.model_dump(mode="json")
-                if observation
+                if success and observation
                 else None,
+                "rejected_observation": observation.model_dump(mode="json")
+                if not success and observation
+                else None,
+                "observation_disposition": (
+                    "parent_promoted"
+                    if success and observation and executable_upload_promoted
+                    else "accepted"
+                    if success and observation
+                    else "rejected"
+                    if observation
+                    else "absent"
+                ),
                 "validation_reason": validation_reason,
                 "stdout_tail": out[-500:],
                 "returncode": proc.returncode if proc is not None else None,
@@ -5630,7 +13537,47 @@ class SandboxManager:
                 "http_trace_error": trace_error or None,
                 "http_trace_rejections": rejection_counts,
                 "http_trace_binding": trace_evidence or None,
+                "executable_upload_parent_promoted": executable_upload_promoted,
                 "ssrf_oracle_error": oracle_error or None,
+                "php_include_oracle_error": php_include_error or None,
+                "php_include_oracle_failure_reason": (
+                    php_include_failure_reason or None
+                ),
+                "php_include_oracle_cleanup_error": (php_include_cleanup_error or None),
+                "php_include_oracle_inspection_retries": (
+                    php_include_inspection_retries
+                ),
+                "php_object_oracle_error": php_object_error or None,
+                "php_object_oracle_failure_reason": (php_object_failure_reason or None),
                 "poc_isolation": isolation_capability,
             },
         )
+        if executable_upload_promoted:
+            run_result.output = _strip_rejected_poc_result_lines(run_result.output) or ""
+            run_result.response = (
+                run_result.output[-2000:] if run_result.output else None
+            )
+            run_result.error_log = (
+                _strip_rejected_poc_result_lines(run_result.error_log) or None
+            )
+            run_result.evidence["stdout_tail"] = run_result.output[-500:]
+        if php_object_receipt_diagnostic is not None:
+            run_result.evidence["php_object_trusted_parent_diagnostic"] = (
+                php_object_receipt_diagnostic[1]
+            )
+        if php_include_expected:
+            if success and observation is not None:
+                run_result.retain_trusted_php_include_observation(observation)
+            redact_php_include_run_result(run_result, php_include_marker)
+        if php_object_expected:
+            if success and php_object_snapshot is not None:
+                run_result.retain_trusted_php_object_snapshot(php_object_snapshot)
+            redact_php_object_run_result(run_result, php_object_private_values)
+        if php_object_gadget_expected:
+            strip_php_object_gadget_child_claims(run_result)
+            if success and php_object_gadget_snapshot is not None:
+                run_result.retain_trusted_php_object_gadget_snapshot(
+                    php_object_gadget_snapshot
+                )
+            redact_php_object_run_result(run_result, php_object_private_values)
+        return run_result

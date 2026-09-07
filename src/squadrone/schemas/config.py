@@ -6,7 +6,21 @@ from pathlib import Path
 from typing import Literal
 
 import yaml  # type: ignore[import-untyped]
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+HypothesisReviewArea = Literal[
+    "authorization_workflows",
+    "injection_files",
+    "xss_lifecycle",
+    "authentication",
+]
+
+DEFAULT_HYPOTHESIS_REVIEW_AREAS: tuple[HypothesisReviewArea, ...] = (
+    "authorization_workflows",
+    "injection_files",
+    "xss_lifecycle",
+    "authentication",
+)
 
 
 class ModelConfig(BaseModel):
@@ -95,6 +109,35 @@ class PipelineConfig(BaseModel):
     reasoning: ReasoningConfig = Field(default_factory=ReasoningConfig)
     verify: VerifyConfig = Field(default_factory=VerifyConfig)
     report: ReportConfig = Field(default_factory=ReportConfig)
+    hypothesis_review_areas: list[HypothesisReviewArea] = Field(
+        default_factory=lambda: list(DEFAULT_HYPOTHESIS_REVIEW_AREAS),
+        min_length=1,
+    )
+    hypothesis_review_item_types: list[str] | None = None
+
+    @field_validator("hypothesis_review_areas")
+    @classmethod
+    def _review_areas_are_unique(
+        cls, review_areas: list[HypothesisReviewArea]
+    ) -> list[HypothesisReviewArea]:
+        if len(review_areas) != len(set(review_areas)):
+            raise ValueError("hypothesis_review_areas must not contain duplicates")
+        return review_areas
+
+    @field_validator("hypothesis_review_item_types")
+    @classmethod
+    def _review_item_types_are_valid(
+        cls, item_types: list[str] | None
+    ) -> list[str] | None:
+        if item_types is None:
+            return None
+        if not item_types:
+            raise ValueError("hypothesis_review_item_types must not be empty")
+        if any(not item_type.strip() for item_type in item_types):
+            raise ValueError("hypothesis_review_item_types must not contain blanks")
+        if len(item_types) != len(set(item_types)):
+            raise ValueError("hypothesis_review_item_types must not contain duplicates")
+        return item_types
 
     @classmethod
     def from_yaml(cls, path: str) -> "PipelineConfig":

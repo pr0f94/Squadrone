@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import json
 import logging
+import posixpath
 import re
 from importlib.resources import files
 from typing import TYPE_CHECKING, Awaitable, Callable, Optional, TypedDict
@@ -14,7 +15,7 @@ from jinja2 import Template
 
 from pathlib import Path
 
-from ..schemas.finding import PoCAttempt
+from ..schemas.finding import PoCAttempt, PoCStatus
 from ..schemas.hypothesis import Hypothesis
 from ..schemas.taxonomy import (
     BugClass,
@@ -22,6 +23,8 @@ from ..schemas.taxonomy import (
     OPEN_CWE_POC_TEMPLATE,
     get_known_cwe_profile,
 )
+from ..services.roles import normalize_attacker_role
+from ..services.diagnostics import bound_diagnostic
 from .plugin_tools import PluginToolHandlers
 from .prompts_io import load_prompt
 from .tools import (
@@ -62,6 +65,20 @@ _DESCRIBED_REQUEST_PARAMETER_RE = re.compile(
     r"\b([A-Za-z_][A-Za-z0-9_.:-]{0,127})\s+"
     r"(?:query|string|form|body|json|request|url)\s+parameter\b",
     re.IGNORECASE,
+)
+_PHP_OBJECT_ARM_TOKEN_RE = re.compile(r"sqpobjt1\.[0-9a-f]{64}\Z")
+PHP_OBJECT_INERT_IMPACT_DESCRIPTION = (
+    "The exact request path instantiated the verifier-owned inert canary and "
+    "ran only its in-memory __wakeup receipt hook; no natural gadget, file "
+    "effect, command execution, or remote-code-execution chain was proved."
+)
+_DETAILED_PREVIOUS_ATTEMPT_LIMIT = 3
+_OLDER_ATTEMPT_LEDGER_MAX_ATTEMPTS = 8
+_OLDER_ATTEMPT_LEDGER_MAX_CHARS = 3072
+_OLDER_ATTEMPT_LEDGER_NUMBER_MAX_CHARS = 16
+_OLDER_ATTEMPT_LEDGER_HEADER = (
+    "=== OLDER ATTEMPT OUTCOME LEDGER "
+    "(parent-classified fixed vocabulary; no historical child text) ==="
 )
 
 
@@ -105,11 +122,18 @@ def _parse_entry_point_transport(entry_point: str) -> _EntryPointTransport:
 
     http_match = _HTTP_ENTRY_POINT_RE.fullmatch(entry_point)
     if http_match:
-        parsed = urlsplit(http_match.group("target"))
+        raw_target = http_match.group("target")
+        if re.search(r"%(?![0-9A-Fa-f]{2})", raw_target):
+            return fallback
+        parsed = urlsplit(raw_target)
         route = parsed.path
         if (
             not route.startswith("/")
             or route.startswith("//")
+            or "//" in route
+            or route != posixpath.normpath(route)
+            or "%" in route
+            or "\\" in route
             or parsed.scheme
             or parsed.netloc
             or parsed.fragment
@@ -121,19 +145,28 @@ def _parse_entry_point_transport(entry_point: str) -> _EntryPointTransport:
                 parsed.query,
                 keep_blank_values=True,
                 strict_parsing=True,
+                max_num_fields=64,
             )
         except ValueError:
-            query_pairs = []
+            return fallback
 
-        dispatch: dict[str, str] = {}
         query_keys = [key for key, _value in query_pairs]
-        if len(query_keys) == len(set(query_keys)) and all(
-            key.strip() and value.strip() for key, value in query_pairs
+        if len(query_keys) != len(set(query_keys)) or any(
+            not key.strip()
+            or key != key.strip()
+            or not value.strip()
+            or value != value.strip()
+            or not key.isascii()
+            or not key.isprintable()
+            or not value.isascii()
+            or not value.isprintable()
+            for key, value in query_pairs
         ):
-            dispatch = {
-                f"query:{key}": value
-                for key, value in sorted(query_pairs, key=lambda item: item[0])
-            }
+            return fallback
+        dispatch = {
+            f"query:{key}": value
+            for key, value in sorted(query_pairs, key=lambda item: item[0])
+        }
 
         return {
             "method": http_match.group("method").upper(),
@@ -207,30 +240,150 @@ def _is_runnable_python(text: str) -> tuple[bool, str]:
     return True, ""
 
 
+def _older_attempt_outcome_category(attempt: PoCAttempt) -> str:
+    """Reduce historical text to one fixed parent-side outcome category."""
+    if attempt.result == PoCStatus.SUCCESS:
+        return "accepted"
+    reason = (attempt.validation_reason or "").casefold()
+    if reason.startswith("trusted parent php object diagnostic:"):
+        return "php_object_receipt_rejected"
+    if reason in {
+        "php object executable-surface attestation failed",
+        "php object executable-surface restoration failed",
+    }:
+        return "php_object_surface_integrity_failure"
+    if reason == "php object attack/control transport incomplete" or re.fullmatch(
+        r"poc process exited -?\d+ before php object transport completed",
+        reason,
+    ):
+        return "php_object_transport_incomplete"
+    if re.fullmatch(r"poc http supervision failed: [a-z0-9_]+", reason):
+        return "parent_http_supervision_failure"
+    if reason == "poc execution timed out" or re.fullmatch(
+        r"poc timed out after \d+(?:\.\d+)?s",
+        reason,
+    ):
+        return "poc_timeout"
+    if reason == "poc execution failed" or re.fullmatch(
+        r"poc process exited -?\d+",
+        reason,
+    ):
+        return "poc_process_failure"
+    if reason.startswith("clean-state snapshot failed:"):
+        return "snapshot_failure"
+    if attempt.rejected_observation is not None:
+        return "child_observation_rejected"
+    if (
+        reason == "missing final squadrone_result=<json> observation"
+        or reason == "poc emitted more than one structured result observation"
+        or reason == "structured result observation is not the final output line"
+        or reason.startswith("invalid observation json:")
+        or reason.startswith("observation schema validation failed:")
+    ):
+        return "child_observation_invalid"
+    return "runner_validation_failed"
+
+
+def _bounded_ledger_number(value: int | None) -> str:
+    """Keep even malformed historical integer fields from defeating the ledger cap."""
+    rendered = str(value)
+    if len(rendered) <= _OLDER_ATTEMPT_LEDGER_NUMBER_MAX_CHARS:
+        return rendered
+    edge_chars = (_OLDER_ATTEMPT_LEDGER_NUMBER_MAX_CHARS - 3) // 2
+    return f"{rendered[:edge_chars]}...{rendered[-edge_chars:]}"
+
+
+def _format_older_attempt_ledger(previous_attempts: list[PoCAttempt]) -> str:
+    """Summarize older attempts without copying historical child-derived text."""
+    older_attempts = previous_attempts[:-_DETAILED_PREVIOUS_ATTEMPT_LIMIT]
+    if not older_attempts:
+        return ""
+
+    retained_attempts = older_attempts[-_OLDER_ATTEMPT_LEDGER_MAX_ATTEMPTS:]
+    omitted_attempts = len(older_attempts) - len(retained_attempts)
+    ledger_parts = [_OLDER_ATTEMPT_LEDGER_HEADER]
+    if omitted_attempts:
+        ledger_parts.append(
+            f"... {omitted_attempts} older attempts omitted; "
+            "latest bounded entries retained ..."
+        )
+    ledger_parts.extend(
+        "- "
+        f"iteration={_bounded_ledger_number(attempt.iteration)} "
+        f"phase={attempt.phase} result={attempt.result.value} "
+        f"outcome={_older_attempt_outcome_category(attempt)}"
+        for attempt in retained_attempts
+    )
+    ledger = "\n".join(ledger_parts)
+    return ledger[:_OLDER_ATTEMPT_LEDGER_MAX_CHARS].rstrip()
+
+
 def _format_previous_attempts(previous_attempts: list[PoCAttempt]) -> str:
-    """Render bounded retry context, including the validator's authoritative reason."""
+    """Render bounded retry context, including authoritative older lessons."""
     history_parts: list[str] = []
-    for attempt in previous_attempts[-3:]:
+    for attempt in previous_attempts[-_DETAILED_PREVIOUS_ATTEMPT_LIMIT:]:
         script_excerpt = "(script unavailable)"
-        validation_reason = (attempt.validation_reason or "(none provided)")[:1000]
+        validation_reason = bound_diagnostic(
+            attempt.validation_reason or "(none provided)", limit=1000
+        )
+        if attempt.observation is not None:
+            impact = attempt.observation.impact
+            observation_context = (
+                "runner_observation=accepted "
+                f"oracle={attempt.observation.oracle} "
+                f"verdict={attempt.observation.verdict} "
+                "impact="
+                f"C:{impact.confidentiality}/I:{impact.integrity}/"
+                f"A:{impact.availability}"
+            )
+        elif attempt.rejected_observation is not None:
+            observation_context = (
+                "runner_observation=rejected; the child self-report is diagnostic "
+                "only and none of its success declarations are established; "
+                f"reported_oracle={attempt.rejected_observation.oracle}"
+            )
+        else:
+            observation_context = "runner_observation=absent"
+        response_snippet = bound_diagnostic(
+            attempt.response_snippet or "", limit=500
+        )
+        if attempt.rejected_observation is not None:
+            response_snippet = "(withheld after rejected child observation)"
+            error_context = "(withheld after rejected child observation)"
+            developer_context = "(withheld after rejected child observation)"
+        else:
+            error_context = bound_diagnostic(
+                attempt.error_log_snippet or "", limit=500
+            )
+            developer_context = bound_diagnostic(
+                attempt.developer_analysis or "(none)", limit=500
+            )
         try:
-            script_excerpt = Path(attempt.script_path).read_text(
-                encoding="utf-8",
-                errors="replace",
-            )[:4000]
+            script_excerpt = bound_diagnostic(
+                Path(attempt.script_path).read_text(
+                    encoding="utf-8",
+                    errors="replace",
+                ),
+                limit=4000,
+            )
         except OSError:
             pass
         history_parts.append(
             f"--- attempt {attempt.iteration} ---\n"
             f"phase={attempt.phase} result={attempt.result.value} "
             f"http_status={attempt.http_status}\n"
+            f"{observation_context}\n"
             f"validator_rejection: {validation_reason}\n"
-            f"response: {(attempt.response_snippet or '')[:500]}\n"
-            f"errors:   {(attempt.error_log_snippet or '')[:500]}\n"
-            f"developer_analysis: {attempt.developer_analysis or '(none)'}\n"
+            f"response: {response_snippet}\n"
+            f"errors:   {error_context}\n"
+            f"developer_analysis: {developer_context}\n"
             f"script tried:\n```python\n{script_excerpt}\n```"
         )
-    return "\n\n".join(history_parts)
+    detailed_history = "\n\n".join(history_parts)
+    older_ledger = _format_older_attempt_ledger(previous_attempts)
+    if not older_ledger:
+        return detailed_history
+    return f"{older_ledger}\n\n{detailed_history}"
 
 
 class PoCAuthorAgent:
@@ -328,9 +481,25 @@ class PoCAuthorAgent:
         entry_transport = _parse_entry_point_transport(hypothesis.entry_point)
         ssrf_oracle = (extra_context or {}).get("ssrf_oracle") or {}
         ssrf_oracle_mode = str(ssrf_oracle.get("mode") or "http")
-        source_transport = (extra_context or {}).get("ssrf_http_transport")
+        php_include_oracle = (extra_context or {}).get("php_include_oracle") or {}
+        php_object_oracle = (extra_context or {}).get("php_object_oracle") or {}
+        attacker_role = (
+            (extra_context or {}).get("attacker_role")
+            or (hypothesis.evidence_summary or {}).get("attacker_role")
+            or "unknown"
+        )
+        php_include_unauthenticated = (
+            normalize_attacker_role(attacker_role) == "unauthenticated"
+        )
+        source_transport = (
+            (extra_context or {}).get("php_object_http_transport")
+            or (extra_context or {}).get("php_include_http_transport")
+            or (extra_context or {}).get("ssrf_http_transport")
+        )
         source_destination_parameter = ""
         source_destination_location = ""
+        source_object_field = ""
+        source_object_location = ""
         if isinstance(source_transport, dict):
             alternatives = source_transport.get("alternatives")
             if isinstance(alternatives, list) and alternatives:
@@ -357,6 +526,20 @@ class PoCAuthorAgent:
                     source_destination_location = source_transport[
                         "destination_location"
                     ]
+                if isinstance(source_transport.get("object_field"), str):
+                    source_object_field = source_transport["object_field"]
+                if isinstance(source_transport.get("object_location"), str):
+                    source_object_location = source_transport["object_location"]
+        php_object_attack_token = str(php_object_oracle.get("attack_token") or "")
+        php_object_control_token = str(php_object_oracle.get("control_token") or "")
+        if (
+            php_object_oracle.get("mode") != "php_object"
+            or _PHP_OBJECT_ARM_TOKEN_RE.fullmatch(php_object_attack_token) is None
+            or _PHP_OBJECT_ARM_TOKEN_RE.fullmatch(php_object_control_token) is None
+            or php_object_attack_token == php_object_control_token
+        ):
+            php_object_attack_token = ""
+            php_object_control_token = ""
         skeleton = _render_template(
             template_name,
             bug_class=hypothesis.bug_class.value,
@@ -370,9 +553,7 @@ class PoCAuthorAgent:
             test_username=(extra_context or {}).get("test_username", ""),
             test_password=(extra_context or {}).get("test_password", ""),
             extra_params=(extra_context or {}).get("extra_params", ""),
-            attacker_role=(extra_context or {}).get("attacker_role")
-            or (hypothesis.evidence_summary or {}).get("attacker_role")
-            or "unknown",
+            attacker_role=attacker_role,
             request_method=entry_transport["method"],
             request_route=entry_transport["route"],
             request_dispatch=entry_transport["dispatch"],
@@ -380,6 +561,16 @@ class PoCAuthorAgent:
             ssrf_control_url=str(ssrf_oracle.get("control_url") or ""),
             ssrf_oracle_mode=ssrf_oracle_mode,
             ssrf_destination_location=source_destination_location,
+            php_include_attack_path=str(php_include_oracle.get("attack_path") or ""),
+            php_include_control_path=str(php_include_oracle.get("control_path") or ""),
+            php_include_header_name=str(php_include_oracle.get("header_name") or ""),
+            php_include_destination_location=source_destination_location,
+            php_include_unauthenticated=php_include_unauthenticated,
+            php_object_attack_token=php_object_attack_token,
+            php_object_control_token=php_object_control_token,
+            php_object_field=source_object_field,
+            php_object_location=source_object_location,
+            php_object_impact_description=PHP_OBJECT_INERT_IMPACT_DESCRIPTION,
         )
 
         system = load_prompt(self.PROMPT)
@@ -388,6 +579,52 @@ class PoCAuthorAgent:
             f"HYPOTHESIS:\n{hypothesis.model_dump_json(indent=2)}",
             f"TEMPLATE ({template_name}):\n```python\n{skeleton}\n```",
         ]
+        verification_target = (extra_context or {}).get("verification_target")
+        if isinstance(verification_target, dict):
+            user_parts.append(
+                "RUNNER VERIFICATION TARGET (source-reviewed aspiration, never "
+                "permission to overclaim):\n"
+                + json.dumps(verification_target, sort_keys=True)
+                + "\nAim to measure this outcome directly. A valid lower-impact proof "
+                "remains useful, but it is not the terminal strategy while the "
+                "target effect can be tested in this sandbox."
+            )
+        verified_partial_proof = (extra_context or {}).get(
+            "verified_partial_proof"
+        )
+        if isinstance(verified_partial_proof, dict):
+            user_parts.append(
+                "RUNNER-CONFIRMED LOWER-BOUND PROOF (reproduced twice from clean "
+                "state):\n"
+                + json.dumps(verified_partial_proof, sort_keys=True)
+                + "\nThe runner retained this finding as a fallback. Use this one "
+                "bounded refinement strategy to measure the missing target effect; "
+                "do not merely re-emit the same or a weaker proof. Preserve the "
+                "working entry point, actor boundary, and negative-control quality."
+            )
+        executable_upload_oracle = (extra_context or {}).get(
+            "executable_upload_oracle"
+        )
+        if isinstance(executable_upload_oracle, dict):
+            user_parts.append(
+                "TRUSTED_EXECUTABLE_UPLOAD_ORACLE (parent-verified):\n"
+                + json.dumps(executable_upload_oracle, sort_keys=True)
+                + "\nRead the exact base64 payload and attack/control filenames from "
+                "the named environment variables on every execution; fail closed if "
+                "any is missing. For a base64 API, submit the payload environment "
+                "value unchanged. For multipart, strict-base64-decode it once and "
+                "submit those exact bytes. Send exactly two comparable upload "
+                "requests in attack-then-control order, changing only the supplied "
+                "filename (.php versus .txt), and parse each server-returned URL. "
+                "Do not probe either URL. Emit a claim-free response_marker handoff: "
+                "verdict=not_vulnerable; all CIA dimensions none; request contains "
+                "only method and URL; and each of attack/control contains only "
+                "observed=false, marker_present=false, and uploaded_url. The parent "
+                "binds the exact bytes, filenames, source route, signed actor, and "
+                "returned URLs, then issues its fresh challenge after the process "
+                "exits. Never emit child status, identity, actor, upload-success, "
+                "execution, marker, or CIA claims for this handoff."
+            )
         if template_name == _OPEN_CWE_TEMPLATE:
             user_parts.append(
                 "OPEN-CWE FALLBACK: This CWE has no specialized PoC template. "
@@ -461,6 +698,141 @@ class PoCAuthorAgent:
                     "any request. The parent independently validates the response and "
                     "oracle ledger. " + mode_guidance
                 )
+        if php_include_oracle:
+            public_keys = {
+                key: str(php_include_oracle.get(key) or "")
+                for key in (
+                    "attack_path",
+                    "control_path",
+                    "attack_basename",
+                    "control_basename",
+                    "header_name",
+                )
+            }
+            if all(public_keys.values()):
+                actor_contract = (
+                    "This proof is unauthenticated: both attack and control must "
+                    'emit attacker_user_id as the literal JSON string "anonymous" '
+                    '(never 0, "0", null/None, "guest", or a username), with '
+                    "identity_verified=true."
+                    if php_include_unauthenticated
+                    else "This proof is authenticated: after a successful wp_login, "
+                    "both attack and control must emit the same positive WordPress "
+                    "user ID measured from login.identity.user_id (never a configured "
+                    "or guessed ID, username, 0, or null/None), with "
+                    "identity_verified=true."
+                )
+                user_parts.append(
+                    "TRUSTED_PHP_INCLUDE_ORACLE (verifier-owned):\n"
+                    + json.dumps(
+                        {"schema_version": 1, **public_keys},
+                        sort_keys=True,
+                    )
+                    + "\nUse these paths only through the exact source-derived "
+                    "request field that reaches the cited PHP include/require. "
+                    "The attack file exists and the distinct control sibling does "
+                    "not. Derive the two traversal destination values from the "
+                    "cited fixed directory, filename prefix, and suffix; do not "
+                    "request or open either path directly from Python. When the "
+                    "request value is concatenated immediately after a fixed filename "
+                    "prefix, the traversal must begin with /.. (a separator followed "
+                    "by a parent segment), not bare .., so PHP virtual-CWD resolution "
+                    "can cancel the synthetic prefix component; derive this from the "
+                    "exact completed expression and do not add a redundant separator "
+                    "when the sink already supplies one. "
+                    + actor_contract
+                    + " After any "
+                    "necessary login/setup traffic, send exactly two proof-bound "
+                    "target requests in order: attack, then control. Extract exactly "
+                    "one SQUADRONE_PHP_INCLUDE_<64 lowercase hex> value from the "
+                    "named response header on the attack; the control must have no "
+                    "such header. Emit response_marker with the extracted value as "
+                    "attack.marker, include_path and destination_value for both arms, "
+                    "the actor identity required above, and identical "
+                    "request_fingerprint objects "
+                    "using destination_parameter/destination_location/dispatch. "
+                    "Claim confidentiality=low and no integrity or availability: "
+                    "this proves the inclusion primitive, not attacker file-write "
+                    "or arbitrary-code-execution amplification. The parent validates "
+                    "the secret receipt, exact wire fields, immutable canary, absent "
+                    "control, and fresh clean-state replay. Never invent or preseed "
+                    "the marker, add exploratory target requests, or substitute a "
+                    "different local file."
+                )
+        if php_object_attack_token and php_object_control_token:
+            object_transport = {
+                "method": entry_transport["method"],
+                "route": entry_transport["route"],
+                "dispatch": entry_transport["dispatch"],
+                "object_field": source_object_field,
+                "object_location": source_object_location,
+            }
+            actor_contract = (
+                'Use attacker_user_id="anonymous" with identity_verified=true in '
+                "both arms and do not log in."
+                if php_include_unauthenticated
+                else "After wp_login, use the same positive WordPress user ID from "
+                "login.identity.user_id in both arms with identity_verified=true."
+            )
+            user_parts.append(
+                "TRUSTED_PHP_OBJECT_ORACLE (verifier-owned):\n"
+                + json.dumps(
+                    {
+                        "schema_version": 1,
+                        "mode": "php_object",
+                        "attack_token": php_object_attack_token,
+                        "control_token": php_object_control_token,
+                        "transport": object_transport,
+                    },
+                    sort_keys=True,
+                )
+                + "\nSubmit the two opaque tokens unchanged as the exact form-field "
+                "value selected by the source-derived transport. Never construct, "
+                "encode, decode, inspect, log, or emit PHP serialized bytes, a class "
+                "name, embedded NUL, proof, secret, or receipt. Before the attack, "
+                "you may perform only the standard wp_login flow or bounded GET/HEAD "
+                "reads of a public form or nonce; do not send any other POST or "
+                "mutating preflight request. When the source workflow requires a "
+                "rendered form, consume the exact public page URL and stable form "
+                "identity from authoritative SANDBOX SETUP, set the template's "
+                "FORM_BOOTSTRAP_REQUIRED decision to true, and make one "
+                "non-redirecting GET. Select exactly one coherent source-grounded "
+                "form; retain its hidden and other non-submit successful controls, "
+                "reusable nonce, duplicate fields, and exact rendered names. Supply "
+                "deterministic semantic values for every source-required or rendered "
+                "required field. Set FORM_BOOTSTRAP_REQUIRED=false only when source "
+                "proves no such bootstrap is needed, and then set "
+                "SOURCE_COMPLETE_FORM_FIELDS to the complete ordered source-required "
+                "field baseline; use an explicit empty list only when source proves "
+                "dispatch plus the object field are the entire envelope. Leave that "
+                "direct baseline unset in rendered-form mode. Exclude dispatch and "
+                "the object field from REQUIRED_FORM_FIELDS because the scaffold "
+                "applies them later. Leaving either decision undecided must fail "
+                "closed. Build the complete baseline before overlaying dispatch or "
+                "the object field. Any required state or configuration setup must use "
+                "the managed setup tools before script execution. Immediately before "
+                "proof, clone the fully bootstrapped/login session into separate "
+                "attack and control sessions with identical headers and cookies, so "
+                "an attack response Set-Cookie cannot alter control. The "
+                "attack and control must then be the next two target requests, in "
+                "that order, with identical method, path, query, headers, cookies, "
+                "and form fields except for the opaque token. Set "
+                "allow_redirects=False on both so a redirect cannot interleave. A "
+                "source-valid reusable nonce may be identical in both arms. "
+                + actor_contract
+                + " Emit object_instantiation with only the shared request "
+                "fingerprint, actor identity, instantiated=true for attack and false "
+                "for control, and effect=verifier_inert_canary_wakeup. Do not emit a "
+                "receipt, token, payload, class, generation, or proof as evidence. "
+                "Claim exactly confidentiality=none, integrity=low, and "
+                "availability=none, preserving the template's impact description "
+                "verbatim. This canary proves only that attacker bytes "
+                "survived the real transport and invoked its inert __wakeup hook; it "
+                "does not prove any shipped natural gadget, file effect, command "
+                "execution, or RCE. The parent privately validates attack/control "
+                "wire traces and uses a fresh generation for the clean replay while "
+                "the same authored token strings remain stable."
+            )
         if previous_attempts:
             user_parts.append(
                 f"PREVIOUS ATTEMPTS:\n{_format_previous_attempts(previous_attempts)}"

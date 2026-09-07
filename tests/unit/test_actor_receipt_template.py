@@ -18,6 +18,9 @@ def _render_template() -> str:
     ).render(
         trace_token="ab" * 16,
         receipt_secret="cd" * 32,
+        php_object_canary_class=(
+            "SquadroneObjectCanary_0123456789abcdef0123456789abcdef"
+        ),
     )
 
 
@@ -27,6 +30,10 @@ def test_actor_receipt_template_renders_the_signed_identity_contract() -> None:
     assert "{{" not in rendered
     assert "$trace_token = '" + ("ab" * 16) + "';" in rendered
     assert "$receipt_secret_hex = '" + ("cd" * 32) + "';" in rendered
+    assert (
+        "$php_object_canary_class = "
+        "'SquadroneObjectCanary_0123456789abcdef0123456789abcdef';"
+    ) in rendered
     assert "hash_equals($trace_token, $request_trace_token)" in rendered
     assert "HTTP_X_SQUADRONE_REQUEST_NONCE" in rendered
     assert "HTTP_X_SQUADRONE_REQUEST_DIGEST" in rendered
@@ -76,6 +83,44 @@ def test_actor_receipt_template_uses_request_metadata_without_query_values() -> 
     assert "headers_sent()" in rendered
 
 
+def test_actor_receipt_uses_proxy_binding_only_for_strict_multipart_ingress() -> None:
+    rendered = _render_template()
+
+    assert "HTTP_X_SQUADRONE_REQUEST_BINDING" in rendered
+    assert "isset($_SERVER['CONTENT_TYPE'])" in rendered
+    assert r"/\Amultipart\/form-data(?:\s*;|\s*\z)/iD" in rendered
+    assert '"SQUADRONE-REQUEST-BINDING-V1\\0"' in rendered
+
+    binding_source = re.search(
+        r"\$computed_request_binding = hash_hmac\((.*?)\n\s*\);",
+        rendered,
+        flags=re.DOTALL,
+    )
+    assert binding_source is not None
+    binding_contract = binding_source.group(1)
+    assert re.findall(
+        r"\. \$(method|request_uri|request_nonce|request_digest)",
+        binding_contract,
+    ) == ["method", "request_uri", "request_nonce", "request_digest"]
+    assert "$receipt_secret" in binding_contract
+    assert "hash_equals($computed_request_binding, $request_binding)" in rendered
+
+    verification_source = re.search(
+        r"if \(\$is_multipart\) \{(.*?)\n\s*\} else \{(.*?)\n\s*\}\n\n"
+        r"\s*\$path_end",
+        rendered,
+        flags=re.DOTALL,
+    )
+    assert verification_source is not None
+    multipart_branch, ordinary_branch = verification_source.groups()
+    assert "if (! $binding_valid)" in multipart_branch
+    assert "return;" in multipart_branch
+    assert "file_get_contents('php://input')" not in multipart_branch
+    assert "file_get_contents('php://input')" in ordinary_branch
+    assert "hash_equals($computed_request_digest, $request_digest)" in ordinary_branch
+    assert "$binding_valid" not in ordinary_branch
+
+
 def test_actor_receipt_freezes_identity_before_header_emission() -> None:
     rendered = _render_template()
 
@@ -90,6 +135,22 @@ def test_actor_receipt_freezes_identity_before_header_emission() -> None:
     header_callback = rendered[receipt_callback:]
     assert "get_current_user_id()" not in header_callback
     assert "wp_get_current_user()" not in header_callback
+
+
+def test_actor_receipt_bridges_only_the_inert_canarys_one_shot_receipt() -> None:
+    rendered = _render_template()
+
+    remove = rendered.index("header_remove('X-Squadrone-PHP-Object-Receipt')")
+    consume = rendered.index("'consumeReceipt'")
+    emit = rendered.index("'X-Squadrone-PHP-Object-Receipt: '")
+    assert remove < consume < emit
+    assert "class_exists($php_object_canary_class, false)" in rendered
+    assert "SquadroneObjectCanary_[0-9a-f]{32}" in rendered
+    assert "sqpobj1\\.[0-9a-f]{64}\\.[0-9a-f]{64}" in rendered
+    assert "resetReceipt" not in rendered
+    assert "sqpobjt1" not in rendered
+    assert "generation_id" not in rendered
+    assert "expected_receipt" not in rendered
 
 
 def test_actor_receipt_template_has_no_ssrf_oracle_state_or_extra_variables() -> None:
@@ -111,6 +172,7 @@ def test_actor_receipt_template_has_no_ssrf_oracle_state_or_extra_variables() ->
     undeclared = environment.parse(source)
 
     assert meta.find_undeclared_variables(undeclared) == {
+        "php_object_canary_class",
         "receipt_secret",
         "trace_token",
     }

@@ -81,8 +81,6 @@ _CURRENT_USER_ID_RE = re.compile(
     r"(?:(?i:get_current_user_id)\s*\(\s*\)|"
     r"(?i:wp_get_current_user)\s*\(\s*\)\s*->\s*ID)"
 )
-
-
 def _review_areas_for_surface(
     surface_type: str,
     existing: Iterable[ReviewArea] = (),
@@ -103,7 +101,7 @@ def _review_areas_for_surface(
 
 
 # (type, function pattern, review areas, coverage kind)
-_PHP_SURFACES: list[tuple[str, re.Pattern[str], list[str], str]] = [
+_PHP_SURFACES: list[tuple[str, re.Pattern[str], list[ReviewArea], str]] = [
     (
         "sql_query",
         re.compile(
@@ -135,6 +133,16 @@ _PHP_SURFACES: list[tuple[str, re.Pattern[str], list[str], str]] = [
     (
         "deserialization",
         re.compile(r"\b(?P<fn>unserialize|maybe_unserialize)\s*\("),
+        ["injection_files"],
+        "sink",
+    ),
+    (
+        "implicit_deserialization",
+        # WordPress update_metadata() can consume the existing stored value
+        # through core metadata handling. Keep this deliberately narrower than
+        # every get_*_meta()/update_*_meta() wrapper: the specialist follows
+        # those calls only after a raw metadata write establishes byte ingress.
+        re.compile(r"\b(?P<fn>update_metadata)\s*\(", re.IGNORECASE),
         ["injection_files"],
         "sink",
     ),
@@ -228,7 +236,7 @@ _PHP_SURFACES: list[tuple[str, re.Pattern[str], list[str], str]] = [
     ),
 ]
 
-_JS_SURFACES: list[tuple[str, re.Pattern[str], list[str], str]] = [
+_JS_SURFACES: list[tuple[str, re.Pattern[str], list[ReviewArea], str]] = [
     (
         "dom_html",
         re.compile(

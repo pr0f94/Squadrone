@@ -9,6 +9,8 @@ proxy port.  There is deliberately no unsandboxed fallback.
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import json
 import os
 import re
 import ssl
@@ -19,6 +21,7 @@ import tempfile
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlsplit
 
 
@@ -27,9 +30,17 @@ DEFAULT_MAX_BUNDLE_FILES = 32
 DEFAULT_MAX_FILE_BYTES = 1024 * 1024
 DEFAULT_MAX_TOTAL_BYTES = 4 * 1024 * 1024
 CROSS_OBJECT_HTTP_CAPABILITY = "cross_object_http"
+EXECUTABLE_UPLOAD_PAYLOAD_ENV = "SQUADRONE_EXEC_UPLOAD_PAYLOAD_B64"
+EXECUTABLE_UPLOAD_ATTACK_FILENAME_ENV = (
+    "SQUADRONE_EXEC_UPLOAD_ATTACK_FILENAME"
+)
+EXECUTABLE_UPLOAD_CONTROL_FILENAME_ENV = (
+    "SQUADRONE_EXEC_UPLOAD_CONTROL_FILENAME"
+)
 _COPY_CHUNK_BYTES = 64 * 1024
 _RUNNER_NAME = "_squadrone_poc_bootstrap.py"
 _PROFILE_NAME = "seatbelt.sb"
+_BUNDLE_MANIFEST_SCHEMA_VERSION = 1
 _LOCALE_ENV_NAMES = ("LANG", "LC_ALL")
 _SAFE_LOCALE_RE = re.compile(r"[A-Za-z0-9_.@-]{1,128}\Z")
 _SYSTEM_READ_ROOTS = (
@@ -69,6 +80,9 @@ PROXY_NAMES = (
 )
 PRESERVED_NAMES = {
     PROXY_ENV,
+    "SQUADRONE_EXEC_UPLOAD_PAYLOAD_B64",
+    "SQUADRONE_EXEC_UPLOAD_ATTACK_FILENAME",
+    "SQUADRONE_EXEC_UPLOAD_CONTROL_FILENAME",
     "HOME", "LANG", "LC_ALL", "PATH", "PYTHONDONTWRITEBYTECODE",
     "TEMP", "TMP", "TMPDIR", "XDG_CACHE_HOME", "XDG_CONFIG_HOME",
     "XDG_DATA_HOME",
@@ -132,6 +146,60 @@ class PoCBundleRejected(PoCIsolationError):
 
 
 @dataclass(frozen=True, slots=True)
+class PoCBundleManifestFile:
+    """One content-addressed Python source in an isolated PoC bundle."""
+
+    name: str
+    role: Literal["entrypoint", "helper", "trusted_bootstrap"]
+    size_bytes: int
+    sha256: str
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "name": self.name,
+            "role": self.role,
+            "size_bytes": self.size_bytes,
+            "sha256": self.sha256,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class PoCBundleManifest:
+    """Canonical identity of the exact isolated Python bundle to execute."""
+
+    schema_version: int
+    entrypoint: str
+    files: tuple[PoCBundleManifestFile, ...]
+    manifest_sha256: str
+    source_file_count: int
+
+    @property
+    def script_sha256(self) -> str:
+        """Return the main-script digest committed by this manifest."""
+        for entry in self.files:
+            if entry.role == "entrypoint":
+                return entry.sha256
+        raise PoCBundleRejected("isolated PoC manifest has no entrypoint")
+
+    def canonical_bytes(self) -> bytes:
+        """Return the bytes whose SHA-256 is ``manifest_sha256``."""
+        return _canonical_bundle_manifest_bytes(
+            schema_version=self.schema_version,
+            entrypoint=self.entrypoint,
+            files=self.files,
+        )
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "entrypoint": self.entrypoint,
+            "files": [entry.as_dict() for entry in self.files],
+            "manifest_sha256": self.manifest_sha256,
+            "source_file_count": self.source_file_count,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class PoCIsolationLaunch:
     """Prepared Seatbelt launch parameters valid for one context lifetime."""
 
@@ -144,6 +212,9 @@ class PoCIsolationLaunch:
     bundle_files: tuple[Path, ...]
     proxy_port: int
     capability: str = CROSS_OBJECT_HTTP_CAPABILITY
+    max_files: int = DEFAULT_MAX_BUNDLE_FILES
+    max_file_bytes: int = DEFAULT_MAX_FILE_BYTES
+    max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES
 
     def command(self, *arguments: str | os.PathLike[str]) -> tuple[str, ...]:
         """Return a complete argv without invoking a shell."""
@@ -185,6 +256,10 @@ class PoCIsolationLaunch:
         if verify_paths.capath and Path(verify_paths.capath).is_dir():
             environment["SSL_CERT_DIR"] = verify_paths.capath
         return environment
+
+    def attest_bundle(self) -> PoCBundleManifest:
+        """Read and identify every Python source in this prepared bundle."""
+        return attest_poc_isolation_bundle(self)
 
 
 def seatbelt_unavailability_reason(
@@ -435,6 +510,148 @@ def _load_bounded_bundle(
     return source_script, tuple(loaded)
 
 
+def _canonical_bundle_manifest_bytes(
+    *,
+    schema_version: int,
+    entrypoint: str,
+    files: tuple[PoCBundleManifestFile, ...],
+) -> bytes:
+    payload = {
+        "schema_version": schema_version,
+        "entrypoint": entrypoint,
+        "files": [entry.as_dict() for entry in files],
+    }
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("ascii")
+
+
+def attest_poc_isolation_bundle(
+    launch: PoCIsolationLaunch,
+) -> PoCBundleManifest:
+    """Content-address the exact copied Python sources before child launch.
+
+    The source directory is no longer authoritative once isolation preparation
+    starts.  This function opens the copied main script, every copied helper,
+    and the trusted bootstrap without following symlinks, then commits their
+    names, roles, lengths, and bytes to one canonical manifest.  Callers should
+    invoke it immediately before starting the isolated process.
+    """
+    if type(launch) is not PoCIsolationLaunch:
+        raise PoCBundleRejected("invalid prepared PoC isolation handle")
+    file_limit = _validate_positive_bound("max_files", launch.max_files)
+    per_file_limit = _validate_positive_bound("max_file_bytes", launch.max_file_bytes)
+    total_limit = _validate_positive_bound("max_total_bytes", launch.max_total_bytes)
+    bundle_dir = _absolute_without_following(launch.cwd)
+    try:
+        bundle_metadata = bundle_dir.lstat()
+    except OSError as exc:
+        raise PoCBundleRejected(f"cannot inspect isolated PoC bundle: {exc}") from exc
+    if (
+        not stat.S_ISDIR(bundle_metadata.st_mode)
+        or stat.S_ISLNK(bundle_metadata.st_mode)
+        or not launch.cwd.is_absolute()
+        or launch.cwd != bundle_dir
+    ):
+        raise PoCBundleRejected("isolated PoC bundle is not a stable directory")
+
+    source_paths = tuple(launch.bundle_files)
+    if not 1 <= len(source_paths) <= file_limit:
+        raise PoCBundleRejected("isolated PoC source inventory is out of bounds")
+    if any(
+        not path.is_absolute()
+        or path.parent != bundle_dir
+        or path.name != os.path.basename(path.name)
+        or path.suffix.casefold() != ".py"
+        or path.name == _RUNNER_NAME
+        for path in source_paths
+    ):
+        raise PoCBundleRejected("isolated PoC source inventory escaped its bundle")
+    source_names = tuple(path.name for path in source_paths)
+    if len(set(source_names)) != len(source_names):
+        raise PoCBundleRejected("isolated PoC source inventory is ambiguous")
+
+    script_path = launch.script_path
+    runner_path = launch.runner_path
+    if (
+        not script_path.is_absolute()
+        or script_path.parent != bundle_dir
+        or script_path not in source_paths
+        or not runner_path.is_absolute()
+        or runner_path != bundle_dir / _RUNNER_NAME
+    ):
+        raise PoCBundleRejected("isolated PoC entrypoint or bootstrap is invalid")
+
+    try:
+        python_entries = tuple(
+            entry
+            for entry in os.scandir(bundle_dir)
+            if Path(entry.name).suffix.casefold() == ".py"
+        )
+    except OSError as exc:
+        raise PoCBundleRejected(
+            f"cannot inspect isolated PoC Python inventory: {exc}"
+        ) from exc
+    expected_python_names = {*source_names, _RUNNER_NAME}
+    if {entry.name for entry in python_entries} != expected_python_names:
+        raise PoCBundleRejected("isolated PoC Python inventory changed")
+    for entry in python_entries:
+        try:
+            metadata = entry.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise PoCBundleRejected(
+                f"cannot inspect isolated Python source {entry.name!r}: {exc}"
+            ) from exc
+        if entry.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+            raise PoCBundleRejected(
+                f"isolated Python source is not a regular file: {entry.name!r}"
+            )
+
+    entries: list[PoCBundleManifestFile] = []
+    source_total = 0
+    for path in (*source_paths, runner_path):
+        content = _read_regular_bounded(path, per_file_limit)
+        if path == runner_path:
+            if content != _BOOTSTRAP_SOURCE:
+                raise PoCBundleRejected("isolated PoC bootstrap identity changed")
+            role: Literal["entrypoint", "helper", "trusted_bootstrap"] = (
+                "trusted_bootstrap"
+            )
+        else:
+            source_total += len(content)
+            if source_total > total_limit:
+                raise PoCBundleRejected(
+                    f"isolated PoC bundle exceeds the {total_limit}-byte total limit"
+                )
+            role = "entrypoint" if path == script_path else "helper"
+        entries.append(
+            PoCBundleManifestFile(
+                name=path.name,
+                role=role,
+                size_bytes=len(content),
+                sha256=hashlib.sha256(content).hexdigest(),
+            )
+        )
+    ordered = tuple(sorted(entries, key=lambda entry: entry.name))
+    if sum(entry.role == "entrypoint" for entry in ordered) != 1:
+        raise PoCBundleRejected("isolated PoC manifest entrypoint is ambiguous")
+    canonical = _canonical_bundle_manifest_bytes(
+        schema_version=_BUNDLE_MANIFEST_SCHEMA_VERSION,
+        entrypoint=script_path.name,
+        files=ordered,
+    )
+    return PoCBundleManifest(
+        schema_version=_BUNDLE_MANIFEST_SCHEMA_VERSION,
+        entrypoint=script_path.name,
+        files=ordered,
+        manifest_sha256=hashlib.sha256(canonical).hexdigest(),
+        source_file_count=len(source_paths),
+    )
+
+
 def _seatbelt_string(value: str) -> str:
     if any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
         raise ValueError("Seatbelt paths cannot contain control characters")
@@ -632,4 +849,7 @@ def prepare_poc_isolation(
             bundle_files=tuple(copied_files),
             proxy_port=port,
             capability=capability,
+            max_files=file_limit,
+            max_file_bytes=per_file_limit,
+            max_total_bytes=total_limit,
         )
