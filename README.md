@@ -19,7 +19,7 @@ It never submits findings automatically.
 
 ## Quickstart
 
-Install the prerequisites, start Docker Desktop, then run:
+Install the prerequisites, make sure Docker and Compose are running, then run:
 
 ```sh
 git clone https://github.com/pr0f94/Squadrone.git squadrone
@@ -45,51 +45,45 @@ not need `OPENAI_API_KEY`.
 
 ## Research Process
 
-1. **Intake** downloads the requested release, rejects closed latest-version
-   targets, and records an immutable run artifact.
-2. **Deterministic coverage** inventories shipped PHP, JavaScript, TypeScript,
-   templates, built assets, external callbacks, storage operations, and risky
-   sinks. Tests/docs are excluded; bundled dependencies remain inspectable.
-3. **Threat mapping** enriches that inventory with plugin objects, roles,
-   capabilities, workflows, dynamic registrations, and call paths.
-4. **Four source reviewers** own authorization/workflows, injection/files,
-   XSS lifecycle, and authentication. They work through bounded source-local
-   batches with unrestricted source tools. Every disposition must cite the
-   assigned line from a tool read, and every candidate must link its hypothesis.
-   Callback workflows receive both authorization and XSS review so reflected
-   rendering remains covered without treating every output call as a separate task.
-   Minified assets retain match columns, so reading only the start of a very long
-   physical line cannot satisfy evidence for a sink later on that line.
-5. **Source verification and critic review** reject hallucinated citations,
-   missed guards, unreachable paths, unrealistic roles, and claims without a
-   concrete security boundary and CIA outcome.
-6. **Scope and ranking** route technically valid candidates by current
-   Wordfence/Patchstack vulnerability, role, and impact rules, rank by attacker
-   role and impact, then apply the sandbox candidate cap. Plugin selection is
-   responsible for asset-level install-count/vendor eligibility. Lower-ranked
-   valid candidates are marked deferred, not falsely rejected.
-7. **Sandbox verification** configures legitimate prerequisites, executes a
-   generated Python PoC, validates a class-specific structured attack/control
-   oracle, restores the full database and `wp-content`, and reruns the exact PoC.
-   A finding requires both executions to pass. HTTP 200, reflection, a blind
-   callback, or printed `SUCCESS` text is not proof.
-8. **Confirmed scoring and deduplication** calculate CVSS v3.1 only from the
-   confirmed attacker role and CIA observation, then compare the result with
-   Wordfence Intelligence and WPScan.
-9. **Reporting** drafts one private report per eligible disclosure program.
-   Confirmed findings that fail the evidence or current program rules do not get
-   polished into submission drafts.
+1. **Intake** downloads the latest release or a pinned historical version,
+   rejects closed latest-version targets, and records the source metadata.
+2. **Coverage and threat mapping** inventory production PHP, JavaScript,
+   TypeScript, templates, built assets, entry points, storage operations, risky
+   sinks, roles, capabilities, workflows, and call paths.
+3. **Specialist source review** examines four areas by default:
+   authorization/workflows, injection/files, XSS lifecycle, and authentication.
+   Review is split into resumable source-local batches, and every disposition
+   requires cited source.
+4. **Source validation** checks each candidate's citations, reachability,
+   controls, attacker role, security boundary, and concrete confidentiality,
+   integrity, or availability impact.
+5. **Triage** ranks source-valid candidates and selects the configured number
+   for sandbox verification. Default scans also apply configured finding-level
+   Wordfence and Patchstack class, role, and impact rules. Asset eligibility,
+   such as install count, vendor exclusions, and program enrollment, must be
+   checked separately. Valid candidates below the cap are retained as deferred.
+6. **Sandbox verification** provisions legitimate prerequisites in an isolated
+   WordPress/MariaDB stack, executes a generated Python PoC with a structured
+   attack/control oracle, restores the database and complete WordPress
+   filesystem, and repeats the exact PoC from clean state. Both executions must
+   pass before Squadrone creates a finding.
+7. **Scoring, deduplication, and reporting** calculate CVSS v3.1 from confirmed
+   evidence, query the available configured Wordfence Intelligence and WPScan
+   sources, and create private report drafts for non-duplicate findings that
+   pass finding-level routing.
 
-This process is mandatory. Pipeline YAML no longer contains switches that turn
-off source grounding, coverage, quality checks, controls, or confirmation.
+Evidence checks, negative controls, and clean-state confirmation are enforced by
+the pipeline. Pipeline YAML configures operational choices such as models,
+budget, candidate limits, and sandbox settings.
 
 ## Prerequisites
 
 - Python 3.12+
-- Docker Desktop
+- Docker with Compose v2 (Docker Desktop on macOS)
 - `ripgrep`
 - Playwright Chromium (installed by the Quickstart command)
-- `subversion` optional; plugin ZIP download is the automatic fallback
+- `subversion` optional; pinned historical releases use SVN when available and
+  fall back to the official versioned ZIP if SVN or the tag is unavailable
 - Access to the models selected in the pipeline YAML
 
 On macOS:
@@ -178,16 +172,18 @@ and `authentication`. The optional item-type list matches deterministic
 .venv/bin/squadrone scan contact-form-7 --verify-only
 ```
 
-`scan` supports `--config`, `--budget`, `--version`, `--resume`, `--from`,
-`--triage-only`, `--verify-only`, and `--verbose`. `scan-batch` supports
-`--concurrency`, `--config`, `--budget`, `--version`, and `--verbose`.
+Use `.venv/bin/squadrone scan --help` or
+`.venv/bin/squadrone scan-batch --help` for the complete option reference.
+`--triage-only` and `--verify-only` are mutually exclusive:
 
-`--triage-only` and `--verify-only` are mutually exclusive. A triage-only run
-writes or reuses artifacts through `triaged.json`, and can later be resumed as a
-normal or verify-only scan.
+- `--triage-only` writes artifacts through `triaged.json` and stops before
+  Docker verification.
+- `--verify-only` includes out-of-program-scope candidates in technical triage,
+  runs verification, and skips vulnerability-database lookup and reporting.
 
-There is intentionally no `--chain`, `--cross-file-taint`, or `--triage-votes`
-mode. Cross-file review is part of the fixed methodology.
+A triage-only run can be resumed with either mode. Verify-only resume reuses its
+technical-triage artifact; a normal resume reruns triage with disclosure scope
+enabled before continuing through verification, deduplication, and reporting.
 
 ## Artifacts
 
@@ -214,10 +210,9 @@ discarded.
 
 ## Manual Review
 
-The critic may use the manual queue only for a source-proven candidate with one
-narrow runtime fact automation cannot establish. Quality-gate failures and
-lower-ranked candidates are rejected or deferred explicitly instead of being
-hidden in that queue.
+Triage or verification may use the manual queue for a source-proven candidate
+with one narrow runtime fact automation cannot establish. Quality-gate failures
+and lower-ranked candidates are rejected or deferred explicitly.
 
 ```sh
 .venv/bin/squadrone manual list
@@ -289,7 +284,6 @@ env -u WORDFENCE_API_KEY -u WPSCAN_API_KEY \
 ```sh
 .venv/bin/pytest -q
 .venv/bin/ruff check src tests benchmarks
-.venv/bin/mypy src
 ```
 
 ## Architecture
@@ -300,7 +294,7 @@ env -u WORDFENCE_API_KEY -u WPSCAN_API_KEY \
 - `src/squadrone/schemas/`: Pydantic artifact contracts
 - `src/squadrone/prompts/`: agent and current program instructions
 - `src/squadrone/poc_templates/`: PoC skeletons and evidence helpers
-- `benchmarks/`: paired vulnerable/fixed regression corpus
+- `benchmarks/`: paired benchmark corpus and seeded historical-CVE regressions
 
 See `DESIGN.md` for the design-level walkthrough.
 
