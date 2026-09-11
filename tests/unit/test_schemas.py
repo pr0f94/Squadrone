@@ -522,6 +522,11 @@ def test_specialist_prompt_names_the_canonical_hypothesis_contract():
     for field in ("id", "specialist", "bug_class", "confidence", "affected_versions"):
         assert f'"{field}"' in prompt
     assert "do not substitute `hypothesis_id`, `reviewer`" in prompt
+    assert '"entry_point": "POST /origin-relative/path"' in prompt
+    assert (
+        '"source": "POST form field exact_name; relative/source-file:123 '
+        "— $_POST['exact_name']\"" in prompt
+    )
 
 
 def test_finding_round_trip(tmp_path):

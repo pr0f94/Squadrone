@@ -487,6 +487,7 @@ class DeveloperAgent:
                 output_schema=RequestedSetupPlan,
                 force_finalise_after=6,
                 force_finalise_allowed_tools={"read_plugin_ranges"},
+                force_finalise_allowed_tool_calls=2,
                 max_tokens=4096,
             )
             if isinstance(result.output, RequestedSetupPlan):
@@ -611,6 +612,7 @@ class DeveloperAgent:
                 output_schema=SetupPlan,
                 force_finalise_after=6,
                 force_finalise_allowed_tools={"read_plugin_ranges"},
+                force_finalise_allowed_tool_calls=2,
                 max_tokens=4096,
             )
             if isinstance(result.output, SetupPlan):

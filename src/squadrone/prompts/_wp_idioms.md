@@ -89,6 +89,50 @@ calls. The list below is a defensive reference, not exhaustive.
   exact path to the dynamic write, rather than merely finding a denylist or
   cleaner used by another caller.
 
+## Core Custom Fields post-meta writers
+
+- The standard post-editor Custom Fields path is a possible writer for a
+  plugin-read fixed post-meta key even when the plugin's own save handler
+  sanitizes that key. Core `edit_post()` and `wp_ajax_add_meta()` can reach
+  `add_meta($post_id)`. `add_meta()` casts the post ID, reads the submitted key
+  and value, rejects `is_protected_meta()` keys and callers lacking
+  `add_post_meta` for that exact post/key, then calls `add_post_meta()`. It does
+  not apply a generic text sanitizer or post-content KSES to the value.
+  Metadata storage still invokes `sanitize_meta()`, so trace any registration,
+  subtype-specific callback, or dynamic sanitizer/filter for the exact key.
+- Core's authenticated `wp_ajax_add-meta` dispatch at
+  `POST /wp-admin/admin-ajax.php` accepts POST form fields `action=add-meta`,
+  `post_id`, `metakeyinput` or `metakeyselect`, `metavalue`, and
+  `_ajax_nonce-add-meta`. `wp_ajax_add_meta()` verifies the nonce for action
+  `add-meta`, casts and resolves `post_id`, and requires `edit_post` on that
+  exact object before calling `add_meta()`; `add_meta()` then requires the
+  mapped `add_post_meta` capability for the exact key. The nonce is emitted by
+  the post editor's Custom Fields form. A claimed low-privilege path therefore
+  must prove the role can edit the exact selected target post and can obtain the
+  nonce from a normally reachable Custom Fields form available to that account.
+  The nonce-providing form need not belong to the selected target or its post
+  subtype. These authorization checks do not apply text sanitization or
+  constrain a public key to a plugin-owned post type.
+- Because this supplied writer contract is in WordPress core, its exact POST
+  fields and calls need not have a plugin `relative/file:line` citation in
+  `evidence_summary.source`. Do not fabricate one. This narrow exception still
+  requires read-tool evidence for the plugin's fixed-key metadata read,
+  shortcode expansion, output context, and assigned coverage item; it does not
+  waive source grounding for a plugin-defined or any other external writer.
+- This is not proof that every post-meta read is attacker-writable. Require the
+  claimed role to pass the exact edit/meta capability for a selected post it
+  owns or otherwise may edit, and prove the reader can select that same object.
+  Bind the post ID's input type and conversion, post type/status and ownership,
+  effective key and publicness, value transformation, and final output context.
+  A leading-underscore/protected key, a server-bound object, or an effective
+  key/post-type restriction can make the core Custom Fields path irrelevant.
+- Save-time KSES on a low-privilege user's `post_content` does not automatically
+  filter HTML returned later by a shortcode callback. When the saved content
+  merely invokes a shortcode and plugin code generates output from a separate
+  public meta value, inspect the callback's final context and its own escaping
+  or KSES. Do not classify that separate path as ordinary Contributor/Author
+  content without tracing it.
+
 ## Object injection / unserialize
 
 - `maybe_unserialize($x)` runs `unserialize` only if `is_serialized($x)` returns true.
@@ -97,13 +141,20 @@ calls. The list below is a defensive reference, not exhaustive.
   has no visible `unserialize()` call. A raw low-level database write that puts
   attacker-controlled serialized bytes into a metadata value can later reach
   core deserialization through a high-level metadata read or update, including
+  `get_metadata()` with a non-empty metadata key and
   `update_metadata()` handling of the existing value. The verified WordPress
-  core contract is: when `$prev_value` is empty, `update_metadata()` calls
-  `get_metadata_raw()` with the non-empty metadata key; that function applies
-  `maybe_unserialize()` to the stored value, which calls unrestricted
-  `unserialize()` when the bytes are serialized. This supplied core contract
-  does not require a WordPress-core file inside the plugin source tree. Trace
-  the same metadata type, object ID, and key across both plugin operations.
+  core contract is: a non-empty-key `get_metadata()` read delegates to
+  `get_metadata_raw()`, whose single-value and list branches apply
+  `maybe_unserialize()` to stored values; when `$prev_value` is empty,
+  `update_metadata()` also calls `get_metadata_raw()` with the non-empty key.
+  `maybe_unserialize()` calls unrestricted `unserialize()` when the bytes are
+  serialized. A non-null result from the dynamic
+  `get_{$meta_type}_metadata` filter short-circuits that cache/key branch, and
+  a low-level write may leave an already-populated metadata cache stale. Trace
+  both conditions for the exact workflow; do not assume a direct API call alone
+  reaches deserialization. This supplied core contract does not require a
+  WordPress-core file inside the plugin source tree. Trace the same metadata
+  type, object ID, and key across both plugin operations.
   That tuple binds the raw write to the later access; the attacker need control
   only the serialized value. A fixed type/key or a server-generated object ID
   does not make the path safe. A definitely non-empty `$prev_value` is relevant

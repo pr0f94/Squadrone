@@ -376,7 +376,10 @@ class LiteLLMTransport:
         force_finalise_after: Optional[int],
         max_tokens: int,
         force_finalise_allowed_tools: Optional[set[str]] = None,
+        force_finalise_allowed_tool_calls: int = 1,
     ) -> AgentResult:
+        if force_finalise_allowed_tool_calls < 1:
+            raise ValueError("force_finalise_allowed_tool_calls must be positive")
         msgs = [dict(m) for m in messages]
         usage_acc: dict = {}
         dev_calls = [0]
@@ -386,7 +389,7 @@ class LiteLLMTransport:
             if force_finalise_allowed_tools is not None
             else None
         )
-        finalisation_tool_used = False
+        finalisation_tool_calls = 0
 
         def _tool_name(tool: dict) -> str:
             function = tool.get("function") or {}
@@ -395,7 +398,7 @@ class LiteLLMTransport:
         def _tools_for_next_call(forced: bool) -> Optional[list[dict]]:
             if not forced or finalisation_allowed_tools is None:
                 return tools
-            if finalisation_tool_used:
+            if finalisation_tool_calls >= force_finalise_allowed_tool_calls:
                 return []
             return [
                 tool
@@ -414,7 +417,10 @@ class LiteLLMTransport:
                     "Stop calling tools and produce your final output now using what you already know. "
                     f"Do not call any more tools. {common}"
                 )
-            if finalisation_tool_used or not finalisation_allowed_tools:
+            remaining_calls = (
+                force_finalise_allowed_tool_calls - finalisation_tool_calls
+            )
+            if remaining_calls <= 0 or not finalisation_allowed_tools:
                 return (
                     f"You have made {total_calls} tool calls — that is enough investigation. "
                     "All tool allowances are exhausted. Produce your final output now; do not call "
@@ -423,10 +429,12 @@ class LiteLLMTransport:
             allowed = ", ".join(
                 f"`{name}`" for name in sorted(finalisation_allowed_tools)
             )
+            call_label = "call" if remaining_calls == 1 else "calls"
             return (
                 f"You have made {total_calls} tool calls — ordinary investigation must stop. "
-                f"You may make at most one finalisation tool call, using only {allowed}, if it is "
-                "needed before final output. All other tools are unavailable. After that tool result, "
+                f"You may make at most {remaining_calls} finalisation tool {call_label}, using only "
+                f"{allowed}, if needed before final output. All other tools are unavailable. "
+                "After those tool results, "
                 f"produce your final output without another tool call. {common}"
             )
 
@@ -510,19 +518,28 @@ class LiteLLMTransport:
                         )
                     except json.JSONDecodeError:
                         args = {}
+                    # Finish the complete tool-call batch that the model emitted
+                    # before it saw the force-finalisation instruction.  Applying
+                    # the allowlist as soon as one call crosses the numeric
+                    # threshold would silently block later calls in that same
+                    # response and deprive the model of results it already chose.
+                    # The bounded finalisation allowance starts on the next model
+                    # turn, once ``forced`` has been set and the restricted tool
+                    # schema has been presented.
                     finalisation_phase = (
-                        finalisation_allowed_tools is not None
-                        and force_finalise_after is not None
-                        and (forced or total_tool_calls >= force_finalise_after)
+                        finalisation_allowed_tools is not None and forced
                     )
+                    finalisation_allowlist = finalisation_allowed_tools or frozenset()
                     if finalisation_phase and (
-                        finalisation_tool_used or name not in finalisation_allowed_tools
+                        finalisation_tool_calls >= force_finalise_allowed_tool_calls
+                        or name not in finalisation_allowlist
                     ):
                         blocked_during_finalisation = True
                         remaining = (
                             "none"
-                            if finalisation_tool_used
-                            else ", ".join(sorted(finalisation_allowed_tools)) or "none"
+                            if finalisation_tool_calls
+                            >= force_finalise_allowed_tool_calls
+                            else ", ".join(sorted(finalisation_allowlist)) or "none"
                         )
                         result = (
                             f"[runtime] tool {name!r} is unavailable during forced "
@@ -534,8 +551,12 @@ class LiteLLMTransport:
                             {
                                 "tool": name,
                                 "args": args,
-                                "allowed_tools": sorted(finalisation_allowed_tools),
-                                "finalisation_tool_used": finalisation_tool_used,
+                                "allowed_tools": sorted(finalisation_allowlist),
+                                "finalisation_tool_used": bool(finalisation_tool_calls),
+                                "finalisation_tool_calls": finalisation_tool_calls,
+                                "finalisation_tool_call_limit": (
+                                    force_finalise_allowed_tool_calls
+                                ),
                             },
                         )
                     else:
@@ -548,12 +569,19 @@ class LiteLLMTransport:
                             call_history=call_history,
                         )
                         if finalisation_phase:
-                            finalisation_tool_used = True
+                            finalisation_tool_calls += 1
                             dispatched_finalisation_tool = True
                             runtime._trace(
                                 agent_name,
                                 "finalisation_tool_dispatched",
-                                {"tool": name, "args": args},
+                                {
+                                    "tool": name,
+                                    "args": args,
+                                    "finalisation_tool_calls": finalisation_tool_calls,
+                                    "finalisation_tool_call_limit": (
+                                        force_finalise_allowed_tool_calls
+                                    ),
+                                },
                             )
                     msgs.append(
                         {
@@ -586,18 +614,34 @@ class LiteLLMTransport:
                                 if finalisation_allowed_tools is not None
                                 else None
                             ),
-                            "finalisation_tool_used": finalisation_tool_used,
+                            "finalisation_tool_used": bool(finalisation_tool_calls),
+                            "finalisation_tool_calls": finalisation_tool_calls,
+                            "finalisation_tool_call_limit": (
+                                force_finalise_allowed_tool_calls
+                            ),
                         },
                     )
                     forced = True
                 elif forced and finalisation_allowed_tools is not None:
                     if dispatched_finalisation_tool:
+                        remaining_calls = (
+                            force_finalise_allowed_tool_calls - finalisation_tool_calls
+                        )
+                        call_label = "call" if remaining_calls == 1 else "calls"
                         msgs.append(
                             {
                                 "role": "user",
                                 "content": (
                                     "The permitted finalisation tool result is now available. "
-                                    "Produce your final output now. No further tool calls are permitted."
+                                    + (
+                                        "Produce your final output now. No further tool calls are permitted."
+                                        if remaining_calls <= 0
+                                        else (
+                                            f"You may use at most {remaining_calls} additional "
+                                            f"permitted finalisation tool {call_label} before producing "
+                                            "your final output."
+                                        )
+                                    )
                                 ),
                             }
                         )

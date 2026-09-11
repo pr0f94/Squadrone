@@ -220,6 +220,28 @@ def _whole_post_plugin(tmp_path: Path, *, unrelated_field: bool = False) -> Path
     return root
 
 
+def _metadata_read_callsite(
+    tmp_path: Path,
+    expression: str,
+) -> tuple[Hypothesis, Path, Path]:
+    root = _whole_post_plugin(tmp_path)
+    source = root / "includes" / "storage.php"
+    source.write_text(
+        "<?php\n"
+        "function read_stored_value($kind, $id, $key) {\n"
+        f"    {expression}\n"
+        "}\n"
+    )
+    hypothesis = _hypothesis().model_copy(
+        update={
+            "line": 3,
+            "sink": "direct keyed metadata read",
+            "sink_code": expression,
+        }
+    )
+    return hypothesis, root, source
+
+
 @pytest.mark.asyncio
 async def test_run_routes_natural_recipe_away_from_shared_persistent_sandbox(
     monkeypatch: pytest.MonkeyPatch,
@@ -350,6 +372,169 @@ def test_php_object_callsite_binds_exact_reviewed_file_bytes_and_sink_lines(
         source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
     )
 
+    expression_only = hypothesis.model_copy(
+        update={
+            "sink_code": "update_metadata($kind, $id, $key, $value, '')",
+        }
+    )
+    assert _expected_php_object_callsite(expression_only, root) == PhpObjectCallsite(
+        relative_path="includes/storage.php",
+        start_line=3,
+        end_line=3,
+        source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+    )
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "return get_metadata($kind, $id, $key, true);",
+        "return get_metadata('give_customer', 7, '_prefix', false);",
+        "return get_metadata('give_customer', '7', '_prefix');",
+        "return \\get_metadata('give_customer', -7, '_prefix');",
+        "return get_metadata('give_customer', 0x10, '0.0', true);",
+        "return get_metadata('give_customer', 0b10, '00', false);",
+        "return get_metadata('give_customer', 7, '0e0', true);",
+    ],
+)
+def test_php_object_callsite_accepts_direct_keyed_wordpress_metadata_reads(
+    tmp_path: Path,
+    expression: str,
+) -> None:
+    hypothesis, root, source = _metadata_read_callsite(tmp_path, expression)
+
+    assert _expected_php_object_callsite(hypothesis, root) == PhpObjectCallsite(
+        relative_path="includes/storage.php",
+        start_line=3,
+        end_line=3,
+        source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+    )
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "return get_metadata($kind, $id);",
+        "return get_metadata($kind, $id, $key, true, $extra);",
+        "return get_metadata($kind, $id, '', true);",
+        'return get_metadata($kind, $id, "", true);',
+        "return get_metadata($kind, $id, '0', true);",
+        'return get_metadata($kind, $id, "0", true);',
+        "return get_metadata($kind, $id, 0, false);",
+        "return get_metadata($kind, $id, 0.0, false);",
+        "return get_metadata($kind, $id, false, false);",
+        "return get_metadata($kind, $id, null, false);",
+        "return get_metadata($kind, $id, [], false);",
+        "return get_metadata($kind, $id, array( ), false);",
+        "return get_metadata('', $id, $key, true);",
+        "return get_metadata(['give_customer'], $id, $key, true);",
+        "return get_metadata($kind, 'not-numeric', $key, true);",
+        "return get_metadata($kind, 0.5, $key, true);",
+        "return get_metadata($kind, [1], $key, true);",
+        r'return get_metadata($kind, "\x66oo", $key, true);',
+        r'return get_metadata("\x30", $id, $key, true);',
+        r'return get_metadata($kind, $id, "\x30", true);',
+        "return get_metadata($kind, '0x10', $key, true);",
+        'return get_metadata($kind, "0b10", $key, true);',
+        "return get_metadata($kind, '0o10', $key, true);",
+        "return $store->get_metadata($kind, $id, $key, true);",
+        "return Store::get_metadata($kind, $id, $key, true);",
+        "return Vendor\\get_metadata($kind, $id, $key, true);",
+        "return \\Vendor\\get_metadata($kind, $id, $key, true);",
+        "return get_metadata_raw($kind, $id, $key, true);",
+        "return new get_metadata($kind, $id, $key, true);",
+        "return new \\get_metadata($kind, $id, $key, true);",
+        (
+            "return get_metadata(meta_type: $kind, object_id: $id, "
+            "meta_key: $key, single: true);"
+        ),
+        "return get_metadata(...$arguments);",
+    ],
+)
+def test_php_object_callsite_rejects_non_core_or_unkeyed_metadata_read_forms(
+    tmp_path: Path,
+    expression: str,
+) -> None:
+    hypothesis, root, _source = _metadata_read_callsite(tmp_path, expression)
+
+    assert _expected_php_object_callsite(hypothesis, root) is None
+
+
+def test_php_object_callsite_rejects_metadata_function_declaration(
+    tmp_path: Path,
+) -> None:
+    root = _whole_post_plugin(tmp_path)
+    source = root / "includes" / "storage.php"
+    declaration = "function &get_metadata($kind, $id, $key) {"
+    source.write_text(f"<?php\n{declaration}\n    return null;\n}}\n")
+    hypothesis = _hypothesis().model_copy(
+        update={"line": 2, "sink_code": declaration}
+    )
+
+    assert _expected_php_object_callsite(hypothesis, root) is None
+
+
+def test_php_object_callsite_requires_global_metadata_function_in_namespaces(
+    tmp_path: Path,
+) -> None:
+    root = _whole_post_plugin(tmp_path)
+    source = root / "includes" / "storage.php"
+    source.write_text(
+        "<?php\n"
+        "namespace Vendor\\Storage;\n"
+        "function read_value($kind, $id, $key) {\n"
+        "    return get_metadata($kind, $id, $key, true);\n"
+        "}\n"
+    )
+    hypothesis = _hypothesis().model_copy(
+        update={
+            "line": 4,
+            "sink_code": "return get_metadata($kind, $id, $key, true);",
+        }
+    )
+
+    assert _expected_php_object_callsite(hypothesis, root) is None
+
+    qualified = "return \\get_metadata($kind, $id, $key, true);"
+    source.write_text(
+        "<?php\n"
+        "namespace Vendor\\Storage;\n"
+        "function read_value($kind, $id, $key) {\n"
+        f"    {qualified}\n"
+        "}\n"
+    )
+    qualified_hypothesis = hypothesis.model_copy(update={"sink_code": qualified})
+
+    assert _expected_php_object_callsite(
+        qualified_hypothesis,
+        root,
+    ) == PhpObjectCallsite(
+        relative_path="includes/storage.php",
+        start_line=4,
+        end_line=4,
+        source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+    )
+
+
+def test_php_object_callsite_rejects_conflicting_global_function_import(
+    tmp_path: Path,
+) -> None:
+    root = _whole_post_plugin(tmp_path)
+    source = root / "includes" / "storage.php"
+    expression = "return get_metadata($kind, $id, $key, true);"
+    source.write_text(
+        "<?php\n"
+        "use function Vendor\\safe_read as get_metadata;\n"
+        "function read_value($kind, $id, $key) {\n"
+        f"    {expression}\n"
+        "}\n"
+    )
+    hypothesis = _hypothesis().model_copy(
+        update={"line": 4, "sink_code": expression}
+    )
+
+    assert _expected_php_object_callsite(hypothesis, root) is None
+
 
 def test_php_object_callsite_rejects_wrong_file_line_and_source_quote(
     tmp_path: Path,
@@ -373,6 +558,323 @@ def test_php_object_callsite_rejects_wrong_file_line_and_source_quote(
         )
         is None
     )
+
+
+@pytest.mark.parametrize(
+    "source_line",
+    [
+        "// update_metadata($kind, $id, $key, $value, '');",
+        "$text = \"update_metadata($kind, $id, $key, $value, '');\";",
+        "safe_update_metadata($kind, $id, $key, $value, '');",
+        "maybe_update_metadata($kind, $id, $key, $value, '');",
+        (
+            "update_metadata($kind, $id, $key, $value, ''); "
+            "update_metadata($kind, $id, $key, $value, '');"
+        ),
+    ],
+)
+def test_php_object_callsite_rejects_masked_or_ambiguous_expression_matches(
+    tmp_path: Path,
+    source_line: str,
+) -> None:
+    hypothesis = _hypothesis().model_copy(
+        update={"sink_code": "update_metadata($kind, $id, $key, $value, '');"}
+    )
+    root = _whole_post_plugin(tmp_path)
+    source = root / "includes" / "storage.php"
+    source.write_text(
+        "<?php\n"
+        "function persist_value($kind, $id, $key, $value) {\n"
+        f"    {source_line}\n"
+        "}\n"
+    )
+
+    assert _expected_php_object_callsite(hypothesis, root) is None
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        (
+            "<?php\n"
+            "/* a multiline comment starts here\n"
+            "update_metadata($kind, $id, $key, $value, '');\n"
+            "*/\n"
+        ),
+        (
+            "<?php\n"
+            "$text = \"a multiline string starts here\n"
+            "update_metadata($kind, $id, $key, $value, '');\n"
+            "\";\n"
+        ),
+    ],
+)
+def test_php_object_callsite_preserves_masking_state_before_the_cited_line(
+    tmp_path: Path,
+    source: str,
+) -> None:
+    hypothesis = _hypothesis().model_copy(
+        update={
+            "line": 3,
+            "sink_code": "update_metadata($kind, $id, $key, $value, '');",
+        }
+    )
+    root = _whole_post_plugin(tmp_path)
+    (root / "includes" / "storage.php").write_text(source)
+
+    assert _expected_php_object_callsite(hypothesis, root) is None
+
+
+def test_php_object_callsite_rejects_quote_lines_absent_from_source(
+    tmp_path: Path,
+) -> None:
+    hypothesis = _hypothesis().model_copy(
+        update={
+            "sink_code": (
+                "update_metadata(\n"
+                "$kind, $id, $key, $value, '' )"
+            ),
+        }
+    )
+    root = _whole_post_plugin(tmp_path)
+
+    assert _expected_php_object_callsite(hypothesis, root) is None
+
+
+@pytest.mark.parametrize(
+    "sink_code",
+    [
+        "update_metadata($kind, $id, $key, $value, '');\n   \n",
+        "\n   \nupdate_metadata($kind, $id, $key, $value, '');",
+    ],
+)
+def test_php_object_callsite_rejects_whitespace_only_boundary_lines(
+    tmp_path: Path,
+    sink_code: str,
+) -> None:
+    root = _whole_post_plugin(tmp_path)
+    hypothesis = _hypothesis().model_copy(update={"sink_code": sink_code})
+
+    assert _expected_php_object_callsite(hypothesis, root) is None
+
+
+def test_php_object_callsite_does_not_normalize_semantic_string_whitespace(
+    tmp_path: Path,
+) -> None:
+    root = _whole_post_plugin(tmp_path)
+    source = root / "includes" / "storage.php"
+    source.write_text(
+        "<?php\n"
+        "function persist_value($kind, $id, $value) {\n"
+        "    return update_metadata($kind, $id, 'a  b', $value, '');\n"
+        "}\n"
+    )
+    hypothesis = _hypothesis().model_copy(
+        update={
+            "sink_code": "update_metadata($kind, $id, 'a b', $value, '');",
+        }
+    )
+
+    assert _expected_php_object_callsite(hypothesis, root) is None
+
+
+@pytest.mark.parametrize(
+    ("source", "line"),
+    [
+        (
+            "<?php\n"
+            "$document = <<<PAYLOAD\n"
+            "update_metadata($kind, $id, $key, $value, '');\n"
+            "PAYLOAD;\n",
+            3,
+        ),
+        (
+            "<?php\n"
+            "$document = <<<\"PAYLOAD\"\n"
+            "update_metadata($kind, $id, $key, $value, '');\n"
+            "PAYLOAD;\n",
+            3,
+        ),
+        (
+            "<?php\n"
+            "$document = <<<'PAYLOAD'\n"
+            "update_metadata($kind, $id, $key, $value, '');\n"
+            "PAYLOAD;\n",
+            3,
+        ),
+        (
+            "<?php\n"
+            "$output = `update_metadata($kind, $id, $key, $value, '');`;\n",
+            2,
+        ),
+        (
+            "<?php\n"
+            "?>\n"
+            "update_metadata($kind, $id, $key, $value, '');\n"
+            "<?php\n",
+            3,
+        ),
+        (
+            "<?php\n"
+            "// closing a line comment also closes PHP ?>\n"
+            "update_metadata($kind, $id, $key, $value, '');\n",
+            3,
+        ),
+        (
+            "<?xml version=\"1.0\"?>\n"
+            "update_metadata($kind, $id, $key, $value, '');\n",
+            2,
+        ),
+    ],
+)
+def test_php_object_callsite_rejects_sink_text_outside_php_code(
+    tmp_path: Path,
+    source: str,
+    line: int,
+) -> None:
+    root = _whole_post_plugin(tmp_path)
+    (root / "includes" / "storage.php").write_text(source)
+    hypothesis = _hypothesis().model_copy(
+        update={
+            "line": line,
+            "sink_code": "update_metadata($kind, $id, $key, $value, '');",
+        }
+    )
+
+    assert _expected_php_object_callsite(hypothesis, root) is None
+
+
+@pytest.mark.parametrize(
+    ("source", "line"),
+    [
+        (
+            "<?php\n"
+            "$document = <<<PAYLOAD\n"
+            "LABEL-like text\n"
+            "    PAYLOAD;\n"
+            "update_metadata($kind, $id, $key, $value, '');\n",
+            5,
+        ),
+        (
+            "<?php\n"
+            "$output = `printf 'safe\\`text'`;\n"
+            "update_metadata($kind, $id, $key, $value, '');\n",
+            3,
+        ),
+        (
+            "<?php\n"
+            "$value = 1;\n"
+            "?>\n"
+            "<p>inline HTML</p>\n"
+            "<?php\n"
+            "update_metadata($kind, $id, $key, $value, '');\n",
+            6,
+        ),
+        (
+            "<?PHP\n"
+            "update_metadata($kind, $id, $key, $value, '');\n"
+            "?>\n",
+            2,
+        ),
+        (
+            "<?php\n"
+            "$text = \"?> <<<LABEL\";\n"
+            "/* ?> <<<BLOCK */\n"
+            "// <<<LINE\n"
+            "update_metadata($kind, $id, $key, $value, '');\n",
+            5,
+        ),
+        (
+            "<?= update_metadata($kind, $id, $key, $value, ''); ?>\n",
+            1,
+        ),
+    ],
+)
+def test_php_object_callsite_accepts_real_sink_after_document_lexical_forms(
+    tmp_path: Path,
+    source: str,
+    line: int,
+) -> None:
+    root = _whole_post_plugin(tmp_path)
+    source_file = root / "includes" / "storage.php"
+    source_file.write_text(source)
+    hypothesis = _hypothesis().model_copy(
+        update={
+            "line": line,
+            "sink_code": "update_metadata($kind, $id, $key, $value, '');",
+        }
+    )
+
+    assert _expected_php_object_callsite(hypothesis, root) == PhpObjectCallsite(
+        relative_path="includes/storage.php",
+        start_line=line,
+        end_line=line,
+        source_sha256=hashlib.sha256(source_file.read_bytes()).hexdigest(),
+    )
+
+
+def test_php_object_callsite_does_not_close_heredoc_on_label_prefix(
+    tmp_path: Path,
+) -> None:
+    root = _whole_post_plugin(tmp_path)
+    source_file = root / "includes" / "storage.php"
+    source_file.write_text(
+        "<?php\n"
+        "$document = <<<LABEL\n"
+        "LABELx\n"
+        "update_metadata($kind, $id, $key, $value, '');\n"
+        "LABEL;\n"
+        "update_metadata($kind, $id, $key, $value, '');\n"
+    )
+
+    sink_code = "update_metadata($kind, $id, $key, $value, '');"
+    inside = _hypothesis().model_copy(
+        update={"line": 4, "sink_code": sink_code}
+    )
+    assert _expected_php_object_callsite(inside, root) is None
+
+    reachable = _hypothesis().model_copy(
+        update={"line": 6, "sink_code": sink_code}
+    )
+    assert _expected_php_object_callsite(reachable, root) == PhpObjectCallsite(
+        relative_path="includes/storage.php",
+        start_line=6,
+        end_line=6,
+        source_sha256=hashlib.sha256(source_file.read_bytes()).hexdigest(),
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "line"),
+    [
+        (
+            "<?php\n"
+            "$document = <<<PAYLOAD\n"
+            "update_metadata($kind, $id, $key, $value, '');\n",
+            3,
+        ),
+        (
+            "<?php\n"
+            "$output = `update_metadata($kind, $id, $key, $value, '');\n",
+            2,
+        ),
+    ],
+)
+def test_php_object_callsite_rejects_unterminated_document_lexical_forms(
+    tmp_path: Path,
+    source: str,
+    line: int,
+) -> None:
+    root = _whole_post_plugin(tmp_path)
+    (root / "includes" / "storage.php").write_text(source)
+    hypothesis = _hypothesis().model_copy(
+        update={
+            "line": line,
+            "sink_code": "update_metadata($kind, $id, $key, $value, '');",
+        }
+    )
+
+    assert _expected_php_object_callsite(hypothesis, root) is None
 
 
 def test_php_object_transport_rejects_literal_field_only_in_unrelated_function(
@@ -662,7 +1164,20 @@ async def test_php_object_author_sees_only_stable_opaque_tokens_and_policy() -> 
     assert "Select exactly one coherent source-grounded form" in prompt
     assert "Leaving either decision undecided must fail closed" in prompt
     assert "SOURCE_COMPLETE_FORM_FIELDS" in prompt
+    assert "SOURCE_ADDITIONAL_FORM_FIELDS" in prompt
+    assert "SOURCE_OMIT_RENDERED_FORM_FIELDS" in prompt
     assert "explicit empty list only when source proves" in prompt
+    assert "Presence, hidden type, or server-side consumption" in prompt
+    assert "does not prove that a control must be non-empty" in prompt
+    assert "reviewed server source explicitly rejects" in prompt
+    assert "presence-required field that validly carries an empty value" in prompt
+    assert "part of the final sink-reaching request envelope" in prompt
+    assert "never add fields merely because a handler ignores or tolerates them" in prompt
+    assert "rendered-form adjustment variables as None in direct mode" in prompt
+    assert "preserving valid empty values" in prompt
+    assert "preliminary or validation-only branch before the sink" in prompt
+    assert "parser, bootstrap validation, session isolation" in prompt
+    assert "do not replace its helpers or create a parallel request path" in prompt
     assert "Build the complete baseline before overlaying dispatch" in prompt
     assert "attack response Set-Cookie cannot alter control" in prompt
     assert "managed setup tools before script execution" in prompt
@@ -682,9 +1197,28 @@ def test_php_object_author_prompt_requires_generic_form_bootstrap_contract() -> 
     assert "reusable nonce" in normalized
     assert "deterministic, semantically valid value" in normalized
     assert "complete ordered source-required `(name, value)` baseline" in normalized
+    assert (
+        "Preserve duplicate controls, exact rendered names, and valid empty values"
+        in normalized
+    )
+    assert "does not by itself prove that it must be non-empty" in normalized
+    assert "Put a field in `REQUIRED_FORM_FIELDS` only when" in normalized
+    assert "reviewed server source explicitly rejects" in normalized
+    assert "`SOURCE_ADDITIONAL_FORM_FIELDS`" in normalized
+    assert "part of the final sink-reaching request envelope" in normalized
+    assert "absent from the selected form" in normalized
+    assert "preserving valid empty values" in normalized
+    assert "Never add arbitrary fields merely because a handler" in normalized
+    assert "presence-required field that validly carries an empty value" in normalized
+    assert "rendered-form adjustment variables as `None` in direct mode" in normalized
+    assert "`SOURCE_OMIT_RENDERED_FORM_FIELDS`" in normalized
+    assert "preliminary or validation-only branch before the sink" in normalized
+    assert "Never omit form identity" in normalized
     assert "complete baseline form before overlaying" in normalized
     assert "sparse dispatch-plus-token scaffold" in normalized
     assert "response `Set-Cookie` state from attack cannot alter" in normalized
+    assert "scaffold's parser, bootstrap validation, session isolation" in normalized
+    assert "do not replace those helpers or write a parallel request path" in normalized
 
 
 def test_php_object_template_uses_two_consecutive_non_redirecting_requests() -> None:
@@ -696,6 +1230,8 @@ def test_php_object_template_uses_two_consecutive_non_redirecting_requests() -> 
     assert rendered.count("session.request(") == 2
     assert rendered.count("allow_redirects=False") == 3
     assert "FORM_BOOTSTRAP_REQUIRED = None" in rendered
+    assert "SOURCE_ADDITIONAL_FORM_FIELDS = None" in rendered
+    assert "SOURCE_OMIT_RENDERED_FORM_FIELDS = None" in rendered
     assert "expected exactly one coherent source-grounded form" in rendered
     assert "successful, non-submit controls" in rendered
     assert "reusable form nonce is missing or ambiguous" in rendered
@@ -738,6 +1274,8 @@ def test_php_object_template_fails_closed_on_undecided_or_sparse_direct_form() -
             raise AssertionError("bootstrap validation must precede HTTP")
 
     session = NoHttpSession()
+    helpers["SOURCE_ADDITIONAL_FORM_FIELDS"] = None
+    helpers["SOURCE_OMIT_RENDERED_FORM_FIELDS"] = None
     helpers["FORM_BOOTSTRAP_REQUIRED"] = None
     with pytest.raises(RuntimeError, match="explicitly decide"):
         bootstrap(session)
@@ -745,12 +1283,29 @@ def test_php_object_template_fails_closed_on_undecided_or_sparse_direct_form() -
 
     helpers["FORM_BOOTSTRAP_REQUIRED"] = False
     helpers["SOURCE_COMPLETE_FORM_FIELDS"] = None
-    with pytest.raises(RuntimeError, match="source-complete field list"):
+    with pytest.raises(RuntimeError, match="source-complete form fields"):
         bootstrap(session)
     assert session.calls == 0
 
     helpers["SOURCE_COMPLETE_FORM_FIELDS"] = []
     assert bootstrap(session) == []
+    helpers["SOURCE_COMPLETE_FORM_FIELDS"] = [
+        ("optional_context", ""),
+        ("semantic_value", "ready"),
+    ]
+    assert bootstrap(session) == [
+        ("optional_context", ""),
+        ("semantic_value", "ready"),
+    ]
+    assert session.calls == 0
+
+    helpers["SOURCE_ADDITIONAL_FORM_FIELDS"] = []
+    with pytest.raises(RuntimeError, match="direct form mode"):
+        bootstrap(session)
+    helpers["SOURCE_ADDITIONAL_FORM_FIELDS"] = None
+    helpers["SOURCE_OMIT_RENDERED_FORM_FIELDS"] = []
+    with pytest.raises(RuntimeError, match="direct form mode"):
+        bootstrap(session)
     assert session.calls == 0
 
 
@@ -767,6 +1322,8 @@ def test_php_object_template_harvests_one_complete_source_grounded_form() -> Non
           <input type="hidden" name="csrf_token" value="nonce-7">
           <input type="hidden" name="metadata" value="alpha">
           <input type="hidden" name="metadata" value="beta">
+          <input type="hidden" name="optional_context" value="">
+          <input type="hidden" name="preliminary_step" value="validate">
           <input type="hidden" name="operation" value="process">
           <input type="email" name="contact_email" required
                  minlength="6" maxlength="80" value="">
@@ -788,6 +1345,8 @@ def test_php_object_template_harvests_one_complete_source_grounded_form() -> Non
         ["csrf_token"],
         ["contact_email", "quantity"],
         {"contact_email": "researcher@example.test", "quantity": "3"},
+        [("presence_required_empty", "")],
+        ["preliminary_step"],
         {"operation", "object_blob"},
     )
 
@@ -804,17 +1363,26 @@ def test_php_object_template_harvests_one_complete_source_grounded_form() -> Non
     assert ("terms", "yes") in pairs
     assert ("tier", "basic") in pairs
     assert ("notes", "hello") in pairs
+    assert ("optional_context", "") in pairs
+    assert ("presence_required_empty", "") in pairs
     assert ("object_blob", "") in pairs
-    assert not any(name in {"ignored", "submit_action"} for name, _value in pairs)
+    assert not any(
+        name in {"ignored", "preliminary_step", "submit_action"}
+        for name, _value in pairs
+    )
 
-    invalid_email = (*arguments[:5], {"contact_email": "invalid", "quantity": "3"}, arguments[6])
+    invalid_email = (
+        *arguments[:5],
+        {"contact_email": "invalid", "quantity": "3"},
+        *arguments[6:],
+    )
     with pytest.raises(RuntimeError, match="valid email"):
         complete(*invalid_email)
 
     invalid_number = (
         *arguments[:5],
         {"contact_email": "researcher@example.test", "quantity": "9"},
-        arguments[6],
+        *arguments[6:],
     )
     with pytest.raises(RuntimeError, match="above its maximum"):
         complete(*invalid_number)
@@ -850,6 +1418,39 @@ def test_php_object_template_rejects_ambiguous_or_browser_only_forms() -> None:
         select_form(disabled_container, identity, coherent)
 
 
+def test_php_object_template_rejects_unproven_rendered_form_adjustments() -> None:
+    helpers = _template_helper_namespace(_rendered_php_object_template())
+    complete = helpers["_complete_rendered_form"]
+    rendered_form = """
+        <form>
+          <input type="hidden" name="fixture_id" value="form-11">
+          <input type="hidden" name="optional_context" value="">
+          <input type="text" name="required_context" required value="ready">
+          <input type="text" name="object_blob" value="">
+        </form>
+    """
+    common = (
+        rendered_form,
+        {"fixture_id": "form-11"},
+        ["object_blob"],
+        [],
+        [],
+        {},
+    )
+
+    with pytest.raises(RuntimeError, match="already has a rendered control"):
+        complete(
+            *common,
+            [("optional_context", "replacement")],
+            [],
+            {"object_blob"},
+        )
+    with pytest.raises(RuntimeError, match="not a successful rendered control"):
+        complete(*common, [], ["missing_context"], {"object_blob"})
+    with pytest.raises(RuntimeError, match="required rendered form control"):
+        complete(*common, [], ["required_context"], {"object_blob"})
+
+
 def test_php_object_template_protects_harvested_identity_and_nonce_before_get() -> (
     None
 ):
@@ -875,10 +1476,71 @@ def test_php_object_template_protects_harvested_identity_and_nonce_before_get() 
             "REUSABLE_CSRF_FIELDS": ["csrf_token"],
             "REQUIRED_FORM_FIELDS": [],
             "FORM_FIELD_VALUES": {"csrf_token": "replacement"},
+            "SOURCE_ADDITIONAL_FORM_FIELDS": [],
+            "SOURCE_OMIT_RENDERED_FORM_FIELDS": [],
         }
     )
     session = NoHttpSession()
 
+    with pytest.raises(RuntimeError, match="configuration is incomplete"):
+        helpers["_bootstrap_form"](session)
+    assert session.calls == 0
+
+
+def test_php_object_template_protects_late_bound_and_identity_adjustments_before_get() -> (
+    None
+):
+    helpers = _template_helper_namespace(_rendered_php_object_template())
+
+    class NoHttpSession:
+        calls = 0
+
+        def get(self, *_args: object, **_kwargs: object) -> None:
+            self.calls += 1
+            raise AssertionError("invalid bootstrap must not perform HTTP")
+
+    helpers.update(
+        {
+            "TARGET": "http://localhost:8123",
+            "OBJECT_FIELD": "object_blob",
+            "DISPATCH": {"form:operation": "process"},
+            "FORM_BOOTSTRAP_REQUIRED": True,
+            "SOURCE_COMPLETE_FORM_FIELDS": None,
+            "PUBLIC_FORM_URL": "http://localhost:8123/public-form",
+            "FORM_IDENTITY": {"fixture_id": "form-7"},
+            "COHERENT_FORM_FIELDS": ["workflow_marker", "object_blob"],
+            "REUSABLE_CSRF_FIELDS": [],
+            "REQUIRED_FORM_FIELDS": [],
+            "FORM_FIELD_VALUES": {},
+            "SOURCE_ADDITIONAL_FORM_FIELDS": [("object_blob", "")],
+            "SOURCE_OMIT_RENDERED_FORM_FIELDS": [],
+        }
+    )
+    session = NoHttpSession()
+
+    with pytest.raises(RuntimeError, match="configuration is incomplete"):
+        helpers["_bootstrap_form"](session)
+    assert session.calls == 0
+
+    helpers["SOURCE_ADDITIONAL_FORM_FIELDS"] = []
+    helpers["SOURCE_OMIT_RENDERED_FORM_FIELDS"] = ["fixture_id"]
+    with pytest.raises(RuntimeError, match="configuration is incomplete"):
+        helpers["_bootstrap_form"](session)
+    assert session.calls == 0
+
+    helpers["SOURCE_ADDITIONAL_FORM_FIELDS"] = [("workflow_marker", "ready")]
+    helpers["SOURCE_OMIT_RENDERED_FORM_FIELDS"] = []
+    with pytest.raises(RuntimeError, match="configuration is incomplete"):
+        helpers["_bootstrap_form"](session)
+    assert session.calls == 0
+
+    helpers["SOURCE_ADDITIONAL_FORM_FIELDS"] = []
+    helpers["SOURCE_OMIT_RENDERED_FORM_FIELDS"] = [["malformed"]]
+    with pytest.raises(RuntimeError, match="configuration is incomplete"):
+        helpers["_bootstrap_form"](session)
+    assert session.calls == 0
+
+    helpers["SOURCE_OMIT_RENDERED_FORM_FIELDS"] = ["stage", "stage"]
     with pytest.raises(RuntimeError, match="configuration is incomplete"):
         helpers["_bootstrap_form"](session)
     assert session.calls == 0

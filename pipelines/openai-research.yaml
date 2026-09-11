@@ -1,7 +1,7 @@
 # OpenAI research pipeline.
 #
 # This uses the ChatGPT-subscription model routing from pipelines/openai.yaml,
-# including Squadrone's temporary chatgpt/gpt-5.5 LiteLLM compatibility patch,
+# including Squadrone's temporary LiteLLM compatibility patches for newer models,
 # and uses a higher budget plus the fixed research-oriented pipeline settings.
 #
 # Use with:
@@ -14,28 +14,28 @@ verify_max_iterations: 7
 developer_calls_per_agent: 7
 
 models:
-  critic: chatgpt/gpt-5.5
-  developer: chatgpt/gpt-5.5
-  specialists: chatgpt/gpt-5.5
-  surveyor: chatgpt/gpt-5.5
-  poc_author: chatgpt/gpt-5.5
-  developer_followup: chatgpt/gpt-5.5
-  reporter: chatgpt/gpt-5.5
-  dedup_fallback: chatgpt/gpt-5.5
-  hypothesis_verifier: chatgpt/gpt-5.5
+  critic: chatgpt/gpt-5.6-sol
+  developer: chatgpt/gpt-5.6-sol
+  specialists: chatgpt/gpt-5.6-sol
+  surveyor: chatgpt/gpt-5.6-sol
+  poc_author: chatgpt/gpt-5.6-sol
+  developer_followup: chatgpt/gpt-5.6-sol
+  reporter: chatgpt/gpt-5.6-sol
+  dedup_fallback: chatgpt/gpt-5.6-sol
+  hypothesis_verifier: chatgpt/gpt-5.6-sol
 
 llm:
-  reasoning_effort: high
-  verbosity: high
+  reasoning_effort: medium
+  verbosity: medium
 
 reasoning:
-  critic: high
-  developer: high
-  specialists: high
+  critic: medium
+  developer: medium
+  specialists: medium
   poc_author: medium
-  hypothesis_verifier: high
-  developer_followup: high
-  surveyor: high
+  hypothesis_verifier: medium
+  developer_followup: medium
+  surveyor: medium
   reporter: medium
   dedup_fallback: medium
 
@@ -53,45 +53,9 @@ vuln_dbs:
   wpscan:
     base_url: https://wpscan.com/api/v3
 
-intake:
-  bundle_wp_core: false
-  classify_files: false
-  fetch_changelog: false
-  detect_closed: false
-  wp_core_version: latest
-
-recon:
-  deterministic_analysis: true
-  validate_entry_points: false
-  trace_cross_file_callees: false
-  scan_nonce_emissions: false
-  exclude_vendor_tests_lang: false
-  enrich_entry_points: false
-  negative_pattern_reference: false
-  max_entries_to_validate: 30
-
-hypothesis:
-  specialist_wp_idioms: true
-  verifier_require_citation: true
-  verifier_wp_idioms: true
-  pre_verifier_dedup: true
-
-quality:
-  enabled: true
-  require_evidence_schema: true
-  false_positive_rules: true
-  recompute_severity: true
-  finding_grader: true
-  report_grader: true
-  focus_area_fanout: true
-  reject_below_submit_bar: true
-
 verify:
-  headless_browser_check: false
   persistent_sandbox: false
   state_introspection_on_failure: true
-  negative_control: true
-  collaborative_dev_poc_loop: false
   headless_browser_timeout_s: 15
 
 report:

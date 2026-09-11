@@ -27,12 +27,20 @@ Bind the metadata type, object ID, and key across both operations as the identit
 of the same stored value. The attacker does not need to choose that identity: a
 fixed metadata type and key or a server-generated object ID is not
 counterevidence. The required attacker control is over the serialized value put
-into that tuple by the raw write. WordPress core may deserialize an existing
-value during `update_metadata()` processing even when plugin source contains no
-explicit `unserialize()` call. Apply the supplied verified WordPress core
-contract for that framework behavior; do not reject the path merely because
-WordPress core is intentionally outside the plugin-only source tools. Confirm
-from plugin source that `$prev_value` can be empty on the reachable call.
+into that tuple by the raw write. WordPress core deserializes stored values for
+a non-empty-key direct `get_metadata()` call, and may deserialize an existing
+value during `update_metadata()` processing, even when
+plugin source contains no explicit `unserialize()` call. Apply the supplied
+verified WordPress core contract for that framework behavior; do not reject the
+path merely because WordPress core is intentionally outside the plugin-only
+source tools. For a direct-read path, anchor the hypothesis's dangerous
+expression at the exact direct `get_metadata()` call in plugin source and
+retain any object-specific wrapper in the taint path. Confirm that the exact
+workflow's `get_{$meta_type}_metadata` filters do not return a non-null
+short-circuit value and that a low-level raw write is not hidden by a previously
+populated metadata cache. For an update path, confirm from plugin source that
+`$prev_value` can be empty on the reachable call and apply those same
+filter/cache checks to its old-value read.
 
 Once a paired raw insert and same-model high-level read or update is found,
 prioritize tracing the mapped value backward to external ingress and confirming
@@ -52,6 +60,65 @@ recursive wrapper is not an explicit PHP-serialization rejection. Treat it as
 safe only if the exact transformation makes `is_serialized()` false for all
 attacker inputs, or if the bytes are stored through `maybe_serialize()` rather
 than the raw database path.
+
+When serialization rejection is applied only to a fixed set of request field
+names, compare that set with every externally assignable field mapped into the
+raw-written model or metadata record. Trace an omitted field only after proving
+that its handler independently accepts it and maps it to the raw write;
+validation of one accepted field does not protect an accepted omitted sibling.
+Before gadget work, make a compact inventory of every distinct `(external field,
+metadata type, object ID, key, later access)` path reaching the assigned raw-
+write location through the batch's reachable handlers and adapters. Do not
+expand the inventory to unrelated models or raw-write locations. Emit a separate
+hypothesis for each independently proven tuple and do not discard a second
+proven path merely because the first one reaches the same helper or gadget.
+
+For every emitted CWE-502 hypothesis, bind one exact request encoding and
+external wire field to the selected tuple. Do not merge JSON and form ingress or
+infer the wire name from a UI label, JSON/DTO property, model property, or
+metadata key. Quote the source statement that reads or maps that exact field and
+carry every rename through `taint_path`. If the field is not source-proven at the
+emitted machine-readable route, do not emit that tuple.
+
+Do not let one completely traced path substitute for the bounded inventory.
+Complete that inventory before returning `candidate`. If forced finalization
+still leaves that inventory incomplete, return `unreviewed` for the assigned
+item rather than silently closing unresolved siblings; cite any already
+completed paths and the specific remaining branches in its reason so the
+targeted retry can continue them.
+A truncated broad search result is not a completed inventory: narrow the search
+and read each relevant assignment before deciding its disposition.
+
+If forced finalization offers one last `read_plugin_ranges` call, treat it only
+as a bounded evidence-grounding allowance. Batch exact, already-located source
+windows into that read and use it to close the strongest outstanding inventory
+or proof gap; do not guess locations or begin a new broad search. After the
+result, return `candidate` only if the complete source contract is established.
+Otherwise preserve the unresolved work as `unreviewed`.
+
+Compare those paths by source-grounded reachability rather than discovery order.
+Prefer the path with the fewest runtime assumptions and an exact same-workflow
+read or update of the raw-written tuple. A later save is sufficient only when
+source proves that it re-emits that exact property and tuple; evidence for one
+model property must never stand in for a sibling property. Deduplicate only
+after this distinct-path inventory. Order emitted hypotheses from strongest to
+weakest after that comparison so canonical IDs preserve that order for the
+downstream verifier's final tie-break among otherwise equally ranked candidates.
+Do not inflate a hypothesis's confidence or impact to affect this order.
+
+Inventory direct high-level metadata reads as well as updates that consume an
+old value. Rank a complete same-request raw-write-to-read path ahead of an
+otherwise equivalent path requiring a later request, optional UI block, or
+deferred job. Fixed model-defined metadata keys and server-generated object IDs
+bind tuple identity and are not reasons to stop tracing external value
+assignments.
+
+When otherwise source-equivalent paths exist, rank a stable standard WordPress
+hook and form-field transport ahead of a route that needs runtime-generated
+query signatures, tokens, or request URLs. Retain the dynamic route as its own
+candidate when it is fully proven; put every acquisition prerequisite in
+`preconditions` and `proof_gaps`, not in `entry_point`. This is a
+proof-completeness ordering rule, not evidence that the dynamic route is safe.
 
 After the complete ingress-to-deserialization path is established, inventory
 reachable bundled classes with `__wakeup`, `__unserialize`, `__destruct`,

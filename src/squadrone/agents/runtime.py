@@ -182,6 +182,7 @@ class AgentRuntime:
         force_finalise_after: Optional[int] = None,
         max_tokens: int = 16384,
         force_finalise_allowed_tools: Optional[set[str]] = None,
+        force_finalise_allowed_tool_calls: int = 1,
     ) -> AgentResult:
         return await LiteLLMTransport().run_agent(
             runtime=self,
@@ -195,4 +196,5 @@ class AgentRuntime:
             force_finalise_after=force_finalise_after,
             max_tokens=max_tokens,
             force_finalise_allowed_tools=force_finalise_allowed_tools,
+            force_finalise_allowed_tool_calls=force_finalise_allowed_tool_calls,
         )

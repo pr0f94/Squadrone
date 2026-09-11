@@ -184,6 +184,179 @@ async def test_verify_only_completes_and_never_invokes_dedup_or_report(
 
 
 @pytest.mark.asyncio
+async def test_triage_only_stops_after_manual_queue_before_verify_checkpoint_logic(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls, events, _finding_result, on_event = _patch_pipeline(monkeypatch, tmp_path)
+    mocked_triage = orchestrator.triage_stage.run
+    scope_modes: list[bool | None] = []
+
+    async def capture_scope_mode(*args, **kwargs):
+        scope_modes.append(kwargs.get("enforce_submission_scope"))
+        triaged = await mocked_triage(*args, **kwargs)
+        triaged.submission_scope_enforced = kwargs["enforce_submission_scope"]
+        run_dir = Path(kwargs["runs_root"]) / kwargs["run_id"]
+        triaged.to_json_file(str(run_dir / "triaged.json"))
+        return triaged
+
+    monkeypatch.setattr(orchestrator.triage_stage, "run", capture_scope_mode)
+
+    queued: list[str] = []
+
+    def capture_manual_queue(_triaged, _run_dir, plugin_slug):
+        queued.append(plugin_slug)
+        return {
+            "manual_queued": 0,
+            "already_queued": 0,
+            "unavailable": 0,
+            "candidates": 0,
+        }
+
+    monkeypatch.setattr(
+        orchestrator, "_emit_triage_manual_review_queue", capture_manual_queue
+    )
+
+    def fail_verify_checkpoint(*_args, **_kwargs):
+        raise AssertionError("triage-only inspected a verify checkpoint")
+
+    monkeypatch.setattr(
+        orchestrator, "_verify_checkpoint_complete", fail_verify_checkpoint
+    )
+    monkeypatch.setattr(
+        orchestrator, "_verify_checkpoint_matches_triage", fail_verify_checkpoint
+    )
+
+    result = await orchestrator.run_scan(
+        "plugin",
+        config_path="unused.yaml",
+        triage_only=True,
+        on_event=on_event,
+    )
+
+    assert result.status == "complete"
+    assert result.finding_count == 0
+    assert result.novel_count == 0
+    assert result.report_paths == []
+    assert calls == ["intake", "recon", "hypothesis", "triage"]
+    assert scope_modes == [False]
+    assert queued == ["plugin"]
+    assert not any(
+        stage in {"verify", "dedup", "report"} for stage, _status in events
+    )
+
+    run_dir = tmp_path / "plugins" / "plugin" / "runs" / result.run_id
+    triaged = TriagedArtifact.from_json_file(str(run_dir / "triaged.json"))
+    assert triaged.submission_scope_enforced is False
+    assert not (run_dir / "findings.jsonl").exists()
+    assert not (run_dir / "verify_complete.json").exists()
+    ledger = [
+        json.loads(line)
+        for line in (run_dir / "decision_ledger.jsonl").read_text().splitlines()
+    ]
+    assert ledger[-1]["stage"] == "_pipeline"
+    assert ledger[-1]["result"] == "complete"
+    assert ledger[-1]["details"]["triage_only"] is True
+    with sqlite3.connect(tmp_path / "squadrone.sqlite") as db:
+        run_row = db.execute(
+            "SELECT status, finding_count FROM runs WHERE run_id = ?", (result.run_id,)
+        ).fetchone()
+    assert run_row == ("complete", 0)
+
+
+@pytest.mark.asyncio
+async def test_triage_only_and_verify_only_are_mutually_exclusive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_config_load(_path):
+        raise AssertionError("conflicting modes should fail before config loading")
+
+    monkeypatch.setattr(
+        orchestrator.PipelineConfig,
+        "from_yaml",
+        staticmethod(fail_config_load),
+    )
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        await orchestrator.run_scan(
+            "plugin",
+            config_path="unused.yaml",
+            verify_only=True,
+            triage_only=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_triage_only_resume_reuses_local_triage_artifacts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls, events, finding, on_event = _patch_pipeline(monkeypatch, tmp_path)
+    run_id = "resume-triage-only"
+    run_dir = tmp_path / "plugins" / "plugin" / "runs" / run_id
+    plugin_dir = run_dir / "plugin"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "plugin.php").write_text("<?php\n")
+    IntakeArtifact(
+        run_id=run_id,
+        plugin_slug="plugin",
+        plugin_version="1.0",
+        source_path=str(plugin_dir),
+        file_count=1,
+        total_lines=1,
+        source_url="https://plugins.svn.wordpress.org/plugin/tags/1.0",
+        scanned_at=datetime.now(timezone.utc),
+    ).to_json_file(str(run_dir / "intake.json"))
+    ReconArtifact(
+        plugin_slug="plugin",
+        entry_points=[],
+        sinks=[],
+        entry_to_sink_paths={},
+        raw_grep_hits={},
+    ).to_json_file(str(run_dir / "recon.json"))
+    (run_dir / "hypotheses.jsonl").write_text(
+        finding.hypothesis.model_dump_json() + "\n"
+    )
+    TriagedArtifact(
+        plugin_slug="plugin",
+        accepted=[finding.hypothesis],
+        rejected=[],
+        merged=[],
+        submission_scope_enforced=False,
+    ).to_json_file(str(run_dir / "triaged.json"))
+
+    def fail_verify_checkpoint(*_args, **_kwargs):
+        raise AssertionError("triage-only inspected a verify checkpoint")
+
+    monkeypatch.setattr(
+        orchestrator, "_verify_checkpoint_complete", fail_verify_checkpoint
+    )
+    monkeypatch.setattr(
+        orchestrator, "_verify_checkpoint_matches_triage", fail_verify_checkpoint
+    )
+
+    result = await orchestrator.run_scan(
+        "plugin",
+        config_path="unused.yaml",
+        resume_run_id=run_id,
+        triage_only=True,
+        on_event=on_event,
+    )
+
+    assert result.status == "complete"
+    assert result.finding_count == 0
+    assert calls == []
+    assert events[:4] == [
+        ("intake", "skipped"),
+        ("recon", "skipped"),
+        ("hypothesis", "skipped"),
+        ("triage", "skipped"),
+    ]
+    assert not (run_dir / "findings.jsonl").exists()
+    assert not (run_dir / "verify_complete.json").exists()
+
+
+@pytest.mark.asyncio
 async def test_normal_scan_still_invokes_dedup_and_report(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

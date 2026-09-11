@@ -65,16 +65,75 @@ cross a broader security boundary. Object ownership does not grant authority
 over every attribute: keep a source-proven mass-assignment path when a
 request-controlled field/key can modify role, capability, approval, ownership,
 payment, authentication, or other security state.
+For stored-XSS paths that read a fixed post-meta key from an attacker-selectable
+or insufficiently type-constrained post ID, do not treat the plugin's intended
+sanitized save handler as the only possible writer. Apply the verified core
+Custom Fields contract: `edit_post()` and `wp_ajax_add_meta()` can reach
+`add_meta()` for an exact post the user may edit; `add_meta()` rejects protected
+keys and missing meta capability, but applies no generic text sanitizer or
+post-content KSES before `add_post_meta()`. Metadata-specific `sanitize_meta()`
+callbacks/filters may still constrain the exact key. Do not require these core
+functions to appear in the plugin source. The standard authenticated AJAX
+writer must use the machine-readable `entry_point` `wp_ajax_add-meta`; its route
+is `POST /wp-admin/admin-ajax.php`. Bind the POST form fields
+`action=add-meta`, `post_id`, `metakeyinput` (or the one
+proven `metakeyselect` alternative), `metavalue`, and `_ajax_nonce-add-meta`.
+Require proof that the claimed role can edit the exact selected target post and
+can obtain the nonce from a normally reachable Custom Fields form available to
+that account for action `add-meta`; the nonce-providing form need not belong to
+the selected target or its post subtype. Record authenticated AJAX,
+the nonce check, `edit_post`, and exact-key `add_post_meta` capability as the
+boundary and controls. Anchor the fixed meta read, shortcode expansion, and
+render to plugin source even though the supplied writer contract is core.
+For this core-writer path only, accept `evidence_summary.source` naming the exact
+core POST fields and calls without a plugin `relative/file:line` for the writer;
+do not demand or invent a plugin expression for core. Continue to require
+read-tool plugin anchors for the fixed-key metadata read and render. This
+exception does not cover a plugin-defined or other external writer.
+Also require exact plugin-source proof of the ID source and accepted
+type/conversion, object/post-type binding, literal/effective key, meta read, and
+final output context, plus proof of the selected post type/status and ownership,
+key publicness, value transformation, victim route, and context-appropriate
+escaping. A numeric cast alone does not bind an otherwise selected ID to a
+trusted object. Normal save-time KSES for Contributor/Author `post_content`
+does not automatically cover HTML generated later by a shortcode callback from
+a separate meta value. Conversely, do not infer writability from a metadata
+read alone: reject this writer path when the exact key is protected or
+sanitized, the object cannot be selected and edited by the claimed role, a
+restrictive object/key rule applies, or the final-context escape prevents XSS.
 For implicit metadata deserialization, apply this verified WordPress core
-contract: when `$prev_value` is empty, `update_metadata()` reads the existing
-key through `get_metadata_raw()`, which applies `maybe_unserialize()` and then
-unrestricted `unserialize()` to serialized bytes. Do not require a WordPress
-core file to exist inside the plugin-only source tree. Require plugin-source
-proof of the earlier raw write, the same metadata type/object/key tuple, the
-attacker-controlled serialized value, and a reachable usable gadget. A fixed
-key or server-generated object ID binds the record; it does not sanitize the
-value. A definitely non-empty `$prev_value` is counterevidence for this exact
-implicit path.
+contract: a non-empty-key `get_metadata()` call delegates to
+`get_metadata_raw()`, which applies `maybe_unserialize()` in its single-value
+and list branches; when `$prev_value` is empty, `update_metadata()` also
+reads the existing key through `get_metadata_raw()`. `maybe_unserialize()` then
+calls unrestricted `unserialize()` on serialized bytes. Do not require a
+WordPress core file to exist inside the plugin-only source tree. Require
+plugin-source proof of the earlier raw write, the same metadata
+type/object/key tuple, the attacker-controlled serialized value, and a
+reachable usable gadget. Anchor a direct-read finding at the exact direct
+`get_metadata()` call rather than an object-specific wrapper. Confirm that a
+non-null `get_{$meta_type}_metadata` filter result does not short-circuit the
+exact access and that a populated metadata cache does not hide the low-level
+write. A fixed key or server-generated object ID binds the record; it does
+not sanitize the value. A definitely non-empty `$prev_value` is counterevidence
+for an update-based path, but does not disprove a separate reachable direct
+read.
+For each such candidate, independently verify that `entry_point` contains one
+machine-readable, source-bound transport rather than prose, and that
+`evidence_summary.source` names one exact wire location and external field. The
+wire field must be proved at that route; a UI block label, DTO/model property,
+metadata key, or unresolved `JSON or form` alternative is not a substitute. Do
+not normalize these immutable fields during triage. Reject a mislabeled or
+source-disproved transport. If the source-proven path instead depends on
+runtime-generated query signatures, tokens, or a request URL, require proof that
+a public workflow can obtain and preserve those exact values for attack and
+control. Their absence from the single immutable `entry_point` is not itself a
+reason for rejection or manual review. Require the immutable hypothesis to name
+the acquisition prerequisite and provenance, but do not ask the critic to
+predict runner support; trusted automatic verification must fail closed when it
+cannot represent the transport. When true duplicate paths are otherwise equally
+proved, retain the stable standard WordPress hook and form-field path over one
+with those runtime-generated prerequisites.
 For a natural deserialization gadget, independently confirm its shipped class
 is loaded or autoloadable, its required serialized property names and visibility
 encoding survive the proven ingress transforms, and its magic method reaches
@@ -203,7 +262,14 @@ rejection over a broad manual handoff.
 
 Merge only true duplicates with the same root cause, outcome, handler, and
 sensitive operation. Keep distinct outcomes or distinct authorization
-boundaries separate.
+boundaries separate. When implicit-deserialization candidates share a terminal
+sink, independently compare each external field and raw-write metadata tuple;
+the common sink does not make their insert-to-access lifecycles interchangeable.
+If they are otherwise true duplicates, keep the representative with the shortest
+source-proven same-workflow transition and fewest runtime assumptions, and merge
+the weaker path into it. Never keep a weaker representative merely because it was
+listed first. Preserve separate candidates when their handler, tuple lifecycle,
+preconditions, boundary, or outcome differs.
 
 Every input hypothesis must appear in exactly one primary disposition:
 `accepted`, `rejected`, `merged` as `merged_from_id`, or `manual_review`.

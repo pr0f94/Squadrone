@@ -12,6 +12,7 @@ import uuid
 from bisect import bisect_right
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from importlib.resources import files as _pkg_files
 from pathlib import Path, PurePosixPath
 from typing import Any, Awaitable, Callable, Literal
@@ -2620,6 +2621,173 @@ def _mask_php_non_code(source: str) -> str:
     return "".join(masked)
 
 
+def _mask_php_document_non_code(source: str) -> str | None:
+    """Mask non-code in one complete PHP document while preserving offsets.
+
+    Unlike ``_mask_php_non_code``, this parser starts outside PHP and handles
+    document-only lexical forms.  It is intentionally separate because many
+    callers pass isolated PHP expressions without opening tags.  Unsupported
+    short tags and unterminated lexical states fail closed.
+    """
+    masked = list(source)
+    state = "inline_html"
+    heredoc_label = ""
+    index = 0
+
+    def mask_range(start: int, end: int) -> None:
+        for position in range(start, end):
+            if source[position] != "\n":
+                masked[position] = " "
+
+    while index < len(source):
+        char = source[index]
+        following = source[index + 1] if index + 1 < len(source) else ""
+
+        if state == "inline_html":
+            standard_tag = source[index : index + 5]
+            standard_boundary = source[index + 5 : index + 6]
+            if standard_tag.casefold() == "<?php" and (
+                not standard_boundary or standard_boundary.isspace()
+            ):
+                mask_range(index, index + 5)
+                index += 5
+                state = "code"
+                continue
+            if source.startswith("<?=", index):
+                mask_range(index, index + 3)
+                index += 3
+                state = "code"
+                continue
+            if source.startswith("<?", index):
+                return None
+            if char != "\n":
+                masked[index] = " "
+            index += 1
+            continue
+
+        if state == "code":
+            if source.startswith("?>", index):
+                mask_range(index, index + 2)
+                index += 2
+                state = "inline_html"
+                continue
+            if source.startswith("<<<", index):
+                line_end = source.find("\n", index)
+                if line_end < 0:
+                    return None
+                opener = source[index:line_end]
+                opener_match = re.fullmatch(
+                    r"<<<[ \t]*(?:(?P<quote>['\"])(?P<quoted>"
+                    r"[A-Za-z_][A-Za-z0-9_]*)(?P=quote)|"
+                    r"(?P<bare>[A-Za-z_][A-Za-z0-9_]*))[ \t]*",
+                    opener,
+                )
+                if opener_match is None:
+                    return None
+                heredoc_label = (
+                    opener_match.group("quoted") or opener_match.group("bare")
+                )
+                mask_range(index, line_end)
+                index = line_end
+                state = "heredoc"
+                continue
+            if char == "'":
+                masked[index] = " "
+                state = "single"
+            elif char == '"':
+                masked[index] = " "
+                state = "double"
+            elif char == "`":
+                masked[index] = " "
+                state = "backtick"
+            elif char == "#":
+                masked[index] = " "
+                state = "line_comment"
+            elif char == "/" and following == "/":
+                masked[index] = masked[index + 1] = " "
+                index += 1
+                state = "line_comment"
+            elif char == "/" and following == "*":
+                masked[index] = masked[index + 1] = " "
+                index += 1
+                state = "block_comment"
+            index += 1
+            continue
+
+        if state in {"single", "double", "backtick"}:
+            if char != "\n":
+                masked[index] = " "
+            if char == "\\" and following:
+                if following != "\n":
+                    masked[index + 1] = " "
+                index += 2
+                continue
+            if (
+                (state == "single" and char == "'")
+                or (state == "double" and char == '"')
+                or (state == "backtick" and char == "`")
+            ):
+                state = "code"
+            index += 1
+            continue
+
+        if state == "line_comment":
+            # A PHP closing tag terminates a // or # comment as well as the
+            # surrounding PHP section.
+            if source.startswith("?>", index):
+                mask_range(index, index + 2)
+                index += 2
+                state = "inline_html"
+                continue
+            if char == "\n":
+                state = "code"
+            else:
+                masked[index] = " "
+            index += 1
+            continue
+
+        if state == "block_comment":
+            if char != "\n":
+                masked[index] = " "
+            if char == "*" and following == "/":
+                masked[index + 1] = " "
+                index += 2
+                state = "code"
+            else:
+                index += 1
+            continue
+
+        if state == "heredoc":
+            if index == 0 or source[index - 1] == "\n":
+                line_end = source.find("\n", index)
+                if line_end < 0:
+                    line_end = len(source)
+                cursor = index
+                while cursor < line_end and source[cursor] in " \t":
+                    cursor += 1
+                if source.startswith(heredoc_label, cursor):
+                    label_end = cursor + len(heredoc_label)
+                    boundary = source[label_end : label_end + 1]
+                    if not boundary or not re.match(r"[A-Za-z0-9_]", boundary):
+                        tail = source[label_end:line_end].lstrip(" \t")
+                        if not tail or tail[0] in ";,)]}":
+                            mask_range(index, label_end)
+                            index = label_end
+                            heredoc_label = ""
+                            state = "code"
+                            continue
+            if char != "\n":
+                masked[index] = " "
+            index += 1
+            continue
+
+        return None
+
+    if state in {"single", "double", "backtick", "block_comment", "heredoc"}:
+        return None
+    return "".join(masked)
+
+
 def _matching_delimiter(
     masked: str,
     opening: int,
@@ -3697,7 +3865,26 @@ def _php_include_oracle_enabled_for_hypotheses(
 
 
 _PHP_OBJECT_SINK_RE = re.compile(
-    r"\b(?P<name>unserialize|maybe_unserialize|update_metadata)\s*\(",
+    r"\b(?P<name>unserialize|maybe_unserialize|update_metadata|get_metadata)\s*\(",
+    re.IGNORECASE,
+)
+_PHP_OBJECT_NAMED_ARGUMENT_RE = re.compile(
+    r"\A\s*[A-Za-z_][A-Za-z0-9_]*\s*:",
+)
+_PHP_OBJECT_DECIMAL_LITERAL_RE = re.compile(
+    r"[+-]?(?:(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:e[+-]?[0-9]+)?)\Z",
+    re.IGNORECASE,
+)
+_PHP_OBJECT_BASE_INTEGER_LITERAL_RE = re.compile(
+    r"[+-]?(?:0[xX][0-9a-fA-F_]+|0[bB][01_]+|0[oO][0-7_]+)\Z"
+)
+_PHP_OBJECT_NAMESPACE_RE = re.compile(
+    r"\bnamespace(?:\s+(?P<name>[A-Za-z_\x80-\uffff]"
+    r"[A-Za-z0-9_\x80-\uffff\\]*))?\s*(?P<delimiter>[;{])",
+    re.IGNORECASE,
+)
+_PHP_OBJECT_FUNCTION_IMPORT_RE = re.compile(
+    r"\buse\s+function\s+(?P<body>[^;]{1,1000});",
     re.IGNORECASE,
 )
 _PHP_OBJECT_ARRAY_KEY_RE = re.compile(
@@ -3729,6 +3916,294 @@ _PHP_OBJECT_FIELD_STOPWORDS = frozenset(
 _PHP_OBJECT_MAX_DESCRIBED_DISPATCH_FIELDS = 8
 
 
+def _php_object_is_direct_global_call(
+    masked: str,
+    call: re.Match[str],
+    *,
+    document_masked: str,
+    document_call_start: int,
+) -> bool:
+    """Accept only an unambiguous call to WordPress's global function."""
+    prefix = masked[: call.start()]
+    root_qualified = False
+    if call.start() > 0 and masked[call.start() - 1] == "\\":
+        before_separator = masked[: call.start() - 1]
+        if before_separator and (
+            before_separator[-1].isalnum()
+            or before_separator[-1] in {"_", "\\"}
+        ):
+            return False
+        prefix = before_separator
+        root_qualified = True
+    if re.search(r"(?:->|::)\s*\Z", prefix) is not None:
+        return False
+    if re.search(
+        r"\b(?:function\s*&?|new)\s*\Z",
+        prefix,
+        re.IGNORECASE,
+    ) is not None:
+        return False
+    if root_qualified:
+        return True
+    if not _php_object_call_is_in_global_namespace(
+        document_masked,
+        document_call_start,
+    ):
+        return False
+    for imported in _PHP_OBJECT_FUNCTION_IMPORT_RE.finditer(
+        document_masked,
+        0,
+        document_call_start,
+    ):
+        body = imported.group("body").strip()
+        if re.search(r"\bget_metadata\b", body, re.IGNORECASE) is None:
+            continue
+        if re.fullmatch(
+            r"\\?get_metadata(?:\s+as\s+get_metadata)?",
+            body,
+            re.IGNORECASE,
+        ) is None:
+            return False
+    return True
+
+
+def _php_object_call_is_in_global_namespace(
+    document_masked: str,
+    call_start: int,
+) -> bool:
+    """Resolve the namespace declaration containing one source call."""
+    declarations = [
+        declaration
+        for declaration in _PHP_OBJECT_NAMESPACE_RE.finditer(document_masked)
+        if declaration.start() < call_start
+    ]
+    if not declarations:
+        return True
+    latest = declarations[-1]
+    if latest.group("delimiter") == ";":
+        return latest.group("name") is None
+    opening_brace = latest.end() - 1
+    closing_brace = _matching_delimiter(
+        document_masked,
+        opening_brace,
+        "{",
+        "}",
+    )
+    return (
+        closing_brace is not None
+        and opening_brace < call_start < closing_brace
+        and latest.group("name") is None
+    )
+
+
+def _php_object_simple_string_literal(value: str) -> str | None:
+    """Return an unescaped, non-interpolated PHP string literal's contents."""
+    stripped = value.strip()
+    if len(stripped) < 2 or stripped[0] not in {"'", '"'}:
+        return None
+    if stripped[-1] != stripped[0]:
+        return None
+    contents = stripped[1:-1]
+    if "\\" in contents or (stripped[0] == '"' and "$" in contents):
+        return None
+    return contents
+
+
+def _php_object_decimal_literal(value: str) -> Decimal | None:
+    """Parse one PHP decimal code literal or numeric-string body."""
+    stripped = value.strip()
+    if _PHP_OBJECT_DECIMAL_LITERAL_RE.fullmatch(stripped) is not None:
+        try:
+            return Decimal(stripped)
+        except InvalidOperation:
+            return None
+    return None
+
+
+def _php_object_code_numeric_literal(value: str) -> Decimal | None:
+    """Parse an unquoted PHP numeric code literal without string coercion."""
+    stripped = value.strip()
+    decimal = _php_object_decimal_literal(stripped)
+    if decimal is not None:
+        return decimal
+    if _PHP_OBJECT_BASE_INTEGER_LITERAL_RE.fullmatch(stripped) is not None:
+        sign = -1 if stripped.startswith("-") else 1
+        unsigned = stripped.lstrip("+-").replace("_", "")
+        try:
+            return Decimal(sign * int(unsigned, 0))
+        except ValueError:
+            return None
+    return None
+
+
+def _php_object_is_quoted_string_syntax(value: str) -> bool:
+    stripped = value.strip()
+    return (
+        len(stripped) >= 2
+        and stripped[0] in {"'", '"'}
+        and stripped[-1] == stripped[0]
+    )
+
+
+def _php_object_is_fixed_array_syntax(value: str) -> bool:
+    compact = re.sub(r"\s+", "", value.strip()).casefold()
+    return (
+        compact.startswith("[")
+        or compact.startswith("array(")
+    )
+
+
+def _php_object_interpolated_string(value: str) -> bool:
+    stripped = value.strip()
+    return (
+        len(stripped) >= 2
+        and stripped[0] == '"'
+        and stripped[-1] == '"'
+        and "$" in stripped[1:-1]
+    )
+
+
+def _php_object_metadata_identity_is_plausible(value: str) -> bool:
+    """Require a possibly truthy metadata type/key without decoding PHP."""
+    stripped = value.strip()
+    folded = stripped.casefold()
+    if not stripped or folded in {"true", "false", "null"}:
+        return False
+    if _php_object_is_fixed_array_syntax(stripped):
+        return False
+    if _php_object_is_quoted_string_syntax(stripped):
+        string_value = _php_object_simple_string_literal(stripped)
+        if string_value is not None:
+            return string_value not in {"", "0"}
+        return _php_object_interpolated_string(stripped)
+    numeric = _php_object_code_numeric_literal(stripped)
+    if numeric is not None:
+        return numeric != 0
+    return True
+
+
+def _php_object_fixed_object_id_is_invalid(value: str) -> bool:
+    """Mirror get_metadata()'s is_numeric/absint early-return for fixed IDs."""
+    stripped = value.strip()
+    folded = stripped.casefold()
+    if not stripped or folded in {"true", "false", "null"}:
+        return True
+    if _php_object_is_fixed_array_syntax(stripped):
+        return True
+    if _php_object_is_quoted_string_syntax(stripped):
+        string_value = _php_object_simple_string_literal(stripped)
+        if string_value is None:
+            return not _php_object_interpolated_string(stripped)
+        numeric_string = _php_object_decimal_literal(string_value.strip())
+        return numeric_string is None or abs(numeric_string) < 1
+    numeric = _php_object_code_numeric_literal(stripped)
+    if numeric is not None:
+        return abs(numeric) < 1
+    return False
+
+
+def _php_object_metadata_read_arguments_are_plausible(
+    arguments: tuple[str, ...],
+) -> bool:
+    """Validate the positional WordPress ``get_metadata`` call contract."""
+    if len(arguments) not in {3, 4}:
+        return False
+    if any(
+        argument.lstrip().startswith("...")
+        or _PHP_OBJECT_NAMED_ARGUMENT_RE.match(argument) is not None
+        for argument in arguments
+    ):
+        return False
+    metadata_type, object_id, metadata_key = (
+        argument.strip() for argument in arguments[:3]
+    )
+    return (
+        _php_object_metadata_identity_is_plausible(metadata_type)
+        and not _php_object_fixed_object_id_is_invalid(object_id)
+        and _php_object_metadata_identity_is_plausible(metadata_key)
+    )
+
+
+def _php_object_source_quote_offset(
+    source: str,
+    *,
+    line: int,
+    source_quote: str,
+) -> int | None:
+    """Locate the already-validated exact source quote in normalized bytes."""
+    normalized_source = source.replace("\r\n", "\n").replace("\r", "\n")
+    quote = source_quote.replace("\r\n", "\n").replace("\r", "\n").strip()
+    quote_lines = quote.splitlines()
+    source_lines = normalized_source.splitlines(keepends=True)
+    start = line - 1
+    end = start + len(quote_lines)
+    if not quote or line < 1 or end > len(source_lines):
+        return None
+    source_span = "".join(source_lines[start:end])
+    matches = list(re.finditer(re.escape(quote), source_span))
+    if len(matches) != 1 or "\n" in source_span[: matches[0].start()]:
+        return None
+    return sum(len(item) for item in source_lines[:start]) + matches[0].start()
+
+
+def _php_object_source_expression_matches(
+    source: str,
+    *,
+    line: int,
+    source_quote: str,
+) -> bool:
+    """Bind one exact dangerous expression to its cited line.
+
+    Specialist source grounding requires the dangerous expression, not the
+    surrounding assignment or return statement.  Match that expression only
+    inside the exact cited source-line span, reject ambiguous raw matches, and
+    independently require the matched bytes to contain one real (unmasked)
+    deserialization sink call.
+    """
+    normalized_source = source.replace("\r\n", "\n").replace("\r", "\n")
+    normalized_quote = source_quote.replace("\r\n", "\n").replace("\r", "\n")
+    framed_quote = normalized_quote.strip("\n")
+    framed_lines = framed_quote.splitlines()
+    if (
+        not framed_lines
+        or not framed_lines[0].strip()
+        or not framed_lines[-1].strip()
+    ):
+        return False
+    quote = framed_quote.strip()
+    quote_lines = quote.splitlines()
+    if not quote or not quote_lines or line < 1:
+        return False
+
+    source_lines = normalized_source.splitlines(keepends=True)
+    start = line - 1
+    end = start + len(quote_lines)
+    if start < 0 or end > len(source_lines):
+        return False
+    source_span = "".join(source_lines[start:end])
+    source_start = sum(len(source_line) for source_line in source_lines[:start])
+    masked_source = _mask_php_document_non_code(normalized_source)
+    if masked_source is None:
+        return False
+    masked_span = masked_source[source_start : source_start + len(source_span)]
+
+    matches = list(re.finditer(re.escape(quote), source_span))
+    if len(matches) != 1:
+        return False
+    match = matches[0]
+    if "\n" in source_span[: match.start()]:
+        return False
+    calls = list(_PHP_OBJECT_SINK_RE.finditer(masked_span))
+    if len(calls) != 1:
+        return False
+    call = calls[0]
+    return (
+        match.start() <= call.start()
+        and call.end() <= match.end()
+        and "\n" not in source_span[: call.start()]
+    )
+
+
 def _is_source_grounded_php_object_hypothesis(
     hypothesis: Hypothesis,
     plugin_root: str | Path,
@@ -3743,19 +4218,18 @@ def _is_source_grounded_php_object_hypothesis(
     if source_file is None or not hypothesis.sink_code.strip():
         return False
     try:
-        lines = source_file.read_text(encoding="utf-8", errors="replace").splitlines()
+        source = source_file.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return False
-    quote_lines = hypothesis.sink_code.strip("\r\n").splitlines()
-    start = hypothesis.line - 1
-    if start < 0 or start + len(quote_lines) > len(lines):
-        return False
-    if [line.strip() for line in quote_lines] != [
-        line.strip() for line in lines[start : start + len(quote_lines)]
-    ]:
+    if not _php_object_source_expression_matches(
+        source,
+        line=hypothesis.line,
+        source_quote=hypothesis.sink_code,
+    ):
         return False
 
-    source_quote = hypothesis.sink_code
+    source_quote = hypothesis.sink_code.replace("\r\n", "\n").replace("\r", "\n")
+    source_quote = source_quote.strip()
     masked = _mask_php_non_code(source_quote)
     calls = list(_PHP_OBJECT_SINK_RE.finditer(masked))
     if len(calls) != 1:
@@ -3782,6 +4256,30 @@ def _is_source_grounded_php_object_hypothesis(
     if arguments is None:
         return False
     sink_name = call.group("name").casefold()
+    if sink_name == "get_metadata":
+        # WordPress deserializes only a keyed metadata read. Keep the trusted
+        # callsite bound to the direct core API rather than accepting arbitrary
+        # object-specific get_meta() wrappers. Tuple/value provenance remains a
+        # source-review responsibility, but clearly empty keys cannot reach the
+        # implicit deserialization branch.
+        normalized_source = source.replace("\r\n", "\n").replace("\r", "\n")
+        document_masked = _mask_php_document_non_code(normalized_source)
+        quote_offset = _php_object_source_quote_offset(
+            normalized_source,
+            line=hypothesis.line,
+            source_quote=source_quote,
+        )
+        return bool(
+            document_masked is not None
+            and quote_offset is not None
+            and _php_object_is_direct_global_call(
+                masked,
+                call,
+                document_masked=document_masked,
+                document_call_start=quote_offset + call.start(),
+            )
+            and _php_object_metadata_read_arguments_are_plausible(arguments)
+        )
     value_index = 3 if sink_name == "update_metadata" else 0
     if len(arguments) <= value_index:
         return False

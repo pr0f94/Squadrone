@@ -86,16 +86,19 @@ def test_run_scan_cli_uses_fixed_scan_path(monkeypatch):
     monkeypatch.setattr("squadrone.orchestrator.run_scan", fake_run_scan)
     monkeypatch.setattr(cli, "_print_scan_result", lambda _result: None)
 
-    asyncio.run(cli._run_scan_cli(
-        plugin_slug="alpha",
-        config="pipelines/default.yaml",
-        budget=None,
-        version=None,
-        resume=None,
-        resume_from=None,
-        verbose=False,
-        verify_only=True,
-    ))
+    asyncio.run(
+        cli._run_scan_cli(
+            plugin_slug="alpha",
+            config="pipelines/default.yaml",
+            budget=None,
+            version=None,
+            resume=None,
+            resume_from=None,
+            verbose=False,
+            verify_only=True,
+            triage_only=False,
+        )
+    )
 
     assert seen["plugin_slug"] == "alpha"
     assert seen["config_path"] == "pipelines/default.yaml"
@@ -108,8 +111,10 @@ def test_run_scan_cli_uses_fixed_scan_path(monkeypatch):
         "resume_run_id",
         "resume_from",
         "verify_only",
+        "triage_only",
     }
     assert seen["verify_only"] is True
+    assert seen["triage_only"] is False
 
 
 def test_scan_accepts_verify_only_flag(monkeypatch):
@@ -125,3 +130,40 @@ def test_scan_accepts_verify_only_flag(monkeypatch):
 
     assert result.exit_code == 0
     assert seen["verify_only"] is True
+    assert seen["triage_only"] is False
+
+
+def test_scan_accepts_triage_only_flag(monkeypatch):
+    seen: dict = {}
+
+    async def fake_run_scan_cli(**kwargs):
+        seen.update(kwargs)
+        return _scan_result(kwargs["plugin_slug"])
+
+    monkeypatch.setattr(cli, "_run_scan_cli", fake_run_scan_cli)
+
+    result = runner.invoke(cli.app, ["scan", "alpha", "--triage-only"])
+
+    assert result.exit_code == 0
+    assert seen["triage_only"] is True
+    assert seen["verify_only"] is False
+
+
+def test_scan_rejects_triage_only_with_verify_only(monkeypatch):
+    called = False
+
+    async def fake_run_scan_cli(**_kwargs):
+        nonlocal called
+        called = True
+        return _scan_result("alpha")
+
+    monkeypatch.setattr(cli, "_run_scan_cli", fake_run_scan_cli)
+
+    result = runner.invoke(
+        cli.app,
+        ["scan", "alpha", "--triage-only", "--verify-only"],
+    )
+
+    assert result.exit_code == 2
+    assert "mutually exclusive" in result.output
+    assert called is False

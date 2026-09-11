@@ -99,6 +99,52 @@ spending one call per fact or repeatedly reading the same snippet. Follow the
 resulting references until every setup-dependent decision on the exact path is
 grounded.
 
+Do not infer whether configuration permits or blocks the path from a setting,
+helper, predicate, flag, or enum name, or from a literal such as
+`enabled`/`disabled`, `yes`/`no`, `allow`/`deny`, or `public`/`private`. Trace the
+relevant runtime value and, where applicable, its source-defined default, canonical
+persisted form, normalization, filters, comparisons, return value, and every
+relevant boolean inversion to the exact guard and branch outcome. Legacy APIs and
+negatively named keys can intentionally have reversed polarity. If you are about
+to return no commands because configuration appears to block the path and a
+permitted `read_plugin_ranges` call remains, use it to resolve that value-to-guard
+mapping. If the mapping still cannot be grounded, identify the unresolved
+predicate rather than claiming the path is blocked.
+
+When a plugin exposes multiple generations or variants of the same feature, treat
+each variant as a distinct execution path. A shared record type, published status,
+or successful creation does not prove that the object reaches the required
+renderer, dispatcher, route, or handler. Once source confirms a variant required
+by the hypothesis, preserve it. Trace every default and discriminator written by a
+candidate creation API through selection of the exact benign request surface.
+Locate the source predicate that distinguishes the variants and, when it is
+callable or re-readable, assert that same predicate as a setup postcondition.
+
+Do not treat an onboarding, sample-data, migration, import, default, or convenience
+factory as sufficient merely because it is plugin-provided or creates the expected
+record type. If its implicit defaults select a different workflow variant, use a
+source-grounded creation path or a source-defined normal mutation API to select the
+required variant, then evaluate the runtime's own discriminator. Prefer a narrower
+Core or plugin API when it establishes the exact path without unrelated defaults.
+Never relabel a source-defined discriminator value to fit the desired path.
+As applicable, exercise the normal benign output and prove the expected controls,
+route, action, or handler is present before treating setup as complete. A helper or
+template name and an HTTP 200 are not proof. If the response is a wrapper, iframe,
+embedded document, or client-side shell, trace the source-generated document or
+request boundary that actually owns the controls without changing the required
+workflow variant.
+
+Match the benign surface to the proof runner's bounded bootstrap workflow. If the
+proof permits only one read before its sink-reaching request, do not accept a
+staged or partial form merely because it exposes an identity, nonce, or first-step
+controls. Compare the selected document with every field and transition that
+source requires to reach the sink. When a missing field is source-stable, source
+proves it belongs to the sink-reaching request envelope, and the server accepts
+it without an intermediate request, report that exact additional field contract.
+Otherwise use a normal presentation that renders the complete
+request envelope. Never rely on a client-side step or document transition that
+the proof will not execute.
+
 The repair and its postconditions must prove both that each created workflow object
 is semantically valid for that path and that the benign request envelope is
 coherent. As applicable, re-read the canonical persisted mode, type, and
@@ -174,6 +220,15 @@ source-grounded benign setup; never infer successful exploitation from a child
 
 ### How to decide
 
+Classify the root cause before the final surface symptom. A traceback or an absent
+exploit request does not by itself make a failure `poc_code`. If the script
+deliberately fails closed because authoritative setup feedback shows a setup-owned
+benign prerequisite is absent, uncommitted, or rejected, the failure remains
+setup-shaped even when that guard raises an exception before transport. Source can
+ground which prerequisite is required, but it does not prove runtime absence. This
+precedence requires runner execution feedback and never follows from an untrusted
+child assertion.
+
 **Setup-shaped failure signs** (return commands):
 
 - "Unknown column" / "Unknown table" / SQL errors in the prior setup output → schema differs from what was assumed; re-issue inserts using actual columns from SCHEMA DIAGNOSTICS, OR switch to a source-grounded Core or plugin data-model API
@@ -183,6 +238,11 @@ source-grounded benign setup; never infer successful exploitation from a child
   retry plugin activation or change the managed identity.
 - PoC stdout shows "no posts of type X", "form_id not found", "endpoint returned 404", "field not present" → the prerequisite record never got created
 - PoC stdout shows the page returned "no items" / "list is empty" / a redirect to a setup page → the plugin isn't in the configured state the bug needs
+- The script intentionally raises before transport because authoritative setup
+  feedback shows a setup-owned benign prerequisite has not been established.
+  Inspect and repair that prerequisite; do not relabel the root cause as `poc_code`
+  merely because the fail-closed guard produced a traceback or prevented the
+  exploit request.
 
 ### Critical: do not repair by planting the exploit
 
@@ -221,6 +281,11 @@ the prohibited operation.
 - For weak crypto / weak PRNG findings (`CWE-327`, `CWE-338`), do not classify a PoC as successful merely because a legitimately generated token logs in. That proves reachability only. If the script did not demonstrate prediction, forgery, brute force, or another practical security effect from the weak primitive, classify the failure as `exploit_shape` or route to manual/code review rather than treating the sandbox state as the issue.
 
 **PoC-code-bug failure signs** (return empty commands AND set `failure_class: "poc_code"`):
+
+Apply these signs when the required benign setup is already established, or when
+the broken acquisition or request logic belongs to the PoC itself rather than to a
+missing setup prerequisite. They do not override the setup-shaped fail-closed case
+above.
 
 - Python `Traceback (most recent call last)` in stderr — the script crashed before reaching the exploit
 - `KeyError`, `IndexError`, `JSONDecodeError`, `AttributeError`, `NameError`, `TypeError` — the script's own logic broke

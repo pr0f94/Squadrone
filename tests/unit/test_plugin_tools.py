@@ -167,6 +167,41 @@ def test_grep_max_results_cap(fake_plugin):
     # Should cap at 3 hits even though many lines match
     body_lines = [line for line in out.splitlines() if line.startswith("long.php:")]
     assert len(body_lines) == 3
+    assert "result cap reached; results incomplete" in out
+
+
+def test_grep_plain_identifier_ranks_later_exact_uses_before_prefixes(tmp_path):
+    root = tmp_path / "identifier-ranking"
+    root.mkdir()
+    (root / "a-prefixes.php").write_text(
+        "<?php\n"
+        "$give_title_prefix = 1;\n"
+        "$give_title_fallback = 2;\n"
+        "$give_title_metadata = 3;\n"
+    )
+    (root / "z-exact.php").write_text("<?php\n$give_title = $_POST['give_title'];\n")
+    h = PluginToolHandlers(plugin_root=root)
+
+    out = h.grep_plugin({"pattern": "give_title", "max_results": 2})
+
+    result_lines = [line for line in out.splitlines() if line.endswith(";")]
+    assert result_lines[0].startswith("z-exact.php:2:")
+    assert "a-prefixes.php:2:" in result_lines[1]
+    assert "exact identifier matches ranked first" in out
+    assert "result cap reached; results incomplete" in out
+
+
+def test_grep_regex_keeps_source_order_and_reports_result_cap(tmp_path):
+    root = tmp_path / "regex-ordering"
+    root.mkdir()
+    (root / "source.php").write_text("alpha_1\nalpha_2\nalpha_3\n")
+    h = PluginToolHandlers(plugin_root=root)
+
+    out = h.grep_plugin({"pattern": r"alpha_\d", "max_results": 2})
+
+    assert out.index("alpha_1") < out.index("alpha_2")
+    assert "alpha_3" not in out
+    assert "result cap reached; results incomplete" in out
 
 
 def test_grep_centers_long_minified_line_on_match(fake_plugin):

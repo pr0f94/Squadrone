@@ -13,8 +13,9 @@ Return exactly one coverage disposition for every `coverage_targets` item:
 Never omit an item. `reason` must name the handler, guard, sanitizer, dead-code
 fact, or source path that supports the disposition. `evidence_locations` must
 include the assigned item's exact `file:line` and any handler/guard locations
-supporting the decision. You must obtain every cited line from
-`read_plugin_file` during this batch; manifest text alone is not reviewed source.
+supporting the decision. You must obtain every cited line from a
+`read_plugin_file` or `read_plugin_ranges` result during this batch; manifest
+text alone is not reviewed source.
 When an assigned item has `column` greater than 1 on a minified line, use
 `read_plugin_file` with that `start_column`; reading only the beginning of the
 same line does not count as reviewing the item.
@@ -34,9 +35,10 @@ assumption into proof.
 ## Source grounding
 
 Every hypothesis must quote the exact dangerous expression in `sink_code` and
-cite its real `file` and `line` from a recent `read_plugin_file` result. Read the
-complete callback and every plugin helper on the claimed path. A 15-line window
-is not enough to assert that a guard or sanitizer is absent.
+cite its real `file` and `line` from a recent `read_plugin_file` or
+`read_plugin_ranges` result. Read the complete callback and every plugin helper
+on the claimed path. A 15-line window is not enough to assert that a guard or
+sanitizer is absent.
 
 Source presence is not branch reachability. When a helper contains conditional,
 fallback, or mutually exclusive dangerous operations, trace the actual source
@@ -120,6 +122,29 @@ Every hypothesis must populate `evidence_summary` with short concrete values for
 Use the supplied `hypothesis_id_prefix` when choosing hypothesis IDs; the runner
 will canonicalize them when the batch is checkpointed.
 
+For an HTTP hypothesis, `entry_point` is a machine-readable transport seed, not
+prose. Use exactly `METHOD /origin-relative/path`, optionally followed by one or
+more source-proven fixed dispatch query pairs such as `?mode=submit&view=public`,
+or one exact standard WordPress action hook: `wp_ajax_nopriv_ACTION`,
+`wp_ajax_ACTION`, `admin_post_nopriv_ACTION`, or `admin_post_ACTION`. Put attacker
+role, runtime signatures or tokens, UI workflow, and explanatory text in
+`preconditions` or `evidence_summary`, never in `entry_point`. Preserve the
+leading `/`; do not emit a bare `?query`, an absolute URL, a callback description,
+or alternative routes in one value. Do not invent a query pair for a queryless
+route.
+
+When the source is an HTTP request value, `evidence_summary.source` must identify
+one exact, source-proven wire location and its key when applicable. Non-exhaustive
+examples include `POST form field <name>`, `multipart file field <name>`, `query
+parameter <name>`, `JSON field <name>`, `path parameter <name>`, `header <name>`,
+and `cookie <name>`; for an unnamed raw or XML body, identify that exact encoding.
+Include `relative/source-file:line — <verbatim source expression>` from a
+source-read result (`read_plugin_file` or `read_plugin_ranges`). Do not write
+alternatives such as `JSON or form`, and do not substitute a UI label, DTO/model
+property, or storage key for the actual wire key. Record every proven rename in
+`taint_path`; emit separate hypotheses for independently reachable alternative
+transports.
+
 Output only this JSON shape:
 
 ```json
@@ -129,7 +154,7 @@ Output only this JSON shape:
       "id": "the supplied hypothesis_id_prefix plus a unique suffix",
       "specialist": "the exact assigned review area",
       "bug_class": "a canonical CWE id or supported CWE-79 variant",
-      "entry_point": "the exact external route",
+      "entry_point": "POST /origin-relative/path",
       "file": "the sink source file",
       "line": 123,
       "sink": "the dangerous operation",
@@ -147,7 +172,7 @@ Output only this JSON shape:
       },
       "evidence_summary": {
         "attacker_role": "lowest demonstrated role",
-        "source": "attacker-controlled input",
+        "source": "POST form field exact_name; relative/source-file:123 — $_POST['exact_name']",
         "control": "nearest effective or missing control",
         "sink": "dangerous operation",
         "reachable_path": "entry -> helpers -> sink",

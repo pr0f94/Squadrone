@@ -40,6 +40,8 @@ GREP_PLUGIN_TOOL: dict = {
             "Search the plugin source for a regular expression. Use this to locate "
             "entry points (e.g. `register_rest_route`, `add_action.*wp_ajax_`), sinks "
             "(e.g. `\\$wpdb->query`, `file_put_contents`), or any other pattern. "
+            "Plain identifier patterns rank exact token-boundary uses before longer "
+            "identifiers that merely contain the pattern. "
             "Returns up to `max_results` matches as `path:line:column:content` lines, "
             "with long minified lines centered on the match. "
             "Prefer narrowing with `path_glob` (e.g. `**/*.php`) on large plugins."
@@ -157,6 +159,7 @@ _READ_FILE_HARD_BYTE_CAP = 60_000
 _READ_RANGES_HARD_COUNT_CAP = 8
 _READ_RANGES_HARD_LINES_PER_RANGE = 500
 _GREP_OUTPUT_HARD_BYTE_CAP = 30_000
+_PLAIN_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 
 
 def _line_excerpt(value: str, center: int, width: int = 1200) -> str:
@@ -188,6 +191,44 @@ def _display_path(value: str, max_chars: int = 180) -> str:
     if len(value) > max_chars:
         clipped += "..."
     return ascii(clipped)
+
+
+def _identifier_matcher(pattern: str, flags: int) -> re.Pattern[str] | None:
+    """Return a token-boundary matcher when *pattern* is one plain identifier."""
+    if _PLAIN_IDENTIFIER_RE.fullmatch(pattern) is None:
+        return None
+    escaped = re.escape(pattern)
+    return re.compile(rf"(?<!\w){escaped}(?!\w)", flags)
+
+
+def _grep_result_block(
+    rel: Path,
+    lines: list[str],
+    line_index: int,
+    match: re.Match[str],
+    context_lines: int,
+) -> str:
+    """Render one bounded grep result block."""
+    line = lines[line_index]
+    match_column = match.start() + 1
+    if not context_lines:
+        return (
+            f"{rel}:{line_index + 1}:{match_column}:"
+            f"{_line_excerpt(line, match.start())}"
+        )
+
+    lo = max(0, line_index - context_lines)
+    hi = min(len(lines), line_index + context_lines + 1)
+    block_lines = [
+        (
+            f"{rel}:{current + 1}:"
+            f"{match_column if current == line_index else 1}"
+            f"{'>' if current == line_index else ':'}"
+            f"{_line_excerpt(lines[current], match.start() if current == line_index else 0)}"
+        )
+        for current in range(lo, hi)
+    ]
+    return "\n".join(block_lines) + "\n--"
 
 
 class PluginToolHandlers:
@@ -300,7 +341,7 @@ class PluginToolHandlers:
         path_glob = args.get("path_glob") or None
         if path_glob is not None and not self._safe_glob_pattern(path_glob):
             return "[grep_plugin] refused: path_glob must be relative and may not contain '..'"
-        max_results = min(int(args.get("max_results") or 50), 200)
+        max_results = max(1, min(int(args.get("max_results") or 50), 200))
         context_lines = max(0, min(int(args.get("context_lines") or 0), 5))
         flags = re.IGNORECASE if args.get("case_insensitive") else 0
         try:
@@ -308,61 +349,137 @@ class PluginToolHandlers:
         except re.error as e:
             return f"[grep_plugin] invalid regex: {e}"
 
-        hits: list[str] = []
-        files_scanned = 0
-        truncated_files = 0
-        output_bytes = 0
-        for rel, abs_path in self._iter_text_files(path_glob):
-            files_scanned += 1
-            try:
-                text = abs_path.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-            lines = text.splitlines()
-            for i, line in enumerate(lines):
-                match = regex.search(line)
-                if not match:
+        def scan(
+            matcher: re.Pattern[str],
+            limit: int,
+        ) -> tuple[list[str], int]:
+            """Collect at most *limit* bounded result blocks in source order."""
+            found: list[str] = []
+            scanned = 0
+            for rel, abs_path in self._iter_text_files(path_glob):
+                scanned += 1
+                try:
+                    text = abs_path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
                     continue
-                match_column = match.start() + 1
-                if context_lines:
-                    lo = max(0, i - context_lines)
-                    hi = min(len(lines), i + context_lines + 1)
-                    block_lines = [
-                        (
-                            f"{rel}:{lo + j + 1}:"
-                            f"{match_column if (lo + j) == i else 1}"
-                            f"{'>' if (lo + j) == i else ':'}"
-                            f"{_line_excerpt(lines[lo + j], match.start() if (lo + j) == i else 0)}"
+                lines = text.splitlines()
+                for line_index, line in enumerate(lines):
+                    match = matcher.search(line)
+                    if match is None:
+                        continue
+                    found.append(
+                        _grep_result_block(
+                            rel,
+                            lines,
+                            line_index,
+                            match,
+                            context_lines,
                         )
-                        for j in range(hi - lo)
-                    ]
-                    block = "\n".join(block_lines) + "\n--"
-                else:
-                    block = (
-                        f"{rel}:{i + 1}:{match_column}:"
-                        f"{_line_excerpt(line, match.start())}"
                     )
-                if output_bytes + len(block) + 1 > _GREP_OUTPUT_HARD_BYTE_CAP:
-                    truncated_files += 1
-                    break
-                hits.append(block)
-                output_bytes += len(block) + 1
-                if len(hits) >= max_results:
-                    break
-            if len(hits) >= max_results:
-                break
+                    if len(found) >= limit:
+                        return found, scanned
+            return found, scanned
+
+        def scan_identifier(
+            identifier_matcher: re.Pattern[str],
+        ) -> tuple[list[str], list[str], int]:
+            """Classify bounded exact and substring identifier results in one pass."""
+            exact: list[str] = []
+            substrings: list[str] = []
+            scanned = 0
+            lookahead_limit = max_results + 1
+            for rel, abs_path in self._iter_text_files(path_glob):
+                scanned += 1
+                try:
+                    text = abs_path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                lines = text.splitlines()
+                for line_index, line in enumerate(lines):
+                    exact_match = identifier_matcher.search(line)
+                    if exact_match is not None:
+                        exact.append(
+                            _grep_result_block(
+                                rel,
+                                lines,
+                                line_index,
+                                exact_match,
+                                context_lines,
+                            )
+                        )
+                        if len(exact) >= lookahead_limit:
+                            return exact, substrings, scanned
+                        continue
+                    if len(substrings) >= lookahead_limit:
+                        continue
+                    substring_match = regex.search(line)
+                    if substring_match is not None:
+                        substrings.append(
+                            _grep_result_block(
+                                rel,
+                                lines,
+                                line_index,
+                                substring_match,
+                                context_lines,
+                            )
+                        )
+            return exact, substrings, scanned
+
+        # Plain identifier searches use a relevance-first single-pass strategy. This
+        # prevents early prefix identifiers from consuming the allowance before a
+        # later exact use. Each class retains only one look-ahead result beyond the
+        # caller's cap, bounding memory while proving truncation.
+        identifier_regex = _identifier_matcher(pattern, flags)
+        result_cap_reached = False
+        files_scanned = 0
+        if identifier_regex is not None:
+            exact_hits, substring_hits, files_scanned = scan_identifier(
+                identifier_regex
+            )
+            if len(exact_hits) > max_results:
+                hits = exact_hits[:max_results]
+                result_cap_reached = True
+            else:
+                remaining = max_results - len(exact_hits)
+                result_cap_reached = len(substring_hits) > remaining
+                hits = exact_hits + substring_hits[:remaining]
+        else:
+            discovered_hits, files_scanned = scan(regex, max_results + 1)
+            result_cap_reached = len(discovered_hits) > max_results
+            hits = discovered_hits[:max_results]
 
         if not hits:
             return (
                 f"[grep_plugin] 0 matches for /{pattern}/ across {files_scanned} files"
                 f"{f' (glob={path_glob})' if path_glob else ''}"
             )
+
+        rendered_hits: list[str] = []
+        output_bytes = 0
+        output_truncated = False
+        for block in hits:
+            block_bytes = len(block.encode("utf-8")) + 1
+            if output_bytes + block_bytes > _GREP_OUTPUT_HARD_BYTE_CAP:
+                output_truncated = True
+                break
+            rendered_hits.append(block)
+            output_bytes += block_bytes
+
+        qualifiers: list[str] = []
+        if identifier_regex is not None:
+            qualifiers.append("exact identifier matches ranked first")
+        if result_cap_reached:
+            qualifiers.append(
+                "result cap reached; results incomplete; narrow with path_glob"
+            )
+        if output_truncated:
+            qualifiers.append("output byte cap reached; results incomplete")
         header = (
-            f"[grep_plugin] {len(hits)} match(es) for /{pattern}/"
+            f"[grep_plugin] {len(rendered_hits)} match(es) for /{pattern}/"
             f"{f' (glob={path_glob})' if path_glob else ''}"
-            f"{' — output truncated; narrow with path_glob' if truncated_files else ''}"
+            f"{' — ' + '; '.join(qualifiers) if qualifiers else ''}"
         )
-        return header + "\n" + "\n".join(hits)
+        return header + "\n" + "\n".join(rendered_hits)
 
     def glob_plugin(self, args: dict) -> str:
         pattern = (args.get("pattern") or "").strip()

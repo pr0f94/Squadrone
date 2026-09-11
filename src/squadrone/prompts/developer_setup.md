@@ -59,6 +59,50 @@ of the current sandbox. Establish them only through source-grounded commands, or
 leave commands empty and explain which identifier or path is not grounded. Do not
 claim a precondition is already satisfied merely because the hypothesis names it.
 
+Do not infer whether configuration permits or blocks the path from a setting,
+helper, predicate, flag, or enum name, or from a literal such as
+`enabled`/`disabled`, `yes`/`no`, `allow`/`deny`, or `public`/`private`. Trace the
+relevant runtime value and, where applicable, its source-defined default, canonical
+persisted form, normalization, filters, comparisons, return value, and every
+relevant boolean inversion to the exact guard and branch outcome in the supplied
+source. Legacy APIs and negatively named keys can intentionally have reversed
+polarity. If that value-to-guard mapping is not grounded, identify the unresolved
+predicate rather than claiming the path is blocked.
+
+When a plugin exposes multiple generations or variants of the same feature, treat
+each variant as a distinct execution path. A shared record type, published status,
+or successful creation does not prove that the object reaches the required
+renderer, dispatcher, route, or handler. Once source confirms a variant required
+by the hypothesis, preserve it. Trace every default and discriminator written by a
+candidate creation API through selection of the exact benign request surface.
+Locate the source predicate that distinguishes the variants and, when it is
+callable or re-readable, assert that same predicate as a setup postcondition.
+
+Do not treat an onboarding, sample-data, migration, import, default, or convenience
+factory as sufficient merely because it is plugin-provided or creates the expected
+record type. If its implicit defaults select a different workflow variant, use a
+source-grounded creation path or a source-defined normal mutation API to select the
+required variant, then evaluate the runtime's own discriminator. Prefer a narrower
+Core or plugin API when it establishes the exact path without unrelated defaults.
+Never relabel a source-defined discriminator value to fit the desired path.
+As applicable, exercise the normal benign output and prove the expected controls,
+route, action, or handler is present before treating setup as complete. A helper or
+template name and an HTTP 200 are not proof. If the response is a wrapper, iframe,
+embedded document, or client-side shell, trace the source-generated document or
+request boundary that actually owns the controls without changing the required
+workflow variant.
+
+Match the benign surface to the proof runner's bounded bootstrap workflow. If the
+proof permits only one read before its sink-reaching request, do not accept a
+staged or partial form merely because it exposes an identity, nonce, or first-step
+controls. Compare the selected document with every field and transition that
+source requires to reach the sink. When a missing field is source-stable, source
+proves it belongs to the sink-reaching request envelope, and the server accepts
+it without an intermediate request, report that exact additional field contract.
+Otherwise use a normal presentation that renders the complete
+request envelope. Never rely on a client-side step or document transition that
+the proof will not execute.
+
 ### Critical: setup must not plant the exploit
 
 Setup commands may create legitimate prerequisite state: a published page with a shortcode, a normal form/quiz/event record, feature toggles, benign users, benign taxonomy terms, upload directories, and other state a real site would already have.

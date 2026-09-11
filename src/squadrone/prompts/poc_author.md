@@ -83,15 +83,31 @@ Rules:
   bootstrap is required, and then set `SOURCE_COMPLETE_FORM_FIELDS` to the
   complete ordered source-required `(name, value)` baseline. Use an explicit
   empty list only when source proves dispatch plus the object field are the
-  entire form envelope. When bootstrap is `true`, leave that direct baseline
+  entire form envelope, and leave both rendered-form adjustment variables as
+  `None` in direct mode. When bootstrap is `true`, leave that direct baseline
   unset and make one non-redirecting `GET` of
   that page before proof, select exactly one coherent source-grounded form, and
   harvest its hidden and other non-submit successful controls. Preserve duplicate
-  controls and exact rendered names. Require every source-required or rendered
-  `required` field to have a deterministic, semantically valid value satisfying
-  its type and constraints, and require each source-approved reusable nonce to be
-  present exactly once and non-empty. `REQUIRED_FORM_FIELDS` must exclude the
-  dispatch and object fields, which the scaffold validates and applies later.
+  controls, exact rendered names, and valid empty values. A control's presence,
+  hidden type, or use by server code does not by itself prove that it must be
+  non-empty. Put a field in `REQUIRED_FORM_FIELDS` only when reviewed server source
+  explicitly rejects an empty value; rendered HTML `required` controls are
+  enforced separately. A presence-required field that validly carries an empty
+  value must stay in the harvested or source-additional pairs, not this list.
+  Require non-empty fields to have deterministic,
+  semantically valid values satisfying their type and constraints, and require
+  each source-approved reusable nonce to be present exactly once and non-empty.
+  `REQUIRED_FORM_FIELDS` must exclude the dispatch and object fields, which the
+  scaffold validates and applies later. Set `SOURCE_ADDITIONAL_FORM_FIELDS` to the
+  ordered source-proven fields that are part of the final sink-reaching request
+  envelope but absent from the selected form, preserving valid empty values, or
+  to `[]` when there are none. Never add arbitrary fields merely because a handler
+  ignores or tolerates them.
+  Set `SOURCE_OMIT_RENDERED_FORM_FIELDS` to `[]` unless reviewed source proves a
+  successful rendered control diverts the request into a preliminary or
+  validation-only branch before the sink. Never omit form identity, coherent
+  selection fields, reusable nonces, source-required fields, dispatch, the object
+  field, or rendered HTML `required` controls.
 - Build the complete baseline form before overlaying the exact dispatch values
   and opaque PHP-object field. Do not send the template's sparse
   dispatch-plus-token scaffold. Immediately before proof, clone the fully
@@ -99,6 +115,11 @@ Rules:
   identical headers and cookies. Send attack through one clone and control through
   the other so response `Set-Cookie` state from attack cannot alter the control
   request envelope.
+- Treat the trusted PHP-object scaffold's parser, bootstrap validation, session
+  isolation, request ordering, and result-emission control flow as fixed. Fill its
+  top-level source-grounded configuration; do not replace those helpers or write a
+  parallel request path. If the scaffold cannot express a necessary source-proven
+  envelope, fail closed and explain the missing generic capability.
 - If a state-changing form returns 2xx but the expected object was not created,
   inspect the returned form for validation errors and surface the sanitized
   error messages in the structured attack/control diagnostics. Rule out invalid

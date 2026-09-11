@@ -170,15 +170,24 @@ and `authentication`. The optional item-type list matches deterministic
 
 # Resume and force a specific stage onward
 .venv/bin/squadrone scan contact-form-7 --resume <run_id> --from verify
+
+# Stop after source-valid triage, before sandbox verification
+.venv/bin/squadrone scan contact-form-7 --triage-only
+
+# Verify source-valid candidates without deduplication or reporting
+.venv/bin/squadrone scan contact-form-7 --verify-only
 ```
 
-`scan` supports `--config`, `--budget`, `--version`, `--resume`, `--from`, and
-`--verbose`. `scan-batch` supports `--concurrency`, `--config`, `--budget`,
-`--version`, and `--verbose`.
+`scan` supports `--config`, `--budget`, `--version`, `--resume`, `--from`,
+`--triage-only`, `--verify-only`, and `--verbose`. `scan-batch` supports
+`--concurrency`, `--config`, `--budget`, `--version`, and `--verbose`.
 
-There is intentionally no `--no-verify`, `--chain`, `--cross-file-taint`, or
-`--triage-votes` mode. Cross-file review and verification are part of the fixed
-methodology.
+`--triage-only` and `--verify-only` are mutually exclusive. A triage-only run
+writes or reuses artifacts through `triaged.json`, and can later be resumed as a
+normal or verify-only scan.
+
+There is intentionally no `--chain`, `--cross-file-taint`, or `--triage-votes`
+mode. Cross-file review is part of the fixed methodology.
 
 ## Artifacts
 

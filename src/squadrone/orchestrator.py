@@ -350,7 +350,11 @@ async def run_scan(
     resume_run_id: Optional[str] = None,
     resume_from: Optional[str] = None,
     verify_only: bool = False,
+    triage_only: bool = False,
 ) -> ScanResult:
+    if verify_only and triage_only:
+        raise ValueError("verify_only and triage_only are mutually exclusive")
+
     config = PipelineConfig.from_yaml(config_path)
     ceiling = (
         budget_override if budget_override is not None else config.cost_ceiling_usd
@@ -538,7 +542,7 @@ async def run_scan(
 
         # ---- triage ----
         budget.set_stage("triage")
-        expected_submission_scope = not verify_only
+        expected_submission_scope = not (verify_only or triage_only)
         triage_scope_changed = False
         loaded_triage = False
         if _should_load("triage") and triaged_path.exists():
@@ -616,126 +620,134 @@ async def run_scan(
                 },
             )
 
-        # ---- verify ----
-        budget.set_stage("verify")
-        verify_checkpoint_stale = _verify_checkpoint_complete(
-            run_dir
-        ) and not _verify_checkpoint_matches_triage(run_dir, triaged)
-        force_verify = (
-            _stage_is_forced("verify", force_idx)
-            or triage_scope_changed
-            or verify_checkpoint_stale
-        )
-        if (
-            not force_verify
-            and _should_load("verify")
-            and _verify_checkpoint_complete(run_dir)
-        ):
-            findings, corrupt_count = read_jsonl_models(
-                findings_path,
-                Finding,
-                corrupt_path=run_dir / "findings_corrupt.jsonl",
+        if not triage_only:
+            # ---- verify ----
+            budget.set_stage("verify")
+            verify_checkpoint_stale = _verify_checkpoint_complete(
+                run_dir
+            ) and not _verify_checkpoint_matches_triage(run_dir, triaged)
+            force_verify = (
+                _stage_is_forced("verify", force_idx)
+                or triage_scope_changed
+                or verify_checkpoint_stale
             )
-            if corrupt_count:
-                append_decision(
-                    run_dir,
-                    stage="verify",
-                    action="recover",
-                    result="corrupt_findings_quarantined",
-                    reason=f"{corrupt_count} malformed findings.jsonl line(s)",
-                    artifact=run_dir / "findings_corrupt.jsonl",
+            if (
+                not force_verify
+                and _should_load("verify")
+                and _verify_checkpoint_complete(run_dir)
+            ):
+                findings, corrupt_count = read_jsonl_models(
+                    findings_path,
+                    Finding,
+                    corrupt_path=run_dir / "findings_corrupt.jsonl",
                 )
-            await _emit(on_event, "verify", "skipped", {"findings": len(findings)})
-        else:
-            await _emit(
-                on_event, "verify", "start", {"to_verify": len(triaged.accepted)}
-            )
-            try:
-                findings = await verify_stage.run(
-                    triaged,
-                    intake.source_path,
+                if corrupt_count:
+                    append_decision(
+                        run_dir,
+                        stage="verify",
+                        action="recover",
+                        result="corrupt_findings_quarantined",
+                        reason=f"{corrupt_count} malformed findings.jsonl line(s)",
+                        artifact=run_dir / "findings_corrupt.jsonl",
+                    )
+                await _emit(
+                    on_event, "verify", "skipped", {"findings": len(findings)}
+                )
+            else:
+                await _emit(
+                    on_event, "verify", "start", {"to_verify": len(triaged.accepted)}
+                )
+                try:
+                    findings = await verify_stage.run(
+                        triaged,
+                        intake.source_path,
+                        config,
+                        budget,
+                        runtime,
+                        runs_root=_runs_root(plugin_slug),
+                        run_id=run_id,
+                        developer=developer,
+                        force=force_verify,
+                    )
+                except verify_stage.VerifyStageError as exc:
+                    # Preserve partial confirmations in the failed ScanResult and run
+                    # record; findings.jsonl remains the crash-safe source of truth.
+                    findings = exc.findings
+                    raise
+                await _emit(
+                    on_event,
+                    "verify",
+                    "done",
+                    {"findings": len(findings), "spent": budget.spent},
+                )
+
+            if verify_only:
+                # Verification checkpoints this artifact, but write it once more at
+                # the orchestration boundary so mocked/custom verifiers get the same
+                # durable contract. No dedup client is constructed in this mode.
+                atomic_write_jsonl(findings_path, findings)
+                await _persist_findings(run_id, plugin_slug, findings)
+            else:
+                # ---- dedup ----
+                # Cheap; always re-run on resume since its output overwrites
+                # findings.jsonl.
+                budget.set_stage("dedup")
+                await _emit(on_event, "dedup", "start", {})
+                findings = await dedup_stage.run(
+                    findings,
+                    plugin_slug,
+                    config,
+                    runs_root=_runs_root(plugin_slug),
+                    run_id=run_id,
+                )
+                novel_count = sum(
+                    1 for f in findings if f.dedup_status == DedupStatus.NOVEL
+                )
+                await _emit(
+                    on_event,
+                    "dedup",
+                    "done",
+                    {
+                        "novel": novel_count,
+                        "possibly_known": sum(
+                            1
+                            for f in findings
+                            if f.dedup_status == DedupStatus.POSSIBLY_KNOWN
+                        ),
+                        "known_dupe": sum(
+                            1
+                            for f in findings
+                            if f.dedup_status == DedupStatus.KNOWN_DUPE
+                        ),
+                    },
+                )
+
+                await _persist_findings(run_id, plugin_slug, findings)
+
+                # ---- report ----
+                # Per-finding skip: existing report files are preserved.
+                budget.set_stage("report")
+                await _emit(on_event, "report", "start", {})
+                report_paths = await report_stage.run(
+                    findings,
+                    plugin_slug,
                     config,
                     budget,
                     runtime,
                     runs_root=_runs_root(plugin_slug),
                     run_id=run_id,
-                    developer=developer,
-                    force=force_verify,
+                    plugin_path=intake.source_path,
+                    plugin_version=intake.plugin_version,
                 )
-            except verify_stage.VerifyStageError as exc:
-                # Preserve partial confirmations in the failed ScanResult and run
-                # record; findings.jsonl remains the crash-safe source of truth.
-                findings = exc.findings
-                raise
-            await _emit(
-                on_event,
-                "verify",
-                "done",
-                {"findings": len(findings), "spent": budget.spent},
-            )
-
-        if verify_only:
-            # Verification already checkpoints this artifact, but write it once more
-            # at the orchestration boundary so mocked/custom verifiers get the same
-            # durable contract. No dedup client is constructed in this mode.
-            atomic_write_jsonl(findings_path, findings)
-            await _persist_findings(run_id, plugin_slug, findings)
-        else:
-            # ---- dedup (cheap; always re-run on resume since output overwrites findings.jsonl) ----
-            budget.set_stage("dedup")
-            await _emit(on_event, "dedup", "start", {})
-            findings = await dedup_stage.run(
-                findings,
-                plugin_slug,
-                config,
-                runs_root=_runs_root(plugin_slug),
-                run_id=run_id,
-            )
-            novel_count = sum(
-                1 for f in findings if f.dedup_status == DedupStatus.NOVEL
-            )
-            await _emit(
-                on_event,
-                "dedup",
-                "done",
-                {
-                    "novel": novel_count,
-                    "possibly_known": sum(
-                        1
-                        for f in findings
-                        if f.dedup_status == DedupStatus.POSSIBLY_KNOWN
-                    ),
-                    "known_dupe": sum(
-                        1 for f in findings if f.dedup_status == DedupStatus.KNOWN_DUPE
-                    ),
-                },
-            )
-
-            await _persist_findings(run_id, plugin_slug, findings)
-
-            # ---- report (per-finding skip: existing report files are preserved) ----
-            budget.set_stage("report")
-            await _emit(on_event, "report", "start", {})
-            report_paths = await report_stage.run(
-                findings,
-                plugin_slug,
-                config,
-                budget,
-                runtime,
-                runs_root=_runs_root(plugin_slug),
-                run_id=run_id,
-                plugin_path=intake.source_path,
-                plugin_version=intake.plugin_version,
-            )
-            await _emit(
-                on_event,
-                "report",
-                "done",
-                {
-                    "reports": len(report_paths),
-                    "spent": budget.spent,
-                },
-            )
+                await _emit(
+                    on_event,
+                    "report",
+                    "done",
+                    {
+                        "reports": len(report_paths),
+                        "spent": budget.spent,
+                    },
+                )
 
         status = "complete"
         append_decision(
@@ -747,6 +759,7 @@ async def run_scan(
                 "findings": len(findings),
                 "cost_usd": budget.spent,
                 "verify_only": verify_only,
+                "triage_only": triage_only,
             },
         )
 

@@ -37,10 +37,19 @@ PUBLIC_FORM_URL = ""
 FORM_IDENTITY = {}
 COHERENT_FORM_FIELDS = None
 REUSABLE_CSRF_FIELDS = None
-# List source-required semantic controls here, excluding dispatch fields and the
-# object field: those source-bound values are deliberately applied afterward.
+# List only controls whose reviewed server source explicitly rejects an empty
+# value. A presence-only field that validly carries "" stays in the harvested or
+# source-additional pairs. Dispatch and the object field are applied afterward.
 REQUIRED_FORM_FIELDS = None
 FORM_FIELD_VALUES = None
+# Ordered source-proven fields that are part of the final sink-reaching request
+# envelope but absent from the selected rendered form. Preserve valid empty values.
+# Use [] explicitly when no additional fields are needed.
+SOURCE_ADDITIONAL_FORM_FIELDS = None
+# Successful rendered controls may be removed only when source proves that their
+# presence diverts into a preliminary or validation-only branch before the sink.
+# Use [] explicitly when no controls must be omitted.
+SOURCE_OMIT_RENDERED_FORM_FIELDS = None
 
 
 class _RenderedFormParser(HTMLParser):
@@ -348,14 +357,27 @@ def _complete_rendered_form(
     csrf_fields,
     source_required_fields,
     field_values,
+    source_additional_fields,
+    source_omit_fields,
     late_bound_fields,
 ):
     form = _select_source_grounded_form(html, identity, coherent_fields)
     pairs = list(form["pairs"])
+    pair_names = {name for name, _value in pairs}
+    for name in source_omit_fields:
+        if name not in pair_names:
+            raise RuntimeError("source-omitted field is not a successful rendered control")
+    if source_omit_fields:
+        omitted = set(source_omit_fields)
+        pairs = [(name, value) for name, value in pairs if name not in omitted]
     for name, value in field_values.items():
         if name not in form["names"]:
             raise RuntimeError("configured form value has no rendered control")
         pairs = _replace_field(pairs, name, value)
+    for name, value in source_additional_fields:
+        if name in form["names"]:
+            raise RuntimeError("source-additional field already has a rendered control")
+        pairs.append((name, value))
     required = (
         set(source_required_fields) | set(form["required"])
     ) - set(late_bound_fields)
@@ -386,13 +408,11 @@ def _late_bound_form_fields():
     return fields
 
 
-def _source_complete_form_fields():
-    if not isinstance(SOURCE_COMPLETE_FORM_FIELDS, (list, tuple)):
-        raise RuntimeError(
-            "direct form mode requires an explicit source-complete field list"
-        )
+def _source_field_pairs(value, label):
+    if not isinstance(value, (list, tuple)):
+        raise RuntimeError(f"{label} requires an explicit ordered field list")
     pairs = []
-    for pair in SOURCE_COMPLETE_FORM_FIELDS:
+    for pair in value:
         if (
             not isinstance(pair, (list, tuple))
             or len(pair) != 2
@@ -400,9 +420,16 @@ def _source_complete_form_fields():
             or not pair[0]
             or not isinstance(pair[1], str)
         ):
-            raise RuntimeError("source-complete form fields must be string pairs")
+            raise RuntimeError(f"{label} must contain string pairs")
         pairs.append((pair[0], pair[1]))
     return pairs
+
+
+def _source_complete_form_fields():
+    return _source_field_pairs(
+        SOURCE_COMPLETE_FORM_FIELDS,
+        "source-complete form fields",
+    )
 
 
 def _clone_bootstrapped_session(source, *, include_cookies=True):
@@ -430,15 +457,14 @@ def _bootstrap_form(session):
             "PoC author must explicitly decide whether rendered-form bootstrap is required"
         )
     if FORM_BOOTSTRAP_REQUIRED is False:
+        if (
+            SOURCE_ADDITIONAL_FORM_FIELDS is not None
+            or SOURCE_OMIT_RENDERED_FORM_FIELDS is not None
+        ):
+            raise RuntimeError("direct form mode cannot use rendered-form adjustments")
         return _source_complete_form_fields()
     if FORM_BOOTSTRAP_REQUIRED is not True:
         raise RuntimeError("FORM_BOOTSTRAP_REQUIRED must be exactly true or false")
-    field_name_groups = (
-        COHERENT_FORM_FIELDS,
-        REUSABLE_CSRF_FIELDS,
-        REQUIRED_FORM_FIELDS,
-    )
-    late_bound_fields = _late_bound_form_fields()
     if (
         not isinstance(PUBLIC_FORM_URL, str)
         or not PUBLIC_FORM_URL
@@ -449,18 +475,37 @@ def _bootstrap_form(session):
         or not isinstance(REUSABLE_CSRF_FIELDS, (list, tuple))
         or not isinstance(REQUIRED_FORM_FIELDS, (list, tuple))
         or not isinstance(FORM_FIELD_VALUES, dict)
+        or not isinstance(SOURCE_ADDITIONAL_FORM_FIELDS, (list, tuple))
+        or not isinstance(SOURCE_OMIT_RENDERED_FORM_FIELDS, (list, tuple))
         or SOURCE_COMPLETE_FORM_FIELDS is not None
-        or any(
+    ):
+        raise RuntimeError("rendered-form bootstrap configuration is incomplete")
+    field_name_groups = (
+        COHERENT_FORM_FIELDS,
+        REUSABLE_CSRF_FIELDS,
+        REQUIRED_FORM_FIELDS,
+        SOURCE_OMIT_RENDERED_FORM_FIELDS,
+    )
+    late_bound_fields = _late_bound_form_fields()
+    source_additional_fields = _source_field_pairs(
+        SOURCE_ADDITIONAL_FORM_FIELDS,
+        "source-additional form fields",
+    )
+    source_additional_names = {name for name, _value in source_additional_fields}
+    if any(
+        any(not isinstance(name, str) or not name for name in names)
+        or len(set(names)) != len(names)
+        for names in field_name_groups
+    ):
+        raise RuntimeError("rendered-form bootstrap configuration is incomplete")
+    source_omit_names = set(SOURCE_OMIT_RENDERED_FORM_FIELDS)
+    if (
+        any(
             not isinstance(name, str)
             or not name
             or not isinstance(value, str)
             or not value
             for name, value in FORM_IDENTITY.items()
-        )
-        or any(
-            any(not isinstance(name, str) or not name for name in names)
-            or len(set(names)) != len(names)
-            for names in field_name_groups
         )
         or any(
             not isinstance(name, str)
@@ -478,9 +523,25 @@ def _bootstrap_form(session):
         or set(FORM_FIELD_VALUES).intersection(
             set(FORM_IDENTITY)
             | set(REUSABLE_CSRF_FIELDS)
+            | source_additional_names
+            | source_omit_names
             | late_bound_fields
         )
         or set(REQUIRED_FORM_FIELDS).intersection(late_bound_fields)
+        or source_additional_names.intersection(
+            set(FORM_IDENTITY)
+            | set(COHERENT_FORM_FIELDS)
+            | set(REUSABLE_CSRF_FIELDS)
+            | late_bound_fields
+        )
+        or source_omit_names.intersection(
+            set(FORM_IDENTITY)
+            | set(COHERENT_FORM_FIELDS)
+            | set(REUSABLE_CSRF_FIELDS)
+            | set(REQUIRED_FORM_FIELDS)
+            | source_additional_names
+            | late_bound_fields
+        )
         or OBJECT_FIELD in set(FORM_IDENTITY) | set(REUSABLE_CSRF_FIELDS)
     ):
         raise RuntimeError("rendered-form bootstrap configuration is incomplete")
@@ -508,6 +569,8 @@ def _bootstrap_form(session):
         REUSABLE_CSRF_FIELDS,
         REQUIRED_FORM_FIELDS,
         FORM_FIELD_VALUES,
+        source_additional_fields,
+        SOURCE_OMIT_RENDERED_FORM_FIELDS,
         late_bound_fields,
     )
 

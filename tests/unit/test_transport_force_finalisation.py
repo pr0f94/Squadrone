@@ -133,6 +133,252 @@ async def test_search_batch_can_finish_with_one_batched_source_read(
 
 
 @pytest.mark.asyncio
+async def test_search_batch_can_finish_with_two_batched_source_reads(
+    monkeypatch, tmp_path
+):
+    responses = iter(
+        [
+            _tool_response(
+                *(
+                    (
+                        f"grep-{index}",
+                        "grep_plugin",
+                        {"pattern": f"symbol_{index}"},
+                    )
+                    for index in range(6)
+                )
+            ),
+            _tool_response(
+                (
+                    "ranges-1",
+                    "read_plugin_ranges",
+                    {
+                        "ranges": [
+                            {"path": "plugin.php", "start_line": 10, "end_line": 30}
+                        ]
+                    },
+                )
+            ),
+            _tool_response(
+                (
+                    "ranges-2",
+                    "read_plugin_ranges",
+                    {
+                        "ranges": [
+                            {"path": "helper.php", "start_line": 40, "end_line": 60}
+                        ]
+                    },
+                )
+            ),
+            _tool_response(
+                (
+                    "ranges-3",
+                    "read_plugin_ranges",
+                    {
+                        "ranges": [
+                            {"path": "extra.php", "start_line": 70, "end_line": 90}
+                        ]
+                    },
+                )
+            ),
+            {
+                "choices": [{"message": {"content": "final setup plan"}}],
+                "usage": {},
+            },
+        ]
+    )
+    requests = []
+
+    async def fake_call_llm(**kwargs):
+        requests.append(kwargs)
+        return next(responses)
+
+    monkeypatch.setattr(
+        "squadrone.agents.transport.litellm_transport.call_llm",
+        fake_call_llm,
+    )
+    dispatched = []
+
+    async def grep_plugin(arguments):
+        dispatched.append(("grep_plugin", arguments))
+        return "plugin.php:10: matching symbol"
+
+    async def read_plugin_ranges(arguments):
+        dispatched.append(("read_plugin_ranges", arguments))
+        path = arguments["ranges"][0]["path"]
+        if path == "plugin.php":
+            return "FIRST RANGE RESULT: helper reference needs one focused read"
+        return "SECOND RANGE RESULT: complete helper source"
+
+    result = await LiteLLMTransport().run_agent(
+        runtime=AgentRuntime(run_dir=str(tmp_path)),
+        agent_name="developer.propose_setup_followup",
+        model="test-model",
+        messages=[{"role": "user", "content": "Inspect source, then plan setup."}],
+        tools=[_tool("grep_plugin"), _tool("read_plugin_ranges")],
+        max_iterations=5,
+        output_schema=None,
+        tool_handlers={
+            "grep_plugin": grep_plugin,
+            "read_plugin_ranges": read_plugin_ranges,
+        },
+        force_finalise_after=6,
+        force_finalise_allowed_tools={"read_plugin_ranges"},
+        force_finalise_allowed_tool_calls=2,
+        max_tokens=100,
+    )
+
+    assert result.output == "final setup plan"
+    assert [name for name, _arguments in dispatched] == [
+        *("grep_plugin" for _index in range(6)),
+        "read_plugin_ranges",
+        "read_plugin_ranges",
+    ]
+    assert [tool["function"]["name"] for tool in requests[1]["tools"]] == [
+        "read_plugin_ranges"
+    ]
+    assert [tool["function"]["name"] for tool in requests[2]["tools"]] == [
+        "read_plugin_ranges"
+    ]
+    assert requests[3]["tools"] == []
+    assert requests[4]["tools"] == []
+    second_read_context = json.dumps(requests[2]["messages"])
+    assert "FIRST RANGE RESULT" in second_read_context
+    assert (
+        "at most 1 additional permitted finalisation tool call"
+        in second_read_context
+    )
+    final_context = json.dumps(requests[3]["messages"])
+    assert "FIRST RANGE RESULT" in final_context
+    assert "SECOND RANGE RESULT" in final_context
+    assert "No further tool calls are permitted" in final_context
+
+    trace = [
+        json.loads(line) for line in (tmp_path / "trace.jsonl").read_text().splitlines()
+    ]
+    dispatches = [
+        item for item in trace if item["kind"] == "finalisation_tool_dispatched"
+    ]
+    assert [item["finalisation_tool_calls"] for item in dispatches] == [1, 2]
+    assert all(item["finalisation_tool_call_limit"] == 2 for item in dispatches)
+    blocked = [
+        item
+        for item in trace
+        if item["kind"] == "finalisation_tool_blocked"
+    ]
+    assert [item["tool"] for item in blocked] == ["read_plugin_ranges"]
+    assert blocked[0]["args"]["ranges"][0]["path"] == "extra.php"
+
+
+@pytest.mark.asyncio
+async def test_threshold_crossing_batch_finishes_before_finalisation_read(
+    monkeypatch, tmp_path
+):
+    responses = iter(
+        [
+            _tool_response(
+                *(
+                    (f"initial-{index}", "grep_plugin", {"pattern": f"initial_{index}"})
+                    for index in range(3)
+                )
+            ),
+            _tool_response(
+                ("cross-1", "grep_plugin", {"pattern": "company"}),
+                ("cross-2", "grep_plugin", {"pattern": "title"}),
+                (
+                    "cross-3",
+                    "read_plugin_ranges",
+                    {
+                        "ranges": [
+                            {"path": "entry.php", "start_line": 10, "end_line": 30}
+                        ]
+                    },
+                ),
+            ),
+            _tool_response(
+                (
+                    "final-read",
+                    "read_plugin_ranges",
+                    {
+                        "ranges": [
+                            {"path": "mapping.php", "start_line": 40, "end_line": 80}
+                        ]
+                    },
+                )
+            ),
+            {
+                "choices": [{"message": {"content": "grounded final output"}}],
+                "usage": {},
+            },
+        ]
+    )
+    requests = []
+
+    async def fake_call_llm(**kwargs):
+        requests.append(kwargs)
+        return next(responses)
+
+    monkeypatch.setattr(
+        "squadrone.agents.transport.litellm_transport.call_llm",
+        fake_call_llm,
+    )
+    dispatched = []
+
+    async def record_tool(arguments):
+        dispatched.append(arguments)
+        return "source evidence"
+
+    result = await LiteLLMTransport().run_agent(
+        runtime=AgentRuntime(run_dir=str(tmp_path)),
+        agent_name="injection_files.b001-retry",
+        model="test-model",
+        messages=[{"role": "user", "content": "Trace the assigned operation."}],
+        tools=[_tool("grep_plugin"), _tool("read_plugin_ranges")],
+        max_iterations=4,
+        output_schema=None,
+        tool_handlers={
+            "grep_plugin": record_tool,
+            "read_plugin_ranges": record_tool,
+        },
+        force_finalise_after=4,
+        force_finalise_allowed_tools={"read_plugin_ranges"},
+        force_finalise_allowed_tool_calls=1,
+        max_tokens=100,
+    )
+
+    assert result.output == "grounded final output"
+    assert [item.get("pattern", "range") for item in dispatched] == [
+        "initial_0",
+        "initial_1",
+        "initial_2",
+        "company",
+        "title",
+        "range",
+        "range",
+    ]
+    assert [tool["function"]["name"] for tool in requests[1]["tools"]] == [
+        "grep_plugin",
+        "read_plugin_ranges",
+    ]
+    assert [tool["function"]["name"] for tool in requests[2]["tools"]] == [
+        "read_plugin_ranges"
+    ]
+    assert requests[3]["tools"] == []
+
+    trace = [
+        json.loads(line) for line in (tmp_path / "trace.jsonl").read_text().splitlines()
+    ]
+    force_events = [item for item in trace if item["kind"] == "force_finalise"]
+    assert force_events[0]["after_tool_calls"] == 6
+    assert force_events[0]["allowed_tools"] == ["read_plugin_ranges"]
+    final_reads = [
+        item for item in trace if item["kind"] == "finalisation_tool_dispatched"
+    ]
+    assert [item["tool"] for item in final_reads] == ["read_plugin_ranges"]
+    assert not [item for item in trace if item["kind"] == "finalisation_tool_blocked"]
+
+
+@pytest.mark.asyncio
 async def test_forced_finalisation_dispatches_only_one_allowlisted_tool(
     monkeypatch, tmp_path
 ):

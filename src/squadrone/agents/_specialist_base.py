@@ -83,6 +83,10 @@ _DYNAMIC_KEY_MAX_ITERATIONS = 40
 _DYNAMIC_KEY_FORCE_FINALISE_AFTER = 32
 _IMPLICIT_DESERIALIZATION_MAX_ITERATIONS = 52
 _IMPLICIT_DESERIALIZATION_FORCE_FINALISE_AFTER = 44
+_IMPLICIT_DESERIALIZATION_FINALISATION_ALLOWED_TOOLS = {"read_plugin_ranges"}
+_IMPLICIT_DESERIALIZATION_FINALISATION_TOOL_CALLS = 1
+_XSS_STORAGE_FINALISATION_ALLOWED_TOOLS = {"read_plugin_ranges"}
+_XSS_STORAGE_FINALISATION_TOOL_CALLS = 1
 AUTHENTICATION_ALTERNATE_PATH_AUDIT_VERSION = 1
 
 
@@ -506,6 +510,26 @@ def _specialist_iteration_limits(
     if name == "authorization_workflows" and _requires_dynamic_key_trace(targets):
         return _DYNAMIC_KEY_MAX_ITERATIONS, _DYNAMIC_KEY_FORCE_FINALISE_AFTER
     return _DEFAULT_MAX_ITERATIONS, _DEFAULT_FORCE_FINALISE_AFTER
+
+
+def _specialist_finalisation_policy(
+    name: ReviewArea,
+    targets: list[CoverageItem],
+) -> tuple[set[str] | None, int]:
+    """Return the narrowly scoped post-force evidence-read allowance."""
+    if _requires_implicit_deserialization_trace(targets):
+        return (
+            set(_IMPLICIT_DESERIALIZATION_FINALISATION_ALLOWED_TOOLS),
+            _IMPLICIT_DESERIALIZATION_FINALISATION_TOOL_CALLS,
+        )
+    if name == "xss_lifecycle" and any(
+        target.kind == "storage_write" for target in targets
+    ):
+        return (
+            set(_XSS_STORAGE_FINALISATION_ALLOWED_TOOLS),
+            _XSS_STORAGE_FINALISATION_TOOL_CALLS,
+        )
+    return None, 1
 
 
 _METHODOLOGY = """
@@ -961,6 +985,10 @@ async def run_specialist(
         name,
         coverage_targets,
     )
+    (
+        force_finalise_allowed_tools,
+        force_finalise_allowed_tool_calls,
+    ) = _specialist_finalisation_policy(name, coverage_targets)
     dynamic_key_trace = (
         name == "authorization_workflows"
         and _requires_dynamic_key_trace(coverage_targets)
@@ -989,6 +1017,8 @@ async def run_specialist(
         output_schema=SpecialistReviewArtifact,
         max_iterations=max_iterations,
         force_finalise_after=force_finalise_after,
+        force_finalise_allowed_tools=force_finalise_allowed_tools,
+        force_finalise_allowed_tool_calls=force_finalise_allowed_tool_calls,
     )
     primary = _enforce_read_evidence(result.output, handlers, coverage_targets)
     if not _requires_authentication_alternate_path_audit(name, coverage_targets):

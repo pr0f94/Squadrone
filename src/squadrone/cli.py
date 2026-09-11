@@ -252,6 +252,7 @@ async def _run_scan_cli(
     resume_from: str | None,
     verbose: bool,
     verify_only: bool = False,
+    triage_only: bool = False,
     batch_prefix: str | None = None,
 ) -> Any:
     from .orchestrator import run_scan
@@ -313,6 +314,7 @@ async def _run_scan_cli(
         resume_run_id=resume,
         resume_from=resume_from,
         verify_only=verify_only,
+        triage_only=triage_only,
     )
 
     _print_scan_result(result)
@@ -528,6 +530,14 @@ def scan(
             "skip vulnerability DB dedup and report generation."
         ),
     ),
+    triage_only: bool = typer.Option(
+        False,
+        "--triage-only",
+        help=(
+            "Run through source-valid triage, then stop before verification, "
+            "dedup, and report generation."
+        ),
+    ),
     verbose: bool = typer.Option(
         False,
         "--verbose",
@@ -536,6 +546,10 @@ def scan(
     ),
 ) -> None:
     """Scan a single plugin for vulnerabilities."""
+    if verify_only and triage_only:
+        raise typer.BadParameter(
+            "--verify-only and --triage-only are mutually exclusive"
+        )
     _configure_logging(verbose=verbose)
     result = asyncio.run(
         _run_scan_cli(
@@ -547,6 +561,7 @@ def scan(
             resume_from=resume_from,
             verbose=verbose,
             verify_only=verify_only,
+            triage_only=triage_only,
         )
     )
 

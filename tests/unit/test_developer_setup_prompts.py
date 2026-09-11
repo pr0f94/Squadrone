@@ -167,6 +167,7 @@ async def test_followup_source_repair_exposes_only_bounded_read_tools(tmp_path):
     assert captured["max_iterations"] == 8
     assert captured["force_finalise_after"] == 6
     assert captured["force_finalise_allowed_tools"] == {"read_plugin_ranges"}
+    assert captured["force_finalise_allowed_tool_calls"] == 2
     assert captured["output_schema"] is SetupPlan
     assert result.failure_class == "setup"
     assert result.commands == [["eval", "create_fixture(0, array());"]]
@@ -221,6 +222,7 @@ async def test_poc_requested_setup_has_distinct_untrusted_planning_context(tmp_p
     assert captured["max_iterations"] == 8
     assert captured["force_finalise_after"] == 6
     assert captured["force_finalise_allowed_tools"] == {"read_plugin_ranges"}
+    assert captured["force_finalise_allowed_tool_calls"] == 2
     assert captured["output_schema"] is RequestedSetupPlan
     tool_names = {
         tool["function"]["name"] for tool in captured["tools"]  # type: ignore[index]
@@ -450,6 +452,103 @@ def test_requested_and_followup_prompts_require_complete_semantic_source_tracing
         assert "do not guess" in normalized
 
 
+def test_setup_prompts_trace_configuration_polarity_before_rejection():
+    agent = DeveloperAgent(model="test-model")
+
+    for prompt in (
+        agent.setup_prompt,
+        agent.requested_setup_prompt,
+        agent.setup_followup_prompt,
+    ):
+        normalized = " ".join(prompt.split())
+        assert (
+            "Do not infer whether configuration permits or blocks the path"
+            in normalized
+        )
+        assert "setting, helper, predicate, flag, or enum name" in normalized
+        assert "relevant runtime value and, where applicable" in normalized
+        assert "source-defined default, canonical persisted form" in normalized
+        assert "normalization, filters, comparisons, return value" in normalized
+        assert "every relevant boolean inversion" in normalized
+        assert (
+            "negatively named keys can intentionally have reversed polarity"
+            in normalized
+        )
+        assert (
+            "unresolved predicate rather than claiming the path is blocked"
+            in normalized
+        )
+
+    for prompt in (agent.requested_setup_prompt, agent.setup_followup_prompt):
+        normalized = " ".join(prompt.split())
+        assert "a permitted `read_plugin_ranges` call remains" in normalized
+        assert "use it to resolve that value-to-guard mapping" in normalized
+
+
+def test_setup_prompts_keep_feature_variants_on_the_exact_execution_path():
+    agent = DeveloperAgent(model="test-model")
+
+    for prompt in (
+        agent.setup_prompt,
+        agent.requested_setup_prompt,
+        agent.setup_followup_prompt,
+    ):
+        normalized = " ".join(prompt.split())
+        assert "treat each variant as a distinct execution path" in normalized
+        assert (
+            "shared record type, published status, or successful creation" in normalized
+        )
+        assert "renderer, dispatcher, route, or handler" in normalized
+        assert "preserve it" in normalized
+        assert (
+            "every default and discriminator written by a candidate creation API"
+            in normalized
+        )
+        assert "source predicate that distinguishes the variants" in normalized
+        assert "assert that same predicate as a setup postcondition" in normalized
+        assert (
+            "onboarding, sample-data, migration, import, default, or convenience factory"
+            in normalized
+        )
+        assert "as sufficient merely because it is plugin-provided" in normalized
+        assert "implicit defaults select a different workflow variant" in normalized
+        assert "source-defined normal mutation API" in normalized
+        assert "evaluate the runtime's own discriminator" in normalized
+        assert "Prefer a narrower Core or plugin API" in normalized
+        assert "Never relabel a source-defined discriminator value" in normalized
+        assert "prove the expected controls, route, action, or handler" in normalized
+        assert "A helper or template name and an HTTP 200 are not proof" in normalized
+        assert "wrapper, iframe, embedded document, or client-side shell" in normalized
+        assert (
+            "document or request boundary that actually owns the controls" in normalized
+        )
+        assert (
+            "Match the benign surface to the proof runner's bounded bootstrap workflow"
+            in normalized
+        )
+        assert "only one read before its sink-reaching request" in normalized
+        assert "staged or partial form" in normalized
+        assert "identity, nonce, or first-step controls" in normalized
+        assert (
+            "every field and transition that source requires to reach the sink"
+            in normalized
+        )
+        assert "missing field is source-stable" in normalized
+        assert "source proves it belongs to the sink-reaching request envelope" in normalized
+        assert "server accepts it without an intermediate request" in normalized
+        assert "exact additional field contract" in normalized
+        assert (
+            "normal presentation that renders the complete request envelope"
+            in normalized
+        )
+        assert (
+            "client-side step or document transition that the proof will not execute"
+            in normalized
+        )
+        assert "DefaultFormFactory" not in normalized
+        assert "sequoia" not in normalized
+
+
 def test_semantic_setup_prompts_ground_names_but_allow_verified_dynamic_values():
     agent = DeveloperAgent(model="test-model")
 
@@ -477,3 +576,19 @@ def test_followup_prompt_makes_parent_validation_authoritative() -> None:
     assert "must not say or imply" in prompt
     assert "parent-owned receipt" in prompt
     assert "SQUADRONE_RESULT" in prompt
+
+
+def test_followup_prompt_classifies_fail_closed_missing_prerequisite_by_root_cause():
+    prompt = " ".join(DeveloperAgent(model="test-model").setup_followup_prompt.split())
+
+    assert "Classify the root cause before the final surface symptom" in prompt
+    assert "A traceback or an absent exploit request does not by itself" in prompt
+    assert "authoritative setup feedback shows a setup-owned" in prompt
+    assert "benign prerequisite is absent, uncommitted, or rejected" in prompt
+    assert "failure remains setup-shaped" in prompt
+    assert "Source can ground which prerequisite is required" in prompt
+    assert "it does not prove runtime absence" in prompt
+    assert "This precedence requires runner execution feedback" in prompt
+    assert "do not relabel the root cause as `poc_code`" in prompt
+    assert "required benign setup is already established" in prompt
+    assert "do not override the setup-shaped fail-closed case" in prompt

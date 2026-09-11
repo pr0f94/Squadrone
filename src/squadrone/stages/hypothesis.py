@@ -22,6 +22,7 @@ from ..agents._specialist_base import (
     _requires_authentication_alternate_path_audit,
     _requires_dynamic_key_trace,
     _requires_variable_php_include_trace,
+    _specialist_finalisation_policy,
     _specialist_iteration_limits,
 )
 from ..agents.prompts_io import load_prompt
@@ -68,6 +69,10 @@ def _batch_input_fingerprint(
         reviewer,
         targets,
     )
+    (
+        force_finalise_allowed_tools,
+        force_finalise_allowed_tool_calls,
+    ) = _specialist_finalisation_policy(reviewer, targets)
     execution_policy = {
         "batch_policy_version": _REVIEW_BATCH_POLICY_VERSION,
         "review_batch_max_items": _review_batch_max_items(reviewer),
@@ -77,6 +82,15 @@ def _batch_input_fingerprint(
         "max_iterations": max_iterations,
         "force_finalise_after": force_finalise_after,
     }
+    if force_finalise_allowed_tools is not None:
+        execution_policy.update(
+            {
+                "force_finalise_allowed_tools": sorted(force_finalise_allowed_tools),
+                "force_finalise_allowed_tool_calls": (
+                    force_finalise_allowed_tool_calls
+                ),
+            }
+        )
     if reviewer == "authentication":
         execution_policy["authentication_state_batches"] = "isolated"
     review_policy_parts = [

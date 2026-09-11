@@ -31,6 +31,7 @@ from squadrone.agents._specialist_base import (
     _merge_alternate_path_reviews,
     _requires_authentication_alternate_path_audit,
     _requires_dynamic_key_trace,
+    _specialist_finalisation_policy,
     run_specialist,
 )
 from squadrone.agents.plugin_tools import PluginToolHandlers
@@ -168,6 +169,94 @@ def test_injection_prompt_traces_read_streams_to_responses():
     assert "attacker-visible response sink" in prompt
 
 
+def test_xss_prompt_audits_core_custom_field_writers_narrowly():
+    prompt = " ".join(load_prompt("specialists/xss_lifecycle").split())
+    idioms = " ".join(load_prompt("_wp_idioms").split())
+
+    assert "fixed post-meta key" in prompt
+    assert "post ID selected through a shortcode attribute" in prompt
+    assert "accepted type and object domain" in prompt
+    assert "Do not stop at the plugin's intended save handler" in prompt
+    assert "post-editor Custom Fields paths" in prompt
+    assert "`add_meta()` and `wp_ajax_add_meta()`" in prompt
+    assert "machine-readable `entry_point` `wp_ajax_add-meta`" in prompt
+    assert "its route is `POST /wp-admin/admin-ajax.php`" in prompt
+    for field in (
+        "`action=add-meta`",
+        "`post_id`",
+        "`metakeyinput`",
+        "`metavalue`",
+        "`_ajax_nonce-add-meta`",
+    ):
+        assert field in prompt
+    assert "`POST form field metavalue`" in prompt
+    assert "edit the exact selected target post" in prompt
+    assert "normally reachable Custom Fields form available to" in prompt
+    assert "nonce-providing form need not belong to" in prompt
+    assert "authenticated-AJAX boundary" in prompt
+    assert "exact `add_post_meta` capability" in prompt
+    assert "need not appear in the plugin tree" in prompt
+    assert "For this supplied core-writer path only" in prompt
+    assert "without a plugin `relative/file:line` for the writer" in prompt
+    assert "do not invent a plugin expression for core" in prompt
+    assert "still cite the plugin-read lines" in prompt
+    assert "does not apply to plugin-defined or other external writers" in prompt
+    assert "exact lowest role" in prompt
+    assert "post type and status, object ownership, edit capability" in prompt
+    assert "key publicness under `is_protected_meta()`" in prompt
+    assert "ID source and type conversion" in prompt
+    assert "final output context" in prompt
+    assert "can bypass it" in prompt
+    assert "never infer that every `get_post_meta()` read is attacker-writable" in prompt
+
+    assert "Core Custom Fields post-meta writers" in idioms
+    assert "rejects `is_protected_meta()` keys" in idioms
+    assert "does not apply a generic text sanitizer or post-content KSES" in idioms
+    assert "Metadata storage still invokes `sanitize_meta()`" in idioms
+    assert "authenticated `wp_ajax_add-meta` dispatch" in idioms
+    assert "`POST /wp-admin/admin-ajax.php`" in idioms
+    assert "requires `edit_post` on that exact object" in idioms
+    assert "nonce is emitted by the post editor's Custom Fields form" in idioms
+    assert "edit the exact selected target post" in idioms
+    assert "normally reachable Custom Fields form available to" in idioms
+    assert "nonce-providing form need not belong to" in idioms
+    assert "Do not fabricate one" in idioms
+    assert "does not waive source grounding" in idioms
+    assert "This is not proof that every post-meta read is attacker-writable" in idioms
+    assert "same object" in idioms
+    assert "Save-time KSES" in idioms
+
+
+def test_critic_preserves_exact_public_post_meta_xss_writer_contract():
+    prompt = " ".join(load_prompt("critic").split())
+
+    assert "fixed post-meta key from an attacker-selectable" in prompt
+    assert "insufficiently type-constrained post ID" in prompt
+    assert "sanitized save handler as the only possible writer" in prompt
+    assert "verified core Custom Fields contract" in prompt
+    assert "applies no generic text sanitizer or post-content KSES" in prompt
+    assert "Do not require these core functions to appear in the plugin source" in prompt
+    assert "machine-readable `entry_point` `wp_ajax_add-meta`" in prompt
+    assert "its route is `POST /wp-admin/admin-ajax.php`" in prompt
+    assert "POST form fields `action=add-meta`, `post_id`, `metakeyinput`" in prompt
+    assert "edit the exact selected target post" in prompt
+    assert "normally reachable Custom Fields form available to" in prompt
+    assert "nonce-providing form need not belong to" in prompt
+    assert "authenticated AJAX, the nonce check, `edit_post`" in prompt
+    assert "Anchor the fixed meta read, shortcode expansion" in prompt
+    assert "For this core-writer path only" in prompt
+    assert "without a plugin `relative/file:line` for the writer" in prompt
+    assert "do not demand or invent a plugin expression for core" in prompt
+    assert "exception does not cover a plugin-defined or other external writer" in prompt
+    assert "ID source and accepted type/conversion" in prompt
+    assert "selected post type/status and ownership" in prompt
+    assert "key publicness, value transformation, victim route" in prompt
+    assert "final output context" in prompt
+    assert "numeric cast alone does not bind" in prompt
+    assert "does not automatically cover HTML generated later by a shortcode" in prompt
+    assert "do not infer writability from a metadata read alone" in prompt
+
+
 def test_injection_prompt_traces_implicit_metadata_deserialization_narrowly():
     prompt = " ".join(load_prompt("specialists/injection_files").split())
     idioms = " ".join(load_prompt("_wp_idioms").split())
@@ -181,6 +270,42 @@ def test_injection_prompt_traces_implicit_metadata_deserialization_narrowly():
     assert "before exploring unrelated tables, migrations, or gadget code" in prompt
     assert "every realistic external assignment" in prompt
     assert "current and legacy public handlers coexist" in prompt
+    assert "serialization rejection is applied only to a fixed set" in prompt
+    assert "every externally assignable field" in prompt
+    assert "proving that its handler independently accepts it" in prompt
+    assert "external field, metadata type, object ID, key, later access" in prompt
+    assert "batch's reachable handlers and adapters" in prompt
+    assert "Do not expand the inventory to unrelated models" in prompt
+    assert "separate hypothesis for each independently proven tuple" in prompt
+    assert "source-grounded reachability rather than discovery order" in prompt
+    assert "fewest runtime assumptions" in prompt
+    assert "re-emits that exact property and tuple" in prompt
+    assert "evidence for one model property" in prompt
+    assert "Deduplicate only after this distinct-path inventory" in prompt
+    assert "Order emitted hypotheses from strongest to weakest" in prompt
+    assert "final tie-break among otherwise equally ranked candidates" in prompt
+    assert "Do not inflate a hypothesis's confidence" in prompt
+    assert "bind one exact request encoding and external wire field" in prompt
+    assert "Do not merge JSON and form ingress" in prompt
+    assert "UI label, JSON/DTO property, model property, or metadata key" in prompt
+    assert "source statement that reads or maps that exact field" in prompt
+    assert "carry every rename through `taint_path`" in prompt
+    assert "one completely traced path substitute" in prompt
+    assert "Complete that inventory before returning `candidate`" in prompt
+    assert "return `unreviewed` for the assigned item" in prompt
+    assert "specific remaining branches" in prompt
+    assert "truncated broad search result is not a completed inventory" in prompt
+    assert "one last `read_plugin_ranges` call" in prompt
+    assert "bounded evidence-grounding allowance" in prompt
+    assert "exact, already-located source windows" in prompt
+    assert "do not guess locations or begin a new broad search" in prompt
+    assert "complete source contract is established" in prompt
+    assert "Inventory direct high-level metadata reads as well as updates" in prompt
+    assert "same-request raw-write-to-read path" in prompt
+    assert "Fixed model-defined metadata keys and server-generated object IDs" in prompt
+    assert "stable standard WordPress hook and form-field transport" in prompt
+    assert "runtime-generated query signatures, tokens, or request URLs" in prompt
+    assert "proof-completeness ordering rule" in prompt
     assert "not an explicit PHP-serialization rejection" in prompt
     assert "exact transformation makes `is_serialized()` false" in prompt
     assert "classes with `__wakeup`, `__unserialize`, `__destruct`" in prompt
@@ -190,6 +315,11 @@ def test_injection_prompt_traces_implicit_metadata_deserialization_narrowly():
     assert "`evidence_summary.usable_gadget`" in prompt
     assert "verifier-owned canary class" in prompt
     assert "during `update_metadata()` processing" in prompt
+    assert "direct `get_metadata()` call" in prompt
+    assert "exact direct `get_metadata()` call" in prompt
+    assert "object-specific wrapper in the taint path" in prompt
+    assert "filters do not return a non-null short-circuit value" in prompt
+    assert "previously populated metadata cache" in prompt
     assert "WordPress core is intentionally outside" in prompt
     assert "`$prev_value` can be empty" in prompt
     assert "usable gadget chain" in prompt
@@ -197,6 +327,10 @@ def test_injection_prompt_traces_implicit_metadata_deserialization_narrowly():
     assert "tuple mismatch between the raw write and later access" in prompt
     assert "implicit deserialization boundary" in idioms
     assert "when `$prev_value` is empty" in idioms
+    assert "non-empty-key `get_metadata()` read" in idioms
+    assert "single-value and list branches" in idioms
+    assert "filter short-circuits that cache/key branch" in idioms
+    assert "already-populated metadata cache stale" in idioms
     assert "calls unrestricted `unserialize()`" in idioms
     assert "does not require a WordPress-core file" in idioms
     assert "definitely non-empty `$prev_value`" in idioms
@@ -221,6 +355,37 @@ def test_shared_rules_expose_unreviewed_for_incomplete_forced_finalization():
     assert "Continue its concrete proof gaps and check alternate callers" in prompt
 
 
+def test_shared_prompt_requires_machine_readable_transport_and_exact_wire_source():
+    prompt = " ".join(load_prompt("specialists/_shared_rules").split())
+
+    assert "machine-readable transport seed, not prose" in prompt
+    assert "METHOD /origin-relative/path" in prompt
+    assert "optionally followed by one or more source-proven fixed dispatch" in prompt
+    assert "?mode=submit&view=public" in prompt
+    assert "Do not invent a query pair for a queryless route" in prompt
+    for hook in (
+        "wp_ajax_nopriv_ACTION",
+        "wp_ajax_ACTION",
+        "admin_post_nopriv_ACTION",
+        "admin_post_ACTION",
+    ):
+        assert hook in prompt
+    assert "Preserve the leading `/`" in prompt
+    assert "POST form field <name>" in prompt
+    assert "multipart file field <name>" in prompt
+    assert "query parameter <name>" in prompt
+    assert "JSON field <name>" in prompt
+    assert "path parameter <name>" in prompt
+    assert "header <name>" in prompt
+    assert "cookie <name>" in prompt
+    assert "unnamed raw or XML body" in prompt
+    assert "key when applicable" in prompt
+    assert "verbatim source expression" in prompt
+    assert "source-read result (`read_plugin_file` or `read_plugin_ranges`)" in prompt
+    assert "alternatives such as `JSON or form`" in prompt
+    assert "Record every proven rename in `taint_path`" in prompt
+
+
 def test_critic_applies_verified_implicit_metadata_contract():
     prompt = " ".join(load_prompt("critic").split())
 
@@ -229,6 +394,19 @@ def test_critic_applies_verified_implicit_metadata_contract():
     assert "Do not require a WordPress core file" in prompt
     assert "fixed key or server-generated object ID binds the record" in prompt
     assert "definitely non-empty `$prev_value`" in prompt
+    assert "non-empty-key `get_metadata()` call" in prompt
+    assert "exact direct `get_metadata()` call" in prompt
+    assert "does not disprove a separate reachable direct read" in prompt
+    assert "non-null `get_{$meta_type}_metadata` filter result" in prompt
+    assert "populated metadata cache does not hide" in prompt
+    assert "one machine-readable, source-bound transport rather than prose" in prompt
+    assert "one exact wire location and external field" in prompt
+    assert "Do not normalize these immutable fields during triage" in prompt
+    assert "runtime-generated query signatures, tokens, or a request URL" in prompt
+    assert "not itself a reason for rejection or manual review" in prompt
+    assert "do not ask the critic to predict runner support" in prompt
+    assert "automatic verification must fail closed" in prompt
+    assert "stable standard WordPress hook and form-field path" in prompt
     assert "trusted taxonomy evidence contract" in prompt
     assert "exact JSON type and value" in prompt
     assert "do not preserve or copy a specialist assertion" in prompt
@@ -236,6 +414,29 @@ def test_critic_applies_verified_implicit_metadata_contract():
     assert "manual_review_only" in prompt
     assert "CWE-502" not in prompt
     assert "evidence_summary.usable_gadget" not in prompt
+
+
+def test_critic_keeps_the_strongest_implicit_deserialization_representative():
+    prompt = " ".join(load_prompt("critic").split())
+
+    assert (
+        "independently compare each external field and raw-write metadata tuple"
+        in prompt
+    )
+    assert (
+        "common sink does not make their insert-to-access lifecycles interchangeable"
+        in prompt
+    )
+    assert "shortest source-proven same-workflow transition" in prompt
+    assert "fewest runtime assumptions" in prompt
+    assert (
+        "Never keep a weaker representative merely because it was listed first"
+        in prompt
+    )
+    assert (
+        "handler, tuple lifecycle, preconditions, boundary, or outcome differs"
+        in prompt
+    )
 
 
 def test_critic_renders_exact_cwe502_contract_only_for_matching_candidates():
@@ -1336,6 +1537,179 @@ async def test_dynamic_write_runtime_limits_are_authorization_specific(
         captured["max_iterations"],
         captured["force_finalise_after"],
     ) == expected_limits
+    assert captured["force_finalise_allowed_tools"] == (
+        {"read_plugin_ranges"} if reviewer == "xss_lifecycle" else None
+    )
+    assert captured["force_finalise_allowed_tool_calls"] == 1
+
+
+def test_implicit_finalisation_read_policy_only_invalidates_implicit_batches(
+    monkeypatch,
+):
+    implicit = CoverageItem(
+        id="implicit",
+        kind="sink",
+        review_areas=["injection_files"],
+        type="implicit_deserialization",
+        name="update_metadata",
+        file="demo.php",
+        line=2,
+        snippet="update_metadata('post', $id, 'payload', $value);",
+    )
+    ordinary = implicit.model_copy(
+        update={"id": "ordinary", "type": "sql_query", "name": "query"}
+    )
+    recon = _recon()
+    implicit_before = _batch_input_fingerprint(
+        recon,
+        [implicit],
+        "injection_files",
+    )
+    ordinary_before = _batch_input_fingerprint(
+        recon,
+        [ordinary],
+        "injection_files",
+    )
+
+    monkeypatch.setattr(
+        specialist_base,
+        "_IMPLICIT_DESERIALIZATION_FINALISATION_TOOL_CALLS",
+        specialist_base._IMPLICIT_DESERIALIZATION_FINALISATION_TOOL_CALLS + 1,
+    )
+
+    assert (
+        _batch_input_fingerprint(recon, [implicit], "injection_files")
+        != implicit_before
+    )
+    assert (
+        _batch_input_fingerprint(recon, [ordinary], "injection_files")
+        == ordinary_before
+    )
+
+
+def test_xss_storage_finalisation_policy_is_reviewer_and_kind_specific():
+    storage_write = CoverageItem(
+        id="xss-storage",
+        kind="storage_write",
+        review_areas=["xss_lifecycle"],
+        type="option_write",
+        name="update_option",
+        file="demo.php",
+        line=2,
+        snippet="update_option('message', $value);",
+    )
+    entry_point = storage_write.model_copy(
+        update={
+            "id": "xss-entry",
+            "kind": "entry_point",
+            "type": "ajax_nopriv",
+            "name": "wp_ajax_nopriv_save_message",
+        }
+    )
+    dom_sink = storage_write.model_copy(
+        update={
+            "id": "xss-dom",
+            "kind": "sink",
+            "type": "dom_html",
+            "name": "innerHTML",
+        }
+    )
+
+    assert _specialist_finalisation_policy(
+        "xss_lifecycle",
+        [entry_point, storage_write],
+    ) == ({"read_plugin_ranges"}, 1)
+    assert _specialist_finalisation_policy(
+        "xss_lifecycle",
+        [entry_point],
+    ) == (None, 1)
+    assert _specialist_finalisation_policy(
+        "xss_lifecycle",
+        [dom_sink],
+    ) == (None, 1)
+    assert _specialist_finalisation_policy(
+        "injection_files",
+        [storage_write],
+    ) == (None, 1)
+
+
+def test_xss_storage_policy_only_invalidates_xss_storage_checkpoints(monkeypatch):
+    storage_write = CoverageItem(
+        id="storage",
+        kind="storage_write",
+        review_areas=["xss_lifecycle"],
+        type="option_write",
+        name="update_option",
+        file="demo.php",
+        line=2,
+        snippet="update_option('message', $value);",
+    )
+    entry_point = storage_write.model_copy(
+        update={
+            "id": "entry",
+            "kind": "entry_point",
+            "type": "ajax_nopriv",
+            "name": "wp_ajax_nopriv_save_message",
+        }
+    )
+    dom_sink = storage_write.model_copy(
+        update={
+            "id": "dom",
+            "kind": "sink",
+            "type": "dom_html",
+            "name": "innerHTML",
+        }
+    )
+    implicit = storage_write.model_copy(
+        update={
+            "id": "implicit",
+            "kind": "sink",
+            "review_areas": ["injection_files"],
+            "type": "implicit_deserialization",
+            "name": "update_metadata",
+        }
+    )
+    recon = _recon()
+    checkpoints = {
+        "xss_storage": _batch_input_fingerprint(
+            recon, [storage_write], "xss_lifecycle"
+        ),
+        "xss_entry": _batch_input_fingerprint(recon, [entry_point], "xss_lifecycle"),
+        "xss_dom": _batch_input_fingerprint(recon, [dom_sink], "xss_lifecycle"),
+        "other_reviewer_storage": _batch_input_fingerprint(
+            recon, [storage_write], "injection_files"
+        ),
+        "implicit": _batch_input_fingerprint(
+            recon, [implicit], "injection_files"
+        ),
+    }
+
+    monkeypatch.setattr(
+        specialist_base,
+        "_XSS_STORAGE_FINALISATION_TOOL_CALLS",
+        specialist_base._XSS_STORAGE_FINALISATION_TOOL_CALLS + 1,
+    )
+
+    assert (
+        _batch_input_fingerprint(recon, [storage_write], "xss_lifecycle")
+        != checkpoints["xss_storage"]
+    )
+    assert (
+        _batch_input_fingerprint(recon, [entry_point], "xss_lifecycle")
+        == checkpoints["xss_entry"]
+    )
+    assert (
+        _batch_input_fingerprint(recon, [dom_sink], "xss_lifecycle")
+        == checkpoints["xss_dom"]
+    )
+    assert (
+        _batch_input_fingerprint(recon, [storage_write], "injection_files")
+        == checkpoints["other_reviewer_storage"]
+    )
+    assert (
+        _batch_input_fingerprint(recon, [implicit], "injection_files")
+        == checkpoints["implicit"]
+    )
 
 
 @pytest.mark.asyncio
@@ -1385,6 +1759,10 @@ async def test_implicit_deserialization_runtime_limits_are_batch_specific(
         captured["max_iterations"],
         captured["force_finalise_after"],
     ) == expected_limits
+    assert captured["force_finalise_allowed_tools"] == (
+        {"read_plugin_ranges"} if target_type == "implicit_deserialization" else None
+    )
+    assert captured["force_finalise_allowed_tool_calls"] == 1
 
 
 @pytest.mark.asyncio
