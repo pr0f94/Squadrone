@@ -111,7 +111,7 @@ class _Developer:
 
 
 def _config(iterations: int) -> PipelineConfig:
-    config = PipelineConfig.from_yaml("pipelines/test.yaml")
+    config = PipelineConfig.from_yaml("tests/fixtures/pipeline.yaml")
     config.verify_max_iterations = iterations
     config.verify.state_introspection_on_failure = False
     config.report.screenshot_capture = False

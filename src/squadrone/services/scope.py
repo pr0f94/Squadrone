@@ -27,6 +27,26 @@ _QUALIFYING_AUTHZ_OUTCOME = re.compile(
     re.IGNORECASE,
 )
 
+_PATCHSTACK_MINOR_OBJECT = re.compile(
+    r"(?<![A-Za-z0-9])"
+    r"(?:attachments?|tickets?|events?|orders?|appointments?|pii[ _-]+alone)"
+    r"(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+
+_CACHE_MAINTENANCE_ACTION = re.compile(
+    r"(?<![A-Za-z0-9])"
+    r"(?:clear(?:s|ed|ing)?|flush(?:es|ed|ing)?|purg(?:e|es|ed|ing)|"
+    r"reset(?:s|ting)?|invalidat(?:e|es|ed|ing|ion)|"
+    r"delet(?:e|es|ed|ing|ion))"
+    r"(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+_CACHE_MAINTENANCE_OBJECT = re.compile(
+    r"(?<![A-Za-z0-9])(?:cach(?:e|es|ed|ing)|transients?)(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+
 
 def _impact_text(hypothesis: Hypothesis) -> str:
     return " ".join(
@@ -47,6 +67,21 @@ def _has_usable_gadget(hypothesis: Hypothesis, impact: str) -> bool:
     return (
         re.search(r"gadget|code execution|file (?:write|delete)", impact, re.I)
         is not None
+    )
+
+
+def _is_minor_cache_maintenance(hypothesis: Hypothesis, impact: str) -> bool:
+    outcome = hypothesis.security_outcome
+    if (
+        outcome.confidentiality != "none"
+        or outcome.integrity == "high"
+        or outcome.availability == "high"
+    ):
+        return False
+    return any(
+        _CACHE_MAINTENANCE_ACTION.search(clause)
+        and _CACHE_MAINTENANCE_OBJECT.search(clause)
+        for clause in re.split(r"[.!?;\n]", impact)
     )
 
 
@@ -106,8 +141,8 @@ def preverification_programs(
         r"internal|metadata|secret|credential|protected|write|change", impact, re.I
     ):
         patchstack_ok = False
-    elif patchstack_policy == "significant_object" and re.search(
-        r"attachment|ticket|event|order|appointment|pii alone", impact, re.I
+    elif patchstack_policy == "significant_object" and _PATCHSTACK_MINOR_OBJECT.search(
+        impact
     ):
         patchstack_ok = False
     elif (
@@ -115,6 +150,12 @@ def preverification_programs(
         and not _QUALIFYING_AUTHZ_OUTCOME.search(impact)
     ):
         patchstack_ok = False
+    if patchstack_ok and _is_minor_cache_maintenance(hypothesis, impact):
+        patchstack_ok = False
+        reasons["patchstack"] = (
+            "cache clearing or invalidation with only minor regenerable-state "
+            "impact is explicitly excluded"
+        )
     if patchstack_ok:
         programs.append("patchstack")
     else:

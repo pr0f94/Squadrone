@@ -327,7 +327,7 @@ def _full_compromise_upload_hypothesis(entry_point: str) -> Hypothesis:
 async def test_ambiguous_full_compromise_source_stops_before_sandbox(
     tmp_path: Path,
 ) -> None:
-    config = PipelineConfig.from_yaml("pipelines/test.yaml")
+    config = PipelineConfig.from_yaml("tests/fixtures/pipeline.yaml")
 
     with pytest.raises(
         RuntimeError,

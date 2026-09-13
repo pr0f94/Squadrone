@@ -53,7 +53,11 @@ _REVIEW_BATCH_MAX_BYTES = 60_000
 _REVIEW_BATCH_MAX_FILES = 6
 _REVIEW_BATCH_MAX_WINDOWS = 6
 _REVIEW_BATCH_WINDOW_LINES = 250
-_REVIEW_BATCH_ATTEMPTS = 2
+# Two narrowing passes after the normal retry prevent one incomplete disposition
+# from discarding every earlier crash-safe checkpoint in a large scan. Each pass
+# receives only the items that remain unresolved, so the last pass is isolated
+# when a batch has narrowed to a single difficult path.
+_REVIEW_BATCH_ATTEMPTS = 4
 _REVIEW_CHECKPOINT_VERSION = 5
 _REVIEW_BATCH_POLICY_VERSION = 2
 _REVIEWABLE_SUPPORT = {"active", "partial", "review_only"}
@@ -414,6 +418,94 @@ def _retry_progress_context(
     return context
 
 
+def _terminal_unreviewed_dispositions(
+    result: SpecialistReviewArtifact,
+    targets: list[CoverageItem],
+    reviewer: ReviewArea,
+) -> list[CoverageDisposition]:
+    """Create truthful runner-owned gaps after every bounded review was used."""
+    target_ids = {target.id for target in targets}
+    last_progress: dict[str, CoverageDisposition] = {}
+    duplicate_ids: set[str] = set()
+    for disposition in result.coverage:
+        if (
+            disposition.item_id not in target_ids
+            or disposition.reviewer != reviewer
+            or disposition.status != "unreviewed"
+        ):
+            continue
+        if disposition.item_id in last_progress:
+            duplicate_ids.add(disposition.item_id)
+            continue
+        last_progress[disposition.item_id] = disposition
+    for item_id in duplicate_ids:
+        last_progress.pop(item_id, None)
+
+    terminal: list[CoverageDisposition] = []
+    for target in targets:
+        progress = last_progress.get(target.id)
+        target_location = f"{target.file}:{target.line}"
+        progress_reason = progress.reason[:2_000] if progress is not None else ""
+        reason = (
+            f"Review remained incomplete after {_REVIEW_BATCH_ATTEMPTS} bounded "
+            "attempts; this item is explicitly not treated as reviewed or as a "
+            "candidate."
+        )
+        if progress_reason:
+            reason = f"{reason} Last specialist progress: {progress_reason}"
+        evidence_locations = list(progress.evidence_locations[:24]) if progress else []
+        if target_location not in evidence_locations:
+            evidence_locations.insert(0, target_location)
+        terminal.append(
+            CoverageDisposition(
+                item_id=target.id,
+                reviewer=reviewer,
+                status="unreviewed",
+                reason=reason,
+                evidence_locations=evidence_locations,
+                hypothesis_ids=[],
+            )
+        )
+    return terminal
+
+
+def _is_reusable_exhausted_checkpoint(
+    checkpoint: SpecialistReviewArtifact,
+    targets: list[CoverageItem],
+    reviewer: ReviewArea,
+    unresolved: list[CoverageItem],
+) -> bool:
+    """Validate the runner-owned terminal-gap envelope before skipping work."""
+    if (
+        checkpoint.checkpoint_status != "exhausted"
+        or checkpoint.attempt_limit != _REVIEW_BATCH_ATTEMPTS
+        or checkpoint.attempts_completed != checkpoint.attempt_limit
+    ):
+        return False
+    target_by_id = {target.id: target for target in targets}
+    coverage_ids = [disposition.item_id for disposition in checkpoint.coverage]
+    if (
+        len(coverage_ids) != len(set(coverage_ids))
+        or set(coverage_ids) != set(target_by_id)
+    ):
+        return False
+    unresolved_ids = {target.id for target in unresolved}
+    if not unresolved_ids or unresolved_ids != set(checkpoint.unresolved_item_ids):
+        return False
+    by_id = {disposition.item_id: disposition for disposition in checkpoint.coverage}
+    for item_id in unresolved_ids:
+        disposition = by_id[item_id]
+        target = target_by_id[item_id]
+        if (
+            disposition.reviewer != reviewer
+            or disposition.status != "unreviewed"
+            or disposition.hypothesis_ids
+            or f"{target.file}:{target.line}" not in disposition.evidence_locations
+        ):
+            return False
+    return True
+
+
 def _canonicalize_batch_hypotheses(
     hypotheses: list[Hypothesis],
     reviewer: ReviewArea,
@@ -584,17 +676,26 @@ async def run(
                     _reconcile_batch_coverage(cached, batch_targets, spec.NAME)
                 )
                 cached_ids = {item.item_id for item in cached_dispositions}
+                reusable_exhausted = _is_reusable_exhausted_checkpoint(
+                    cached,
+                    batch_targets,
+                    spec.NAME,
+                    cached_unresolved,
+                )
                 if (
                     cached.input_fingerprint == input_fingerprint
-                    and not cached_unresolved
-                    and cached_ids == target_ids
+                    and (
+                        (not cached_unresolved and cached_ids == target_ids)
+                        or reusable_exhausted
+                    )
                     and cached_hypothesis_ids == {item.id for item in cached.hypotheses}
                 ):
                     logger.info(
-                        "specialist %s: loaded batch %d/%d checkpoint",
+                        "specialist %s: loaded batch %d/%d %s checkpoint",
                         spec.NAME,
                         batch_number,
                         len(batches),
+                        cached.checkpoint_status,
                     )
                     specialist_hypotheses.extend(cached.hypotheses)
                     specialist_dispositions.extend(cached.coverage)
@@ -604,7 +705,10 @@ async def run(
             batch_hypotheses: list[Hypothesis] = []
             batch_dispositions: dict[str, CoverageDisposition] = {}
             retry_progress: list[dict[str, Any]] = []
+            attempts_completed = 0
+            last_result: SpecialistReviewArtifact | None = None
             for attempt in range(1, _REVIEW_BATCH_ATTEMPTS + 1):
+                attempts_completed = attempt
                 attempt_id = batch_id if attempt == 1 else f"{batch_id}-retry"
                 priority_files = sorted({item.file for item in unresolved})
                 logger.info(
@@ -637,6 +741,7 @@ async def run(
                         exc,
                     )
                     raise
+                last_result = result
                 accepted, unresolved, accepted_hypothesis_ids = (
                     _reconcile_batch_coverage(
                         result,
@@ -699,17 +804,50 @@ async def run(
                     spec.NAME,
                 )
 
-            if unresolved:
-                unresolved_ids = ", ".join(item.id for item in unresolved)
-                raise ValueError(
-                    f"specialist {spec.NAME} batch {batch_id} left evidence-unreviewed "
-                    f"coverage items after retry: {unresolved_ids}"
+            exhausted_targets = list(unresolved)
+            if exhausted_targets:
+                assert last_result is not None
+                terminal = _terminal_unreviewed_dispositions(
+                    last_result,
+                    exhausted_targets,
+                    spec.NAME,
+                )
+                batch_dispositions.update({item.item_id: item for item in terminal})
+                unresolved_ids = [item.id for item in exhausted_targets]
+                logger.warning(
+                    "specialist %s batch %s exhausted %d attempts; preserving "
+                    "unreviewed coverage gaps: %s",
+                    spec.NAME,
+                    batch_id,
+                    attempts_completed,
+                    ", ".join(unresolved_ids),
+                )
+                append_decision(
+                    spec_dir,
+                    stage="hypothesis",
+                    action="review_attempts_exhausted",
+                    result="unreviewed_preserved",
+                    reason=(
+                        "Bounded specialist review could not establish a complete "
+                        "source-grounded disposition; items remain explicitly unreviewed."
+                    ),
+                    details={
+                        "reviewer": spec.NAME,
+                        "batch_id": batch_id,
+                        "attempts_completed": attempts_completed,
+                        "attempt_limit": _REVIEW_BATCH_ATTEMPTS,
+                        "unresolved_item_ids": unresolved_ids,
+                    },
                 )
 
             batch_result = SpecialistReviewArtifact(
                 hypotheses=batch_hypotheses,
                 coverage=[batch_dispositions[item.id] for item in batch_targets],
                 input_fingerprint=input_fingerprint,
+                checkpoint_status="exhausted" if exhausted_targets else "complete",
+                attempts_completed=attempts_completed,
+                attempt_limit=_REVIEW_BATCH_ATTEMPTS,
+                unresolved_item_ids=[item.id for item in exhausted_targets],
             )
             atomic_write_json(checkpoint, batch_result.model_dump(mode="json"))
             specialist_hypotheses.extend(batch_result.hypotheses)

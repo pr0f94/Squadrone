@@ -80,6 +80,27 @@ def test_concurrent_add_preserves_total():
     assert bt.spent == pytest.approx(0.024)
 
 
+def test_cost_report_restores_calls_and_cumulative_ceiling(tmp_path):
+    first = BudgetTracker(ceiling_usd=0.02)
+    asyncio.run(first.add(_usage(1000, 1000), "some-unknown-model", agent="reviewer"))
+    first.set_stage("hypothesis")
+    asyncio.run(first.add(_usage(100, 100), "some-unknown-model", agent="verifier"))
+    first.write_cost_report(tmp_path)
+
+    resumed = BudgetTracker(ceiling_usd=0.02)
+    assert resumed.restore_cost_report(tmp_path) == 2
+    assert resumed.spent == pytest.approx(first.spent, abs=1e-6)
+    assert resumed.input_tokens == first.input_tokens
+    assert resumed.output_tokens == first.output_tokens
+    assert [record.agent for record in resumed.calls] == ["reviewer", "verifier"]
+
+    with pytest.raises(BudgetExceededError):
+        asyncio.run(resumed.reserve("some-unknown-model", 1000, 1000))
+
+    resumed.write_cost_report(tmp_path)
+    assert len((tmp_path / "cost_calls.tsv").read_text().splitlines()) == 3
+
+
 @pytest.mark.asyncio
 async def test_llm_budget_is_rejected_before_provider_dispatch(monkeypatch, tmp_path):
     cache_db = str(tmp_path / "llm.sqlite")

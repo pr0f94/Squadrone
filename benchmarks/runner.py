@@ -221,7 +221,7 @@ def _compute_metrics(variants: list[VariantResult], corpus: list[CorpusEntry]) -
 async def run_benchmark(
     corpus_path: str,
     split: str = "train",
-    config_path: str = "pipelines/default.yaml",
+    config_path: str = "pipelines/chatgpt.yaml",
     budget_override: Optional[float] = None,
 ) -> BenchmarkResult:
     corpus_data = json.loads(Path(corpus_path).read_text())

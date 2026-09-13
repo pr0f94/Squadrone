@@ -1,0 +1,302 @@
+<?php
+/**
+ * Squadrone sandbox actor receipt.
+ *
+ * This file is rendered with per-sandbox hex values and installed as a
+ * must-use plugin. It deliberately has no observable effect unless the
+ * request presents the exact trace token for that sandbox.
+ */
+
+if (! defined('ABSPATH')) {
+    return;
+}
+
+try {
+    (static function () {
+        $trace_token = '{{ trace_token }}';
+        $receipt_secret_hex = '{{ receipt_secret }}';
+        $php_object_canary_class = '{{ php_object_canary_class }}';
+
+        if (
+            $trace_token === ''
+            || (strlen($trace_token) % 2) !== 0
+            || preg_match('/\A[0-9a-fA-F]+\z/D', $trace_token) !== 1
+        ) {
+            return;
+        }
+
+        $request_trace_token = isset($_SERVER['HTTP_X_SQUADRONE_TRACE_TOKEN'])
+            && is_string($_SERVER['HTTP_X_SQUADRONE_TRACE_TOKEN'])
+            ? $_SERVER['HTTP_X_SQUADRONE_TRACE_TOKEN']
+            : '';
+
+        if (! hash_equals($trace_token, $request_trace_token)) {
+            return;
+        }
+
+        $request_nonce = isset($_SERVER['HTTP_X_SQUADRONE_REQUEST_NONCE'])
+            && is_string($_SERVER['HTTP_X_SQUADRONE_REQUEST_NONCE'])
+            ? $_SERVER['HTTP_X_SQUADRONE_REQUEST_NONCE']
+            : '';
+        $request_digest = isset($_SERVER['HTTP_X_SQUADRONE_REQUEST_DIGEST'])
+            && is_string($_SERVER['HTTP_X_SQUADRONE_REQUEST_DIGEST'])
+            ? $_SERVER['HTTP_X_SQUADRONE_REQUEST_DIGEST']
+            : '';
+        $request_binding = isset($_SERVER['HTTP_X_SQUADRONE_REQUEST_BINDING'])
+            && is_string($_SERVER['HTTP_X_SQUADRONE_REQUEST_BINDING'])
+            ? $_SERVER['HTTP_X_SQUADRONE_REQUEST_BINDING']
+            : '';
+        if (
+            preg_match('/\A[0-9a-f]{64}\z/D', $request_nonce) !== 1
+            || preg_match('/\A[0-9a-f]{64}\z/D', $request_digest) !== 1
+        ) {
+            return;
+        }
+
+        if (
+            $receipt_secret_hex === ''
+            || (strlen($receipt_secret_hex) % 2) !== 0
+            || preg_match('/\A[0-9a-fA-F]+\z/D', $receipt_secret_hex) !== 1
+        ) {
+            return;
+        }
+
+        $receipt_secret = hex2bin($receipt_secret_hex);
+        if ($receipt_secret === false || $receipt_secret === '') {
+            return;
+        }
+
+        $method = isset($_SERVER['REQUEST_METHOD']) && is_string($_SERVER['REQUEST_METHOD'])
+            ? strtoupper($_SERVER['REQUEST_METHOD'])
+            : '';
+        if (
+            $method === ''
+            || strlen($method) > 32
+            || preg_match('/[\x00-\x20\x7f]/', $method) === 1
+        ) {
+            return;
+        }
+
+        $request_uri = isset($_SERVER['REQUEST_URI']) && is_string($_SERVER['REQUEST_URI'])
+            ? $_SERVER['REQUEST_URI']
+            : '';
+        if ($request_uri === '' || strlen($request_uri) > 8192) {
+            return;
+        }
+
+        $binding_valid = false;
+        if (preg_match('/\A[0-9a-f]{64}\z/D', $request_binding) === 1) {
+            $computed_request_binding = hash_hmac(
+                'sha256',
+                "SQUADRONE-REQUEST-BINDING-V1\0"
+                    . $method . "\0"
+                    . $request_uri . "\0"
+                    . $request_nonce . "\0"
+                    . $request_digest,
+                $receipt_secret,
+                false
+            );
+            $binding_valid = is_string($computed_request_binding)
+                && hash_equals($computed_request_binding, $request_binding);
+        }
+
+        $content_type = isset($_SERVER['CONTENT_TYPE'])
+            && is_string($_SERVER['CONTENT_TYPE'])
+            ? trim($_SERVER['CONTENT_TYPE'])
+            : '';
+        $is_multipart = preg_match(
+            '/\Amultipart\/form-data(?:\s*;|\s*\z)/iD',
+            $content_type
+        ) === 1;
+
+        // Only multipart uses the proxy-authenticated raw-body digest because
+        // PHP consumes that body while populating $_FILES. Every other media
+        // type retains independent reconstruction through php://input.
+        if ($is_multipart) {
+            if (! $binding_valid) {
+                return;
+            }
+        } else {
+            $raw_body = file_get_contents('php://input');
+            if (! is_string($raw_body)) {
+                return;
+            }
+            $computed_request_digest = hash(
+                'sha256',
+                "SQUADRONE-REQUEST-V1\0"
+                    . $method . "\0"
+                    . $request_uri . "\0"
+                    . $raw_body,
+                false
+            );
+            if (
+                ! is_string($computed_request_digest)
+                || ! hash_equals($computed_request_digest, $request_digest)
+            ) {
+                return;
+            }
+        }
+
+        $path_end = strlen($request_uri);
+        foreach (array('?', '#') as $separator) {
+            $separator_position = strpos($request_uri, $separator);
+            if ($separator_position !== false && $separator_position < $path_end) {
+                $path_end = $separator_position;
+            }
+        }
+        $raw_path = substr($request_uri, 0, $path_end);
+        if ($raw_path === '') {
+            $raw_path = '/';
+        }
+        if ($raw_path[0] !== '/' || preg_match('/[\x00-\x1f\x7f]/', $raw_path) === 1) {
+            return;
+        }
+
+        $path_segments = array();
+        foreach (explode('/', str_replace('\\', '/', $raw_path)) as $segment) {
+            if ($segment === '' || $segment === '.') {
+                continue;
+            }
+            if ($segment === '..') {
+                array_pop($path_segments);
+                continue;
+            }
+            $path_segments[] = $segment;
+        }
+        $path = '/' . implode('/', $path_segments);
+
+        if (! function_exists('header_register_callback') || headers_sent()) {
+            return;
+        }
+
+        // Freeze the request's authenticated principal before the endpoint or a
+        // plugin callback can call wp_set_current_user(). Normal WordPress cookie
+        // authentication is available by init; this MU plugin registers first at
+        // the lowest possible priority.
+        $ingress_identity = null;
+        add_action(
+            'init',
+            static function () use (&$ingress_identity) {
+                if ($ingress_identity !== null) {
+                    return;
+                }
+                if (
+                    ! function_exists('get_current_user_id')
+                    || ! function_exists('wp_get_current_user')
+                ) {
+                    return;
+                }
+
+                $user_id = (int) get_current_user_id();
+                if ($user_id < 0) {
+                    $user_id = 0;
+                }
+
+                $roles = array();
+                $user = wp_get_current_user();
+                if (is_object($user) && isset($user->roles) && is_array($user->roles)) {
+                    foreach ($user->roles as $role) {
+                        if (is_string($role) && $role !== '') {
+                            $roles[] = $role;
+                        }
+                    }
+                }
+                $roles = array_values(array_unique($roles, SORT_STRING));
+                sort($roles, SORT_STRING);
+                $ingress_identity = array(
+                    'user_id' => $user_id,
+                    'roles' => $roles,
+                );
+            },
+            PHP_INT_MIN
+        );
+
+        @header_register_callback(
+            static function () use (
+                $trace_token,
+                $receipt_secret,
+                $request_nonce,
+                $request_digest,
+                $method,
+                $path,
+                $php_object_canary_class,
+                &$ingress_identity
+            ) {
+                try {
+                    static $emitted = false;
+                    if ($emitted || headers_sent()) {
+                        return;
+                    }
+                    $emitted = true;
+
+                    // A plugin response must never be able to impersonate the
+                    // verifier-owned object receipt.  The trusted canary is the
+                    // only code allowed to repopulate this private header.
+                    @header_remove('X-Squadrone-PHP-Object-Receipt');
+
+                    if (
+                        $php_object_canary_class !== ''
+                        && preg_match(
+                            '/\ASquadroneObjectCanary_[0-9a-f]{32}\z/D',
+                            $php_object_canary_class
+                        ) === 1
+                        && class_exists($php_object_canary_class, false)
+                        && is_callable(array($php_object_canary_class, 'consumeReceipt'))
+                    ) {
+                        $php_object_receipt = call_user_func(
+                            array($php_object_canary_class, 'consumeReceipt')
+                        );
+                        if (
+                            is_string($php_object_receipt)
+                            && preg_match(
+                                '/\Asqpobj1\.[0-9a-f]{64}\.[0-9a-f]{64}\z/D',
+                                $php_object_receipt
+                            ) === 1
+                        ) {
+                            @header(
+                                'X-Squadrone-PHP-Object-Receipt: '
+                                . $php_object_receipt,
+                                true
+                            );
+                        }
+                    }
+
+                    if (! function_exists('wp_json_encode') || $ingress_identity === null) {
+                        return;
+                    }
+
+                    $payload = array(
+                        'v' => 2,
+                        'trace_token' => $trace_token,
+                        'nonce' => bin2hex(random_bytes(16)),
+                        'request_nonce' => $request_nonce,
+                        'request_digest' => $request_digest,
+                        'user_id' => $ingress_identity['user_id'],
+                        'roles' => $ingress_identity['roles'],
+                        'method' => $method,
+                        'path' => $path,
+                    );
+                    $json = wp_json_encode($payload, JSON_UNESCAPED_SLASHES);
+                    if (! is_string($json) || $json === '') {
+                        return;
+                    }
+
+                    $encoded_payload = rtrim(strtr(base64_encode($json), '+/', '-_'), '=');
+                    $signature = hash_hmac('sha256', $encoded_payload, $receipt_secret, false);
+                    if (! is_string($signature) || strlen($signature) !== 64) {
+                        return;
+                    }
+
+                    @header(
+                        'X-Squadrone-Actor-Receipt: ' . $encoded_payload . '.' . $signature,
+                        true
+                    );
+                } catch (\Throwable $ignored) {
+                    // A receipt must never interfere with the request under test.
+                }
+            }
+        );
+    })();
+} catch (\Throwable $ignored) {
+    // Invalid rendering or an unavailable PHP primitive disables receipts silently.
+}

@@ -124,6 +124,47 @@ def test_ticket_idor_is_not_routed_to_patchstack():
     assert "does not meet" in reasons["patchstack"]
 
 
+def test_significant_idor_is_not_excluded_by_minor_object_substrings():
+    for collision in ("prevents", "eventual", "disorder", "disappointment"):
+        programs, _ = preverification_programs(
+            _hypothesis(
+                bug_class=BugClass.IDOR,
+                reasoning=(
+                    f"The route {collision} one unrelated condition while "
+                    "disclosing protected reusable-block content."
+                ),
+                security_outcome=SecurityOutcome(
+                    confidentiality="high",
+                    description="Disclosure of protected reusable-block content.",
+                ),
+            )
+        )
+
+        assert programs == ["patchstack"]
+
+
+def test_minor_object_terms_and_identifiers_remain_excluded():
+    for object_reference in (
+        "attachments",
+        "ticket_id",
+        "event_id",
+        "order-id",
+        "appointments",
+        "PII alone",
+    ):
+        programs, _ = preverification_programs(
+            _hypothesis(
+                bug_class=BugClass.IDOR,
+                security_outcome=SecurityOutcome(
+                    confidentiality="high",
+                    description=f"Disclosure of another user's {object_reference}.",
+                ),
+            )
+        )
+
+        assert programs == []
+
+
 def test_missing_authorization_with_arbitrary_options_impact_routes_wordfence():
     programs, _ = preverification_programs(
         _hypothesis(
@@ -168,6 +209,46 @@ def test_missing_authentication_does_not_bypass_wordfence_outcome_filter():
 
     assert programs == ["patchstack"]
     assert "qualifying security outcome" in reasons["wordfence"]
+
+
+def test_minor_cache_maintenance_is_not_routed_to_patchstack():
+    for operation in (
+        "clears cache",
+        "invalidates plugin caches",
+        "reset_filters_cache",
+        "deletes generated cache files",
+    ):
+        programs, reasons = preverification_programs(
+            _hypothesis(
+                bug_class=BugClass.MISSING_AUTH_CRITICAL_FUNCTION,
+                reasoning=f"An unauthenticated request {operation}.",
+                security_outcome=SecurityOutcome(
+                    integrity="low",
+                    availability="low",
+                    description=f"The request {operation} and forces regeneration.",
+                ),
+            )
+        )
+
+        assert programs == []
+        assert "cache clearing or invalidation" in reasons["patchstack"]
+
+
+def test_high_impact_cache_operations_remain_routed_to_patchstack():
+    for impact_dimension in ("confidentiality", "integrity", "availability"):
+        dimensions = {impact_dimension: "high"}
+        programs, _ = preverification_programs(
+            _hypothesis(
+                bug_class=BugClass.MISSING_AUTH_CRITICAL_FUNCTION,
+                reasoning="An unauthenticated request clears a security cache.",
+                security_outcome=SecurityOutcome(
+                    **dimensions,
+                    description="Clearing the cache has a demonstrated High impact.",
+                ),
+            )
+        )
+
+        assert "patchstack" in programs
 
 
 def test_structured_false_gadget_evidence_overrides_negative_keywords():

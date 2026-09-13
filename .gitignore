@@ -8,6 +8,7 @@ __pycache__/
 *.py[cod]
 *.pyo
 *.egg-info/
+build/
 
 .pytest_cache/
 .mypy_cache/
@@ -21,6 +22,9 @@ plugins/
 cache/
 db/*.sqlite
 db/*.sqlite-*
+db/*.db
+db/*.db-*
+.squadrone-batch-*.txt
 output.txt
 *.log
 
@@ -41,4 +45,3 @@ AGENTS.md
 CODEX.md
 GEMINI.md
 scripts/codex_repro.py
-pipelines/openai-research.yaml

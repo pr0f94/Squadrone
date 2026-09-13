@@ -2,7 +2,7 @@
 
 `call_llm()` is the bottom layer for all LLM access in Squadrone. LiteLLM
 handles provider routing (Anthropic, OpenAI, Gemini, Bedrock, Vertex, etc.)
-via API keys and ChatGPT-subscription OAuth — see `pipelines/openai.yaml`
+via API keys and ChatGPT-subscription OAuth — see `pipelines/chatgpt.yaml`
 for the ChatGPT-via-LiteLLM example.
 
 LiteLLM is the only LLM transport used by the application.
@@ -48,6 +48,7 @@ CHATGPT_COMPAT_SOURCE_MODEL = "chatgpt/gpt-5.4"
 CHATGPT_COMPAT_MODELS = (
     "chatgpt/gpt-5.5",
     "chatgpt/gpt-5.6-sol",
+    "chatgpt/gpt-daybreak-blue-latest",
 )
 
 _RETRYABLE_LLM_EXCEPTIONS = (
@@ -169,6 +170,41 @@ def _install_chatgpt_model_patches() -> tuple[str, ...]:
         )
 
     return tuple(registered)
+
+
+def _install_chatgpt_model_family_patch() -> None:
+    """Teach LiteLLM that compatibility aliases use GPT-5 parameters.
+
+    LiteLLM chooses its parameter mapper from the model name, independently of
+    the model metadata registered above.  Product aliases such as Daybreak Blue
+    do not contain ``gpt-5``, so LiteLLM otherwise rejects valid GPT-5 controls
+    (notably ``reasoning_effort``) before making the provider request.
+
+    Extend the detector only for Squadrone's explicit compatibility aliases.
+    Native model detection remains authoritative for every other model, and the
+    wrapper becomes a harmless no-op once LiteLLM recognizes an alias itself.
+    """
+    try:
+        from litellm.llms.openai.chat.gpt_5_transformation import OpenAIGPT5Config
+    except ImportError:
+        return
+
+    if getattr(OpenAIGPT5Config, "_squadrone_model_family_patched", False):
+        return
+
+    original = OpenAIGPT5Config.is_model_gpt_5_model.__func__
+    compat_names = frozenset(model.rsplit("/", 1)[-1] for model in CHATGPT_COMPAT_MODELS)
+
+    @classmethod
+    def patched(cls, model: str) -> bool:
+        normalized = model.rsplit("/", 1)[-1]
+        return normalized in compat_names or original(cls, model)
+
+    OpenAIGPT5Config.is_model_gpt_5_model = patched  # type: ignore[method-assign]
+    OpenAIGPT5Config._squadrone_model_family_patched = True  # type: ignore[attr-defined]
+    logger.info(
+        "extended LiteLLM GPT-5 parameter mapping for ChatGPT compatibility aliases"
+    )
 
 
 async def init_cache(cache_db: str = DEFAULT_CACHE_DB) -> None:
@@ -329,6 +365,7 @@ def _install_chatgpt_aggregator_patch() -> None:
 
 # Install at import time so any caller of call_llm() benefits.
 _install_chatgpt_model_patches()
+_install_chatgpt_model_family_patch()
 _install_chatgpt_aggregator_patch()
 
 

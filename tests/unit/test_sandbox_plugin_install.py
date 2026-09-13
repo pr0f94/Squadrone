@@ -49,7 +49,6 @@ def _manager(
             wp_admin_user="admin",
             wp_admin_pass="password",
             wp_admin_email="admin@example.test",
-            wp_url="http://localhost:8080",
         ),
         ssrf_oracle_modes=ssrf_oracle_modes,  # type: ignore[arg-type]
         php_include_oracle_enabled=php_include_oracle_enabled,
@@ -646,7 +645,6 @@ async def test_post_install_admin_init_uses_configured_admin_credentials(monkeyp
             wp_admin_user="configured-owner",
             wp_admin_pass="configured-secret",
             wp_admin_email="owner@example.test",
-            wp_url="http://localhost:8080",
         )
     )
     manager.target_url = "http://localhost:8199"

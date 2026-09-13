@@ -581,10 +581,9 @@ def test_invalid_data_raises():
 
 
 def test_pipeline_config_loads():
-    cfg = PipelineConfig.from_yaml("pipelines/default.yaml")
+    cfg = PipelineConfig.from_yaml("pipelines/chatgpt.yaml")
     assert cfg.cost_ceiling_usd > 0
     assert cfg.models.specialists
-    assert "wordfence" in cfg.vuln_dbs.model_dump()
     assert cfg.hypothesis_review_areas == [
         "authorization_workflows",
         "injection_files",
@@ -603,7 +602,7 @@ def test_pipeline_config_loads():
     ],
 )
 def test_pipeline_config_rejects_invalid_hypothesis_review_areas(review_areas):
-    payload = PipelineConfig.from_yaml("pipelines/default.yaml").model_dump()
+    payload = PipelineConfig.from_yaml("pipelines/chatgpt.yaml").model_dump()
     payload["hypothesis_review_areas"] = review_areas
 
     with pytest.raises(ValidationError):
@@ -620,7 +619,7 @@ def test_pipeline_config_rejects_invalid_hypothesis_review_areas(review_areas):
     ],
 )
 def test_pipeline_config_rejects_invalid_hypothesis_review_item_types(item_types):
-    payload = PipelineConfig.from_yaml("pipelines/default.yaml").model_dump()
+    payload = PipelineConfig.from_yaml("pipelines/chatgpt.yaml").model_dump()
     payload["hypothesis_review_item_types"] = item_types
 
     with pytest.raises(ValidationError):
@@ -628,15 +627,18 @@ def test_pipeline_config_rejects_invalid_hypothesis_review_item_types(item_types
 
 
 def test_pipeline_llm_options_load():
-    cfg = PipelineConfig.from_yaml("pipelines/openai.yaml")
-    assert cfg.llm_options_for_role("critic") == {
-        "reasoning_effort": "high",
-        "verbosity": "high",
-    }
-    assert cfg.llm_options_for_role("surveyor") == {
-        "reasoning_effort": "high",
-        "verbosity": "high",
-    }
+    cfg = PipelineConfig.from_yaml("pipelines/chatgpt.yaml")
+    assert cfg.llm_options_for_role("critic") == {"reasoning_effort": "medium"}
+    assert cfg.llm_options_for_role("surveyor") == {"reasoning_effort": "medium"}
+
+
+@pytest.mark.parametrize("role", ["developer_followup", "hypothesis_verifier"])
+def test_pipeline_model_roles_have_no_provider_specific_fallback(role):
+    payload = PipelineConfig.from_yaml("pipelines/chatgpt.yaml").model_dump()
+    del payload["models"][role]
+
+    with pytest.raises(ValidationError):
+        PipelineConfig.model_validate(payload)
 
 
 def test_hypothesis_coerces_list_to_str():

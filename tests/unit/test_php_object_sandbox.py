@@ -77,7 +77,6 @@ def _manager(*, enabled: bool = False) -> SandboxManager:
             wp_admin_user="admin",
             wp_admin_pass="password",
             wp_admin_email="admin@example.test",
-            wp_url="http://localhost:8080",
         ),
         php_object_oracle_enabled=enabled,
     )

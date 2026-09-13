@@ -1,14 +1,11 @@
 from __future__ import annotations
 
 import re
-from pathlib import Path
+from importlib.resources import files
 
 from jinja2 import StrictUndefined, Template, meta
 
-
-_TEMPLATE_PATH = (
-    Path(__file__).resolve().parents[2] / "docker/squadrone-actor-receipt.php.j2"
-)
+_TEMPLATE_PATH = files("squadrone.docker") / "squadrone-actor-receipt.php.j2"
 
 
 def _render_template() -> str:

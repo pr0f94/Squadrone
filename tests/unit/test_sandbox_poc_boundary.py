@@ -106,7 +106,6 @@ def _manager(
             wp_admin_user="admin",
             wp_admin_pass="password",
             wp_admin_email="admin@example.test",
-            wp_url="http://unused.test",
         ),
         poc_timeout_s=poc_timeout_s,  # type: ignore[arg-type]
         ssrf_oracle_modes=ssrf_oracle_modes,  # type: ignore[arg-type]

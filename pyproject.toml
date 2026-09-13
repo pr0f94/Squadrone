@@ -1,29 +1,39 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools==80.9.0", "wheel==0.45.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "squadrone"
 version = "0.1.0"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.13"
 description = "Squadrone multi-agent WordPress plugin vulnerability research tool"
 dependencies = [
-    "litellm>=1.89.1",
-    "httpx>=0.27.0",
-    "requests>=2.32.0",
-    "aiosqlite>=0.20.0",
-    "pydantic>=2.7.0",
-    "typer>=0.12.0",
-    "aiodocker>=0.22.0",
-    "pyyaml>=6.0.1",
-    "jinja2>=3.1.0",
-    "playwright>=1.49.0",
-    "rich>=13.7.0",
-    "tenacity>=8.3.0",
+    # 1.100.x routes ChatGPT Responses through a bridge that bypasses the
+    # stream-output compatibility adapter in services/llm.py.
+    "litellm==1.89.1",
+    "httpx==0.28.1",
+    "requests==2.34.2",
+    "aiosqlite==0.22.1",
+    "pydantic==2.13.5",
+    "typer==0.27.2",
+    "aiodocker==0.27.0",
+    "pyyaml==6.0.3",
+    "jinja2==3.1.6",
+    "playwright==1.62.0",
+    "rich==15.0.0",
+    "tenacity==9.1.4",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "pytest-asyncio", "pytest-httpx", "ruff", "mypy"]
+dev = [
+    "setuptools==80.9.0",
+    "wheel==0.45.1",
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.0",
+    "pytest-httpx==0.36.2",
+    "ruff==0.16.7",
+    "mypy==2.3.1",
+]
 
 [project.scripts]
 squadrone = "squadrone.cli:app"
@@ -33,6 +43,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 squadrone = ["prompts/*.md", "prompts/specialists/*.md", "poc_templates/*.j2", "poc_templates/*.py"]
+"squadrone.docker" = ["*.j2", "*.sh"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

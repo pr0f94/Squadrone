@@ -27,7 +27,6 @@ def _manager(tmp_path: Path) -> tuple[SandboxManager, PhpIncludeOracle, Path]:
             wp_admin_user="admin",
             wp_admin_pass="password",
             wp_admin_email="admin@example.test",
-            wp_url="http://localhost:8080",
         ),
         php_include_oracle_enabled=True,
     )

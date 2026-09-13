@@ -25,7 +25,8 @@ Install the prerequisites, make sure Docker and Compose are running, then run:
 git clone https://github.com/pr0f94/Squadrone.git squadrone
 cd squadrone
 python3.12 -m venv .venv
-.venv/bin/python -m pip install -e ".[dev]"
+.venv/bin/python -m pip install "pip==26.2.1"
+.venv/bin/python -m pip install -c requirements/constraints.txt -e ".[dev]"
 .venv/bin/playwright install chromium
 cp .env.example .env
 $EDITOR .env
@@ -33,11 +34,12 @@ set -a; . ./.env; set +a
 .venv/bin/squadrone scan hello-dolly
 ```
 
-The default pipeline uses Anthropic models and needs `ANTHROPIC_API_KEY`. To use
-ChatGPT subscription OAuth through LiteLLM instead:
+The default pipeline uses Daybreak Blue through ChatGPT subscription OAuth in
+LiteLLM. The authenticated ChatGPT account must be provisioned for that model;
+no OpenAI API key is needed:
 
 ```sh
-.venv/bin/squadrone scan hello-dolly --config pipelines/openai.yaml
+.venv/bin/squadrone scan hello-dolly --config pipelines/chatgpt.yaml
 ```
 
 The first `chatgpt/` request may start an OAuth device-code flow. This route does
@@ -78,7 +80,7 @@ budget, candidate limits, and sandbox settings.
 
 ## Prerequisites
 
-- Python 3.12+
+- Python 3.12.14 (recorded in `.python-version`)
 - Docker with Compose v2 (Docker Desktop on macOS)
 - `ripgrep`
 - Playwright Chromium (installed by the Quickstart command)
@@ -96,9 +98,14 @@ Install the project:
 
 ```sh
 python3.12 -m venv .venv
-.venv/bin/pip install -e ".[dev]"
+.venv/bin/python -m pip install "pip==26.2.1"
+.venv/bin/python -m pip install -c requirements/constraints.txt -e ".[dev]"
 .venv/bin/playwright install chromium
 ```
+
+`pyproject.toml` pins every direct and development dependency. The constraints
+file additionally pins the complete resolved dependency graph; use it for all
+supported installs so transitive packages cannot drift independently.
 
 ## Configuration
 
@@ -108,7 +115,7 @@ cp .env.example .env
 
 | Variable | Used for | Required |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | Models in `pipelines/default.yaml` | For the default pipeline |
+| `ANTHROPIC_API_KEY` | Custom pipeline configurations using Anthropic models | Only for those custom configurations |
 | `OPENAI_API_KEY` | OpenAI API models | Not for `chatgpt/` OAuth models |
 | `WORDFENCE_API_KEY` | Optional authenticated dedup feed access | No |
 | `WPSCAN_API_KEY` | WPScan dedup lookup | No |
@@ -147,7 +154,7 @@ and `authentication`. The optional item-type list matches deterministic
 
 # ChatGPT subscription pipeline with detailed logs
 .venv/bin/squadrone scan contact-form-7 \
-  --config pipelines/openai.yaml --budget 5 --verbose
+  --config pipelines/chatgpt.yaml --budget 5 --verbose
 
 # Newline-delimited batch, sequential by default
 .venv/bin/squadrone scan-batch plugins.txt
@@ -157,7 +164,7 @@ and `authentication`. The optional item-type list matches deterministic
 
 # Higher-budget research batch
 .venv/bin/squadrone scan-batch plugins.txt --budget 100 \
-  --config pipelines/openai-research.yaml --verbose
+  --config pipelines/chatgpt.yaml --verbose
 
 # Resume after the latest completed stage
 .venv/bin/squadrone scan contact-form-7 --resume <run_id>
@@ -272,7 +279,7 @@ under ignored `benchmarks/results/`.
 ```sh
 env -u WORDFENCE_API_KEY -u WPSCAN_API_KEY \
   .venv/bin/squadrone regression benchmarks/regressions.json \
-  --config pipelines/openai.yaml --budget 100
+  --config pipelines/chatgpt.yaml --budget 100
 
 # Run one or more named cases from the same manifest
 .venv/bin/squadrone regression benchmarks/regressions.json --budget 100 \

@@ -389,7 +389,7 @@ async def test_triage_completes_only_post_quality_scope_and_cap_candidates(
         lambda artifact, run_dir, *, enforce_submission_scope: None,
     )
     monkeypatch.setattr(triage_stage, "rank_hypothesis", lambda item: item.id)
-    config = PipelineConfig.from_yaml("pipelines/test.yaml")
+    config = PipelineConfig.from_yaml("tests/fixtures/pipeline.yaml")
     config.max_hypotheses_to_verify = 1
 
     result = await triage_stage.run(

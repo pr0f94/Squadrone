@@ -316,7 +316,7 @@ async def test_run_routes_natural_recipe_away_from_shared_persistent_sandbox(
             item.php_object_gadget_recipe is not None for item in hypotheses
         ),
     )
-    config = PipelineConfig.from_yaml("pipelines/test.yaml")
+    config = PipelineConfig.from_yaml("tests/fixtures/pipeline.yaml")
     config.verify.persistent_sandbox = True
 
     await verify_stage.run(
@@ -1707,7 +1707,7 @@ async def test_verify_records_primitive_but_does_not_promote_full_finding(
             return result
 
     monkeypatch.setattr(verify_stage, "PoCAuthorAgent", FakePoCAuthor)
-    config = PipelineConfig.from_yaml("pipelines/test.yaml")
+    config = PipelineConfig.from_yaml("tests/fixtures/pipeline.yaml")
     config.verify_max_iterations = 1
     config.report.screenshot_capture = False
     config.verify.state_introspection_on_failure = False
@@ -2034,7 +2034,7 @@ async def test_verify_promotes_only_after_two_natural_gadget_executions(
         "validate_php_object_natural_finding_confirmation",
         fake_validate,
     )
-    config = PipelineConfig.from_yaml("pipelines/test.yaml")
+    config = PipelineConfig.from_yaml("tests/fixtures/pipeline.yaml")
     config.verify_max_iterations = 1
     config.report.screenshot_capture = False
     config.verify.state_introspection_on_failure = False
@@ -2243,7 +2243,7 @@ async def test_parent_oracle_rejection_outranks_child_success_declaration(
             )
 
     monkeypatch.setattr(verify_stage, "PoCAuthorAgent", FakePoCAuthor)
-    config = PipelineConfig.from_yaml("pipelines/test.yaml")
+    config = PipelineConfig.from_yaml("tests/fixtures/pipeline.yaml")
     config.verify_max_iterations = 2
     config.report.screenshot_capture = False
     config.verify.state_introspection_on_failure = False

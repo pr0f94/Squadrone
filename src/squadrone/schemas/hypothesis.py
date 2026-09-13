@@ -343,6 +343,12 @@ class SpecialistReviewArtifact(JSONFileMixin):
     # checkpoint persistence fills it so changed targets/context cannot reuse a
     # semantically stale review solely because coverage IDs happen to match.
     input_fingerprint: str = ""
+    # Runner-owned checkpoint metadata. Model responses use the defaults; the
+    # hypothesis stage fills these fields only when it persists a batch.
+    checkpoint_status: Literal["complete", "exhausted"] = "complete"
+    attempts_completed: int = Field(default=0, ge=0)
+    attempt_limit: int = Field(default=0, ge=0)
+    unresolved_item_ids: list[str] = Field(default_factory=list)
 
 
 class SourceAnchor(JSONFileMixin):

@@ -12,8 +12,8 @@ import os
 import posixpath
 import re
 import secrets
-import signal
 import shutil
+import signal
 import socket
 import stat
 import statistics
@@ -23,6 +23,7 @@ import time
 import uuid
 from collections import Counter
 from dataclasses import dataclass
+from importlib.resources import files as _package_files
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, Optional, cast
 from urllib.parse import parse_qsl, quote, quote_plus, unquote, urlparse, urlsplit
@@ -40,24 +41,24 @@ from ..poc_isolation import (
     prepare_poc_isolation,
 )
 from ..poc_proxy import (
-    ExecutableUploadPolicy,
     PHP_INCLUDE_RECEIPT_HEADER,
+    ExecutableUploadPolicy,
     PhpObjectRewritePolicy,
     PocProxySupervisor,
     normalize_trace_origin,
     salted_file_content_sha256,
     salted_scalar_sha256,
 )
+from ..schemas.config import SandboxConfig
+from ..schemas.observation import CIAImpact, PoCObservation
 from ..schemas.php_object_gadget import (
     PhpObjectGadgetDirectPathEffectBinding,
     PhpObjectGadgetRecipe,
     PhpObjectGadgetSourceAnchor,
 )
-from ..schemas.config import SandboxConfig
-from ..schemas.observation import CIAImpact, PoCObservation
 from ..schemas.taxonomy import (
-    BugClass,
     KNOWN_CWE_REGISTRY,
+    BugClass,
     get_known_cwe_profile,
 )
 from .php_include_oracle import (
@@ -74,11 +75,6 @@ from .php_include_oracle import (
     PhpIncludeProvisioningAttestation,
     PhpIncludeVerificationAttestation,
 )
-from .php_object_oracle import (
-    PhpObjectCallsite,
-    PhpObjectOracle,
-    PhpObjectOracleSnapshot,
-)
 from .php_object_gadget_oracle import (
     PHP_OBJECT_GADGET_DIRECTORY,
     PHP_OBJECT_GADGET_ORACLE_MODE,
@@ -89,6 +85,11 @@ from .php_object_gadget_oracle import (
     PhpObjectGadgetRuntimeBinding,
     PhpObjectGadgetTransportAttestation,
     php_object_gadget_recipe_sha256,
+)
+from .php_object_oracle import (
+    PhpObjectCallsite,
+    PhpObjectOracle,
+    PhpObjectOracleSnapshot,
 )
 from .roles import UNKNOWN_ATTACKER_ROLE, normalize_attacker_role
 from .setup_http import SetupHttpContext
@@ -111,7 +112,7 @@ logger = logging.getLogger(__name__)
 _PORT_MIN = 8100
 _PORT_MAX = 8200
 _PROJECT_PREFIX = "squadrone"
-_DOCKER_DIR = Path(__file__).resolve().parents[3] / "docker"
+_DOCKER_DIR = _package_files("squadrone.docker")
 _SANDBOX_DATABASE_NAME = "wordpress"
 _SANDBOX_DATABASE_USER = "wpuser"
 _SANDBOX_DATABASE_PASSWORD = "wppass"
@@ -10009,6 +10010,8 @@ class SandboxManager:
 
             template = Template((_DOCKER_DIR / "docker-compose.yml.j2").read_text())
             rendered = template.render(
+                wordpress_image=self.config.wordpress_image,
+                db_image=self.config.db_image,
                 port=self.port,
                 wp_url=self.target_url,
                 wp_title="Squadrone Sandbox",
@@ -10041,8 +10044,9 @@ class SandboxManager:
                 ),
             )
             (self.workdir / "docker-compose.yml").write_text(rendered)
-            shutil.copy(_DOCKER_DIR / "wp-init.sh", self.workdir / "wp-init.sh")
-            (self.workdir / "wp-init.sh").chmod(0o755)
+            wp_init_path = self.workdir / "wp-init.sh"
+            wp_init_path.write_bytes((_DOCKER_DIR / "wp-init.sh").read_bytes())
+            wp_init_path.chmod(0o755)
 
             logger.info("sandbox boot project=%s port=%d", self.project, self.port)
             await _run(

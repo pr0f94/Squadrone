@@ -502,7 +502,7 @@ def manual_clear() -> None:
 def scan(
     plugin_slug: str = typer.Argument(..., help="WordPress plugin slug"),
     config: str = typer.Option(
-        "pipelines/default.yaml", "--config", help="Pipeline config YAML path"
+        "pipelines/chatgpt.yaml", "--config", help="Pipeline config YAML path"
     ),
     budget: float | None = typer.Option(
         None, "--budget", help="Override cost ceiling (USD)"
@@ -600,7 +600,7 @@ def scan_batch(
         1, "--concurrency", min=1, help="Number of plugins to scan in parallel"
     ),
     config: str = typer.Option(
-        "pipelines/default.yaml", "--config", help="Pipeline config YAML path"
+        "pipelines/chatgpt.yaml", "--config", help="Pipeline config YAML path"
     ),
     budget: float | None = typer.Option(
         None, "--budget", help="Per-plugin cost ceiling override (USD)"
@@ -694,7 +694,7 @@ def benchmark(
         "train", "--split", help="Corpus split to evaluate (e.g. train, test, holdout)"
     ),
     config: str = typer.Option(
-        "pipelines/default.yaml", "--config", help="Pipeline config YAML path"
+        "pipelines/chatgpt.yaml", "--config", help="Pipeline config YAML path"
     ),
     budget: float | None = typer.Option(
         None, "--budget", help="Per-scan budget override (USD)"
@@ -788,7 +788,7 @@ def regression(
         help="Required per-case cost ceiling (USD)",
     ),
     config: str = typer.Option(
-        "pipelines/default.yaml",
+        "pipelines/chatgpt.yaml",
         "--config",
         help="Pipeline config YAML path",
     ),

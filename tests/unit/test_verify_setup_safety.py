@@ -1154,7 +1154,7 @@ async def test_verification_rejects_success_after_indirect_managed_state_drift(
             return "import requests\n"
 
     monkeypatch.setattr(verify_stage, "PoCAuthorAgent", FakePoCAuthor)
-    config = PipelineConfig.from_yaml("pipelines/test.yaml")
+    config = PipelineConfig.from_yaml("tests/fixtures/pipeline.yaml")
     config.verify_max_iterations = 1
     sandbox = FakeSandbox()
 
@@ -1801,7 +1801,7 @@ async def test_atomic_setup_repair_does_not_consume_poc_requested_quota(
             return "from pathlib import Path\n"
 
     monkeypatch.setattr(verify_stage, "PoCAuthorAgent", FakePoCAuthor)
-    config = PipelineConfig.from_yaml("pipelines/test.yaml")
+    config = PipelineConfig.from_yaml("tests/fixtures/pipeline.yaml")
     config.verify_max_iterations = 1
     developer = FakeDeveloper()
     sandbox = FakeSandbox()
@@ -1994,7 +1994,7 @@ async def test_blocked_lifecycle_repairs_cannot_starve_poc_requested_setup(
             return "from pathlib import Path\n"
 
     monkeypatch.setattr(verify_stage, "PoCAuthorAgent", FakePoCAuthor)
-    config = PipelineConfig.from_yaml("pipelines/test.yaml")
+    config = PipelineConfig.from_yaml("tests/fixtures/pipeline.yaml")
     config.verify_max_iterations = 3
     developer = FakeDeveloper()
     sandbox = FakeSandbox()

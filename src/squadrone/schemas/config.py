@@ -25,16 +25,13 @@ DEFAULT_HYPOTHESIS_REVIEW_AREAS: tuple[HypothesisReviewArea, ...] = (
 
 class ModelConfig(BaseModel):
     critic: str
-    developer: str  # propose_setup (initial) + consult — Opus-tier reasoning
+    developer: str
+    developer_followup: str
     surveyor: str
     poc_author: str
     specialists: str
     reporter: str
-    dedup_fallback: str
-    hypothesis_verifier: str = "claude-haiku-4-5-20251001"  # cheap source-quote check
-    # propose_setup_followup is a structured diagnostic task — Sonnet handles it fine
-    # at ~30% the cost of Opus. Falls back to `developer` if not set.
-    developer_followup: str = "claude-sonnet-4-6"
+    hypothesis_verifier: str
 
 
 ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "default"]
@@ -62,7 +59,6 @@ class ReasoningConfig(BaseModel):
     poc_author: ReasoningEffort | None = None
     specialists: ReasoningEffort | None = None
     reporter: ReasoningEffort | None = None
-    dedup_fallback: ReasoningEffort | None = None
     hypothesis_verifier: ReasoningEffort | None = None
 
 
@@ -72,16 +68,6 @@ class SandboxConfig(BaseModel):
     wp_admin_user: str
     wp_admin_pass: str
     wp_admin_email: str
-    wp_url: str
-
-
-class VulnDbSourceConfig(BaseModel):
-    base_url: str
-
-
-class VulnDbConfig(BaseModel):
-    wordfence: VulnDbSourceConfig
-    wpscan: VulnDbSourceConfig
 
 
 class ReportConfig(BaseModel):
@@ -104,7 +90,6 @@ class PipelineConfig(BaseModel):
     developer_calls_per_agent: int
     models: ModelConfig
     sandbox: SandboxConfig
-    vuln_dbs: VulnDbConfig
     llm: LLMConfig = Field(default_factory=LLMConfig)
     reasoning: ReasoningConfig = Field(default_factory=ReasoningConfig)
     verify: VerifyConfig = Field(default_factory=VerifyConfig)
@@ -140,7 +125,7 @@ class PipelineConfig(BaseModel):
         return item_types
 
     @classmethod
-    def from_yaml(cls, path: str) -> "PipelineConfig":
+    def from_yaml(cls, path: str) -> PipelineConfig:
         data = yaml.safe_load(Path(path).read_text())
         return cls.model_validate(data)
 

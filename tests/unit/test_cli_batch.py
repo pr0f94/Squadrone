@@ -89,7 +89,7 @@ def test_run_scan_cli_uses_fixed_scan_path(monkeypatch):
     asyncio.run(
         cli._run_scan_cli(
             plugin_slug="alpha",
-            config="pipelines/default.yaml",
+            config="pipelines/chatgpt.yaml",
             budget=None,
             version=None,
             resume=None,
@@ -101,7 +101,7 @@ def test_run_scan_cli_uses_fixed_scan_path(monkeypatch):
     )
 
     assert seen["plugin_slug"] == "alpha"
-    assert seen["config_path"] == "pipelines/default.yaml"
+    assert seen["config_path"] == "pipelines/chatgpt.yaml"
     assert set(seen) == {
         "plugin_slug",
         "config_path",

@@ -12,6 +12,8 @@ we can see the cache hit rate on each scan.
 from __future__ import annotations
 
 import asyncio
+import csv
+import math
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -121,6 +123,63 @@ class BudgetTracker:
                     f"{int(s['cache_read_tokens'])}\t{int(s['cache_write_tokens'])}\t{hit:.3f}\n"
                 )
         return summary_path
+
+    def restore_cost_report(self, run_dir: str | Path) -> int:
+        """Restore prior calls so a resumed run keeps one cumulative ceiling.
+
+        The report is rewritten from ``self.calls`` when the run finishes, so
+        loading it also prevents a resume from discarding the earlier rows.
+        """
+        if self.calls or self.spent or self._reserved_usd:
+            raise RuntimeError("budget tracker must be empty before restore")
+
+        calls_path = Path(run_dir) / "cost_calls.tsv"
+        if not calls_path.exists():
+            return 0
+
+        records: list[CallRecord] = []
+        with calls_path.open(newline="") as handle:
+            reader = csv.DictReader(handle, delimiter="\t")
+            expected = {
+                "stage", "agent", "model", "input", "output",
+                "cache_read", "cache_write", "cost_usd",
+            }
+            if set(reader.fieldnames or ()) != expected:
+                raise ValueError(f"invalid cost report header: {calls_path}")
+            for row in reader:
+                record = CallRecord(
+                    stage=row["stage"],
+                    agent=row["agent"],
+                    model=row["model"],
+                    input_tokens=int(row["input"]),
+                    output_tokens=int(row["output"]),
+                    cache_read_tokens=int(row["cache_read"]),
+                    cache_write_tokens=int(row["cache_write"]),
+                    cost_usd=float(row["cost_usd"]),
+                )
+                numeric = (
+                    record.input_tokens,
+                    record.output_tokens,
+                    record.cache_read_tokens,
+                    record.cache_write_tokens,
+                    record.cost_usd,
+                )
+                if any(value < 0 for value in numeric) or not math.isfinite(record.cost_usd):
+                    raise ValueError(f"invalid cost report row: {calls_path}")
+                records.append(record)
+
+        self.calls.extend(records)
+        self.input_tokens = sum(record.input_tokens for record in records)
+        self.output_tokens = sum(record.output_tokens for record in records)
+        self.cache_read_tokens = sum(record.cache_read_tokens for record in records)
+        self.cache_write_tokens = sum(record.cache_write_tokens for record in records)
+        self.spent = math.fsum(record.cost_usd for record in records)
+        if self.spent > self.ceiling:
+            raise BudgetExceededError(
+                f"Restored spend ${self.spent:.2f} exceeds budget ceiling "
+                f"${self.ceiling:.2f}"
+            )
+        return len(records)
 
     @staticmethod
     def estimate_call_cost(

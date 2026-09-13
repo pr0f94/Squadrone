@@ -369,7 +369,7 @@ async def test_dedup_reuses_stored_wordfence_matches_when_live_source_fails(
     result = await dedup_stage.run(
         [finding],
         "ai-engine",
-        PipelineConfig.from_yaml("pipelines/test.yaml"),
+        PipelineConfig.from_yaml("tests/fixtures/pipeline.yaml"),
         runs_root=str(tmp_path),
         run_id="run",
     )
@@ -425,7 +425,7 @@ async def test_dedup_wordfence_failure_without_stored_match_is_non_mutating(
         await dedup_stage.run(
             [finding],
             "ai-engine",
-            PipelineConfig.from_yaml("pipelines/test.yaml"),
+            PipelineConfig.from_yaml("tests/fixtures/pipeline.yaml"),
             runs_root=str(tmp_path),
             run_id="run",
         )
@@ -464,7 +464,7 @@ async def test_dedup_allows_novel_when_wordfence_succeeded_and_wpscan_is_disable
     await dedup_stage.run(
         [finding],
         "ai-engine",
-        PipelineConfig.from_yaml("pipelines/test.yaml"),
+        PipelineConfig.from_yaml("tests/fixtures/pipeline.yaml"),
         runs_root=str(tmp_path),
         run_id="run",
     )

@@ -60,7 +60,7 @@ def test_regression_cli_forwards_per_case_budget_and_selection(monkeypatch) -> N
             "--budget",
             "100",
             "--config",
-            "pipelines/openai.yaml",
+            "pipelines/chatgpt.yaml",
             "--case",
             "first",
             "--case",
@@ -71,7 +71,7 @@ def test_regression_cli_forwards_per_case_budget_and_selection(monkeypatch) -> N
     assert result.exit_code == 0
     assert seen == {
         "manifest_path": "benchmarks/regressions.json",
-        "config_path": "pipelines/openai.yaml",
+        "config_path": "pipelines/chatgpt.yaml",
         "budget_per_case_usd": 100.0,
         "case_ids": ["first", "second"],
     }

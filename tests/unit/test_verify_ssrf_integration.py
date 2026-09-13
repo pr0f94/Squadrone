@@ -245,7 +245,7 @@ async def test_verify_binds_ssrf_context_accounts_and_both_runs(
             )
 
     monkeypatch.setattr(verify_stage, "PoCAuthorAgent", FakePoCAuthor)
-    config = PipelineConfig.from_yaml("pipelines/test.yaml")
+    config = PipelineConfig.from_yaml("tests/fixtures/pipeline.yaml")
     config.verify_max_iterations = 1
     config.report.screenshot_capture = False
     config.verify.state_introspection_on_failure = False
@@ -397,7 +397,7 @@ async def test_verify_restarts_wordpress_after_every_local_resource_restore_only
             )
 
     monkeypatch.setattr(verify_stage, "PoCAuthorAgent", FakePoCAuthor)
-    config = PipelineConfig.from_yaml("pipelines/test.yaml")
+    config = PipelineConfig.from_yaml("tests/fixtures/pipeline.yaml")
     config.verify_max_iterations = 1
     config.report.screenshot_capture = False
     config.verify.state_introspection_on_failure = False

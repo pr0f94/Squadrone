@@ -483,7 +483,7 @@ async def test_verify_wires_php_include_context_and_both_clean_runs(
 
     monkeypatch.setattr(verify_stage, "atomic_write_json", capture_checkpoint)
     caplog.set_level("DEBUG")
-    config = PipelineConfig.from_yaml("pipelines/test.yaml")
+    config = PipelineConfig.from_yaml("tests/fixtures/pipeline.yaml")
     config.verify_max_iterations = 1
     config.report.screenshot_capture = False
     config.verify.state_introspection_on_failure = False

@@ -902,7 +902,7 @@ async def test_report_stage_scores_confirmed_known_duplicate(tmp_path):
     reports = await report_stage.run(
         [finding],
         plugin_slug="demo",
-        config=PipelineConfig.from_yaml("pipelines/test.yaml"),
+        config=PipelineConfig.from_yaml("tests/fixtures/pipeline.yaml"),
         budget=BudgetTracker(1.0),
         runtime=object(),  # type: ignore[arg-type]
         runs_root=str(tmp_path),

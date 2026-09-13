@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+from importlib.resources import files
 from pathlib import Path
 
 import pytest
 from jinja2 import Template
-import squadrone.services.sandbox as sandbox_module
 
+import squadrone.services.sandbox as sandbox_module
 from squadrone.schemas.config import SandboxConfig
 from squadrone.schemas.observation import CIAImpact, PoCObservation
 from squadrone.schemas.php_object_gadget import (
@@ -22,9 +23,9 @@ from squadrone.services.php_object_gadget_oracle import (
     PhpObjectGadgetOracleSnapshot,
 )
 from squadrone.services.sandbox import (
+    _PHP_OBJECT_GADGET_RUNTIME_SCRIPT,
     SandboxManager,
     SandboxRunResult,
-    _PHP_OBJECT_GADGET_RUNTIME_SCRIPT,
     _inspect_php_object_gadget_runtime,
     _validate_php_object_gadget_measurement_payload,
     _validate_php_object_gadget_runtime_payload,
@@ -84,7 +85,6 @@ def _config() -> SandboxConfig:
         database_name="wordpress",
         database_user="wpuser",
         database_password="wppass",
-        wp_url="http://localhost:8080",
     )
 
 
@@ -93,7 +93,7 @@ def _render_compose(
     enabled: bool,
     constants: tuple[str, ...] = (),
 ) -> str:
-    source = Path("docker/docker-compose.yml.j2").read_text()
+    source = (files("squadrone.docker") / "docker-compose.yml.j2").read_text()
     return Template(source).render(
         port=8123,
         wp_url="http://localhost:8123",

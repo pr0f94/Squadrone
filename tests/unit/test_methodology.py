@@ -40,6 +40,7 @@ from squadrone.stages.hypothesis import (
     _batch_input_fingerprint,
     _build_review_batches,
     _canonicalize_batch_hypotheses,
+    _is_reusable_exhausted_checkpoint,
     _pre_verifier_dedup,
     _reconcile_batch_coverage,
     _retry_progress_context,
@@ -794,7 +795,7 @@ async def test_hypothesis_review_item_types_filter_targets_and_dispositions(
         hypothesis_stage, "_build_specialists", lambda *_args: [specialist]
     )
     monkeypatch.setattr(hypothesis_stage, "_verify_hypotheses", fake_verify)
-    config = PipelineConfig.from_yaml("pipelines/test.yaml")
+    config = PipelineConfig.from_yaml("tests/fixtures/pipeline.yaml")
     config.hypothesis_review_item_types = ["deserialization"]
     runs_root = tmp_path / "runs"
 
@@ -2715,7 +2716,7 @@ async def test_hypothesis_retry_continues_bounded_incomplete_progress(
         hypothesis_stage, "_build_specialists", lambda *_args: [specialist]
     )
     monkeypatch.setattr(hypothesis_stage, "_verify_hypotheses", fake_verify)
-    config = PipelineConfig.from_yaml("pipelines/test.yaml")
+    config = PipelineConfig.from_yaml("tests/fixtures/pipeline.yaml")
 
     artifact = await hypothesis_stage.run(
         recon,
@@ -2738,6 +2739,346 @@ async def test_hypothesis_retry_continues_bounded_incomplete_progress(
             "evidence_locations": ["metadata.php:2"],
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_hypothesis_gets_final_isolated_pass_before_unreviewed_failure(
+    monkeypatch, tmp_path
+):
+    target = CoverageItem(
+        id="cov-0001",
+        kind="entry_point",
+        review_areas=["authorization_workflows"],
+        type="ajax_priv",
+        name="save_listing",
+        file="handler.php",
+        line=2,
+        snippet="save_listing();",
+    )
+    recon = _recon().model_copy(update={"coverage": CoverageArtifact(items=[target])})
+    (tmp_path / "handler.php").write_text("<?php\nsave_listing();\n")
+
+    class FakeSpecialist:
+        NAME = "authorization_workflows"
+
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        async def analyze(self, *_args, **kwargs):
+            self.calls.append(kwargs)
+            resolved = len(self.calls) == 4
+            return SpecialistReviewArtifact(
+                hypotheses=[],
+                coverage=[
+                    CoverageDisposition(
+                        item_id=target.id,
+                        reviewer=self.NAME,
+                        status="reviewed" if resolved else "unreviewed",
+                        reason="Resolved on the final isolated pass." if resolved else "Trace incomplete.",
+                        evidence_locations=["handler.php:2"],
+                    )
+                ],
+            )
+
+    async def fake_verify(_verifier, hypotheses, _plugin_path):
+        assert hypotheses == []
+        return []
+
+    specialist = FakeSpecialist()
+    monkeypatch.setattr(hypothesis_stage, "_build_specialists", lambda *_args: [specialist])
+    monkeypatch.setattr(hypothesis_stage, "_verify_hypotheses", fake_verify)
+
+    artifact = await hypothesis_stage.run(
+        recon,
+        str(tmp_path),
+        PipelineConfig.from_yaml("tests/fixtures/pipeline.yaml"),
+        BudgetTracker(10.0),
+        SimpleNamespace(),
+        runs_root=str(tmp_path / "runs"),
+        run_id="final-focused-pass",
+    )
+
+    assert artifact.hypotheses == []
+    assert len(specialist.calls) == 4
+    assert specialist.calls[3]["coverage_targets"] == [target]
+
+
+@pytest.mark.asyncio
+async def test_hypothesis_preserves_and_reuses_exhausted_unreviewed_checkpoint(
+    monkeypatch, tmp_path
+):
+    target = CoverageItem(
+        id="cov-0001",
+        kind="sink",
+        review_areas=["authorization_workflows"],
+        type="post_meta_read",
+        name="get_post_meta",
+        file="demo.php",
+        line=2,
+        snippet="get_post_meta($id, 'secret', true);",
+    )
+
+    def make_recon():
+        return _recon().model_copy(update={"coverage": CoverageArtifact(items=[target])})
+
+    (tmp_path / "demo.php").write_text("<?php\nget_post_meta();\n")
+
+    class AlwaysUnreviewed:
+        NAME = "authorization_workflows"
+
+        def __init__(self, fail: bool = False) -> None:
+            self.calls = 0
+            self.fail = fail
+
+        async def analyze(self, *_args, **_kwargs):
+            self.calls += 1
+            if self.fail:
+                raise AssertionError("valid exhausted checkpoint should be reused")
+            return SpecialistReviewArtifact(
+                hypotheses=[_hypothesis(f"discarded-{self.calls}", line=2)],
+                coverage=[
+                    CoverageDisposition(
+                        item_id=target.id,
+                        reviewer=self.NAME,
+                        status="unreviewed",
+                        reason="Caller-level authorization remains incomplete.",
+                        evidence_locations=["demo.php:2"],
+                        hypothesis_ids=[f"discarded-{self.calls}"],
+                    )
+                ],
+            )
+
+    async def fake_verify(_verifier, hypotheses, _plugin_path):
+        assert hypotheses == []
+        return []
+
+    first = AlwaysUnreviewed()
+    monkeypatch.setattr(hypothesis_stage, "_build_specialists", lambda *_args: [first])
+    monkeypatch.setattr(hypothesis_stage, "_verify_hypotheses", fake_verify)
+    config = PipelineConfig.from_yaml("tests/fixtures/pipeline.yaml")
+    runs_root = str(tmp_path / "runs")
+
+    artifact = await hypothesis_stage.run(
+        make_recon(),
+        str(tmp_path),
+        config,
+        BudgetTracker(10.0),
+        SimpleNamespace(),
+        runs_root=runs_root,
+        run_id="terminal-gap",
+    )
+
+    checkpoint_path = (
+        tmp_path
+        / "runs"
+        / "terminal-gap"
+        / "review_batches"
+        / "authorization_workflows"
+        / "b001.json"
+    )
+    checkpoint = SpecialistReviewArtifact.model_validate_json(
+        checkpoint_path.read_text()
+    )
+    assert artifact.hypotheses == []
+    assert first.calls == 4
+    assert checkpoint.checkpoint_status == "exhausted"
+    assert checkpoint.attempts_completed == 4
+    assert checkpoint.attempt_limit == 4
+    assert checkpoint.unresolved_item_ids == [target.id]
+    assert checkpoint.hypotheses == []
+    assert checkpoint.coverage[0].status == "unreviewed"
+    assert checkpoint.coverage[0].hypothesis_ids == []
+    assert "explicitly not treated as reviewed" in checkpoint.coverage[0].reason
+
+    ledger = [
+        json.loads(line)
+        for line in (tmp_path / "runs" / "terminal-gap" / "decision_ledger.jsonl")
+        .read_text()
+        .splitlines()
+    ]
+    assert ledger[-1]["action"] == "review_attempts_exhausted"
+    assert ledger[-1]["details"]["unresolved_item_ids"] == [target.id]
+
+    resumed = AlwaysUnreviewed(fail=True)
+    monkeypatch.setattr(
+        hypothesis_stage, "_build_specialists", lambda *_args: [resumed]
+    )
+    await hypothesis_stage.run(
+        make_recon(),
+        str(tmp_path),
+        config,
+        BudgetTracker(10.0),
+        SimpleNamespace(),
+        runs_root=runs_root,
+        run_id="terminal-gap",
+    )
+    assert resumed.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_hypothesis_exhaustion_keeps_only_valid_mixed_batch_candidate(
+    monkeypatch, tmp_path
+):
+    candidate_target = CoverageItem(
+        id="cov-0001",
+        kind="entry_point",
+        review_areas=["authorization_workflows"],
+        type="ajax_priv",
+        name="wp_ajax_demo",
+        file="demo.php",
+        line=1,
+        snippet="add_action('wp_ajax_demo', 'demo');",
+    )
+    unresolved_target = CoverageItem(
+        id="cov-0002",
+        kind="sink",
+        review_areas=["authorization_workflows"],
+        type="post_meta_read",
+        name="get_post_meta",
+        file="demo.php",
+        line=2,
+        snippet="get_post_meta($id, 'secret', true);",
+    )
+    recon = _recon().model_copy(
+        update={
+            "coverage": CoverageArtifact(items=[candidate_target, unresolved_target])
+        }
+    )
+    (tmp_path / "demo.php").write_text("<?php\nget_post_meta();\n")
+
+    class MixedSpecialist:
+        NAME = "authorization_workflows"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def analyze(self, *_args, **kwargs):
+            self.calls += 1
+            invalid_id = f"unresolved-{self.calls}"
+            hypotheses = [_hypothesis(invalid_id, line=2)]
+            coverage = [
+                CoverageDisposition(
+                    item_id=unresolved_target.id,
+                    reviewer=self.NAME,
+                    status="unreviewed",
+                    reason="Not every caller was traced.",
+                    evidence_locations=["demo.php:2"],
+                    hypothesis_ids=[invalid_id],
+                )
+            ]
+            if self.calls == 1:
+                hypotheses.insert(0, _hypothesis("valid", line=1))
+                coverage.insert(
+                    0,
+                    CoverageDisposition(
+                        item_id=candidate_target.id,
+                        reviewer=self.NAME,
+                        status="candidate",
+                        reason="Subscriber reaches the cross-object read.",
+                        evidence_locations=["demo.php:1"],
+                        hypothesis_ids=["valid"],
+                    ),
+                )
+            else:
+                assert kwargs["coverage_targets"] == [unresolved_target]
+            return SpecialistReviewArtifact(
+                hypotheses=hypotheses,
+                coverage=coverage,
+            )
+
+    async def fake_verify(_verifier, hypotheses, _plugin_path):
+        assert len(hypotheses) == 1
+        assert hypotheses[0].id == "authz-b001-001"
+        return [SimpleNamespace(verdict="keep", reason="grounded", citation=None)]
+
+    specialist = MixedSpecialist()
+    monkeypatch.setattr(
+        hypothesis_stage, "_build_specialists", lambda *_args: [specialist]
+    )
+    monkeypatch.setattr(hypothesis_stage, "_verify_hypotheses", fake_verify)
+
+    artifact = await hypothesis_stage.run(
+        recon,
+        str(tmp_path),
+        PipelineConfig.from_yaml("tests/fixtures/pipeline.yaml"),
+        BudgetTracker(10.0),
+        SimpleNamespace(),
+        runs_root=str(tmp_path / "runs"),
+        run_id="mixed-terminal-gap",
+    )
+
+    checkpoint = SpecialistReviewArtifact.model_validate_json(
+        (
+            tmp_path
+            / "runs"
+            / "mixed-terminal-gap"
+            / "review_batches"
+            / "authorization_workflows"
+            / "b001.json"
+        ).read_text()
+    )
+    assert specialist.calls == 4
+    assert [item.id for item in artifact.hypotheses] == ["authz-b001-001"]
+    assert [item.id for item in checkpoint.hypotheses] == ["authz-b001-001"]
+    unresolved = next(
+        item for item in checkpoint.coverage if item.item_id == unresolved_target.id
+    )
+    assert checkpoint.checkpoint_status == "exhausted"
+    assert unresolved.status == "unreviewed"
+    assert unresolved.hypothesis_ids == []
+
+
+def test_exhausted_checkpoint_reuse_rejects_linked_or_stale_gaps():
+    target = CoverageItem(
+        id="cov-0001",
+        kind="sink",
+        review_areas=["authorization_workflows"],
+        type="post_meta_read",
+        name="get_post_meta",
+        file="demo.php",
+        line=2,
+        snippet="get_post_meta($id, 'secret', true);",
+    )
+    disposition = CoverageDisposition(
+        item_id=target.id,
+        reviewer="authorization_workflows",
+        status="unreviewed",
+        reason="Bounded review was incomplete.",
+        evidence_locations=["demo.php:2"],
+        hypothesis_ids=[],
+    )
+    checkpoint = SpecialistReviewArtifact(
+        hypotheses=[],
+        coverage=[disposition],
+        checkpoint_status="exhausted",
+        attempts_completed=4,
+        attempt_limit=4,
+        unresolved_item_ids=[target.id],
+    )
+
+    assert _is_reusable_exhausted_checkpoint(
+        checkpoint,
+        [target],
+        "authorization_workflows",
+        [target],
+    )
+
+    linked = checkpoint.model_copy(deep=True)
+    linked.coverage[0].hypothesis_ids = ["untrusted-hypothesis"]
+    assert not _is_reusable_exhausted_checkpoint(
+        linked,
+        [target],
+        "authorization_workflows",
+        [target],
+    )
+
+    stale = checkpoint.model_copy(update={"attempt_limit": 5})
+    assert not _is_reusable_exhausted_checkpoint(
+        stale,
+        [target],
+        "authorization_workflows",
+        [target],
+    )
 
 
 def test_canonical_hypothesis_ids_can_replace_coverage_links():
@@ -2872,7 +3213,7 @@ async def test_hypothesis_stage_checkpoints_canonical_coverage_links(
     first = FakeSpecialist()
     monkeypatch.setattr(hypothesis_stage, "_build_specialists", lambda *_args: [first])
     monkeypatch.setattr(hypothesis_stage, "_verify_hypotheses", fake_verify)
-    config = PipelineConfig.from_yaml("pipelines/test.yaml")
+    config = PipelineConfig.from_yaml("tests/fixtures/pipeline.yaml")
     runs_root = str(tmp_path / "runs")
 
     artifact = await hypothesis_stage.run(

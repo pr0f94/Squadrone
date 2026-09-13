@@ -195,12 +195,11 @@ async def _record_run_finish(
     run_id: str, status: str, cost: float, finding_count: int
 ) -> None:
     async with connect_sqlite(DB_PATH) as db:
-        # Cumulative cost across resumes: add this run's spend to the previous
-        # value rather than overwriting (an empty cost row is 0, so first
-        # finish reads 0 and stores `cost`; subsequent --resume finishes add).
+        # BudgetTracker restores prior call rows on resume, so `cost` is the
+        # cumulative run total and must replace (not add to) the stored value.
         await db.execute(
             "UPDATE runs SET finished_at=?, status=?, "
-            "cost_usd=COALESCE(cost_usd,0)+?, finding_count=? WHERE run_id=?",
+            "cost_usd=?, finding_count=? WHERE run_id=?",
             (
                 datetime.now(timezone.utc).isoformat(),
                 status,
@@ -343,7 +342,7 @@ def _verify_checkpoint_matches_triage(
 
 async def run_scan(
     plugin_slug: str,
-    config_path: str = "pipelines/default.yaml",
+    config_path: str = "pipelines/chatgpt.yaml",
     budget_override: Optional[float] = None,
     on_event: Optional[EventCallback] = None,
     version: Optional[str] = None,
@@ -388,6 +387,8 @@ async def run_scan(
         return True
 
     budget = BudgetTracker(ceiling_usd=ceiling)
+    if resume_run_id:
+        budget.restore_cost_report(run_dir)
 
     await init_cache()
     await _init_db()
