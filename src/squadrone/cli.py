@@ -300,6 +300,10 @@ async def _run_scan_cli(
             console.print(
                 f"{prefix}[yellow]⚠ budget exceeded — {info.get('message', '')}[/]"
             )
+        elif status == "interrupted":
+            console.print(
+                f"{prefix}[yellow]■ pipeline interrupted — {info.get('message', '')}[/]"
+            )
         elif status == "failed":
             console.print(
                 f"{prefix}[red]✗ pipeline failed — {info.get('message', '')}[/]"

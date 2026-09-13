@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -18,6 +19,7 @@ from .agents.runtime import AgentRuntime
 from .schemas.config import PipelineConfig
 from .schemas.finding import DedupStatus, Finding
 from .schemas.hypothesis import Hypothesis, TriagedArtifact
+from .services import verify_helpers
 from .services.artifacts import (
     atomic_write_json,
     atomic_write_jsonl,
@@ -27,7 +29,6 @@ from .services.artifacts import (
 from .services.budget import BudgetExceededError, BudgetTracker
 from .services.decision_ledger import append_decision
 from .services.llm import init_cache
-from .services import verify_helpers
 from .services.sqlite import connect_sqlite
 from .stages import dedup as dedup_stage
 from .stages import hypothesis as hypothesis_stage
@@ -390,50 +391,110 @@ async def run_scan(
     if resume_run_id:
         budget.restore_cost_report(run_dir)
 
-    await init_cache()
-    await _init_db()
-    if not resume_run_id:
-        await _record_run_start(run_id, plugin_slug)
-    else:
-        # Mark the existing run record as running again
-        async with connect_sqlite(DB_PATH) as db:
-            await db.execute(
-                "UPDATE runs SET status='running', finished_at=NULL WHERE run_id=?",
-                (run_id,),
-            )
-            await db.commit()
-
-    developer = DeveloperAgent(
-        model=config.models.developer,
-        followup_model=config.models.developer_followup,
-        budget_tracker=budget,
-        llm_options=config.llm_options_for_role("developer"),
-        followup_llm_options=config.llm_options_for_role("developer_followup"),
-    )
-    runtime = AgentRuntime(
-        run_dir=str(run_dir),
-        developer=developer,
-        developer_calls_per_agent=config.developer_calls_per_agent,
-        budget_tracker=budget,
-        llm_options=config.llm.model_dump(exclude_none=True),
-        role_reasoning=config.reasoning.model_dump(exclude_none=True),
-    )
-
     status = "running"
     findings: list[Finding] = []
     report_paths: list[str] = []
     novel_count = 0
+    intake_path = run_dir / "intake.json"
+    recon_path = run_dir / "recon.json"
+    hyps_path = run_dir / "hypotheses.jsonl"
+    triaged_path = run_dir / "triaged.json"
+    findings_path = run_dir / "findings.jsonl"
+    interruption_recorded = False
+
+    async def _checkpoint_interruption(exc: asyncio.CancelledError) -> None:
+        nonlocal findings, interruption_recorded, status
+
+        status = "interrupted"
+        reason = str(exc).strip() or "scan interrupted"
+        logger.info("scan %s: interrupted — %s", run_id, reason)
+        if interruption_recorded:
+            return
+
+        checkpoint_loaded = False
+        if findings_path.exists():
+            try:
+                checkpointed, corrupt_count = read_jsonl_models(
+                    findings_path,
+                    Finding,
+                    corrupt_path=run_dir / "findings_corrupt.jsonl",
+                )
+                checkpoint_loaded = True
+                merged = {finding.id: finding for finding in checkpointed}
+                merged.update({finding.id: finding for finding in findings})
+                findings = list(merged.values())
+                if corrupt_count:
+                    logger.warning(
+                        "scan %s: quarantined %d malformed interrupted finding(s)",
+                        run_id,
+                        corrupt_count,
+                    )
+            except Exception as checkpoint_error:
+                logger.warning(
+                    "scan %s: failed to load interrupted finding checkpoint: %s",
+                    run_id,
+                    checkpoint_error,
+                )
+
+        append_decision(
+            run_dir,
+            stage="_pipeline",
+            action="finish",
+            result=status,
+            reason=reason,
+            details={"findings": len(findings), "cost_usd": budget.spent},
+        )
+        interruption_recorded = True
+        if findings or checkpoint_loaded:
+            try:
+                await _persist_findings(run_id, plugin_slug, findings)
+            except Exception as persistence_error:
+                logger.warning(
+                    "scan %s: failed to persist interrupted findings: %s",
+                    run_id,
+                    persistence_error,
+                )
+        try:
+            await _emit(on_event, "_pipeline", status, {"message": reason})
+        except Exception as event_error:
+            logger.warning(
+                "scan %s: interrupted event callback failed: %s", run_id, event_error
+            )
 
     try:
-        from .schemas.hypothesis import Hypothesis, HypothesesArtifact, TriagedArtifact
+        await init_cache()
+        await _init_db()
+
+        if not resume_run_id:
+            await _record_run_start(run_id, plugin_slug)
+        else:
+            # Mark the existing run record as running again.
+            async with connect_sqlite(DB_PATH) as db:
+                await db.execute(
+                    "UPDATE runs SET status='running', finished_at=NULL WHERE run_id=?",
+                    (run_id,),
+                )
+                await db.commit()
+
+        developer = DeveloperAgent(
+            model=config.models.developer,
+            followup_model=config.models.developer_followup,
+            budget_tracker=budget,
+            llm_options=config.llm_options_for_role("developer"),
+            followup_llm_options=config.llm_options_for_role("developer_followup"),
+        )
+        runtime = AgentRuntime(
+            run_dir=str(run_dir),
+            developer=developer,
+            developer_calls_per_agent=config.developer_calls_per_agent,
+            budget_tracker=budget,
+            llm_options=config.llm.model_dump(exclude_none=True),
+            role_reasoning=config.reasoning.model_dump(exclude_none=True),
+        )
+
+        from .schemas.hypothesis import HypothesesArtifact, Hypothesis, TriagedArtifact
         from .schemas.intake import IntakeArtifact
         from .schemas.recon import ReconArtifact
-
-        intake_path = run_dir / "intake.json"
-        recon_path = run_dir / "recon.json"
-        hyps_path = run_dir / "hypotheses.jsonl"
-        triaged_path = run_dir / "triaged.json"
-        findings_path = run_dir / "findings.jsonl"
 
         # ---- intake ----
         budget.set_stage("intake")
@@ -651,9 +712,7 @@ async def run_scan(
                         reason=f"{corrupt_count} malformed findings.jsonl line(s)",
                         artifact=run_dir / "findings_corrupt.jsonl",
                     )
-                await _emit(
-                    on_event, "verify", "skipped", {"findings": len(findings)}
-                )
+                await _emit(on_event, "verify", "skipped", {"findings": len(findings)})
             else:
                 await _emit(
                     on_event, "verify", "start", {"to_verify": len(triaged.accepted)}
@@ -764,6 +823,14 @@ async def run_scan(
             },
         )
 
+    except asyncio.CancelledError as exc:
+        # asyncio cancellation inherits directly from BaseException, so it must be
+        # handled explicitly. Record the durable checkpoint without translating or
+        # swallowing the cancellation; asyncio.run then retains normal Ctrl-C
+        # semantics and a batch cancellation still reaches every peer task.
+        await _checkpoint_interruption(exc)
+        raise
+
     except BudgetExceededError as e:
         logger.warning("scan %s: budget exceeded — %s", run_id, e)
         await _persist_findings(run_id, plugin_slug, findings)
@@ -800,6 +867,28 @@ async def run_scan(
             logger.warning("scan %s: failed to write cost report: %s", run_id, e)
         try:
             await _record_run_finish(run_id, status, budget.spent, len(findings))
+        except asyncio.CancelledError as exc:
+            # Cancellation can first be delivered at this await after the last stage
+            # completed synchronously. Convert the already-written `running` row and
+            # retry finalization before propagating the original cancellation.
+            await _checkpoint_interruption(exc)
+            try:
+                budget.write_cost_report(run_dir)
+            except Exception as cost_error:
+                logger.warning(
+                    "scan %s: failed to write interrupted cost report: %s",
+                    run_id,
+                    cost_error,
+                )
+            try:
+                await _record_run_finish(run_id, status, budget.spent, len(findings))
+            except Exception as finish_error:
+                logger.warning(
+                    "scan %s: failed to record interrupted run finish: %s",
+                    run_id,
+                    finish_error,
+                )
+            raise
         except Exception as e:
             logger.warning("scan %s: failed to record run finish: %s", run_id, e)
 

@@ -12,7 +12,7 @@ CREATE TABLE IF NOT EXISTS runs (
     plugin_slug   TEXT,
     started_at    TEXT,
     finished_at   TEXT,
-    status        TEXT,   -- running | complete | failed | budget_exceeded
+    status        TEXT,   -- running | complete | failed | budget_exceeded | interrupted
     cost_usd      REAL,
     finding_count INTEGER DEFAULT 0,
     FOREIGN KEY (plugin_slug) REFERENCES plugins(slug)

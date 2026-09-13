@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 from datetime import datetime, timezone
@@ -241,9 +242,7 @@ async def test_triage_only_stops_after_manual_queue_before_verify_checkpoint_log
     assert calls == ["intake", "recon", "hypothesis", "triage"]
     assert scope_modes == [False]
     assert queued == ["plugin"]
-    assert not any(
-        stage in {"verify", "dedup", "report"} for stage, _status in events
-    )
+    assert not any(stage in {"verify", "dedup", "report"} for stage, _status in events)
 
     run_dir = tmp_path / "plugins" / "plugin" / "runs" / result.run_id
     triaged = TriagedArtifact.from_json_file(str(run_dir / "triaged.json"))
@@ -383,6 +382,166 @@ async def test_normal_scan_still_invokes_dedup_and_report(
     assert result.novel_count == 1
     assert result.report_paths == ["report.md"]
     assert finding.dedup_status is DedupStatus.NOVEL
+
+
+@pytest.mark.asyncio
+async def test_cancelled_scan_persists_partial_findings_cost_and_terminal_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _calls, events, finding, on_event = _patch_pipeline(monkeypatch, tmp_path)
+    cancellation = asyncio.CancelledError("operator stop")
+
+    async def interrupt_verify(
+        _triaged,
+        _plugin_path,
+        _config,
+        budget,
+        _runtime,
+        *,
+        runs_root,
+        run_id,
+        **_kwargs,
+    ):
+        await budget.add(
+            {"prompt_tokens": 1000, "completion_tokens": 1000},
+            "some-unknown-model",
+            agent="verifier",
+        )
+        findings_path = Path(runs_root) / run_id / "findings.jsonl"
+        findings_path.write_text(finding.model_dump_json() + "\n")
+        raise cancellation
+
+    monkeypatch.setattr(orchestrator.verify_stage, "run", interrupt_verify)
+
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await orchestrator.run_scan(
+            "plugin",
+            config_path="unused.yaml",
+            verify_only=True,
+            on_event=on_event,
+        )
+
+    assert caught.value is cancellation
+    run_dirs = list((tmp_path / "plugins" / "plugin" / "runs").iterdir())
+    assert len(run_dirs) == 1
+    run_dir = run_dirs[0]
+    with sqlite3.connect(tmp_path / "squadrone.sqlite") as db:
+        run_row = db.execute(
+            "SELECT status, finished_at, cost_usd, finding_count FROM runs"
+        ).fetchone()
+        finding_row = db.execute(
+            "SELECT finding_id, run_id FROM findings WHERE finding_id = ?",
+            (finding.id,),
+        ).fetchone()
+
+    assert run_row is not None
+    assert run_row[0] == "interrupted"
+    assert run_row[1] is not None
+    assert run_row[2] == pytest.approx(0.018)
+    assert run_row[3] == 1
+    assert finding_row == (finding.id, run_dir.name)
+    ledger = [
+        json.loads(line)
+        for line in (run_dir / "decision_ledger.jsonl").read_text().splitlines()
+    ]
+    assert ledger[-1]["stage"] == "_pipeline"
+    assert ledger[-1]["action"] == "finish"
+    assert ledger[-1]["result"] == "interrupted"
+    assert ledger[-1]["reason"] == "operator stop"
+    assert ledger[-1]["details"] == {"findings": 1, "cost_usd": 0.018}
+    assert events[-1] == ("_pipeline", "interrupted")
+    assert (
+        "verify\tverifier\tsome-unknown-model"
+        in (run_dir / "cost_calls.tsv").read_text()
+    )
+    assert "verify\t1\t0.018000" in (run_dir / "cost_per_stage.tsv").read_text()
+    assert not (run_dir / "error.log").exists()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_after_run_start_cannot_leave_running_row(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _calls, events, _finding_result, on_event = _patch_pipeline(monkeypatch, tmp_path)
+    cancellation = asyncio.CancelledError("cancelled after start")
+    record_run_start = orchestrator._record_run_start
+
+    async def record_then_interrupt(run_id: str, plugin_slug: str) -> None:
+        await record_run_start(run_id, plugin_slug)
+        raise cancellation
+
+    monkeypatch.setattr(orchestrator, "_record_run_start", record_then_interrupt)
+
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await orchestrator.run_scan(
+            "plugin",
+            config_path="unused.yaml",
+            on_event=on_event,
+        )
+
+    assert caught.value is cancellation
+    with sqlite3.connect(tmp_path / "squadrone.sqlite") as db:
+        run_row = db.execute(
+            "SELECT run_id, status, finished_at, cost_usd, finding_count FROM runs"
+        ).fetchone()
+    assert run_row is not None
+    assert run_row[1] == "interrupted"
+    assert run_row[2] is not None
+    assert run_row[3:] == (0.0, 0)
+    run_dir = tmp_path / "plugins" / "plugin" / "runs" / run_row[0]
+    ledger = [
+        json.loads(line)
+        for line in (run_dir / "decision_ledger.jsonl").read_text().splitlines()
+    ]
+    assert ledger[-1]["result"] == "interrupted"
+    assert events == [("_pipeline", "interrupted")]
+    assert (run_dir / "cost_calls.tsv").exists()
+    assert (run_dir / "cost_per_stage.tsv").exists()
+    assert not (run_dir / "error.log").exists()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_first_delivered_during_finalization_is_recorded(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _calls, events, _finding_result, capture_event = _patch_pipeline(
+        monkeypatch, tmp_path
+    )
+
+    def cancel_after_last_stage(stage: str, status: str, info: dict) -> None:
+        capture_event(stage, status, info)
+        if (stage, status) == ("report", "done"):
+            task = asyncio.current_task()
+            assert task is not None
+            task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await orchestrator.run_scan(
+            "plugin",
+            config_path="unused.yaml",
+            on_event=cancel_after_last_stage,
+        )
+
+    with sqlite3.connect(tmp_path / "squadrone.sqlite") as db:
+        run_row = db.execute(
+            "SELECT run_id, status, finished_at, cost_usd, finding_count FROM runs"
+        ).fetchone()
+    assert run_row is not None
+    assert run_row[1] == "interrupted"
+    assert run_row[2] is not None
+    assert run_row[3:] == (0.0, 1)
+    run_dir = tmp_path / "plugins" / "plugin" / "runs" / run_row[0]
+    ledger = [
+        json.loads(line)
+        for line in (run_dir / "decision_ledger.jsonl").read_text().splitlines()
+    ]
+    assert ledger[-2]["result"] == "complete"
+    assert ledger[-1]["result"] == "interrupted"
+    assert events[-1] == ("_pipeline", "interrupted")
+    assert not (run_dir / "error.log").exists()
 
 
 def test_historical_novel_finding_remains_loadable() -> None:
