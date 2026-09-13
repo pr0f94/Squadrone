@@ -34,9 +34,10 @@ set -a; . ./.env; set +a
 .venv/bin/squadrone scan hello-dolly
 ```
 
-The default pipeline uses Daybreak Blue through ChatGPT subscription OAuth in
-LiteLLM. The authenticated ChatGPT account must be provisioned for that model;
-no OpenAI API key is needed:
+The sole shipped pipeline routes every LLM role to
+`chatgpt/gpt-daybreak-blue-latest` through ChatGPT subscription OAuth in
+LiteLLM. It uses `medium` reasoning by default. The authenticated ChatGPT
+account must be provisioned for that model; no OpenAI API key is needed:
 
 ```sh
 .venv/bin/squadrone scan hello-dolly --config pipelines/chatgpt.yaml
@@ -44,6 +45,12 @@ no OpenAI API key is needed:
 
 The first `chatgpt/` request may start an OAuth device-code flow. This route does
 not need `OPENAI_API_KEY`.
+
+The shipped pipeline has a `$10` estimated ceiling for each plugin run. Before
+dispatch, Squadrone blocks a call whose conservative reservation would cross
+that ceiling. A response that has already completed is retained and accounted
+for. With ChatGPT subscription OAuth, these dollar values are internal
+token-price estimates, not API charges or an account invoice.
 
 ## Research Process
 
@@ -54,8 +61,10 @@ not need `OPENAI_API_KEY`.
    sinks, roles, capabilities, workflows, and call paths.
 3. **Specialist source review** examines four areas by default:
    authorization/workflows, injection/files, XSS lifecycle, and authentication.
-   Review is split into resumable source-local batches, and every disposition
-   requires cited source.
+   Review is split into resumable source-local batches, and every completed
+   review disposition requires cited source. Incomplete work receives up to
+   four progressively narrowed attempts; any remaining gap is stored explicitly
+   as `unreviewed` rather than silently treated as covered.
 4. **Source validation** checks each candidate's citations, reachability,
    controls, attacker role, security boundary, and concrete confidentiality,
    integrity, or availability impact.
@@ -70,9 +79,9 @@ not need `OPENAI_API_KEY`.
    filesystem, and repeats the exact PoC from clean state. Both executions must
    pass before Squadrone creates a finding.
 7. **Scoring, deduplication, and reporting** calculate CVSS v3.1 from confirmed
-   evidence, query the available configured Wordfence Intelligence and WPScan
-   sources, and create private report drafts for non-duplicate findings that
-   pass finding-level routing.
+   evidence, query Wordfence Intelligence and, when `WPSCAN_API_KEY` is set,
+   WPScan, and create private report drafts for non-duplicate findings that pass
+   finding-level routing.
 
 Evidence checks, negative controls, and clean-state confirmation are enforced by
 the pipeline. Pipeline YAML configures operational choices such as models,
@@ -126,6 +135,12 @@ cap, PoC iterations, sandbox images/timeouts, persistent sandbox reuse, failure
 state dumps, and optional screenshots. Most users only need to change models or
 budget.
 
+`llm.reasoning_effort` is inherited by every agent role. A value under
+`reasoning.<role>` overrides it only for that role; the four focused reviewers
+all use the `specialists` role. Supported override names are `critic`,
+`developer`, `developer_followup`, `surveyor`, `poc_author`, `specialists`,
+`reporter`, and `hypothesis_verifier`.
+
 Focused discovery can limit source review to one or more areas; omit this field
 to retain all four reviewers in their fixed order:
 
@@ -146,7 +161,7 @@ and `authentication`. The optional item-type list matches deterministic
 # Latest release, default pipeline
 .venv/bin/squadrone scan contact-form-7
 
-# Per-scan budget override
+# Per-run cumulative budget ceiling override
 .venv/bin/squadrone scan contact-form-7 --budget 5
 
 # Historical release, primarily for benchmark/regression work
@@ -162,7 +177,7 @@ and `authentication`. The optional item-type list matches deterministic
 # Parallel batch
 .venv/bin/squadrone scan-batch plugins.txt --concurrency 3
 
-# Higher-budget research batch
+# Higher-budget research batch ($100 independently per plugin)
 .venv/bin/squadrone scan-batch plugins.txt --budget 100 \
   --config pipelines/chatgpt.yaml --verbose
 
@@ -192,6 +207,18 @@ A triage-only run can be resumed with either mode. Verify-only resume reuses its
 technical-triage artifact; a normal resume reruns triage with disclosure scope
 enabled before continuing through verification, deduplication, and reporting.
 
+Resume restores the prior `cost_calls.tsv` before making another model call.
+Earlier and resumed calls, including work repeated with `--from`, share one
+cumulative ceiling; `--budget` replaces that total ceiling rather than adding
+new allowance. A ceiling below already-recorded spend is rejected. Batch
+ceilings are independent per plugin.
+
+Ctrl-C retains normal cancellation semantics. Every committed run row is
+checkpointed with terminal status `interrupted`, a finish timestamp, cumulative
+cost reports, a pipeline ledger entry, and any crash-safe partial findings. In a
+parallel batch, cancellation propagates to active peers; queued plugins may not
+start, and interrupted runs are resumed individually by run ID.
+
 ## Artifacts
 
 Each run is stored under `plugins/<slug>/runs/<run_id>/`. Important files are:
@@ -209,11 +236,20 @@ Each run is stored under `plugins/<slug>/runs/<run_id>/`. Important files are:
 - `findings.jsonl`: clean-state confirmed findings and structured observations
 - `decision_ledger.jsonl`: every keep, reject, defer, verify, dedup, and report decision
 - `trace.jsonl`: agent and tool activity
+- `cost_calls.tsv`: cumulative per-model-call token and estimated-cost records
+- `cost_per_stage.tsv`: cumulative per-stage cost and cache-use summary
 - `report_<finding_id>_<program>.md`: private report drafts
 
 Artifacts used for resume are written atomically where possible. Malformed
 finding rows are quarantined to `findings_corrupt.jsonl` rather than silently
 discarded.
+
+Once a sandbox context is active, teardown attempts `docker compose down -v`
+and removes temporary work and snapshot directories after normal completion,
+failure, and ordinary cancellation. Cleanup is best effort. An interrupt during
+optional persistent-sandbox setup, a repeated interrupt, or a hard process kill
+may require manual Docker cleanup. Persistent sandbox reuse remains confined to
+one verification run.
 
 ## Manual Review
 
@@ -290,14 +326,19 @@ env -u WORDFENCE_API_KEY -u WPSCAN_API_KEY \
 
 ```sh
 .venv/bin/pytest -q
-.venv/bin/ruff check src tests benchmarks
+.venv/bin/ruff check --select E9,F63,F7,F82 src tests benchmarks
 ```
+
+The Ruff command checks critical syntax and name failures across the current
+tree. Use broader Ruff checks on the files changed by a patch rather than
+assuming every optional rule is part of the current baseline.
 
 ## Architecture
 
 - `src/squadrone/stages/`: intake through report pipeline
 - `src/squadrone/agents/`: source reviewers and LLM runtime
 - `src/squadrone/services/`: coverage, scope, quality, LLM, Docker, and dedup services
+- `src/squadrone/docker/`: packaged Compose and WordPress runtime assets
 - `src/squadrone/schemas/`: Pydantic artifact contracts
 - `src/squadrone/prompts/`: agent and current program instructions
 - `src/squadrone/poc_templates/`: PoC skeletons and evidence helpers

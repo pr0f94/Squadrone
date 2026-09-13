@@ -25,7 +25,7 @@ vulnerability.
 plugin slug
   -> intake
   -> deterministic coverage + threat mapping
-  -> four accountable source reviews
+  -> configured accountable source reviews (four by default)
   -> citation verifier
   -> full-source critic
   -> technical quality gate
@@ -36,12 +36,18 @@ plugin slug
   -> private report drafts
 ```
 
+This is the default disclosure scan. `--triage-only` stops after source-valid
+technical triage, before runtime verification. `--verify-only` disables
+disclosure-program scope filtering, verifies source-valid candidates, and skips
+known-vulnerability deduplication and report generation.
+
 ### 1. Intake
 
 Intake obtains the latest WordPress.org release unless a version is explicitly
-pinned. It uses the official plugin ZIP and falls back to SVN for historical
-versions. Latest-version scans reject components that WordPress.org reports as
-closed.
+pinned. Latest releases use the official plugin ZIP. Pinned historical releases
+use the matching SVN tag when available and fall back to the official versioned
+ZIP when SVN or the tag is unavailable. Latest-version scans reject components
+that WordPress.org reports as closed.
 
 Output: `intake.json`.
 
@@ -78,8 +84,10 @@ Outputs: `recon.json` and initial `coverage.json`.
 
 ### 3. Source Review
 
-Four reviewers own distinct security questions; one workflow can be assigned to
-more than one reviewer when it crosses those questions:
+Four review areas own distinct security questions and are all enabled in the
+shipped pipeline. Configuration may select a non-empty subset or restrict the
+coverage-item types reviewed for focused and regression work. One workflow can
+be assigned to more than one enabled reviewer when it crosses those questions:
 
 | Review area | Responsibility |
 |---|---|
@@ -94,12 +102,19 @@ call edges. Every batch starts with a fresh model context while unrestricted
 range-aware source tools remain available. This prevents the full recon and old
 tool history from being resent on every turn.
 
-For each item the reviewer must return `candidate`, `reviewed`, or
-`unreachable`, cite the assigned `file:line` from an actual source-tool read,
-and link every candidate to an emitted hypothesis. Deterministic targets retain
+For each item the reviewer must return `candidate`, `reviewed`, `unreachable`,
+or `unreviewed`. Every completed `candidate`, `reviewed`, or `unreachable`
+disposition cites the assigned `file:line` from an actual source-tool read, and
+every candidate links to an emitted hypothesis. Deterministic targets retain
 their match column, and minified-line targets count as read only when the tool
-window includes that column. Incomplete batches retry once and then fail
-explicitly; they are never silently treated as covered.
+window includes that column. Runner-generated terminal `unreviewed` gaps remain
+anchored to the assigned location but do not claim a successful source read.
+
+An incomplete disposition receives up to four bounded, progressively narrowed
+attempts. If work remains unresolved, Squadrone records explicit `unreviewed`
+gaps and a reusable `exhausted` checkpoint; it does not treat those items as
+covered or discard the completed work from a large batch. A reviewer transport
+or runtime failure still fails the stage.
 
 A hypothesis must include the exact sink expression and location, lowest
 attacker role, source-to-outcome path, closest control, security boundary,
@@ -110,9 +125,9 @@ Outputs: `review_batches/<area>/`, `hypotheses_<area>.jsonl`,
 
 ### 4. Verification And Critic Review
 
-The low-cost hypothesis verifier has one job: reject a fabricated citation or a
-contradiction visible in the cited source window. It does not attempt a second,
-partial vulnerability methodology.
+The narrowly scoped hypothesis verifier has one job: reject a fabricated
+citation or a contradiction visible in the cited source window. It does not
+attempt a second, partial vulnerability methodology.
 
 The Critic can read any plugin file. It re-derives complete callbacks and
 helpers, attempts to disprove every claim, checks default configuration and the
@@ -219,9 +234,11 @@ all other TCP destinations. Browser and inbound-callback oracles retain their
 compatibility execution path until dedicated capability profiles are added;
 they are never accepted as cross-object evidence.
 
-Before each attempt, Squadrone snapshots the full database and `wp-content`.
-After an oracle passes, it strictly restores that state and runs the exact same
-script again. Snapshot/restore errors fail closed. Only a successful
+Before each attempt, Squadrone snapshots the full database and complete
+`/var/www/html` volume, including hidden and root-level WordPress files. Trusted
+oracle mounts under `/var/lib/squadrone` remain outside that archive by design.
+After an oracle passes, Squadrone strictly restores the snapshot and runs the
+exact same script again. Snapshot/restore errors fail closed. Only a successful
 confirmation creates a `Finding`; historical `partial` values remain parseable
 but are never accepted.
 
@@ -233,37 +250,76 @@ CVSS v3.1 base metrics are calculated after confirmation from the observed
 attacker role, vulnerability interaction/scope semantics, and CIA dimensions.
 The exact vector and score are stored in the finding.
 
-Deduplication checks Wordfence Intelligence and WPScan and distinguishes exact
-known paths from potentially related issues. Reports are generated only for a
-confirmed, evidence-complete, non-duplicate finding that still meets the target
-program's current rules.
+Deduplication checks Wordfence Intelligence and, when `WPSCAN_API_KEY` is set,
+WPScan, and distinguishes exact known paths from potentially related issues.
+Reports are generated only for a confirmed, evidence-complete, non-duplicate
+finding that still meets the target program's current rules.
 
 Outputs: updated `findings.jsonl` and
 `report_<finding_id>_<program>.md`.
 
 ## Configuration Surface
 
-Pipeline YAML intentionally contains only operational controls:
+Pipeline YAML contains operational controls:
 
-- model names and per-role reasoning settings
+- role models, global generation controls, and per-role reasoning overrides
 - cost ceiling and candidate cap
 - verification iterations and timeouts
 - developer consultation cap
 - Docker image/account settings
 - persistent sandbox reuse, failure diagnostics, and screenshots
-- vulnerability database endpoints
+- optional reviewer-area and coverage-item selection
 
-Coverage, source tools, reviewer areas, technical quality, negative controls,
-clean confirmation, scope routing, and report grading are fixed behavior.
+Vulnerability-database endpoints, source tools, technical quality gates,
+negative controls, clean confirmation, scope routing, and report grading are
+fixed behavior. Wordfence and WPScan credentials are supplied through the
+environment rather than pipeline YAML.
+
+`llm.reasoning_effort` is the default for every role. A non-null
+`reasoning.<role>` value overrides it for that role, with all four focused review
+areas mapping to `specialists`.
+
+### Runtime And Distribution
+
+The sole shipped operational profile is `pipelines/chatgpt.yaml`. It uses
+provisioned ChatGPT-subscription access and
+`chatgpt/gpt-daybreak-blue-latest` for every role with `medium` reasoning.
+LiteLLM is the only model transport.
+
+A bounded in-process compatibility layer registers explicit newer ChatGPT
+aliases when LiteLLM does not yet know them, maps them to GPT-5 generation
+controls, and repairs incomplete streamed Responses aggregation. The current
+allowlist is `chatgpt/gpt-5.5`, `chatgpt/gpt-5.6-sol`, and
+`chatgpt/gpt-daybreak-blue-latest`; unrelated future aliases are not patched
+implicitly. Native LiteLLM support remains authoritative when present.
+
+The supported runtime is CPython 3.12, with 3.12.14 recorded for the reference
+environment and Python 3.13 excluded. Direct, development, and build
+dependencies are exactly pinned. `requirements/constraints.txt` pins the full
+resolved graph, and LiteLLM stays on the adapter-compatible release until the
+compatibility layer is no longer required.
+
+Compose, WordPress initialization, and actor-receipt templates are installed as
+`squadrone.docker` package resources so wheel installations do not depend on the
+repository working directory. The root `docker/` files are compatibility
+mirrors and must remain byte-identical to the packaged copies. The shipped
+pipeline also pins the WordPress and MariaDB images by digest.
 
 The LLM budget is reserved conservatively before uncached calls. Completed
-responses are charged and returned before another call can be rejected, so a
-ceiling does not discard an already-paid batch result.
+responses are accounted for and returned before another call can be rejected,
+so a ceiling does not discard an already-completed batch result. Dollar values
+are internal token-price estimates; under subscription OAuth they are
+pre-dispatch scheduling guardrails rather than API charges.
+
+On resume, prior `cost_calls.tsv` rows are restored before new calls. Earlier
+and resumed work share one cumulative ceiling, including stages repeated with
+`--from`. Malformed, negative, non-finite, or already-over-ceiling restored data
+fails closed. Batch scans create a separate ceiling for each plugin.
 
 The public scan flags are:
 
 ```text
-scan:       --config --budget --version --resume --from --verbose
+scan:       --config --budget --version --resume --from --verify-only --triage-only --verbose
 scan-batch: --concurrency --config --budget --version --verbose
 ```
 
@@ -285,9 +341,29 @@ findings are not silently labeled false positives.
 ## Persistence And Recovery
 
 Run artifacts are the stage-level source of truth. SQLite indexes runs,
-findings, disclosures, and cache data for lookup. `decision_ledger.jsonl`
-records every consequential decision. JSON/JSONL writes are atomic where
-possible, and malformed finding rows are quarantined during resume.
+findings, disclosures, and cache data for lookup. A run status is `running`,
+`complete`, `failed`, `budget_exceeded`, or `interrupted`.
+
+Resume loads compatible stage artifacts unless `--from` forces that stage and
+all later stages to run again. Specialist checkpoints are fingerprinted and
+may be complete or explicitly exhausted. Triage reuse is bound to submission
+scope, while verification reuse is additionally bound to the accepted and
+manual candidate sets and finding IDs. Incompatible checkpoints are rerun.
+`decision_ledger.jsonl` records every consequential decision, JSON/JSONL writes
+are atomic where possible, and malformed finding rows are quarantined.
+
+Cancellation is recorded without being swallowed. Squadrone merges a crash-safe
+finding checkpoint, persists partial findings and cumulative cost, appends and
+emits an `interrupted` pipeline decision, and finalizes any existing SQLite row
+even when cancellation first arrives during finalization. The original
+cancellation then propagates to the caller.
+
+`scan-batch` creates independent per-plugin runs under bounded concurrency.
+Cancellation propagates to active peer scans so each started run can perform the
+same interrupted-run finalization; plugins still waiting for a concurrency slot
+may never start. Once a sandbox context is active, teardown attempts to remove
+Compose volumes and temporary work and snapshot directories on normal
+completion, failure, and ordinary cancellation. Cleanup is best effort.
 
 ## Known Limits
 
@@ -303,3 +379,6 @@ possible, and malformed finding rows are quarantined during resume.
   checked date and must be refreshed when official rules change.
 - A corpus labeled for one CVE cannot determine whether an unrelated finding is
   valid; benchmark metrics therefore avoid claiming global precision.
+- An interrupt during optional persistent-sandbox setup, a repeated interrupt,
+  or a hard process kill can pre-empt cooperative finalizers and require manual
+  Docker cleanup.
