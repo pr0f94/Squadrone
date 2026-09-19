@@ -106,6 +106,7 @@ def _render_compose(
         enable_php_include_oracle=False,
         enable_php_object_gadget_oracle=enabled,
         php_object_gadget_directory_constants=constants,
+        bootstrap_network_name="squadrone-test-bootstrap",
     )
 
 

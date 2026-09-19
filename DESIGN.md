@@ -170,6 +170,21 @@ Docker stack and creates baseline WordPress roles. The Developer proposes only
 legitimate prerequisite setup. Setup that directly seeds an exploit payload
 into storage invalidates the proof.
 
+The stack uses three distinct network roles. MariaDB is attached only to the
+internal application network. WordPress temporarily also joins a per-sandbox
+bootstrap network while WordPress and its tooling are installed, then Squadrone
+disconnects it and removes that network before exposing the verifier API. A
+trusted ingress sidecar spans the internal application network and a separate
+ingress network. Its normal HTTP listener proxies only to the fixed WordPress
+service and is published only on `127.0.0.1`. After sealing, Squadrone inspects
+both Docker network flags, all three containers' exact network memberships, and
+every published-port binding. WordPress persists the internal network as its
+primary Docker network while the bootstrap network owns only the temporary
+installation-time default route; sealing attests that persistent mode so a
+clean-state container restart cannot reference the removed network. A
+disconnect, removal, inspection, or topology mismatch fails the boot and
+triggers partial-project cleanup.
+
 Every PoC emits one structured observation:
 
 ```json
@@ -217,22 +232,34 @@ SSRF response proofs use the same parent proxy with one of two verifier-owned
 oracles. Network-fetch claims use a short-lived HTTP service outside the
 WordPress container: its private marker, generation, and hit ledger never enter
 the plugin trust domain, and each inner hit must fall inside its matching outer
-request. Local-resource scheme-bypass claims instead use an opaque canary file
-outside the web root, supplied through an exact read-only bind mount. The parent
-withholds the fresh marker, attests the mount and immutable file before and after
-execution, confines the opaque path capability to the two destination fields,
-and restarts WordPress request workers before clean-state confirmation. In both
-modes the cited method, route, dispatch, destination field, request values,
-headers, actor boundary, and confirmation are bound exactly. Alternate
+request. The sealed WordPress container reaches that service only through a
+temporary fixed-path relay in the trusted ingress. The relay has one unexposed
+listener matching the current parent oracle port, denies every other path, and
+maps only `/_squadrone/ssrf/` to that exact host-gateway port; it is not a
+forward proxy. Its configuration is staged, syntax-checked, activated, and
+probed from WordPress before use. Rotation disables the prior relay before its
+parent listener closes, and readiness or relay-mutation failure fails closed;
+teardown follows the same relay-before-listener ordering.
+
+Local-resource scheme-bypass claims instead use an opaque canary file outside
+the web root, supplied through an exact read-only bind mount. The parent
+withholds the fresh marker, attests the mount and immutable file before and
+after execution, confines the opaque path capability to the two destination
+fields, and restarts WordPress request workers before clean-state confirmation.
+In both modes the cited method, route, dispatch, destination field, request
+values, headers, actor boundary, and confirmation are bound exactly. Alternate
 self-reported SSRF oracles fail closed.
 
-Trace-bound HTTP PoCs additionally run in a bounded macOS Seatbelt profile. It can
-read only the copied PoC bundle and derived Python/runtime dependencies, write
-only inside the bundle, and connect only to the parent proxy port. The profile
-denies host credential paths, process inspection/spawning, Unix sockets, and
-all other TCP destinations. Browser and inbound-callback oracles retain their
-compatibility execution path until dedicated capability profiles are added;
-they are never accepted as cross-object evidence.
+Trace-bound HTTP PoCs additionally run in a bounded macOS Seatbelt profile. It
+can read only the copied PoC bundle and derived Python/runtime dependencies,
+write only inside the bundle, and connect only to the parent proxy port. The
+profile denies host credential paths, process inspection/spawning, Unix
+sockets, and all other TCP destinations. PoCs outside that trace-bound path use
+the host-side compatibility runner with a filtered environment but without a
+strict socket policy. The Docker target remains network-sealed, but the
+compatibility process itself is not an external-egress boundary. Browser and
+inbound-callback oracles retain this path until dedicated capability profiles
+are added; they are never accepted as cross-object evidence.
 
 Before each attempt, Squadrone snapshots the full database and complete
 `/var/www/html` volume, including hidden and root-level WordPress files. Trusted
@@ -362,8 +389,10 @@ cancellation then propagates to the caller.
 Cancellation propagates to active peer scans so each started run can perform the
 same interrupted-run finalization; plugins still waiting for a concurrency slot
 may never start. Once a sandbox context is active, teardown attempts to remove
-Compose volumes and temporary work and snapshot directories on normal
-completion, failure, and ordinary cancellation. Cleanup is best effort.
+an active SSRF relay before its parent listener, the temporary bootstrap
+network, Compose volumes, and temporary work and snapshot directories on normal
+completion, failure, and ordinary cancellation. Bootstrap-network removal is
+checked before local cleanup state is discarded. Cleanup is best effort.
 
 ## Known Limits
 
@@ -371,10 +400,11 @@ completion, failure, and ordinary cancellation. Cleanup is best effort.
   resolve every dynamic PHP pattern. The Surveyor must validate and augment it.
 - Generated PoCs remain test programs, not mathematical proof. Their source and
   measured output must still be reviewed before disclosure.
-- Strict OS isolation currently requires macOS Seatbelt and covers the
-  requests-based cross-object and SSRF proof capabilities. Browser and
+- Strict host-side PoC isolation currently requires macOS Seatbelt and covers
+  the requests-based cross-object and SSRF proof capabilities. Other PoCs use
+  the compatibility runner without a strict socket policy; browser and
   inbound-callback oracles need separate OS-isolated brokers before they can use
-  that profile.
+  that profile. This limit is separate from the Docker target's sealed network.
 - Program rules and asset thresholds change. Scope references include their
   checked date and must be refreshed when official rules change.
 - A corpus labeled for one CVE cannot determine whether an unrelated finding is

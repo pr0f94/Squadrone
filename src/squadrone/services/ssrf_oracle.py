@@ -27,7 +27,7 @@ from urllib.parse import urlsplit
 SSRF_ATTACK_URL_ENV = "SQUADRONE_SSRF_ATTACK_URL"
 SSRF_CONTROL_URL_ENV = "SQUADRONE_SSRF_CONTROL_URL"
 
-DEFAULT_ADVERTISED_HOST = "host.docker.internal"
+DEFAULT_ADVERTISED_HOST = "squadrone-ssrf-relay.internal"
 DEFAULT_LISTEN_HOST = "0.0.0.0"
 DEFAULT_MAX_HEADER_BYTES = 16 * 1024
 DEFAULT_MAX_BODY_BYTES = 1024 * 1024
@@ -571,7 +571,7 @@ class SsrfOracleServer:
         write_timeout_s: float = DEFAULT_WRITE_TIMEOUT_S,
     ) -> None:
         if advertised_host != DEFAULT_ADVERTISED_HOST:
-            raise ValueError("SSRF oracle must advertise host.docker.internal")
+            raise ValueError("SSRF oracle must advertise the fixed internal relay")
         if listen_host != DEFAULT_LISTEN_HOST:
             raise ValueError("SSRF oracle must bind the IPv4 wildcard host")
         if max_header_bytes < 1024:

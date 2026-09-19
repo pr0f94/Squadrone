@@ -28,8 +28,12 @@ _TRACE_SALT = bytes.fromhex("77" * 32)
 _TRACE_SECRET = bytes.fromhex("88" * 32)
 _TRACE_TOKEN = "99" * 32
 _TRACE_TARGET = "http://localhost:8100"
-_SSRF_ATTACK_URL = "http://host.docker.internal:49152/_squadrone/ssrf/" + ("a" * 64)
-_SSRF_CONTROL_URL = "http://host.docker.internal:49152/_squadrone/ssrf/" + ("b" * 64)
+_SSRF_ATTACK_URL = "http://squadrone-ssrf-relay.internal:49152/_squadrone/ssrf/" + (
+    "a" * 64
+)
+_SSRF_CONTROL_URL = "http://squadrone-ssrf-relay.internal:49152/_squadrone/ssrf/" + (
+    "b" * 64
+)
 _SSRF_MARKER = "SQUADRONE_SSRF_" + ("c" * 64)
 _SSRF_GENERATION = "d" * 64
 _DEFAULT_SSRF_HTTP_TRANSPORT: dict[str, object] = {

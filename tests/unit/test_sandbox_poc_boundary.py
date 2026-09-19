@@ -218,14 +218,15 @@ class _OracleStub:
         fail_snapshot: bool = False,
     ) -> None:
         self.attack_url = (
-            f"http://host.docker.internal:{port}/_squadrone/ssrf/" + "a" * 64
+            f"http://squadrone-ssrf-relay.internal:{port}/_squadrone/ssrf/" + "a" * 64
         )
         self.control_url = (
-            f"http://host.docker.internal:{port}/_squadrone/ssrf/" + "b" * 64
+            f"http://squadrone-ssrf-relay.internal:{port}/_squadrone/ssrf/" + "b" * 64
         )
         self.readiness_url = (
-            f"http://host.docker.internal:{port}/_squadrone/ssrf/" + "c" * 64
+            f"http://squadrone-ssrf-relay.internal:{port}/_squadrone/ssrf/" + "c" * 64
         )
+        self.port = port
         self.generation_id = "d" * 64
         self.private_marker = "SQUADRONE_SSRF_" + "e" * 64
         self.is_running = False
@@ -327,16 +328,32 @@ async def test_prepare_ssrf_oracle_rotates_service_and_returns_only_destinations
     manager = _manager(tmp_path, ssrf_oracle_modes=frozenset({"http"}))
     manager._booted = True
     manager.container_name = "wordpress-test"
-    old = _OracleStub(port=49151)
+    events: list[str] = []
+    old = _OracleStub(port=49151, events=events)
     old.is_running = True
     manager._ssrf_oracle = old  # type: ignore[assignment]
-    fresh = _OracleStub(port=49152)
+    manager._ssrf_relay_port = old.port
+    fresh = _OracleStub(port=49152, events=events)
     probes: list[tuple[str, str]] = []
+    relay_events: list[tuple[str, int | None]] = []
+
+    async def disable_relay() -> None:
+        events.append("relay_disable")
+        relay_events.append(("disable", manager._ssrf_relay_port))
+        manager._ssrf_relay_port = None
+
+    async def configure_relay(port: int) -> None:
+        events.append("relay_configure")
+        relay_events.append(("configure", port))
+        manager._ssrf_relay_port = port
 
     async def probe(container_name: str, readiness_url: str) -> None:
+        events.append("probe")
         probes.append((container_name, readiness_url))
 
     monkeypatch.setattr(sandbox_module, "SsrfOracleServer", lambda: fresh)
+    monkeypatch.setattr(manager, "_disable_ssrf_relay_locked", disable_relay)
+    monkeypatch.setattr(manager, "_configure_ssrf_relay_locked", configure_relay)
     monkeypatch.setattr(sandbox_module, "_probe_ssrf_oracle_readiness", probe)
 
     context = await manager.prepare_ssrf_oracle()
@@ -348,8 +365,17 @@ async def test_prepare_ssrf_oracle_rotates_service_and_returns_only_destinations
     }
     assert old.close_calls == 1
     assert fresh.start_calls == 1
+    assert relay_events == [("disable", 49151), ("configure", 49152)]
+    assert events == [
+        "relay_disable",
+        "oracle_close",
+        "oracle_start",
+        "relay_configure",
+        "probe",
+    ]
     assert probes == [("wordpress-test", fresh.readiness_url)]
     assert manager._ssrf_oracle is fresh
+    assert manager._ssrf_relay_port == 49152
     serialized = json.dumps(context)
     assert fresh.private_marker not in serialized
     assert fresh.generation_id not in serialized
@@ -365,26 +391,41 @@ async def test_prepare_ssrf_oracle_failure_closes_new_service(
     manager._booted = True
     manager.container_name = "wordpress-test"
     fresh = _OracleStub()
+    relay_events: list[tuple[str, int | None]] = []
+
+    async def configure_relay(port: int) -> None:
+        relay_events.append(("configure", port))
+        manager._ssrf_relay_port = port
+
+    async def disable_relay() -> None:
+        relay_events.append(("disable", manager._ssrf_relay_port))
+        manager._ssrf_relay_port = None
 
     async def fail_probe(_container_name: str, _readiness_url: str) -> None:
         raise RuntimeError("private readiness failure")
 
     monkeypatch.setattr(sandbox_module, "SsrfOracleServer", lambda: fresh)
+    monkeypatch.setattr(manager, "_configure_ssrf_relay_locked", configure_relay)
+    monkeypatch.setattr(manager, "_disable_ssrf_relay_locked", disable_relay)
     monkeypatch.setattr(sandbox_module, "_probe_ssrf_oracle_readiness", fail_probe)
 
     with pytest.raises(RuntimeError, match="failed to prepare the SSRF oracle") as exc:
         await manager.prepare_ssrf_oracle()
 
     assert "private readiness failure" not in str(exc.value)
+    assert relay_events == [("disable", None), ("configure", 49152), ("disable", 49152)]
     assert fresh.close_calls == 1
     assert manager._ssrf_oracle is None
+    assert manager._ssrf_relay_port is None
 
 
 @pytest.mark.asyncio
 async def test_readiness_probe_uses_stdin_and_requires_exact_json(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    readiness_url = "http://host.docker.internal:49152/_squadrone/ssrf/" + "f" * 64
+    readiness_url = (
+        "http://squadrone-ssrf-relay.internal:49152/_squadrone/ssrf/" + "f" * 64
+    )
     commands: list[tuple[str, ...]] = []
     supplied: list[bytes] = []
 
@@ -418,6 +459,93 @@ async def test_readiness_probe_uses_stdin_and_requires_exact_json(
 
 
 @pytest.mark.asyncio
+async def test_readiness_probe_retries_only_transient_listener_startup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    readiness_url = (
+        "http://squadrone-ssrf-relay.internal:49152/_squadrone/ssrf/" + "f" * 64
+    )
+    results = [
+        (71, b"", b""),
+        (0, b'{"ready":true,"schema_version":1}', b""),
+    ]
+    supplied: list[bytes] = []
+    sleeps: list[float] = []
+
+    class ReadinessProcess:
+        def __init__(self, result: tuple[int, bytes, bytes]) -> None:
+            self.returncode, self.stdout, self.stderr = result
+
+        async def communicate(self, payload: bytes) -> tuple[bytes, bytes]:
+            supplied.append(payload)
+            return self.stdout, self.stderr
+
+        def kill(self) -> None:
+            raise AssertionError("completed readiness process must not be killed")
+
+        async def wait(self) -> int:
+            return self.returncode
+
+    async def create(*_command: str, **_kwargs: object) -> ReadinessProcess:
+        return ReadinessProcess(results.pop(0))
+
+    async def sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(sandbox_module.asyncio, "create_subprocess_exec", create)
+    monkeypatch.setattr(sandbox_module.asyncio, "sleep", sleep)
+
+    await sandbox_module._probe_ssrf_oracle_readiness(
+        "wordpress-test",
+        readiness_url,
+    )
+
+    assert supplied == [readiness_url.encode("ascii")] * 2
+    assert sleeps == [sandbox_module._SSRF_READINESS_RETRY_DELAY_S]
+    assert not results
+
+
+@pytest.mark.asyncio
+async def test_readiness_probe_bounds_transient_listener_startup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+    sleeps: list[float] = []
+
+    class ReadinessProcess:
+        returncode = 71
+
+        async def communicate(self, _payload: bytes) -> tuple[bytes, bytes]:
+            return b"", b""
+
+        def kill(self) -> None:
+            raise AssertionError("completed readiness process must not be killed")
+
+        async def wait(self) -> int:
+            return self.returncode
+
+    async def create(*_command: str, **_kwargs: object) -> ReadinessProcess:
+        nonlocal attempts
+        attempts += 1
+        return ReadinessProcess()
+
+    async def sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(sandbox_module.asyncio, "create_subprocess_exec", create)
+    monkeypatch.setattr(sandbox_module.asyncio, "sleep", sleep)
+
+    with pytest.raises(RuntimeError, match="readiness probe failed"):
+        await sandbox_module._probe_ssrf_oracle_readiness(
+            "wordpress-test",
+            "http://squadrone-ssrf-relay.internal:49152/_squadrone/ssrf/" + "f" * 64,
+        )
+
+    assert attempts == sandbox_module._SSRF_READINESS_MAX_ATTEMPTS
+    assert sleeps == [sandbox_module._SSRF_READINESS_RETRY_DELAY_S] * (attempts - 1)
+
+
+@pytest.mark.asyncio
 async def test_readiness_probe_rejects_extra_json_fields(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -441,7 +569,7 @@ async def test_readiness_probe_rejects_extra_json_fields(
     with pytest.raises(RuntimeError, match="readiness response is invalid"):
         await sandbox_module._probe_ssrf_oracle_readiness(
             "wordpress-test",
-            "http://host.docker.internal:49152/_squadrone/ssrf/" + "f" * 64,
+            "http://squadrone-ssrf-relay.internal:49152/_squadrone/ssrf/" + "f" * 64,
         )
 
 
@@ -455,6 +583,30 @@ async def test_teardown_always_closes_prepared_ssrf_oracle(tmp_path: Path) -> No
 
     assert oracle.close_calls == 1
     assert manager._ssrf_oracle is None
+
+
+@pytest.mark.asyncio
+async def test_teardown_removes_relay_before_releasing_parent_port(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    manager = _manager(tmp_path)
+    _install_prepared_oracle(manager, events=events)
+    manager._ssrf_relay_port = 49152
+    manager.project = ""
+
+    async def disable_relay() -> None:
+        events.append("relay_disable")
+        manager._ssrf_relay_port = None
+
+    monkeypatch.setattr(manager, "_disable_ssrf_relay_locked", disable_relay)
+
+    await manager.teardown()
+
+    assert events == ["relay_disable", "oracle_close"]
+    assert manager._ssrf_oracle is None
+    assert manager._ssrf_relay_port is None
 
 
 @pytest.mark.asyncio
@@ -918,7 +1070,9 @@ async def test_non_cross_object_class_keeps_compatibility_runner(
     assert PRIVATE_TRACE_ENV_NAMES.isdisjoint(environment)
     assert manager._trace_token not in environment.values()
     assert proxy.trace_salt.hex() not in environment.values()
-    assert environment["NO_PROXY"] == "localhost,127.0.0.1,::1,host.docker.internal"
+    assert environment["NO_PROXY"] == (
+        "localhost,127.0.0.1,::1,host.docker.internal,squadrone-ssrf-relay.internal"
+    )
     assert oracle.begin_calls == 0
     assert oracle.snapshot_calls == 0
 

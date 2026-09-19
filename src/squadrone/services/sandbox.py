@@ -553,8 +553,18 @@ _CROSS_OBJECT_REQUEST_SENTINEL_FLAGS = frozenset(
     }
 )
 _CROSS_OBJECT_VALUE_TEMPLATE_TOKEN = "{object_id}"
-_SSRF_ORACLE_HOST = "host.docker.internal"
+_SSRF_ORACLE_HOST = "squadrone-ssrf-relay.internal"
 _SSRF_ORACLE_PATH_PREFIX = "/_squadrone/ssrf/"
+_SSRF_RELAY_GATEWAY_HOST = "squadrone.host.internal"
+_SSRF_RELAY_CONFIG_BASENAME = "squadrone-ssrf-relay.conf"
+_SSRF_RELAY_CONTAINER_CONFIG = (
+    f"/etc/apache2/conf-enabled/{_SSRF_RELAY_CONFIG_BASENAME}"
+)
+_SSRF_RELAY_CONTAINER_STAGING_CONFIG = (
+    f"/etc/apache2/conf-enabled/.{_SSRF_RELAY_CONFIG_BASENAME}.new"
+)
+_SSRF_READINESS_MAX_ATTEMPTS = 8
+_SSRF_READINESS_RETRY_DELAY_S = 0.2
 _SSRF_REQUEST_LOCATIONS = frozenset({"query", "form", "json", "multipart"})
 _SSRF_REQUEST_FIELDS = (
     "method",
@@ -820,7 +830,7 @@ def _compatibility_poc_environment() -> dict[str, str]:
     environment.setdefault("HOME", os.fspath(Path.home()))
     environment.setdefault("PATH", os.defpath)
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
-    local_hosts = "localhost,127.0.0.1,::1,host.docker.internal"
+    local_hosts = "localhost,127.0.0.1,::1,host.docker.internal,squadrone-ssrf-relay.internal"
     environment["NO_PROXY"] = local_hosts
     environment["no_proxy"] = local_hosts
     return environment
@@ -4973,6 +4983,37 @@ def _valid_ssrf_oracle_url(value: str) -> bool:
     )
 
 
+def _ssrf_relay_apache_config(port: int) -> str:
+    """Build one literal, fixed-path relay to a validated parent oracle port."""
+    if type(port) is not int or not 1024 <= port <= 65535:
+        raise ValueError("SSRF relay port must be a high TCP port")
+    upstream = f"http://{_SSRF_RELAY_GATEWAY_HOST}:{port}{_SSRF_ORACLE_PATH_PREFIX}"
+    return "\n".join(
+        (
+            f"Listen {port}",
+            f"<VirtualHost *:{port}>",
+            f"    ServerName {_SSRF_ORACLE_HOST}",
+            "    ProxyRequests Off",
+            "    ProxyPreserveHost On",
+            "    ProxyAddHeaders Off",
+            "    ProxyPassInterpolateEnv Off",
+            "    ProxyPassInherit Off",
+            "    UseCanonicalName Off",
+            "    AllowEncodedSlashes NoDecode",
+            '    <Location "/">',
+            "        Require all denied",
+            "    </Location>",
+            f'    <Location "{_SSRF_ORACLE_PATH_PREFIX}">',
+            "        Require all granted",
+            "    </Location>",
+            f'    ProxyPass "{_SSRF_ORACLE_PATH_PREFIX}" "{upstream}" nocanon',
+            f'    ProxyPassReverse "{_SSRF_ORACLE_PATH_PREFIX}" "{upstream}"',
+            "</VirtualHost>",
+            "",
+        )
+    )
+
+
 def _valid_ssrf_local_oracle_pair(attack_url: str, control_url: str) -> bool:
     """Validate a scheme-only pair for one protected target-local path."""
     try:
@@ -7561,39 +7602,48 @@ async def _probe_ssrf_oracle_readiness(
         "if(!is_string($data)||!preg_match('/^HTTP\\/[0-9.]+ 200(?: |$)/',$status))"
         "{exit(71);}fwrite(STDOUT,$data);"
     )
-    proc = await asyncio.create_subprocess_exec(
-        "docker",
-        "exec",
-        "-i",
-        container_name,
-        "php",
-        "-r",
-        php,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    try:
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(readiness_url.encode("ascii")),
-            timeout=6.0,
+    for attempt in range(_SSRF_READINESS_MAX_ATTEMPTS):
+        proc = await asyncio.create_subprocess_exec(
+            "docker",
+            "exec",
+            "-i",
+            container_name,
+            "php",
+            "-r",
+            php,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-    except BaseException:
-        if proc.returncode is None:
-            proc.kill()
-        await proc.wait()
-        raise
-    if proc.returncode != 0 or stderr or len(stdout) > 256:
-        raise RuntimeError("SSRF oracle readiness probe failed")
-    try:
-        payload = json.loads(stdout.decode("ascii"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise RuntimeError("SSRF oracle readiness response is malformed") from exc
-    if type(payload) is not dict or payload != {
-        "schema_version": 1,
-        "ready": True,
-    }:
-        raise RuntimeError("SSRF oracle readiness response is invalid")
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(readiness_url.encode("ascii")),
+                timeout=6.0,
+            )
+        except BaseException:
+            if proc.returncode is None:
+                proc.kill()
+            await proc.wait()
+            raise
+        # apache2ctl's graceful reload may return just before the new listener
+        # accepts connections.  PHP exit 71 with no output is the exact
+        # transport-not-ready signal; retry only that bounded startup race.
+        transport_not_ready = proc.returncode == 71 and not stdout and not stderr
+        if transport_not_ready and attempt + 1 < _SSRF_READINESS_MAX_ATTEMPTS:
+            await asyncio.sleep(_SSRF_READINESS_RETRY_DELAY_S)
+            continue
+        if proc.returncode != 0 or stderr or len(stdout) > 256:
+            raise RuntimeError("SSRF oracle readiness probe failed")
+        try:
+            payload = json.loads(stdout.decode("ascii"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("SSRF oracle readiness response is malformed") from exc
+        if type(payload) is not dict or payload != {
+            "schema_version": 1,
+            "ready": True,
+        }:
+            raise RuntimeError("SSRF oracle readiness response is invalid")
+        return
 
 
 def _local_resource_host_path(
@@ -9627,9 +9677,9 @@ def _validate_php_object_surface_summary(
 class SandboxManager:
     """Boots a fresh WordPress + MariaDB stack and tears it down on exit."""
 
-    # Docker publishes the container's port 80 on a dynamic host port for PoCs.
-    # WP-CLI setup runs inside this same container, so its HTTP postconditions
-    # must use the fixed container-local listener instead of ``target_url``.
+    # A trusted ingress publishes WordPress's port 80 on a dynamic host port for
+    # PoCs. WP-CLI setup runs inside WordPress, so its HTTP postconditions must use
+    # the fixed container-local listener instead of ``target_url``.
     INTERNAL_WORDPRESS_ORIGIN = "http://127.0.0.1:80"
 
     def setup_http_context(self) -> SetupHttpContext:
@@ -9704,6 +9754,7 @@ class SandboxManager:
         self._receipt_secret = secrets.token_bytes(32)
         self._ssrf_oracle_modes = frozenset(ssrf_oracle_modes)
         self._ssrf_oracle: SsrfOracleServer | None = None
+        self._ssrf_relay_port: int | None = None
         self._ssrf_local_oracle: LocalResourceSsrfOracle | None = None
         self._ssrf_local_host_dir: Path | None = None
         self._php_include_oracle_enabled = php_include_oracle_enabled
@@ -9751,13 +9802,136 @@ class SandboxManager:
         async with self._ssrf_operation_lock:
             return await self._prepare_ssrf_oracle_locked()
 
+    async def _stop_ingress_after_relay_failure(self) -> None:
+        """Make a relay mutation failure terminal without restoring target egress."""
+        self._booted = False
+        try:
+            await _run(
+                "docker",
+                "stop",
+                "--time",
+                "5",
+                self.ingress_container_name,
+                check=False,
+            )
+        except BaseException:
+            logger.warning("failed to stop ingress after an SSRF relay failure")
+
+    async def _disable_ssrf_relay_locked(self) -> None:
+        """Remove the one fixed relay listener before its host port can be reused."""
+        if self._ssrf_relay_port is None:
+            return
+        try:
+            await _run(
+                "docker",
+                "exec",
+                self.ingress_container_name,
+                "rm",
+                "-f",
+                "--",
+                _SSRF_RELAY_CONTAINER_CONFIG,
+                _SSRF_RELAY_CONTAINER_STAGING_CONFIG,
+            )
+            await _run(
+                "docker",
+                "exec",
+                self.ingress_container_name,
+                "apache2ctl",
+                "configtest",
+            )
+            await _run(
+                "docker",
+                "exec",
+                self.ingress_container_name,
+                "apache2ctl",
+                "-k",
+                "graceful",
+            )
+        except BaseException:
+            await self._stop_ingress_after_relay_failure()
+            raise
+        self._ssrf_relay_port = None
+
+    async def _configure_ssrf_relay_locked(self, port: int) -> None:
+        """Atomically install one literal port-and-path Apache relay."""
+        if (
+            "http" not in self._ssrf_oracle_modes
+            or not self._booted
+            or not self.project
+            or self.workdir is None
+            or self._ssrf_relay_port is not None
+        ):
+            raise RuntimeError("sandbox SSRF relay is unavailable")
+        config = _ssrf_relay_apache_config(port)
+        local_path = self.workdir / _SSRF_RELAY_CONFIG_BASENAME
+        local_path.write_text(config)
+        local_path.chmod(0o600)
+        self._ssrf_relay_port = port
+        try:
+            await _run(
+                "docker",
+                "cp",
+                os.fspath(local_path),
+                f"{self.ingress_container_name}:{_SSRF_RELAY_CONTAINER_STAGING_CONFIG}",
+            )
+            await _run(
+                "docker",
+                "exec",
+                self.ingress_container_name,
+                "chown",
+                "root:root",
+                _SSRF_RELAY_CONTAINER_STAGING_CONFIG,
+            )
+            await _run(
+                "docker",
+                "exec",
+                self.ingress_container_name,
+                "chmod",
+                "0600",
+                _SSRF_RELAY_CONTAINER_STAGING_CONFIG,
+            )
+            await _run(
+                "docker",
+                "exec",
+                self.ingress_container_name,
+                "mv",
+                "-f",
+                "--",
+                _SSRF_RELAY_CONTAINER_STAGING_CONFIG,
+                _SSRF_RELAY_CONTAINER_CONFIG,
+            )
+            await _run(
+                "docker",
+                "exec",
+                self.ingress_container_name,
+                "apache2ctl",
+                "configtest",
+            )
+            await _run(
+                "docker",
+                "exec",
+                self.ingress_container_name,
+                "apache2ctl",
+                "-k",
+                "graceful",
+            )
+        finally:
+            local_path.unlink(missing_ok=True)
+
+    async def _retire_ssrf_oracle_locked(self) -> None:
+        """Remove a relay before closing the parent listener behind its port."""
+        previous, self._ssrf_oracle = self._ssrf_oracle, None
+        try:
+            await self._disable_ssrf_relay_locked()
+        finally:
+            if previous is not None:
+                await previous.close()
+
     async def _prepare_ssrf_oracle_locked(self) -> dict[str, str]:
         """Prepare an oracle while excluding runs and lifecycle mutation."""
         if "http" not in self._ssrf_oracle_modes:
             raise RuntimeError("HTTP SSRF oracle was not enabled for this sandbox")
-        previous, self._ssrf_oracle = self._ssrf_oracle, None
-        if previous is not None:
-            await previous.close()
+        await self._retire_ssrf_oracle_locked()
         self._clear_ssrf_local_oracle_locked()
         if not self._booted or not self.container_name:
             raise RuntimeError("sandbox is unavailable for SSRF oracle preparation")
@@ -9765,21 +9939,28 @@ class SandboxManager:
         oracle = SsrfOracleServer()
         try:
             await oracle.start()
-            await _probe_ssrf_oracle_readiness(
-                self.container_name,
-                oracle.readiness_url,
-            )
             attack_url = oracle.attack_url
             control_url = oracle.control_url
+            readiness_url = oracle.readiness_url
+            oracle_urls = (attack_url, control_url, readiness_url)
             if (
                 not oracle.is_running
-                or not _valid_ssrf_oracle_url(attack_url)
-                or not _valid_ssrf_oracle_url(control_url)
-                or attack_url == control_url
+                or type(oracle.port) is not int
+                or not all(_valid_ssrf_oracle_url(url) for url in oracle_urls)
+                or any(urlsplit(url).port != oracle.port for url in oracle_urls)
+                or len(set(oracle_urls)) != len(oracle_urls)
             ):
                 raise RuntimeError("SSRF oracle produced invalid public URLs")
+            await self._configure_ssrf_relay_locked(oracle.port)
+            await _probe_ssrf_oracle_readiness(
+                self.container_name,
+                readiness_url,
+            )
         except BaseException as exc:
-            await oracle.close()
+            try:
+                await self._disable_ssrf_relay_locked()
+            finally:
+                await oracle.close()
             if isinstance(exc, asyncio.CancelledError):
                 raise
             raise RuntimeError("failed to prepare the SSRF oracle") from exc
@@ -9793,9 +9974,7 @@ class SandboxManager:
                 raise RuntimeError(
                     "local-resource SSRF oracle was not enabled for this sandbox"
                 )
-            previous, self._ssrf_oracle = self._ssrf_oracle, None
-            if previous is not None:
-                await previous.close()
+            await self._retire_ssrf_oracle_locked()
             self._clear_ssrf_local_oracle_locked()
             if (
                 not self._booted
@@ -9983,12 +10162,26 @@ class SandboxManager:
     async def boot(self) -> None:
         if self._booted:
             return
+        if self.project:
+            raise RuntimeError("sandbox has incomplete cleanup from a previous boot")
+        try:
+            await self._boot_once()
+        except BaseException:
+            try:
+                await self.teardown()
+            except BaseException:
+                logger.warning("failed to clean a partially booted sandbox")
+            raise
+
+    async def _boot_once(self) -> None:
         self._baseline_accounts = None
         self._pre_plugin_role_capabilities = None
         self._installed_plugin_slug = None
         self._php_object_surface_poisoned = False
         self._php_object_callsite = None
         self._php_object_gadget_oracle = None
+        self._ssrf_relay_port = None
+        self.wp_cli = None
         async with _PORT_ALLOC_LOCK:
             self.port = _alloc_port()
             self.project = f"{_PROJECT_PREFIX}-{uuid.uuid4().hex[:8]}"
@@ -10042,6 +10235,7 @@ class SandboxManager:
                     if self._php_include_host_dir is not None
                     else ""
                 ),
+                bootstrap_network_name=self.bootstrap_network_name,
             )
             (self.workdir / "docker-compose.yml").write_text(rendered)
             wp_init_path = self.workdir / "wp-init.sh"
@@ -10049,6 +10243,14 @@ class SandboxManager:
             wp_init_path.chmod(0o755)
 
             logger.info("sandbox boot project=%s port=%d", self.project, self.port)
+            await _run(
+                "docker",
+                "network",
+                "create",
+                "--driver",
+                "bridge",
+                self.bootstrap_network_name,
+            )
             await _run(
                 "docker",
                 "compose",
@@ -10060,10 +10262,14 @@ class SandboxManager:
             )
 
         await self._wait_for_wordpress()
-        self.wp_cli = WPCli(self.container_name)
         # wp-init.sh may not have completed `wp core install` by the time the port answers;
         # ensure it has, then we are ready.
         await self._ensure_wp_installed()
+        await self._seal_runtime_network()
+        # The host reaches WordPress only through the fixed-target ingress service.
+        # Re-probe after removing bootstrap egress before exposing any sandbox API.
+        await self._wait_for_wordpress()
+        self.wp_cli = WPCli(self.container_name)
         await self._install_actor_receipt_plugin()
         await self._ensure_wp_upload_path()
         self._booted = True
@@ -10073,34 +10279,88 @@ class SandboxManager:
             await self._teardown_locked()
 
     async def _teardown_locked(self) -> None:
+        project = self.project
+        container_name = self.container_name
+        workdir = self.workdir
+        bootstrap_network_name = self.bootstrap_network_name if project else ""
+        docker_cleanup_complete = not project
         oracle, self._ssrf_oracle = self._ssrf_oracle, None
         try:
-            if oracle is not None:
-                await oracle.close()
+            try:
+                await self._disable_ssrf_relay_locked()
+            finally:
+                if oracle is not None:
+                    await oracle.close()
             self._clear_ssrf_local_oracle_locked()
             self._clear_php_include_oracle_locked()
             await self._clear_php_object_oracle_locked()
         finally:
             try:
                 try:
-                    await self._remove_actor_receipt_plugin()
-                except Exception:
-                    logger.warning("failed to remove sandbox actor receipt plugin")
-                if self.project:
-                    logger.info("sandbox teardown project=%s", self.project)
-                    await _run(
-                        "docker",
-                        "compose",
-                        "-p",
-                        self.project,
-                        "down",
-                        "-v",
-                        cwd=str(self.workdir) if self.workdir else None,
-                        check=False,
-                    )
+                    if project and container_name:
+                        await _run(
+                            "docker",
+                            "network",
+                            "disconnect",
+                            "--force",
+                            bootstrap_network_name,
+                            container_name,
+                            check=False,
+                        )
+                finally:
+                    try:
+                        try:
+                            await self._remove_actor_receipt_plugin()
+                        except Exception:
+                            logger.warning(
+                                "failed to remove sandbox actor receipt plugin"
+                            )
+                    finally:
+                        if project:
+                            logger.info("sandbox teardown project=%s", project)
+                            try:
+                                rc, _out, _err = await _run(
+                                    "docker",
+                                    "compose",
+                                    "-p",
+                                    project,
+                                    "down",
+                                    "-v",
+                                    cwd=str(workdir) if workdir else None,
+                                    check=False,
+                                )
+                                if rc != 0:
+                                    raise RuntimeError(
+                                        "sandbox Docker Compose cleanup failed"
+                                    )
+                            finally:
+                                try:
+                                    await _run(
+                                        "docker",
+                                        "network",
+                                        "rm",
+                                        bootstrap_network_name,
+                                        check=False,
+                                    )
+                                finally:
+                                    rc, output, _error = await _run(
+                                        "docker",
+                                        "network",
+                                        "ls",
+                                        "--filter",
+                                        f"name=^{bootstrap_network_name}$",
+                                        "--format",
+                                        "{{.Name}}",
+                                        check=False,
+                                    )
+                                    if rc != 0 or output.strip():
+                                        raise RuntimeError(
+                                            "sandbox bootstrap network cleanup failed"
+                                        )
+                            docker_cleanup_complete = True
             finally:
-                if self.workdir and self.workdir.exists():
-                    shutil.rmtree(self.workdir, ignore_errors=True)
+                if docker_cleanup_complete and workdir and workdir.exists():
+                    shutil.rmtree(workdir, ignore_errors=True)
                 for snapshot_dir in self._snapshot_dirs:
                     shutil.rmtree(snapshot_dir, ignore_errors=True)
                 self._snapshot_dirs.clear()
@@ -10111,6 +10371,14 @@ class SandboxManager:
                 self._php_object_callsite = None
                 self._installed_plugin_slug = None
                 self._php_object_surface_poisoned = False
+                self.wp_cli = None
+                if docker_cleanup_complete:
+                    self._ssrf_relay_port = None
+                    self.port = 0
+                    self.project = ""
+                    self.workdir = None
+                    self.container_name = ""
+                    self.target_url = ""
                 if (
                     self._php_include_oracle is None
                     or self._php_include_host_dir is None
@@ -10126,6 +10394,22 @@ class SandboxManager:
     @property
     def db_container_name(self) -> str:
         return f"{self.project}-db-1"
+
+    @property
+    def ingress_container_name(self) -> str:
+        return f"{self.project}-ingress-1"
+
+    @property
+    def internal_network_name(self) -> str:
+        return f"{self.project}_default"
+
+    @property
+    def ingress_network_name(self) -> str:
+        return f"{self.project}_ingress"
+
+    @property
+    def bootstrap_network_name(self) -> str:
+        return f"{self.project}-bootstrap"
 
     async def snapshot(self) -> Path:
         """Capture the DB and complete WordPress volume to a temp directory.
@@ -10332,6 +10616,175 @@ class SandboxManager:
             )
 
     # ── helpers ─────────────────────────────────────────────────
+
+    async def _inspect_network_internal(self, network_name: str) -> bool:
+        rc, output, _error = await _run(
+            "docker",
+            "network",
+            "inspect",
+            "--format",
+            "{{json .Internal}}",
+            network_name,
+            check=False,
+        )
+        if rc != 0:
+            raise RuntimeError("sandbox network inspection failed")
+        try:
+            value = json.loads(output.strip())
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("sandbox network inspection was malformed") from exc
+        if type(value) is not bool:
+            raise RuntimeError("sandbox network inspection was malformed")
+        return value
+
+    async def _inspect_container_network_settings(
+        self,
+        container_name: str,
+    ) -> tuple[frozenset[str], dict[str, object]]:
+        rc, output, _error = await _run(
+            "docker",
+            "inspect",
+            "--format",
+            "{{json .NetworkSettings}}",
+            container_name,
+            check=False,
+        )
+        if rc != 0:
+            raise RuntimeError("sandbox container network inspection failed")
+        try:
+            value = json.loads(output.strip())
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "sandbox container network inspection was malformed"
+            ) from exc
+        if type(value) is not dict:
+            raise RuntimeError("sandbox container network inspection was malformed")
+        networks = value.get("Networks")
+        ports = value.get("Ports")
+        if (
+            type(networks) is not dict
+            or not all(
+                type(name) is str and type(details) is dict
+                for name, details in networks.items()
+            )
+            or type(ports) is not dict
+            or not all(type(name) is str for name in ports)
+        ):
+            raise RuntimeError("sandbox container network inspection was malformed")
+        return frozenset(networks), cast(dict[str, object], ports)
+
+    async def _inspect_container_network_mode(self, container_name: str) -> str:
+        """Read Docker's persisted primary network used for later restarts."""
+        rc, output, _error = await _run(
+            "docker",
+            "inspect",
+            "--format",
+            "{{json .HostConfig.NetworkMode}}",
+            container_name,
+            check=False,
+        )
+        if rc != 0:
+            raise RuntimeError("sandbox persistent network mode inspection failed")
+        try:
+            value = json.loads(output.strip())
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "sandbox persistent network mode inspection was malformed"
+            ) from exc
+        if type(value) is not str or not value:
+            raise RuntimeError(
+                "sandbox persistent network mode inspection was malformed"
+            )
+        return value
+
+    @staticmethod
+    def _published_port_bindings(
+        ports: dict[str, object],
+    ) -> tuple[tuple[str, str, str], ...]:
+        published: list[tuple[str, str, str]] = []
+        for container_port, raw_bindings in ports.items():
+            if raw_bindings is None:
+                continue
+            if type(raw_bindings) is not list:
+                raise RuntimeError("sandbox published-port inspection was malformed")
+            for raw_binding in raw_bindings:
+                if (
+                    type(raw_binding) is not dict
+                    or set(raw_binding) != {"HostIp", "HostPort"}
+                    or type(raw_binding.get("HostIp")) is not str
+                    or type(raw_binding.get("HostPort")) is not str
+                ):
+                    raise RuntimeError(
+                        "sandbox published-port inspection was malformed"
+                    )
+                published.append(
+                    (
+                        container_port,
+                        cast(str, raw_binding["HostIp"]),
+                        cast(str, raw_binding["HostPort"]),
+                    )
+                )
+        return tuple(sorted(published))
+
+    async def _seal_runtime_network(self) -> None:
+        """Remove bootstrap egress and attest the exact verifier topology."""
+        if (
+            not self.project.startswith(f"{_PROJECT_PREFIX}-")
+            or self.container_name != f"{self.project}-wordpress-1"
+            or self.port < _PORT_MIN
+            or self.port > _PORT_MAX
+        ):
+            raise RuntimeError("sandbox network identity is unavailable")
+
+        await _run(
+            "docker",
+            "network",
+            "disconnect",
+            self.bootstrap_network_name,
+            self.container_name,
+        )
+        await _run("docker", "network", "rm", self.bootstrap_network_name)
+
+        internal_is_internal = await self._inspect_network_internal(
+            self.internal_network_name
+        )
+        ingress_is_internal = await self._inspect_network_internal(
+            self.ingress_network_name
+        )
+        if not internal_is_internal or ingress_is_internal:
+            raise RuntimeError("sandbox network isolation attestation failed")
+
+        expected_internal = frozenset({self.internal_network_name})
+        wordpress_network_mode = await self._inspect_container_network_mode(
+            self.container_name
+        )
+        wordpress_networks, wordpress_ports = (
+            await self._inspect_container_network_settings(self.container_name)
+        )
+        database_networks, database_ports = (
+            await self._inspect_container_network_settings(self.db_container_name)
+        )
+        ingress_networks, ingress_ports = (
+            await self._inspect_container_network_settings(self.ingress_container_name)
+        )
+        if (
+            wordpress_networks != expected_internal
+            or database_networks != expected_internal
+            or ingress_networks
+            != frozenset({self.internal_network_name, self.ingress_network_name})
+        ):
+            raise RuntimeError("sandbox container network topology attestation failed")
+
+        if wordpress_network_mode != self.internal_network_name:
+            raise RuntimeError("sandbox persistent network mode attestation failed")
+
+        if (
+            self._published_port_bindings(wordpress_ports)
+            or self._published_port_bindings(database_ports)
+            or self._published_port_bindings(ingress_ports)
+            != (("80/tcp", "127.0.0.1", str(self.port)),)
+        ):
+            raise RuntimeError("sandbox published-port topology attestation failed")
 
     async def _wait_for_wordpress(self) -> None:
         """Wait for Apache to answer (any HTTP status) — pre-install it returns 302."""

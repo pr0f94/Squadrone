@@ -28,8 +28,10 @@ _ACCOUNTS = [
     },
 ]
 _ORACLE_CONTEXT = {
-    "attack_url": "http://host.docker.internal:49152/_squadrone/ssrf/" + "a" * 64,
-    "control_url": "http://host.docker.internal:49152/_squadrone/ssrf/" + "b" * 64,
+    "attack_url": "http://squadrone-ssrf-relay.internal:49152/_squadrone/ssrf/"
+    + "a" * 64,
+    "control_url": "http://squadrone-ssrf-relay.internal:49152/_squadrone/ssrf/"
+    + "b" * 64,
 }
 
 

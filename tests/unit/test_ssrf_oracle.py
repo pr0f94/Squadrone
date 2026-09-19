@@ -26,7 +26,7 @@ from squadrone.services.ssrf_oracle import (
 def _target_and_authority(url: str) -> tuple[str, str]:
     parsed = urlsplit(url)
     assert parsed.scheme == "http"
-    assert parsed.hostname == "host.docker.internal"
+    assert parsed.hostname == "squadrone-ssrf-relay.internal"
     assert parsed.port is not None
     target = parsed.path + (f"?{parsed.query}" if parsed.query else "")
     return target, parsed.netloc

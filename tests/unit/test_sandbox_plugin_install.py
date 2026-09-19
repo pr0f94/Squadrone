@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import stat
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -126,6 +127,7 @@ async def test_boot_renders_only_requested_ssrf_resources(
     monkeypatch.setattr(sandbox_module, "_run", fake_run)
     monkeypatch.setattr(manager, "_wait_for_wordpress", no_op)
     monkeypatch.setattr(manager, "_ensure_wp_installed", no_op)
+    monkeypatch.setattr(manager, "_seal_runtime_network", no_op)
     monkeypatch.setattr(manager, "_install_actor_receipt_plugin", no_op)
     monkeypatch.setattr(manager, "_ensure_wp_upload_path", no_op)
 
@@ -134,10 +136,33 @@ async def test_boot_renders_only_requested_ssrf_resources(
     compose_text = (workdir / "docker-compose.yml").read_text()
     compose = yaml.safe_load(compose_text)
     wordpress = compose["services"]["wordpress"]
-    assert ("extra_hosts" in wordpress) is ("http" in ssrf_oracle_modes)
-    assert ("host.docker.internal:host-gateway" in compose_text) is (
-        "http" in ssrf_oracle_modes
+    ingress = compose["services"]["ingress"]
+    http_ssrf_enabled = "http" in ssrf_oracle_modes
+    assert compose["networks"]["default"] == {"internal": True}
+    assert wordpress["networks"] == {
+        "default": {"priority": 1000},
+        "bootstrap": {"gw_priority": 1000},
+    }
+    assert compose["services"]["db"]["networks"] == ["default"]
+    if http_ssrf_enabled:
+        assert ingress["networks"] == {
+            "default": {"aliases": ["squadrone-ssrf-relay.internal"]},
+            "ingress": None,
+        }
+        assert ingress["extra_hosts"] == ["squadrone.host.internal:host-gateway"]
+    else:
+        assert ingress["networks"] == ["default", "ingress"]
+        assert "extra_hosts" not in ingress
+    assert ingress["ports"] == ["127.0.0.1:8199:80"]
+    assert compose["networks"]["bootstrap"] == {
+        "external": True,
+        "name": manager.bootstrap_network_name,
+    }
+    assert "extra_hosts" not in wordpress
+    assert ("squadrone.host.internal:host-gateway" in compose_text) is (
+        http_ssrf_enabled
     )
+    assert ("squadrone-ssrf-relay.internal" in compose_text) is http_ssrf_enabled
     assert ("/var/lib/squadrone/ssrf:ro" in compose_text) is (
         "local_resource" in ssrf_oracle_modes
     )
@@ -831,8 +856,13 @@ async def test_boot_prepares_upload_path_before_becoming_ready(monkeypatch, tmp_
     workdir = tmp_path / "sandbox-workdir"
     workdir.mkdir()
 
-    async def fake_run(*_args: str, **_kwargs) -> tuple[int, str, str]:
-        events.append("compose")
+    async def fake_run(*args: str, **_kwargs) -> tuple[int, str, str]:
+        if args[:3] == ("docker", "network", "create"):
+            events.append("network_create")
+        elif args[:2] == ("docker", "compose"):
+            events.append("compose")
+        else:
+            raise AssertionError(f"unexpected command: {args!r}")
         return 0, "", ""
 
     async def fake_wait() -> None:
@@ -841,12 +871,18 @@ async def test_boot_prepares_upload_path_before_becoming_ready(monkeypatch, tmp_
     async def fake_ensure() -> None:
         events.append("ensure")
 
+    async def fake_seal() -> None:
+        assert manager._booted is False
+        assert manager.wp_cli is None
+        events.append("seal")
+
     async def fake_upload_path() -> None:
         assert manager._booted is False
         events.append("upload_path")
 
     async def fake_actor_receipt() -> None:
         assert manager._booted is False
+        assert manager.wp_cli is not None
         events.append("actor_receipt")
 
     manager = _manager()
@@ -859,13 +895,621 @@ async def test_boot_prepares_upload_path_before_becoming_ready(monkeypatch, tmp_
     monkeypatch.setattr(sandbox_module, "_run", fake_run)
     monkeypatch.setattr(manager, "_wait_for_wordpress", fake_wait)
     monkeypatch.setattr(manager, "_ensure_wp_installed", fake_ensure)
+    monkeypatch.setattr(manager, "_seal_runtime_network", fake_seal)
     monkeypatch.setattr(manager, "_install_actor_receipt_plugin", fake_actor_receipt)
     monkeypatch.setattr(manager, "_ensure_wp_upload_path", fake_upload_path)
 
     await manager.boot()
 
-    assert events == ["compose", "wait", "ensure", "actor_receipt", "upload_path"]
+    assert events == [
+        "network_create",
+        "compose",
+        "wait",
+        "ensure",
+        "seal",
+        "wait",
+        "actor_receipt",
+        "upload_path",
+    ]
     assert manager._booted is True
+
+
+def _network_test_manager() -> SandboxManager:
+    manager = _manager()
+    manager.project = "squadrone-deadbeef"
+    manager.container_name = "squadrone-deadbeef-wordpress-1"
+    manager.port = 8199
+    return manager
+
+
+def _network_settings(
+    networks: set[str],
+    ports: dict[str, object],
+) -> str:
+    return json.dumps(
+        {
+            "Networks": {name: {} for name in sorted(networks)},
+            "Ports": ports,
+        }
+    )
+
+
+def test_ssrf_relay_config_has_one_literal_default_denied_upstream() -> None:
+    config = sandbox_module._ssrf_relay_apache_config(49152)
+
+    assert config.splitlines() == [
+        "Listen 49152",
+        "<VirtualHost *:49152>",
+        "    ServerName squadrone-ssrf-relay.internal",
+        "    ProxyRequests Off",
+        "    ProxyPreserveHost On",
+        "    ProxyAddHeaders Off",
+        "    ProxyPassInterpolateEnv Off",
+        "    ProxyPassInherit Off",
+        "    UseCanonicalName Off",
+        "    AllowEncodedSlashes NoDecode",
+        '    <Location "/">',
+        "        Require all denied",
+        "    </Location>",
+        '    <Location "/_squadrone/ssrf/">',
+        "        Require all granted",
+        "    </Location>",
+        '    ProxyPass "/_squadrone/ssrf/" '
+        '"http://squadrone.host.internal:49152/_squadrone/ssrf/" nocanon',
+        '    ProxyPassReverse "/_squadrone/ssrf/" '
+        '"http://squadrone.host.internal:49152/_squadrone/ssrf/"',
+        "</VirtualHost>",
+    ]
+    assert config.count("ProxyPass ") == 1
+    assert config.count("ProxyPassReverse ") == 1
+    assert "${" not in config
+
+
+@pytest.mark.parametrize("port", [True, 0, 1023, 65536, "49152"])
+def test_ssrf_relay_config_rejects_non_high_integer_ports(port: object) -> None:
+    with pytest.raises(ValueError, match="high TCP port"):
+        sandbox_module._ssrf_relay_apache_config(port)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_ssrf_relay_install_rotation_and_removal_are_exact(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manager = _manager(ssrf_oracle_modes=frozenset({"http"}))
+    manager.project = "squadrone-deadbeef"
+    manager.container_name = "squadrone-deadbeef-wordpress-1"
+    manager.workdir = tmp_path
+    manager._booted = True
+    calls: list[tuple[str, ...]] = []
+    copied_config = ""
+    copied_mode = 0
+
+    async def fake_run(*args: str, **_kwargs: object) -> tuple[int, str, str]:
+        nonlocal copied_config, copied_mode
+        calls.append(args)
+        if args[:2] == ("docker", "cp"):
+            source = Path(args[2])
+            copied_config = source.read_text()
+            copied_mode = stat.S_IMODE(source.stat().st_mode)
+        return 0, "", ""
+
+    monkeypatch.setattr(sandbox_module, "_run", fake_run)
+
+    await manager._configure_ssrf_relay_locked(49152)
+
+    assert manager._ssrf_relay_port == 49152
+    assert copied_config == sandbox_module._ssrf_relay_apache_config(49152)
+    assert copied_mode == 0o600
+    assert not (tmp_path / "squadrone-ssrf-relay.conf").exists()
+    assert calls == [
+        (
+            "docker",
+            "cp",
+            str(tmp_path / "squadrone-ssrf-relay.conf"),
+            "squadrone-deadbeef-ingress-1:"
+            "/etc/apache2/conf-enabled/.squadrone-ssrf-relay.conf.new",
+        ),
+        (
+            "docker",
+            "exec",
+            "squadrone-deadbeef-ingress-1",
+            "chown",
+            "root:root",
+            "/etc/apache2/conf-enabled/.squadrone-ssrf-relay.conf.new",
+        ),
+        (
+            "docker",
+            "exec",
+            "squadrone-deadbeef-ingress-1",
+            "chmod",
+            "0600",
+            "/etc/apache2/conf-enabled/.squadrone-ssrf-relay.conf.new",
+        ),
+        (
+            "docker",
+            "exec",
+            "squadrone-deadbeef-ingress-1",
+            "mv",
+            "-f",
+            "--",
+            "/etc/apache2/conf-enabled/.squadrone-ssrf-relay.conf.new",
+            "/etc/apache2/conf-enabled/squadrone-ssrf-relay.conf",
+        ),
+        (
+            "docker",
+            "exec",
+            "squadrone-deadbeef-ingress-1",
+            "apache2ctl",
+            "configtest",
+        ),
+        (
+            "docker",
+            "exec",
+            "squadrone-deadbeef-ingress-1",
+            "apache2ctl",
+            "-k",
+            "graceful",
+        ),
+    ]
+
+    calls.clear()
+    await manager._disable_ssrf_relay_locked()
+
+    assert manager._ssrf_relay_port is None
+    assert calls == [
+        (
+            "docker",
+            "exec",
+            "squadrone-deadbeef-ingress-1",
+            "rm",
+            "-f",
+            "--",
+            "/etc/apache2/conf-enabled/squadrone-ssrf-relay.conf",
+            "/etc/apache2/conf-enabled/.squadrone-ssrf-relay.conf.new",
+        ),
+        (
+            "docker",
+            "exec",
+            "squadrone-deadbeef-ingress-1",
+            "apache2ctl",
+            "configtest",
+        ),
+        (
+            "docker",
+            "exec",
+            "squadrone-deadbeef-ingress-1",
+            "apache2ctl",
+            "-k",
+            "graceful",
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_ssrf_relay_removal_failure_stops_ingress_and_latches_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _network_test_manager()
+    manager._booted = True
+    manager._ssrf_relay_port = 49152
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_run(*args: str, **_kwargs: object) -> tuple[int, str, str]:
+        calls.append(args)
+        if args[:2] == ("docker", "exec"):
+            raise RuntimeError("synthetic relay cleanup failure")
+        return 0, "", ""
+
+    monkeypatch.setattr(sandbox_module, "_run", fake_run)
+
+    with pytest.raises(RuntimeError, match="synthetic relay cleanup failure"):
+        await manager._disable_ssrf_relay_locked()
+
+    assert manager._booted is False
+    assert manager._ssrf_relay_port == 49152
+    assert calls[-1] == (
+        "docker",
+        "stop",
+        "--time",
+        "5",
+        manager.ingress_container_name,
+    )
+
+
+@pytest.mark.asyncio
+async def test_runtime_network_seal_removes_egress_and_attests_exact_topology(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _network_test_manager()
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_run(*args: str, **_kwargs: object) -> tuple[int, str, str]:
+        calls.append(args)
+        if args[:3] == ("docker", "network", "inspect"):
+            network = args[-1]
+            return (
+                0,
+                "true" if network == manager.internal_network_name else "false",
+                "",
+            )
+        if args[:2] == ("docker", "inspect"):
+            if args[3] == "{{json .HostConfig.NetworkMode}}":
+                return 0, json.dumps(manager.internal_network_name), ""
+            container = args[-1]
+            if container == manager.container_name:
+                return 0, _network_settings(
+                    {manager.internal_network_name}, {"80/tcp": None}
+                ), ""
+            if container == manager.db_container_name:
+                return 0, _network_settings(
+                    {manager.internal_network_name}, {"3306/tcp": None}
+                ), ""
+            if container == manager.ingress_container_name:
+                return 0, _network_settings(
+                    {
+                        manager.internal_network_name,
+                        manager.ingress_network_name,
+                    },
+                    {
+                        "80/tcp": [
+                            {"HostIp": "127.0.0.1", "HostPort": "8199"}
+                        ]
+                    },
+                ), ""
+        return 0, "", ""
+
+    monkeypatch.setattr(sandbox_module, "_run", fake_run)
+
+    await manager._seal_runtime_network()
+
+    assert calls[:2] == [
+        (
+            "docker",
+            "network",
+            "disconnect",
+            manager.bootstrap_network_name,
+            manager.container_name,
+        ),
+        ("docker", "network", "rm", manager.bootstrap_network_name),
+    ]
+    assert calls[2:] == [
+        (
+            "docker",
+            "network",
+            "inspect",
+            "--format",
+            "{{json .Internal}}",
+            manager.internal_network_name,
+        ),
+        (
+            "docker",
+            "network",
+            "inspect",
+            "--format",
+            "{{json .Internal}}",
+            manager.ingress_network_name,
+        ),
+        (
+            "docker",
+            "inspect",
+            "--format",
+            "{{json .HostConfig.NetworkMode}}",
+            manager.container_name,
+        ),
+        (
+            "docker",
+            "inspect",
+            "--format",
+            "{{json .NetworkSettings}}",
+            manager.container_name,
+        ),
+        (
+            "docker",
+            "inspect",
+            "--format",
+            "{{json .NetworkSettings}}",
+            manager.db_container_name,
+        ),
+        (
+            "docker",
+            "inspect",
+            "--format",
+            "{{json .NetworkSettings}}",
+            manager.ingress_container_name,
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_mode", "message"),
+    [
+        ("internal_is_public", "network isolation"),
+        ("ingress_is_internal", "network isolation"),
+        ("wordpress_has_egress", "container network topology"),
+        ("database_has_egress", "container network topology"),
+        ("ingress_has_bootstrap", "container network topology"),
+        ("ingress_is_publicly_bound", "published-port topology"),
+        ("malformed_network_inspection", "network inspection was malformed"),
+        ("failed_network_inspection", "network inspection failed"),
+        (
+            "stale_persistent_network_mode",
+            "persistent network mode attestation failed",
+        ),
+        (
+            "malformed_persistent_network_mode",
+            "persistent network mode inspection was malformed",
+        ),
+        (
+            "failed_persistent_network_mode_inspection",
+            "persistent network mode inspection failed",
+        ),
+        ("failed_container_inspection", "container network inspection failed"),
+        ("malformed_inspection", "container network inspection was malformed"),
+        ("malformed_port_binding", "published-port inspection was malformed"),
+    ],
+)
+async def test_runtime_network_seal_fails_closed_on_topology_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_mode: str,
+    message: str,
+) -> None:
+    manager = _network_test_manager()
+
+    async def fake_run(*args: str, **_kwargs: object) -> tuple[int, str, str]:
+        if args[:3] == ("docker", "network", "inspect"):
+            network = args[-1]
+            if network == manager.internal_network_name:
+                if failure_mode == "malformed_network_inspection":
+                    return 0, "null", ""
+                if failure_mode == "failed_network_inspection":
+                    return 1, "", "synthetic inspect failure"
+                return 0, "false" if failure_mode == "internal_is_public" else "true", ""
+            return 0, "true" if failure_mode == "ingress_is_internal" else "false", ""
+        if args[:2] == ("docker", "inspect"):
+            if args[3] == "{{json .HostConfig.NetworkMode}}":
+                if failure_mode == "failed_persistent_network_mode_inspection":
+                    return 1, "", "synthetic inspect failure"
+                if failure_mode == "malformed_persistent_network_mode":
+                    return 0, "null", ""
+                mode = (
+                    manager.bootstrap_network_name
+                    if failure_mode == "stale_persistent_network_mode"
+                    else manager.internal_network_name
+                )
+                return 0, json.dumps(mode), ""
+            container = args[-1]
+            if container == manager.container_name:
+                if failure_mode == "failed_container_inspection":
+                    return 1, "", "synthetic inspect failure"
+                if failure_mode == "malformed_inspection":
+                    return 0, "not-json", ""
+                networks = {manager.internal_network_name}
+                if failure_mode == "wordpress_has_egress":
+                    networks.add(manager.bootstrap_network_name)
+                return 0, _network_settings(networks, {"80/tcp": None}), ""
+            if container == manager.db_container_name:
+                networks = {manager.internal_network_name}
+                if failure_mode == "database_has_egress":
+                    networks.add(manager.ingress_network_name)
+                return 0, _network_settings(networks, {"3306/tcp": None}), ""
+            networks = {
+                manager.internal_network_name,
+                manager.ingress_network_name,
+            }
+            if failure_mode == "ingress_has_bootstrap":
+                networks.add(manager.bootstrap_network_name)
+            host_ip = (
+                "0.0.0.0"
+                if failure_mode == "ingress_is_publicly_bound"
+                else "127.0.0.1"
+            )
+            return 0, _network_settings(
+                networks,
+                {
+                    "80/tcp": (
+                        {"HostIp": host_ip, "HostPort": "8199"}
+                        if failure_mode == "malformed_port_binding"
+                        else [{"HostIp": host_ip, "HostPort": "8199"}]
+                    )
+                },
+            ), ""
+        return 0, "", ""
+
+    monkeypatch.setattr(sandbox_module, "_run", fake_run)
+
+    with pytest.raises(RuntimeError, match=message):
+        await manager._seal_runtime_network()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_command", ["disconnect", "rm"])
+async def test_runtime_network_seal_fails_closed_when_egress_removal_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    failed_command: str,
+) -> None:
+    manager = _network_test_manager()
+
+    async def fake_run(*args: str, **_kwargs: object) -> tuple[int, str, str]:
+        if args[:3] == ("docker", "network", failed_command):
+            raise RuntimeError("synthetic Docker failure")
+        return 0, "", ""
+
+    monkeypatch.setattr(sandbox_module, "_run", fake_run)
+
+    with pytest.raises(RuntimeError, match="synthetic Docker failure"):
+        await manager._seal_runtime_network()
+
+
+@pytest.mark.asyncio
+async def test_boot_seal_failure_tears_down_partial_project(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manager = _manager()
+    workdir = tmp_path / "sandbox-workdir"
+    workdir.mkdir()
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_run(*args: str, **_kwargs: object) -> tuple[int, str, str]:
+        calls.append(args)
+        return 0, "", ""
+
+    async def no_op() -> None:
+        return None
+
+    async def fail_seal() -> None:
+        raise RuntimeError("synthetic isolation failure")
+
+    monkeypatch.setattr(sandbox_module, "_alloc_port", lambda: 8199)
+    monkeypatch.setattr(
+        sandbox_module.tempfile,
+        "mkdtemp",
+        lambda **_kwargs: str(workdir),
+    )
+    monkeypatch.setattr(sandbox_module, "_run", fake_run)
+    monkeypatch.setattr(manager, "_wait_for_wordpress", no_op)
+    monkeypatch.setattr(manager, "_ensure_wp_installed", no_op)
+    monkeypatch.setattr(manager, "_seal_runtime_network", fail_seal)
+    monkeypatch.setattr(manager, "_remove_actor_receipt_plugin", no_op)
+
+    with pytest.raises(RuntimeError, match="synthetic isolation failure"):
+        async with manager:
+            pytest.fail("an unsealed sandbox must never be yielded")
+
+    assert manager._booted is False
+    assert manager.wp_cli is None
+    assert not workdir.exists()
+    assert any(call[:2] == ("docker", "compose") and "down" in call for call in calls)
+    assert any(call[:3] == ("docker", "network", "rm") for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_direct_boot_cancellation_tears_down_partial_project(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manager = _manager()
+    workdir = tmp_path / "sandbox-workdir"
+    workdir.mkdir()
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_run(*args: str, **_kwargs: object) -> tuple[int, str, str]:
+        calls.append(args)
+        return 0, "", ""
+
+    async def no_op() -> None:
+        return None
+
+    async def cancel_seal() -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(sandbox_module, "_alloc_port", lambda: 8199)
+    monkeypatch.setattr(
+        sandbox_module.tempfile,
+        "mkdtemp",
+        lambda **_kwargs: str(workdir),
+    )
+    monkeypatch.setattr(sandbox_module, "_run", fake_run)
+    monkeypatch.setattr(manager, "_wait_for_wordpress", no_op)
+    monkeypatch.setattr(manager, "_ensure_wp_installed", no_op)
+    monkeypatch.setattr(manager, "_seal_runtime_network", cancel_seal)
+    monkeypatch.setattr(manager, "_remove_actor_receipt_plugin", no_op)
+
+    with pytest.raises(asyncio.CancelledError):
+        await manager.boot()
+
+    assert not workdir.exists()
+    assert manager.project == ""
+    assert any(call[:2] == ("docker", "compose") and "down" in call for call in calls)
+    assert any(call[:3] == ("docker", "network", "rm") for call in calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failed_command", "retains_retry_state"),
+    [
+        ("disconnect", False),
+        ("compose", True),
+        ("network_rm", True),
+        ("network_attestation", True),
+    ],
+)
+async def test_teardown_attempts_all_cleanup_and_preserves_retry_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failed_command: str,
+    retains_retry_state: bool,
+) -> None:
+    manager = _network_test_manager()
+    workdir = tmp_path / "sandbox-workdir"
+    workdir.mkdir()
+    manager.workdir = workdir
+    bootstrap_network_name = manager.bootstrap_network_name
+    calls: list[tuple[str, ...]] = []
+    failed_once = False
+
+    async def fake_run(*args: str, **_kwargs: object) -> tuple[int, str, str]:
+        nonlocal failed_once
+        calls.append(args)
+        should_fail = (
+            (
+                failed_command == "disconnect"
+                and args[:3] == ("docker", "network", "disconnect")
+            )
+            or (
+                failed_command == "compose"
+                and args[:2] == ("docker", "compose")
+            )
+            or (
+                failed_command == "network_rm"
+                and args[:3] == ("docker", "network", "rm")
+            )
+            or (
+                failed_command == "network_attestation"
+                and args[:3] == ("docker", "network", "ls")
+            )
+        )
+        if should_fail and not failed_once:
+            failed_once = True
+            raise RuntimeError(f"synthetic {failed_command} failure")
+        return 0, "", ""
+
+    monkeypatch.setattr(sandbox_module, "_run", fake_run)
+
+    with pytest.raises(RuntimeError, match=f"synthetic {failed_command} failure"):
+        await manager.teardown()
+
+    assert any(call[:2] == ("docker", "compose") and "down" in call for call in calls)
+    assert ("docker", "network", "rm", bootstrap_network_name) in calls
+    assert manager._booted is False
+    assert manager.wp_cli is None
+    if retains_retry_state:
+        assert workdir.exists()
+        assert manager.port == 8199
+        assert manager.project == "squadrone-deadbeef"
+        assert manager.workdir == workdir
+        assert manager.container_name == "squadrone-deadbeef-wordpress-1"
+        assert manager.target_url == ""
+    else:
+        assert not workdir.exists()
+        assert manager.port == 0
+        assert manager.project == ""
+        assert manager.workdir is None
+        assert manager.container_name == ""
+        assert manager.target_url == ""
+
+    calls_before_retry = len(calls)
+    await manager.teardown()
+    if retains_retry_state:
+        assert len(calls) > calls_before_retry
+        assert not workdir.exists()
+        assert manager.project == ""
+        assert manager.workdir is None
+        assert manager.container_name == ""
+    else:
+        assert len(calls) == calls_before_retry
 
 
 @pytest.mark.asyncio

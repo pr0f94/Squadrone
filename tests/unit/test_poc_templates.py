@@ -42,10 +42,12 @@ def test_all_poc_templates_render_as_valid_python() -> None:
             request_route="/wp-admin/admin-ajax.php",
             request_dispatch={"form:action": "test_action"},
             ssrf_attack_url=(
-                "http://host.docker.internal:49152/_squadrone/ssrf/" + "ab" * 32
+                "http://squadrone-ssrf-relay.internal:49152/_squadrone/ssrf/"
+                + "ab" * 32
             ),
             ssrf_control_url=(
-                "http://host.docker.internal:49152/_squadrone/ssrf/" + "cd" * 32
+                "http://squadrone-ssrf-relay.internal:49152/_squadrone/ssrf/"
+                + "cd" * 32
             ),
         )
         ast.parse(rendered, filename=template_name)
@@ -1002,7 +1004,7 @@ def test_poc_author_prompt_requires_boundary_isolating_ssrf_control() -> None:
 
 
 def test_ssrf_template_uses_only_verifier_owned_destination_urls() -> None:
-    oracle_base = "http://host.docker.internal:49152/_squadrone/ssrf/"
+    oracle_base = "http://squadrone-ssrf-relay.internal:49152/_squadrone/ssrf/"
     attack_url = oracle_base + "ab" * 32
     control_url = oracle_base + "cd" * 32
 
@@ -1042,7 +1044,7 @@ async def test_poc_author_surfaces_ssrf_urls_but_no_expected_marker() -> None:
 
     from squadrone.agents.poc_author import PoCAuthorAgent
 
-    oracle_base = "http://host.docker.internal:49152/_squadrone/ssrf/"
+    oracle_base = "http://squadrone-ssrf-relay.internal:49152/_squadrone/ssrf/"
     attack_url = oracle_base + "ab" * 32
     control_url = oracle_base + "cd" * 32
     author = PoCAuthorAgent(FakeRuntime(), model="test-model")

@@ -69,7 +69,7 @@ def _is_retryable_llm_error(exc: BaseException) -> bool:
     # while preserving only the original message.
     if isinstance(exc, APIError):
         message = str(exc).lower()
-        return any(
+        if any(
             marker in message
             for marker in (
                 "ssl",
@@ -80,6 +80,33 @@ def _is_retryable_llm_error(exc: BaseException) -> bool:
                 "temporarily unavailable",
                 "timeout",
             )
+        ):
+            return True
+
+        # Some providers report transient control-plane/access checks as a
+        # generic APIError instead of ServiceUnavailableError.  Retry only
+        # when the provider supplies both a temporal qualifier and an explicit
+        # retry directive, so permanent authentication/authorization failures
+        # remain non-retryable.
+        has_verification_failure = any(
+            marker in message
+            for marker in (
+                "unable to verify",
+                "cannot verify",
+                "could not verify",
+                "failed to verify",
+            )
+        )
+        has_retry_directive = any(
+            marker in message for marker in ("please retry", "try again")
+        )
+        has_temporal_qualifier = any(
+            marker in message for marker in ("right now", "temporar", "later")
+        )
+        return (
+            has_verification_failure
+            and has_retry_directive
+            and has_temporal_qualifier
         )
     return False
 

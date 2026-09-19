@@ -1,6 +1,8 @@
 services:
   db:
     image: "{{ db_image | default('mariadb:10.11', true) }}"
+    networks:
+      - default
     environment:
       MYSQL_ROOT_PASSWORD: rootpass
       MYSQL_DATABASE: {{ database_name }}
@@ -14,15 +16,19 @@ services:
 
   wordpress:
     image: "{{ wordpress_image | default('wordpress:latest', true) }}"
+    networks:
+      default:
+        # Keep the durable internal network as Docker's persisted primary
+        # NetworkMode so a later container restart cannot reference the
+        # temporary bootstrap network after it has been removed.
+        priority: 1000
+      bootstrap:
+        # Bootstrap still owns the initial default route for installation.
+        # It is disconnected and removed before any verifier API is exposed.
+        gw_priority: 1000
     depends_on:
       db:
         condition: service_healthy
-{% if enable_http_ssrf %}
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-{% endif %}
-    ports:
-      - "{{ port }}:80"
     environment:
       WORDPRESS_DB_HOST: db
       WORDPRESS_DB_USER: {{ database_user }}
@@ -61,5 +67,57 @@ services:
       - "/var/lib/squadrone/php-object-gadget:rw,noexec,nosuid,nodev,mode=0770,uid=0,gid=33"
 {% endif %}
 
+  ingress:
+    image: "{{ wordpress_image | default('wordpress:latest', true) }}"
+    depends_on:
+      wordpress:
+        condition: service_started
+{% if enable_http_ssrf %}
+    extra_hosts:
+      - "squadrone.host.internal:host-gateway"
+{% endif %}
+    networks:
+{% if enable_http_ssrf %}
+      default:
+        aliases:
+          - squadrone-ssrf-relay.internal
+      ingress:
+{% else %}
+      - default
+      - ingress
+{% endif %}
+    ports:
+      - "127.0.0.1:{{ port }}:80"
+    entrypoint:
+      - /bin/sh
+      - -ec
+    command:
+      - |
+        a2enmod proxy proxy_http >/dev/null
+        a2dissite 000-default >/dev/null
+        printf '%s\n' \
+          'ServerName localhost' \
+          '<VirtualHost *:80>' \
+          '  ServerName localhost' \
+          '  ProxyRequests Off' \
+          '  ProxyPreserveHost On' \
+          '  ProxyAddHeaders Off' \
+          '  ProxyPassInterpolateEnv Off' \
+          '  UseCanonicalName Off' \
+          '  AllowEncodedSlashes NoDecode' \
+          '  ProxyPass "/" "http://wordpress:80/" nocanon' \
+          '  ProxyPassReverse "/" "http://wordpress:80/"' \
+          '</VirtualHost>' \
+          > /etc/apache2/conf-enabled/squadrone-ingress.conf
+        exec apache2-foreground
+
 volumes:
   wp_data:
+
+networks:
+  default:
+    internal: true
+  ingress:
+  bootstrap:
+    external: true
+    name: "{{ bootstrap_network_name }}"

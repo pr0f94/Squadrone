@@ -87,10 +87,34 @@ Evidence checks, negative controls, and clean-state confirmation are enforced by
 the pipeline. Pipeline YAML configures operational choices such as models,
 budget, candidate limits, and sandbox settings.
 
+Verification begins only after Squadrone removes WordPress from its temporary
+bootstrap network. At runtime WordPress and MariaDB have only an internal Docker
+network, while a trusted fixed-target ingress proxies the sandbox URL from a
+host port bound to `127.0.0.1`. Startup inspects the network flags, exact
+container memberships, published-port bindings, and Docker's persisted primary
+network mode and fails closed if the sealed topology differs. The internal
+network remains the persistent restart target while the temporary bootstrap
+network owns only the installation-time default route.
+
+HTTP SSRF proofs do not reopen general target egress. When requested, the
+ingress receives one unexposed listener for the current parent-owned oracle
+port; it denies every path except the fixed `/_squadrone/ssrf/` capability
+prefix. Squadrone validates the proxy configuration and probes it from
+WordPress. Rotation removes the old relay before releasing its parent port, and
+teardown removes the relay before stopping the oracle.
+
+The Docker target keeps this server-side boundary for every PoC. Host-side PoCs
+outside the trace-bound HTTP path use a compatibility runner with a filtered
+environment, however, and do not yet have strict socket isolation. Browser and
+inbound-callback proofs therefore require operator review when external network
+access is prohibited.
+
 ## Prerequisites
 
 - Python 3.12.14 (recorded in `.python-version`)
-- Docker with Compose v2 (Docker Desktop on macOS)
+- Docker Engine 28.0 or later with Docker Compose 2.33.1 or later (current
+  Docker Desktop on macOS); the sealed sandbox uses `priority` and
+  `gw_priority` to separate its durable restart network from bootstrap egress
 - `ripgrep`
 - Playwright Chromium (installed by the Quickstart command)
 - `subversion` optional; pinned historical releases use SVN when available and
@@ -244,12 +268,13 @@ Artifacts used for resume are written atomically where possible. Malformed
 finding rows are quarantined to `findings_corrupt.jsonl` rather than silently
 discarded.
 
-Once a sandbox context is active, teardown attempts `docker compose down -v`
-and removes temporary work and snapshot directories after normal completion,
-failure, and ordinary cancellation. Cleanup is best effort. An interrupt during
-optional persistent-sandbox setup, a repeated interrupt, or a hard process kill
-may require manual Docker cleanup. Persistent sandbox reuse remains confined to
-one verification run.
+Once a sandbox context is active, teardown removes any active SSRF relay before
+releasing its parent listener, attempts `docker compose down -v`, removes the
+temporary bootstrap network, and removes temporary work and snapshot
+directories after normal completion, failure, and ordinary cancellation.
+Cleanup is best effort. An interrupt during optional persistent-sandbox setup,
+a repeated interrupt, or a hard process kill may require manual Docker cleanup.
+Persistent sandbox reuse remains confined to one verification run.
 
 ## Manual Review
 
