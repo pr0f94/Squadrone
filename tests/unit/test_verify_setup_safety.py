@@ -58,6 +58,43 @@ def test_blocks_direct_sqli_seed():
     assert reason and "SQL injection" in reason
 
 
+@pytest.mark.parametrize(
+    "args",
+    [
+        [
+            "eval",
+            "update_option('plugin_formula', 'eval($_POST[\"code\"]);');",
+        ],
+        [
+            "db",
+            "query",
+            "INSERT INTO wp_options VALUES ('payload', '<?php echo 7;')",
+        ],
+        [
+            "eval",
+            "update_post_meta(7, 'plugin_formula', 'system($_GET[\"cmd\"]);');",
+        ],
+        ["option", "update", "plugin_formula", "SQUADRONE_CODE_PROOF"],
+    ],
+)
+def test_blocks_direct_php_code_injection_seed(args):
+    reason = _setup_command_plants_exploit_payload(
+        args,
+        _hyp(BugClass.PHP_CODE_INJECTION),
+    )
+
+    assert reason and "PHP code-injection payload" in reason
+
+
+def test_php_code_seed_guard_allows_benign_prerequisite_state():
+    reason = _setup_command_plants_exploit_payload(
+        ["eval", "update_option('plugin_feature_enabled', '1');"],
+        _hyp(BugClass.PHP_CODE_INJECTION),
+    )
+
+    assert reason is None
+
+
 def test_allows_benign_prerequisite_seed():
     reason = _setup_command_plants_exploit_payload(
         ["eval", "global $wpdb; $wpdb->insert('x', ['title' => 'Normal record']);"],

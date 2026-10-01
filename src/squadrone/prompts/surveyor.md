@@ -7,10 +7,14 @@ and `direct_php` scripts with top-level request dispatch. A top-level dispatcher
 such as `->run()` counts even when it parses request data inside a loaded class
 rather than referencing a request superglobal in the wrapper script.
 
-Sinks: $wpdb->query/get_results/get_var/get_row with non-literal args, file_put_contents,
-move_uploaded_file, unlink, include/require with variables, eval(), shell_exec(),
-exec(), system(), passthru(), popen(), wp_remote_get/post with user-controlled URLs,
-unserialize()/maybe_unserialize() with non-literal args, and direct
+Sinks: $wpdb->query/get_results/get_var/get_row with non-literal args;
+file_put_contents/fwrite/fopen and WP_Filesystem put_contents; move_uploaded_file,
+wp_handle_upload/wp_handle_sideload, media_handle_upload/media_handle_sideload, and
+wp_upload_bits; unlink/wp_delete_file; file_get_contents/readfile/readgzfile,
+fpassthru/SplFileObject and WP_Filesystem get_contents/get_contents_array;
+include/require expressions with variables; eval(); shell_exec(), exec(), system(),
+passthru(), popen(); wp_remote_get/post with user-controlled URLs;
+unserialize()/maybe_unserialize() with non-literal args; and direct
 update_metadata() calls as implicit-deserialization review anchors. Do not add
 every get_*_meta()/update_*_meta() wrapper as a separate sink.
 
@@ -58,7 +62,7 @@ Output ONLY valid JSON matching the ReconArtifact schema:
   ],
   "sinks": [
     {
-      "type": "db_query" | "file_op" | "external_http" | "unserialize" | "eval" | "include",
+      "type": "sql_query" | "file_upload" | "file_write" | "file_read" | "file_delete" | "external_http" | "deserialization" | "implicit_deserialization" | "php_code_execution" | "dynamic_include",
       "function": str,
       "file": str,
       "line": int,

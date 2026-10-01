@@ -198,6 +198,12 @@ and `authentication`. The optional item-type list matches deterministic
 # Newline-delimited batch, sequential by default
 .venv/bin/squadrone scan-batch plugins.txt
 
+# Sequential verification-only batch (no deduplication or reporting)
+.venv/bin/squadrone scan-batch plugins.txt --concurrency 1 --verify-only
+
+# Sequential triage-only batch (no sandbox verification, deduplication, or reporting)
+.venv/bin/squadrone scan-batch plugins.txt --concurrency 1 --triage-only
+
 # Parallel batch
 .venv/bin/squadrone scan-batch plugins.txt --concurrency 3
 

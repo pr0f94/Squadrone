@@ -700,6 +700,18 @@ _SHELL_PAYLOAD_SEED_RE = re.compile(
     r"(?:\b(?:id|whoami|uname)\b\s*[;&|`$]|\$\(|`[^`]+`)", re.IGNORECASE
 )
 
+_PHP_CODE_PAYLOAD_SEED_RE = re.compile(
+    r"(?:['\"]\s*(?:"
+    r"<\?(?:php|=)?|"
+    r"(?:eval|assert|create_function|system|shell_exec|passthru|exec|popen|"
+    r"proc_open)\s*\(|"
+    r"(?:echo|print|return|throw|include|require)\b|"
+    r"\$[A-Za-z_][A-Za-z0-9_]*\s*=|"
+    r"\$_(?:GET|POST|REQUEST|COOKIE|FILES)\b"
+    r")|SQUADRONE[_-][A-Za-z0-9_-]+)",
+    re.IGNORECASE,
+)
+
 _FILESYSTEM_PERMISSION_MUTATION_RE = re.compile(
     r"(?:\b(?:chmod|chown|chgrp)\s*(?:\(|\s)|"
     r"\bwp_chmod_(?:file|dir)\s*\(|"
@@ -1248,6 +1260,8 @@ def _setup_command_plants_exploit_payload(
         return "setup command directly wrote a serialized object payload into storage"
     if hyp.bug_class.value == "CWE-78" and _SHELL_PAYLOAD_SEED_RE.search(command):
         return "setup command directly wrote a command-injection payload into storage"
+    if hyp.bug_class.value == "CWE-94" and _PHP_CODE_PAYLOAD_SEED_RE.search(command):
+        return "setup command directly wrote a PHP code-injection payload into storage"
     return None
 
 

@@ -31,6 +31,7 @@ def test_scan_batch_defaults_to_sequential(tmp_path, monkeypatch):
     plugins_file = tmp_path / "plugins.txt"
     plugins_file.write_text("alpha\n\n# comment\nbeta\ngamma\n")
     calls: list[str] = []
+    modes: list[tuple[bool, bool]] = []
     active = 0
     max_active = 0
 
@@ -38,6 +39,7 @@ def test_scan_batch_defaults_to_sequential(tmp_path, monkeypatch):
         nonlocal active, max_active
         plugin_slug = kwargs["plugin_slug"]
         calls.append(plugin_slug)
+        modes.append((kwargs["verify_only"], kwargs["triage_only"]))
         active += 1
         max_active = max(max_active, active)
         await asyncio.sleep(0)
@@ -50,6 +52,7 @@ def test_scan_batch_defaults_to_sequential(tmp_path, monkeypatch):
 
     assert result.exit_code == 0
     assert calls == ["alpha", "beta", "gamma"]
+    assert modes == [(False, False), (False, False), (False, False)]
     assert max_active == 1
 
 
@@ -76,6 +79,77 @@ def test_scan_batch_honors_concurrency_option(tmp_path, monkeypatch):
 
     assert result.exit_code == 0
     assert max_active == 2
+
+
+def test_scan_batch_passes_verify_only_to_each_sequential_scan(tmp_path, monkeypatch):
+    plugins_file = tmp_path / "plugins.txt"
+    plugins_file.write_text("alpha\nbeta\ngamma\n")
+    calls: list[tuple[str, bool]] = []
+
+    async def fake_run_scan_cli(**kwargs):
+        calls.append((kwargs["plugin_slug"], kwargs["verify_only"]))
+        return _scan_result(kwargs["plugin_slug"])
+
+    monkeypatch.setattr(cli, "_run_scan_cli", fake_run_scan_cli)
+
+    result = runner.invoke(
+        cli.app,
+        ["scan-batch", str(plugins_file), "--concurrency", "1", "--verify-only"],
+    )
+
+    assert result.exit_code == 0
+    assert calls == [("alpha", True), ("beta", True), ("gamma", True)]
+    assert "verify only" in result.output
+
+
+def test_scan_batch_passes_triage_only_to_each_sequential_scan(tmp_path, monkeypatch):
+    plugins_file = tmp_path / "plugins.txt"
+    plugins_file.write_text("alpha\nbeta\ngamma\n")
+    calls: list[tuple[str, bool]] = []
+
+    async def fake_run_scan_cli(**kwargs):
+        calls.append((kwargs["plugin_slug"], kwargs["triage_only"]))
+        return _scan_result(kwargs["plugin_slug"])
+
+    monkeypatch.setattr(cli, "_run_scan_cli", fake_run_scan_cli)
+
+    result = runner.invoke(
+        cli.app,
+        ["scan-batch", str(plugins_file), "--concurrency", "1", "--triage-only"],
+    )
+
+    assert result.exit_code == 0
+    assert calls == [("alpha", True), ("beta", True), ("gamma", True)]
+    assert "triage only" in result.output
+
+
+def test_scan_batch_rejects_triage_only_with_verify_only_before_reading_file(
+    tmp_path, monkeypatch
+):
+    missing_plugins_file = tmp_path / "missing.txt"
+    called = False
+
+    async def fake_run_scan_cli(**_kwargs):
+        nonlocal called
+        called = True
+        return _scan_result("alpha")
+
+    monkeypatch.setattr(cli, "_run_scan_cli", fake_run_scan_cli)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "scan-batch",
+            str(missing_plugins_file),
+            "--triage-only",
+            "--verify-only",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "mutually exclusive" in result.output
+    assert "plugins file not found" not in result.output
+    assert called is False
 
 
 def test_scan_batch_propagates_cancellation_and_cancels_peers(tmp_path, monkeypatch):

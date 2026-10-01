@@ -123,6 +123,15 @@ _PHP_SURFACES: list[tuple[str, re.Pattern[str], list[ReviewArea], str]] = [
         "sink",
     ),
     (
+        "php_code_execution",
+        # eval is a language construct and PHP permits whitespace/newlines before
+        # its opening parenthesis. Match the executable token here; statement
+        # extraction below captures and validates the complete construct.
+        re.compile(r"(?<![$A-Za-z0-9_])(?P<fn>eval)\b", re.IGNORECASE),
+        ["injection_files"],
+        "sink",
+    ),
+    (
         "external_http",
         re.compile(
             r"\b(?P<fn>wp_remote_get|wp_remote_post|wp_remote_request|wp_remote_head|curl_exec)\s*\("
@@ -157,7 +166,9 @@ _PHP_SURFACES: list[tuple[str, re.Pattern[str], list[ReviewArea], str]] = [
     (
         "file_upload",
         re.compile(
-            r"\b(?P<fn>move_uploaded_file|wp_handle_upload|media_handle_upload)\s*\("
+            r"\b(?P<fn>move_uploaded_file|wp_handle_upload|media_handle_upload|"
+            r"wp_handle_sideload|media_handle_sideload|wp_upload_bits)\s*\(",
+            re.IGNORECASE,
         ),
         ["injection_files"],
         "sink",
@@ -165,26 +176,43 @@ _PHP_SURFACES: list[tuple[str, re.Pattern[str], list[ReviewArea], str]] = [
     (
         "file_write",
         re.compile(
-            r"\b(?P<fn>file_put_contents|fwrite|fopen|copy|rename|extractTo)\s*\("
+            r"(?:\b(?P<fn>file_put_contents|fwrite|fputs|fopen|copy|rename|touch|"
+            r"symlink|link|extractTo)\s*\(|"
+            r"\$[A-Za-z_][A-Za-z0-9_]*(?:\s*->\s*[A-Za-z_][A-Za-z0-9_]*)*"
+            r"\s*->\s*(?P<method>put_contents)\s*\()",
+            re.IGNORECASE,
         ),
         ["injection_files"],
         "sink",
     ),
     (
         "file_delete",
-        re.compile(r"\b(?P<fn>unlink|rmdir)\s*\("),
+        re.compile(
+            r"\b(?P<fn>unlink|rmdir|wp_delete_file|"
+            r"wp_delete_file_from_directory)\s*\(",
+            re.IGNORECASE,
+        ),
         ["injection_files"],
         "sink",
     ),
     (
         "file_read",
-        re.compile(r"\b(?P<fn>file_get_contents|readfile|file|glob)\s*\("),
+        re.compile(
+            r"(?:\b(?P<fn>file_get_contents|readfile|readgzfile|fpassthru|fread|"
+            r"stream_get_contents|gzfile|file|glob|SplFileObject)\s*\(|"
+            r"\$[A-Za-z_][A-Za-z0-9_]*(?:\s*->\s*[A-Za-z_][A-Za-z0-9_]*)*"
+            r"\s*->\s*(?P<method>get_contents|get_contents_array)\s*\()",
+            re.IGNORECASE,
+        ),
         ["injection_files"],
         "sink",
     ),
     (
         "dynamic_include",
-        re.compile(r"\b(?P<fn>include|include_once|require|require_once)\s*[\($]"),
+        re.compile(
+            r"\b(?P<fn>include|include_once|require|require_once)\b",
+            re.IGNORECASE,
+        ),
         ["injection_files"],
         "sink",
     ),
@@ -547,6 +575,68 @@ def _php_call_snippet(
                 break
     end = closing if closing >= 0 else limit
     return source[match_start:end].strip()
+
+
+def _php_statement_snippet(
+    source: str,
+    masked_source: str,
+    line_start: int,
+    match_start: int,
+) -> str:
+    """Return one bounded PHP statement, retaining multiline operands."""
+    limit = min(len(source), match_start + _SURFACE_SNIPPET_MAX_CHARS)
+    round_depth = 0
+    square_depth = 0
+    brace_depth = 0
+    end = -1
+    for index in range(match_start, limit):
+        char = masked_source[index]
+        if char == "(":
+            round_depth += 1
+        elif char == ")":
+            round_depth = max(0, round_depth - 1)
+        elif char == "[":
+            square_depth += 1
+        elif char == "]":
+            square_depth = max(0, square_depth - 1)
+        elif char == "{":
+            brace_depth += 1
+        elif char == "}":
+            brace_depth = max(0, brace_depth - 1)
+        elif char == ";" and not (round_depth or square_depth or brace_depth):
+            end = index + 1
+            break
+    if end < 0:
+        end = limit
+    return source[line_start:end].strip()
+
+
+def _is_reviewable_php_construct(surface_type: str, snippet: str) -> bool:
+    """Filter broad PHP construct tokens after complete statement extraction."""
+    masked = _mask_non_code(snippet, mask_strings=True)
+    if surface_type == "php_code_execution":
+        return (
+            re.search(
+                r"(?<![$A-Za-z0-9_:>])eval\s*\(",
+                masked,
+                re.IGNORECASE,
+            )
+            is not None
+        )
+    if surface_type != "dynamic_include":
+        return True
+    match = re.search(
+        r"\b(?:include|include_once|require|require_once)\b",
+        masked,
+        re.IGNORECASE,
+    )
+    if match is None:
+        return False
+    operand = masked[match.end() :].lstrip()
+    # Preserve existing fixed parenthesized include coverage while excluding
+    # ordinary unparenthesized fixed bootstraps. Any variable in the complete
+    # operand makes expression-form and multiline includes reviewable.
+    return operand.startswith("(") or "$" in operand
 
 
 def _php_call_arguments(snippet: str, function_name: str) -> list[str] | None:
@@ -1089,14 +1179,22 @@ def _surface_items(
                     continue
                 groups = match.groupdict()
                 name = next((value for value in groups.values() if value), surface_type)
-                key = (kind, rel, line_no, name)
-                if key in seen:
-                    continue
-                seen.add(key)
                 fallback_snippet = line[
                     max(0, match.start() - 200) : match.end() + 300
                 ].strip()
-                if patterns is _PHP_SURFACES and "(" in match.group(0):
+                if patterns is _PHP_SURFACES and surface_type in {
+                    "dynamic_include",
+                    "php_code_execution",
+                }:
+                    snippet = _php_statement_snippet(
+                        source,
+                        scan_source,
+                        line_start,
+                        line_start + match.start(),
+                    )
+                    if not _is_reviewable_php_construct(surface_type, snippet):
+                        continue
+                elif patterns is _PHP_SURFACES and "(" in match.group(0):
                     snippet = (
                         _php_call_snippet(
                             source,
@@ -1108,6 +1206,10 @@ def _surface_items(
                     )
                 else:
                     snippet = fallback_snippet
+                key = (kind, rel, line_no, name)
+                if key in seen:
+                    continue
+                seen.add(key)
                 item_areas = list(areas)
                 if patterns is _PHP_SURFACES and _sql_object_access_review(
                     surface_type=surface_type,
@@ -1398,7 +1500,8 @@ def merge_deterministic_coverage(
             continue
         haystack = " ".join((sink.type, sink.function)).lower()
         if re.search(
-            r"sql|query|file|upload|unlink|include|require|remote|curl|xml|unserial|exec|system",
+            r"sql|query|file|upload|unlink|include|require|remote|curl|xml|"
+            r"unserial|exec|system|eval|php[_ -]?code",
             haystack,
         ):
             sink_areas: list[ReviewArea] = ["injection_files"]

@@ -27,11 +27,25 @@ RIPGREP_PATTERNS: dict[str, str] = {
     "wpdb": r"\$wpdb->",
     "unserialize": r"\b(?:maybe_)?unserialize\s*\(",
     "implicit_deserialization": r"(?i:\bupdate_metadata)\s*\(",
-    "file_put_contents": r"\bfile_put_contents\s*\(",
-    "move_uploaded_file": r"\bmove_uploaded_file\s*\(",
-    "unlink": r"\bunlink\s*\(",
-    "include_require": r"\b(?:include|require)(?:_once)?\s*\(",
-    "eval": r"\beval\s*\(",
+    "file_put_contents": (
+        r"(?i:\b(?:file_put_contents|fwrite|fputs|fopen|copy|rename|touch|"
+        r"symlink|link|extractTo)\s*\(|->\s*put_contents\s*\()"
+    ),
+    "move_uploaded_file": (
+        r"(?i:\b(?:move_uploaded_file|wp_handle_upload|media_handle_upload|"
+        r"wp_handle_sideload|media_handle_sideload|wp_upload_bits)\s*\()"
+    ),
+    "file_reads": (
+        r"(?i:\b(?:file_get_contents|readfile|readgzfile|fpassthru|fread|"
+        r"stream_get_contents|gzfile|file|glob|SplFileObject)\s*\(|"
+        r"->\s*(?:get_contents|get_contents_array)\s*\()"
+    ),
+    "unlink": (
+        r"(?i:\b(?:unlink|rmdir|wp_delete_file|"
+        r"wp_delete_file_from_directory)\s*\()"
+    ),
+    "include_require": r"(?i:\b(?:include|require)(?:_once)?\b)",
+    "eval": r"(?i:\beval\b)",
     "shell_exec": r"\b(?:shell_exec|exec|system|passthru|popen|proc_open)\s*\(",
     "wp_remote": r"\bwp_remote_(?:get|post|request|head)\s*\(",
     "xml_parsers": r"\b(?:simplexml_load_string|DOMDocument|SimpleXMLElement)\b",

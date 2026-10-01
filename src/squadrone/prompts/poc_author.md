@@ -269,6 +269,13 @@ Rules:
   is setup evidence, not proof of weak randomness.
 - SQLi: use a `timing` oracle with at least three attack and three control samples, or a unique `response_marker` absent from the control.
 - Auth bypass: use `authorization` or `state_change` and record the actual privileged effect.
+- PHP code injection (CWE-94): keep the route and request shape identical between
+  attack and control, changing only the code-bearing value. Prove an
+  execution-only effect, not reflection or a PHP error. For `response_marker`,
+  make evaluated code construct the complete marker at runtime so that exact
+  value is absent from every transmitted request byte, and require it to be
+  absent from the comparable non-executing control. Prefer a measured
+  `state_change` or `file_effect` when the natural vulnerable path provides one.
 - File ops: use `file_effect` and snapshot the deterministic attack and control
   paths before sending either request, then snapshot each path again after its
   comparable request. A successful attack must prove either file creation

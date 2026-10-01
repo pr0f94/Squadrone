@@ -3,7 +3,10 @@ from __future__ import annotations
 import re
 
 from squadrone.schemas import EntryPoint, ReconArtifact
-from squadrone.agents._specialist_base import _requires_dynamic_key_trace
+from squadrone.agents._specialist_base import (
+    _requires_dynamic_key_trace,
+    _requires_variable_php_include_trace,
+)
 from squadrone.services.coverage import (
     build_coverage_artifact,
     merge_deterministic_coverage,
@@ -134,6 +137,111 @@ def test_recon_grep_tracks_only_direct_implicit_metadata_anchor():
     assert pattern.search("UPDATE_METADATA('post', $id, $key, $value)")
     assert not pattern.search("update_post_meta($id, $key, $value)")
     assert not pattern.search("get_metadata('post', $id, $key, true)")
+
+
+def test_coverage_inventories_php_eval_and_extended_file_apis(tmp_path):
+    (tmp_path / "plugin.php").write_text(
+        "<?php\n"
+        "eval($_POST['code']);\n"
+        "EVAL\n"
+        "    ($_REQUEST['other_code']);\n"
+        "wp_handle_sideload($_FILES['archive'], []);\n"
+        "wp_upload_bits($name, null, $bytes);\n"
+        "$wp_filesystem->put_contents($path, $bytes);\n"
+        "$wp_filesystem->get_contents($path);\n"
+        "$wp_filesystem->get_contents_array($path);\n"
+        "readgzfile($path);\n"
+        "fpassthru($handle);\n"
+        "new SplFileObject($path);\n"
+        "// eval($_GET['commented']);\n"
+        "/* wp_upload_bits('ignored', null, $bytes); */\n"
+        "$example = \"readgzfile($path)\";\n"
+    )
+
+    artifact, _, sinks = build_coverage_artifact(tmp_path)
+
+    relevant = [
+        item
+        for item in artifact.items
+        if item.type
+        in {"php_code_execution", "file_upload", "file_write", "file_read"}
+    ]
+    assert {(item.type, item.name.lower()) for item in relevant} == {
+        ("php_code_execution", "eval"),
+        ("file_upload", "wp_handle_sideload"),
+        ("file_upload", "wp_upload_bits"),
+        ("file_write", "put_contents"),
+        ("file_read", "get_contents"),
+        ("file_read", "get_contents_array"),
+        ("file_read", "readgzfile"),
+        ("file_read", "fpassthru"),
+        ("file_read", "splfileobject"),
+    }
+    assert sum(item.type == "php_code_execution" for item in relevant) == 2
+    assert all(item.kind == "sink" for item in relevant)
+    assert all(item.review_areas == ["injection_files"] for item in relevant)
+    assert {
+        (sink["type"], sink["function"].lower())
+        for sink in sinks
+        if sink["type"]
+        in {"php_code_execution", "file_upload", "file_write", "file_read"}
+    } == {(item.type, item.name.lower()) for item in relevant}
+
+
+def test_coverage_detects_expression_form_php_includes(tmp_path):
+    (tmp_path / "plugin.php").write_text(
+        "<?php\n"
+        "include __DIR__ . '/views/' . $template . '.php';\n"
+        "require dirname(__FILE__) . '/modules/'\n"
+        "    . $module . '.php';\n"
+        "include_once plugin_dir_path(__FILE__) . $_GET['partial'];\n"
+        "include('fixed-parenthesized.php');\n"
+        "include 'fixed-unparenthesized.php';\n"
+        "// require __DIR__ . $commented;\n"
+        "/* include_once __DIR__ . $also_commented; */\n"
+        "$example = \"include __DIR__ . $inside_string\";\n"
+    )
+
+    artifact, _, sinks = build_coverage_artifact(tmp_path)
+
+    includes = [item for item in artifact.items if item.type == "dynamic_include"]
+    assert [(item.line, item.name.lower()) for item in includes] == [
+        (2, "include"),
+        (3, "require"),
+        (5, "include_once"),
+        (6, "include"),
+    ]
+    assert "$template" in includes[0].snippet
+    assert "$module" in includes[1].snippet
+    assert "\n" in includes[1].snippet
+    assert "$_GET['partial']" in includes[2].snippet
+    assert includes[3].snippet == "include('fixed-parenthesized.php');"
+    assert all(_requires_variable_php_include_trace(item) for item in includes[:3])
+    assert not _requires_variable_php_include_trace(includes[3])
+    assert [(sink["line"], sink["function"].lower()) for sink in sinks] == [
+        (2, "include"),
+        (3, "require"),
+        (5, "include_once"),
+        (6, "include"),
+    ]
+
+
+def test_recon_grep_tracks_extended_file_and_php_code_surfaces():
+    write_pattern = re.compile(RIPGREP_PATTERNS["file_put_contents"])
+    upload_pattern = re.compile(RIPGREP_PATTERNS["move_uploaded_file"])
+    read_pattern = re.compile(RIPGREP_PATTERNS["file_reads"])
+    delete_pattern = re.compile(RIPGREP_PATTERNS["unlink"])
+    include_pattern = re.compile(RIPGREP_PATTERNS["include_require"])
+    eval_pattern = re.compile(RIPGREP_PATTERNS["eval"])
+
+    assert write_pattern.search("$wp_filesystem->put_contents($path, $bytes)")
+    assert upload_pattern.search("wp_handle_sideload($file, $overrides)")
+    assert upload_pattern.search("wp_upload_bits($name, null, $bytes)")
+    assert read_pattern.search("$wp_filesystem->get_contents_array($path)")
+    assert read_pattern.search("new SplFileObject($path)")
+    assert delete_pattern.search("wp_delete_file($path)")
+    assert include_pattern.search("require __DIR__ . '/' . $module")
+    assert eval_pattern.search("EVAL\n    ($code)")
 
 
 def test_dynamic_sql_identity_crud_routes_to_authorization_without_broad_sql_routing(
@@ -473,6 +581,31 @@ def test_merge_normalizes_and_deduplicates_surveyor_and_static_routes(tmp_path):
     assert recon.entry_points[0].name == "demo/v1/thing"
     entry_items = [item for item in coverage.items if item.kind == "entry_point"]
     assert len(entry_items) == 1
+
+
+def test_merge_routes_legacy_surveyor_eval_sink_to_injection_review(tmp_path):
+    (tmp_path / "plugin.php").write_text("<?php\n$callable($value);\n")
+    coverage, callbacks, sinks = build_coverage_artifact(tmp_path)
+    recon = ReconArtifact(
+        plugin_slug="demo",
+        entry_points=[],
+        sinks=[
+            {
+                "type": "eval",
+                "function": "eval",
+                "file": "plugin.php",
+                "line": 2,
+                "tainted_args": ["$value"],
+            }
+        ],
+        entry_to_sink_paths={},
+        raw_grep_hits={},
+    )
+
+    merge_deterministic_coverage(recon, tmp_path, coverage, callbacks, sinks)
+
+    item = next(item for item in coverage.items if item.type == "eval")
+    assert item.review_areas == ["injection_files"]
 
 
 def test_coverage_inventories_unguarded_top_level_php_dispatcher(tmp_path):

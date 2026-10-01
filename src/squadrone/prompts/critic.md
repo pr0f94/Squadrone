@@ -207,6 +207,13 @@ For `acceptance_mode: manual_review_only`, never put the hypothesis in
 claim; otherwise put the complete original hypothesis in `manual_review` and
 state that no reviewed family-specific evidence contract exists. A missing or
 unrecognized contract also fails closed as `manual_review_only`.
+For a CWE-94 PHP code-injection candidate, prove that external input controls
+executable PHP syntax at the exact reachable `eval()` sink for the claimed
+attacker role. A static or finite-allowlisted expression, data safely encoded
+inside fixed PHP, a parse error, or submitted PHP merely reflected in a response
+is not code-execution evidence. Reject outcome-only relabeling of command
+injection, executable upload, file inclusion, or object-injection chains as
+CWE-94; retain their actual root-cause class.
 Before rejecting a PHP `include`/`require` candidate as contained, evaluate the
 exact completed path under PHP include-path semantics. A fixed filename prefix
 or suffix, or a review-time `file_exists`, `realpath`, or

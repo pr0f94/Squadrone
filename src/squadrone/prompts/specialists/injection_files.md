@@ -11,13 +11,22 @@ prefer one `read_plugin_ranges` call (up to eight bounded ranges) over separate
 `read_plugin_file` calls. This only reduces tool turns: inspect the same complete
 paths and obtain every line used as evidence.
 
-Look for SQL/command injection, arbitrary file upload/write/read/delete,
-traversal or inclusion, XXE, exploitable PHP object injection with a reachable
-gadget, and SSRF with a protected internal read/write/action. A callback to an
-attacker server proves an SSRF primitive but not reportable CIA impact. Do not
-emit open redirects, safe fixed-path operations, upload of harmless allowed
-types, `unserialize` without attacker-controlled bytes, or dependency CVEs with
-no reachable plugin path.
+Look for SQL/OS-command injection, PHP code injection, arbitrary file
+upload/write/read/delete, traversal or inclusion, XXE, exploitable PHP object
+injection with a reachable gadget, and SSRF with a protected internal
+read/write/action. A callback to an attacker server proves an SSRF primitive but
+not reportable CIA impact. Do not emit open redirects, safe fixed-path
+operations, upload of harmless allowed types, `unserialize` without
+attacker-controlled bytes, or dependency CVEs with no reachable plugin path.
+
+Classify an externally reachable `eval()` path as CWE-94 only when the attacker
+controls executable PHP syntax at the exact sink. Trace every transformation and
+guard between ingress and `eval`: fixed or finite-allowlisted expressions, safe
+data encoding into fixed PHP, parse errors, reflected payload text, or selection
+among harmless existing callbacks do not establish code injection. Keep root
+causes distinct: shell-process execution is CWE-78, an executable upload/write
+is CWE-434, traversal-driven inclusion is CWE-22, and a deserialization gadget
+is CWE-502 even when any of those produces a code-execution outcome.
 
 Treat an assigned `implicit_deserialization` operation as a focused storage
 trace, not proof of a vulnerability by itself. Work backward to a low-level raw
@@ -241,7 +250,7 @@ otherwise overlooked stream read as security-relevant when its data reaches an
 attacker-visible response sink.
 
 Classify request-controlled directory escape at an include/require sink as
-CWE-22. Typical classes: CWE-89, CWE-78, CWE-22, CWE-434, CWE-918, CWE-611,
-CWE-502.
+CWE-22. Typical classes: CWE-89, CWE-78, CWE-94, CWE-22, CWE-434, CWE-918,
+CWE-611, CWE-502.
 
 Your `reviewer` value is exactly `injection_files`.

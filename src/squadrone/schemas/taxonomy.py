@@ -129,6 +129,7 @@ class BugClass(str, Enum):
     MISSING_NONCE = "CWE-352"
     SQLI = "CWE-89"
     COMMAND_INJECTION = "CWE-78"
+    PHP_CODE_INJECTION = "CWE-94"
     PATH_TRAVERSAL = "CWE-22"
     ARBITRARY_FILE_WRITE = "CWE-434"
     SSRF = "CWE-918"
@@ -288,6 +289,21 @@ _KNOWN_CWE_REGISTRY: dict[BugClass, KnownCWEProfile] = {
         "command_injection",
         "injection_files",
         surfaces=("command_execution",),
+        owasp="A03:2021-Injection",
+        template="auth_bypass.py.j2",
+        template_fit="generic",
+        oracles=("file_effect", "response_marker", "state_change"),
+        wordfence="direct",
+        patchstack="direct",
+        analysis="partial",
+        delivery="conditional",
+    ),
+    BugClass.PHP_CODE_INJECTION: _profile(
+        "CWE-94",
+        "command_code_injection",
+        "php_code_injection",
+        "injection_files",
+        surfaces=("php_code_execution",),
         owasp="A03:2021-Injection",
         template="auth_bypass.py.j2",
         template_fit="generic",

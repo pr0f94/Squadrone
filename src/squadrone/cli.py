@@ -614,6 +614,22 @@ def scan_batch(
         "--version",
         help="Pin the same plugin version for every slug in the batch",
     ),
+    verify_only: bool = typer.Option(
+        False,
+        "--verify-only",
+        help=(
+            "Verify source-valid candidates even without an automatic disclosure route; "
+            "skip vulnerability DB dedup and report generation."
+        ),
+    ),
+    triage_only: bool = typer.Option(
+        False,
+        "--triage-only",
+        help=(
+            "Run through source-valid triage, then stop before verification, "
+            "dedup, and report generation."
+        ),
+    ),
     verbose: bool = typer.Option(
         False,
         "--verbose",
@@ -622,6 +638,10 @@ def scan_batch(
     ),
 ) -> None:
     """Scan multiple plugins from a newline-delimited file."""
+    if verify_only and triage_only:
+        raise typer.BadParameter(
+            "--verify-only and --triage-only are mutually exclusive"
+        )
     _configure_logging(verbose=verbose)
     plugin_slugs = _read_plugins_file(plugins_file)
     console.print(
@@ -633,6 +653,7 @@ def scan_batch(
                     f"[b]Budget[/b]       {f'${budget:.2f} per plugin' if budget is not None else 'from config'}",
                     f"[b]Concurrency[/b]  {concurrency}",
                     f"[b]Version[/b]      {version or 'latest'}",
+                    f"[b]Mode[/b]         {'triage only' if triage_only else 'verify only' if verify_only else 'full pipeline'}",
                 ]
             ),
             title="Squadrone Batch Scan",
@@ -656,6 +677,8 @@ def scan_batch(
                         resume=None,
                         resume_from=None,
                         verbose=verbose,
+                        verify_only=verify_only,
+                        triage_only=triage_only,
                         batch_prefix=prefix,
                     )
                 except Exception as exc:

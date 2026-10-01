@@ -514,6 +514,20 @@ def test_injection_prompt_anchors_file_uploads_at_the_write_operation():
     assert "record that as a proof gap" in prompt
 
 
+def test_php_code_injection_prompts_require_execution_not_reflection():
+    specialist = " ".join(load_prompt("specialists/injection_files").split())
+    critic = " ".join(load_prompt("critic").split())
+    poc_author = " ".join(load_prompt("poc_author").split())
+
+    assert "attacker controls executable PHP syntax" in specialist
+    assert "`eval()` path as CWE-94" in specialist
+    assert "shell-process execution is CWE-78" in specialist
+    assert "executable upload/write is CWE-434" in specialist
+    assert "submitted PHP merely reflected" in critic
+    assert "execution-only effect, not reflection or a PHP error" in poc_author
+    assert "exact value is absent from every transmitted request byte" in poc_author
+
+
 def test_injection_prompt_uses_php_include_resolution_not_filesystem_prechecks():
     prompt = " ".join(load_prompt("specialists/injection_files").split())
 

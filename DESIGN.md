@@ -347,7 +347,7 @@ The public scan flags are:
 
 ```text
 scan:       --config --budget --version --resume --from --verify-only --triage-only --verbose
-scan-batch: --concurrency --config --budget --version --verbose
+scan-batch: --concurrency --config --budget --version --verify-only --triage-only --verbose
 ```
 
 ## Benchmark Semantics

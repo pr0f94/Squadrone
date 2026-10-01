@@ -56,6 +56,11 @@ def test_exact_profile_taxonomy_and_review_ownership() -> None:
             "injection_files",
             ("command_execution",),
         ),
+        BugClass.PHP_CODE_INJECTION: (
+            "php_code_injection",
+            "injection_files",
+            ("php_code_execution",),
+        ),
         BugClass.PATH_TRAVERSAL: (
             "path_traversal_or_file_access",
             "injection_files",
@@ -213,7 +218,10 @@ def test_registry_family_partition_is_explicit_and_disjoint() -> None:
             BugClass.WEAK_PASSWORD_RECOVERY,
             BugClass.SESSION_FIXATION,
         },
-        "command_code_injection": {BugClass.COMMAND_INJECTION},
+        "command_code_injection": {
+            BugClass.COMMAND_INJECTION,
+            BugClass.PHP_CODE_INJECTION,
+        },
         "cross_site_scripting": {BugClass.XSS_REFLECTED, BugClass.XSS_STORED},
         "cryptography_tokens": {BugClass.WEAK_CRYPTO, BugClass.WEAK_PRNG},
         "database_injection": {BugClass.SQLI},
@@ -359,7 +367,7 @@ def test_open_cwe_preserves_exact_id_without_declaring_support() -> None:
         == "manual_review_only"
     )
     assert unknown not in KNOWN_CWE_REGISTRY
-    assert len(BugClass) == len(KNOWN_CWE_REGISTRY) == 23
+    assert len(BugClass) == len(KNOWN_CWE_REGISTRY) == 24
 
 
 @pytest.mark.parametrize(

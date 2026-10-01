@@ -341,6 +341,13 @@ def test_legacy_cwe79_artifact_is_upgraded_from_context():
             BugClass.RESOURCE_EXHAUSTION,
         ),
         ("SQL Injection", BugClass.SQLI),
+        ("Code Injection", BugClass.PHP_CODE_INJECTION),
+        ("PHP Code Injection", BugClass.PHP_CODE_INJECTION),
+        ("PHP Eval Injection", BugClass.PHP_CODE_INJECTION),
+        (
+            "Improper Control of Generation of Code",
+            BugClass.PHP_CODE_INJECTION,
+        ),
         ("Server-Side Request Forgery", BugClass.SSRF),
         (
             "Unrestricted Upload of File with Dangerous Type",

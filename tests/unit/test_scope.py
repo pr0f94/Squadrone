@@ -48,6 +48,20 @@ def test_low_privilege_sqli_routes_to_both_programs():
     assert reasons == {}
 
 
+def test_low_privilege_php_code_injection_routes_to_both_programs():
+    programs, reasons = preverification_programs(
+        _hypothesis(
+            bug_class=BugClass.PHP_CODE_INJECTION,
+            sink="eval",
+            sink_code="eval($_POST['code']);",
+            taint_path=["$_POST['code']", "eval"],
+        )
+    )
+
+    assert programs == ["wordfence", "patchstack"]
+    assert reasons == {}
+
+
 def test_descriptive_unauthenticated_role_routes_like_canonical_role():
     programs, reasons = preverification_programs(
         _hypothesis(
