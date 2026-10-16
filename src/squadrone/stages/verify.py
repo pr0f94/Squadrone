@@ -21,6 +21,7 @@ from ..agents.developer import DeveloperAgent, RequestedSetupPlan, SetupPlan
 from ..agents.poc_author import (
     PHP_OBJECT_INERT_IMPACT_DESCRIPTION,
     PoCAuthorAgent,
+    _explicit_request_field,
     _parse_entry_point_transport,
 )
 from ..agents.runtime import AgentRuntime
@@ -45,6 +46,7 @@ from ..services.budget import BudgetTracker
 from ..services.decision_ledger import append_decision
 from ..services.diagnostics import bound_diagnostic
 from ..services.quality_gate import (
+    automatic_verifier_contract_violations,
     infer_attacker_role,
     validate_php_object_natural_finding_confirmation,
 )
@@ -63,12 +65,22 @@ from ..services.sandbox import (
     SandboxManager,
     SandboxRunResult,
     WORDPRESS_WEB_USER,
+    execution_private_marker_from_observation,
     php_include_private_marker_from_observation,
+    redact_execution_run_result,
     redact_php_include_run_result,
     validate_confirmation_observations,
     validate_plugin_slug,
 )
 from ..services import verify_helpers
+from ..services.verification_checkpoint import (
+    VERIFICATION_CHECKPOINT_SCHEMA_VERSION,
+    VERIFICATION_POLICY_VERSION,
+    canonical_hypothesis_digest,
+    finding_verification_binding_matches,
+    verification_binding,
+    verification_binding_matches,
+)
 from .triage import validate_php_object_gadget_recipe_sources
 
 logger = logging.getLogger(__name__)
@@ -172,6 +184,21 @@ def _consume_php_include_live_observation(
     live_observation = trusted_observation or result.observation
     private_marker = php_include_private_marker_from_observation(live_observation)
     redact_php_include_run_result(result, private_marker)
+    return live_observation
+
+
+def _consume_execution_live_observation(
+    result: SandboxRunResult,
+    *,
+    execution_expected: bool,
+) -> PoCObservation | None:
+    """Take one raw execution canary while keeping persisted fields redacted."""
+    if not execution_expected:
+        return result.observation
+    trusted_observation = result.take_trusted_execution_observation()
+    live_observation = trusted_observation or result.observation
+    private_marker = execution_private_marker_from_observation(live_observation)
+    redact_execution_run_result(result, private_marker)
     return live_observation
 
 
@@ -1927,6 +1954,20 @@ def _has_full_compromise_target(outcome: SecurityOutcome) -> bool:
     return all(
         getattr(outcome, dimension) == "high"
         for dimension in ("confidentiality", "integrity", "availability")
+    )
+
+
+def _has_source_validated_executable_upload_target(hypothesis: Hypothesis) -> bool:
+    """Select an exact CWE-434 execution chain without trusting its display label alone."""
+    evidence = hypothesis.evidence_summary or {}
+    return bool(
+        hypothesis.bug_class == BugClass.ARBITRARY_FILE_WRITE
+        and "potential_rce" in hypothesis.impact_labels
+        and all(
+            isinstance(evidence.get(key), str)
+            and bool(str(evidence[key]).strip())
+            for key in ("code_execution_path", "code_execution_sink")
+        )
     )
 
 
@@ -3868,7 +3909,9 @@ def _php_include_oracle_enabled_for_hypotheses(
 ) -> bool:
     """Return whether this sandbox needs the additive PHP include capability."""
     return any(
-        _expected_php_include_http_transport(
+        hypothesis.bug_class
+        in {BugClass.COMMAND_INJECTION, BugClass.PHP_CODE_INJECTION}
+        or _expected_php_include_http_transport(
             hypothesis,
             plugin_root,
             plugin_slug,
@@ -4803,12 +4846,64 @@ async def _verify_one(
     php_object_natural_failure_reason = ""
     expected_attacker_role = infer_attacker_role(hyp)
     expected_bug_class = hyp.bug_class.oracle_key
+    expected_injection_order = hyp.injection_order
     ssrf_expected = expected_bug_class in {
         BugClass.SSRF.name,
         BugClass.SSRF.value,
     }
     ssrf_oracle_mode = _ssrf_oracle_mode(hyp) if ssrf_expected else "http"
     sandbox_ssrf_modes = frozenset({ssrf_oracle_mode}) if ssrf_expected else frozenset()
+    execution_trace_expected = hyp.bug_class in {
+        BugClass.COMMAND_INJECTION,
+        BugClass.PHP_CODE_INJECTION,
+    }
+    second_order_sqli_expected = bool(
+        hyp.bug_class == BugClass.SQLI and expected_injection_order == "second"
+    )
+    source_entry_http_transport = _parse_entry_point_transport(hyp.entry_point)
+    source_entry_parameter, source_entry_parameter_location = (
+        _explicit_request_field(hyp)
+    )
+    if execution_trace_expected or second_order_sqli_expected:
+        source_entry_http_transport = dict(source_entry_http_transport)
+        source_entry_http_transport["destination_parameter"] = (
+            source_entry_parameter
+        )
+        source_entry_http_transport["destination_location"] = (
+            source_entry_parameter_location
+        )
+    second_order_trigger_http_transport: dict[str, object] | None = None
+    second_order_storage_binding: str | None = None
+    second_order_write_success_marker: str | None = None
+    expected_preflight_http_transports: list[dict[str, object]] = []
+    if second_order_sqli_expected:
+        second_order_trigger_http_transport = dict(
+            _parse_entry_point_transport(
+                str((hyp.evidence_summary or {}).get("trigger") or "")
+            )
+        )
+        second_order_storage_binding = str(
+            (hyp.evidence_summary or {}).get("storage_identity") or ""
+        ).strip()
+        second_order_write_success_marker = str(
+            (hyp.evidence_summary or {}).get("write_success_marker") or ""
+        )
+    if execution_trace_expected or second_order_sqli_expected:
+        raw_preflights = (hyp.evidence_summary or {}).get(
+            "verification_preflights"
+        )
+        if isinstance(raw_preflights, list):
+            for raw_preflight in raw_preflights:
+                if not isinstance(raw_preflight, str):
+                    continue
+                parsed_preflight = dict(
+                    _parse_entry_point_transport(raw_preflight)
+                )
+                if (
+                    parsed_preflight.get("method") in {"GET", "HEAD"}
+                    and parsed_preflight.get("route")
+                ):
+                    expected_preflight_http_transports.append(parsed_preflight)
     php_include_http_transport = _expected_php_include_http_transport(
         hyp,
         plugin_path,
@@ -4849,8 +4944,11 @@ async def _verify_one(
     ) and not (ssrf_expected or php_include_expected or php_object_expected)
     executable_upload_http_transport = _parse_entry_point_transport(hyp.entry_point)
     executable_upload_candidate = bool(
-        seek_full_compromise
-        and hyp.bug_class == BugClass.ARBITRARY_FILE_WRITE
+        hyp.bug_class == BugClass.ARBITRARY_FILE_WRITE
+        and (
+            seek_full_compromise
+            or _has_source_validated_executable_upload_target(hyp)
+        )
     )
     if executable_upload_candidate and (
         executable_upload_http_transport.get("method") != "POST"
@@ -4904,8 +5002,8 @@ async def _verify_one(
         atomic_write_json(
             poc_dir / "attempts.json",
             {
-                "schema_version": 1,
-                "hypothesis_id": hyp.id,
+                "schema_version": VERIFICATION_CHECKPOINT_SCHEMA_VERSION,
+                **verification_binding(hyp),
                 "status": status,
                 "attempts": [attempt.model_dump(mode="json") for attempt in attempts],
             },
@@ -5275,7 +5373,9 @@ async def _verify_one(
             boot_timeout_s=max(config.sandbox_timeout_seconds, 180),
             poc_timeout_s=config.sandbox_timeout_seconds,
             ssrf_oracle_modes=sandbox_ssrf_modes,
-            php_include_oracle_enabled=php_include_expected,
+            php_include_oracle_enabled=(
+                php_include_expected or execution_trace_expected
+            ),
             php_object_oracle_enabled=php_object_expected,
             php_object_gadget_oracle_enabled=php_object_natural_expected,
             php_object_gadget_directory_constants=(
@@ -5308,6 +5408,7 @@ async def _verify_one(
             if (
                 ssrf_oracle_mode == "local_resource"
                 or php_include_expected
+                or execution_trace_expected
                 or php_object_expected
             ):
                 await sb.restart_wordpress_runtime()
@@ -5354,6 +5455,8 @@ async def _verify_one(
             expected_http_transport = php_object_http_transport
         elif executable_upload_expected:
             expected_http_transport = dict(executable_upload_http_transport)
+        elif execution_trace_expected or second_order_sqli_expected:
+            expected_http_transport = dict(source_entry_http_transport)
         else:
             expected_http_transport = None
         if (
@@ -5361,6 +5464,8 @@ async def _verify_one(
             or php_include_expected
             or php_object_expected
             or executable_upload_expected
+            or execution_trace_expected
+            or second_order_sqli_expected
         ):
             author_user_accounts = [role_account] if role_account is not None else []
         else:
@@ -5368,6 +5473,7 @@ async def _verify_one(
 
         ssrf_oracle: dict[str, str] | None = None
         php_include_oracle: dict[str, str] | None = None
+        execution_oracle: dict[str, str] | None = None
         php_object_oracle: dict[str, str] | None = None
         replay_script_after_setup: str | None = None
         verified_partial_proof: dict[str, object] | None = None
@@ -5401,6 +5507,11 @@ async def _verify_one(
                 php_include_oracle = (
                     await sb.prepare_php_include_oracle()
                     if php_include_expected
+                    else None
+                )
+                execution_oracle = (
+                    await sb.prepare_execution_oracle()
+                    if execution_trace_expected
                     else None
                 )
                 php_object_oracle = (
@@ -5455,6 +5566,9 @@ async def _verify_one(
                 if php_include_oracle is not None:
                     extra_ctx["php_include_oracle"] = php_include_oracle
                     extra_ctx["php_include_http_transport"] = expected_http_transport
+                if execution_oracle is not None:
+                    extra_ctx["execution_oracle"] = execution_oracle
+                    extra_ctx["execution_http_transport"] = expected_http_transport
                 if php_object_oracle is not None:
                     extra_ctx["php_object_oracle"] = php_object_oracle
                     extra_ctx["php_object_http_transport"] = php_object_http_transport
@@ -5524,7 +5638,16 @@ async def _verify_one(
                 str(script_path),
                 expected_bug_class=expected_bug_class,
                 expected_attacker_role=normalized_role,
+                expected_injection_order=expected_injection_order,
                 expected_http_transport=expected_http_transport,
+                expected_trigger_http_transport=(
+                    second_order_trigger_http_transport
+                ),
+                expected_storage_binding=second_order_storage_binding,
+                expected_write_success_marker=second_order_write_success_marker,
+                expected_preflight_http_transports=(
+                    expected_preflight_http_transports
+                ),
                 expected_php_include=php_include_expected,
                 expected_php_object=php_object_expected,
                 expected_php_object_transport=php_object_http_transport,
@@ -5544,9 +5667,16 @@ async def _verify_one(
                         if not bounded
                         else "trusted PHP object run lacks parent attestation"
                     )
-            live_result_observation = _consume_php_include_live_observation(
-                result,
-                php_include_expected=php_include_expected,
+            live_result_observation = (
+                _consume_execution_live_observation(
+                    result,
+                    execution_expected=True,
+                )
+                if execution_trace_expected
+                else _consume_php_include_live_observation(
+                    result,
+                    php_include_expected=php_include_expected,
+                )
             )
             attempt = PoCAttempt(
                 iteration=iteration,
@@ -5587,6 +5717,9 @@ async def _verify_one(
                         "plugin/WordPress entry point reachable by the claimed attacker role."
                     )
                     result.reject(reason[:1000])
+                    if execution_trace_expected:
+                        attempt.observation = None
+                        attempt.rejected_observation = None
                     attempt.mark_failed(reason[:1000])
                     attempt.developer_analysis = reason[:1000]
                     _checkpoint_attempts()
@@ -5606,7 +5739,18 @@ async def _verify_one(
                     str(script_path),
                     expected_bug_class=expected_bug_class,
                     expected_attacker_role=normalized_role,
+                    expected_injection_order=expected_injection_order,
                     expected_http_transport=expected_http_transport,
+                    expected_trigger_http_transport=(
+                        second_order_trigger_http_transport
+                    ),
+                    expected_storage_binding=second_order_storage_binding,
+                    expected_write_success_marker=(
+                        second_order_write_success_marker
+                    ),
+                    expected_preflight_http_transports=(
+                        expected_preflight_http_transports
+                    ),
                     expected_php_include=php_include_expected,
                     expected_php_object=php_object_expected,
                     expected_php_object_transport=php_object_http_transport,
@@ -5626,9 +5770,16 @@ async def _verify_one(
                             if not bounded
                             else "trusted PHP object replay lacks parent attestation"
                         )
-                live_confirmation_observation = _consume_php_include_live_observation(
-                    confirm,
-                    php_include_expected=php_include_expected,
+                live_confirmation_observation = (
+                    _consume_execution_live_observation(
+                        confirm,
+                        execution_expected=True,
+                    )
+                    if execution_trace_expected
+                    else _consume_php_include_live_observation(
+                        confirm,
+                        php_include_expected=php_include_expected,
+                    )
                 )
                 confirmation_attempt = PoCAttempt(
                     iteration=iteration,
@@ -5847,6 +5998,9 @@ async def _verify_one(
                     break
                 if confirm.success:
                     confirm.reject(confirmation_reason)
+                    if execution_trace_expected:
+                        confirmation_attempt.observation = None
+                        confirmation_attempt.rejected_observation = None
                     confirmation_attempt.mark_failed(confirmation_reason)
                 elif not confirmation_attempt.validation_reason:
                     confirmation_attempt.validation_reason = (
@@ -5857,6 +6011,9 @@ async def _verify_one(
                     + (confirm.validation_reason or "oracle did not reproduce")
                 )
                 result.reject(first_run_rejection)
+                if execution_trace_expected:
+                    attempt.observation = None
+                    attempt.rejected_observation = None
                 attempt.mark_failed(first_run_rejection)
                 attempt.developer_analysis = (attempt.validation_reason or "")[:1000]
                 attempts.append(confirmation_attempt)
@@ -6085,6 +6242,8 @@ async def _verify_one(
     finding = Finding(
         id=_next_finding_id(),
         hypothesis=verified_hypothesis,
+        verification_policy_version=VERIFICATION_POLICY_VERSION,
+        hypothesis_digest=canonical_hypothesis_digest(hyp),
         poc_status=PoCStatus.SUCCESS,
         poc_script_path=selected_confirmation.script_path,
         poc_attempts=attempts,
@@ -6178,9 +6337,10 @@ def _open_cwe_manual_checkpoint_matches(
         return False
     return (
         isinstance(marker, dict)
-        and marker.get("schema_version") == 1
+        and marker.get("schema_version")
+        == VERIFICATION_CHECKPOINT_SCHEMA_VERSION
+        and verification_binding_matches(marker, hypothesis)
         and marker.get("status") == "manual_review"
-        and marker.get("hypothesis_id") == hypothesis.id
         and marker.get("bug_class") == hypothesis.bug_class.value
         and marker.get("source") == _OPEN_CWE_MANUAL_REVIEW_SOURCE
         and not (hyp_dir / "error.log").exists()
@@ -6190,22 +6350,23 @@ def _open_cwe_manual_checkpoint_matches(
     )
 
 
-def _attempt_checkpoint_state(hyp_dir: Path) -> str | None:
-    """Return a trusted attempt state, or ``incomplete`` for a bad checkpoint.
-
-    ``None`` identifies historical verification directories that predate the
-    checkpoint.  Their existing iteration-only resume behavior is preserved.
-    """
+def _attempt_checkpoint_state(hyp_dir: Path, hypothesis: Hypothesis) -> str:
+    """Return a trusted attempt state, or ``incomplete`` for a stale checkpoint."""
     path = hyp_dir / "attempts.json"
     if not path.exists():
-        return None
+        return "incomplete"
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
         return "incomplete"
-    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version")
+        != VERIFICATION_CHECKPOINT_SCHEMA_VERSION
+        or not verification_binding_matches(payload, hypothesis)
+    ):
         return "incomplete"
-    if payload.get("hypothesis_id") != hyp_dir.name:
+    if hypothesis.id != hyp_dir.name:
         return "incomplete"
     status = payload.get("status")
     if status not in {
@@ -6302,6 +6463,25 @@ async def run(
     developer: DeveloperAgent | None = None,
     force: bool = False,
 ) -> list[Finding]:
+    contract_violations = {
+        hypothesis.id: automatic_verifier_contract_violations(hypothesis)
+        for hypothesis in triaged.accepted
+        if hypothesis.bug_class.is_known
+    }
+    contract_violations = {
+        hypothesis_id: rules
+        for hypothesis_id, rules in contract_violations.items()
+        if rules
+    }
+    if contract_violations:
+        details = "; ".join(
+            f"{hypothesis_id}: {', '.join(rules)}"
+            for hypothesis_id, rules in sorted(contract_violations.items())
+        )
+        raise ValueError(
+            "triaged hypotheses violate the current automatic-verifier contract; "
+            f"rerun triage ({details})"
+        )
     automatic_hypotheses = [
         hypothesis for hypothesis in triaged.accepted if hypothesis.bug_class.is_known
     ]
@@ -6353,17 +6533,26 @@ async def run(
             Finding,
             corrupt_path=run_dir / "findings_corrupt.jsonl",
         )
-        accepted_hypothesis_ids = {hypothesis.id for hypothesis in triaged.accepted}
+        accepted_hypotheses = {
+            hypothesis.id: hypothesis for hypothesis in triaged.accepted
+        }
         stale_findings = [
             finding
             for finding in parsed
-            if finding.hypothesis.id not in accepted_hypothesis_ids
+            if (
+                (current := accepted_hypotheses.get(finding.hypothesis.id)) is None
+                or not finding_verification_binding_matches(finding, current)
+            )
+        ]
+        resumable_findings = [
+            finding for finding in parsed if finding not in stale_findings
         ]
         if stale_findings:
             stale_path = run_dir / "findings_stale.jsonl"
             atomic_write_jsonl(stale_path, stale_findings)
             logger.warning(
-                "verify: quarantined %d finding(s) outside the current triage set to %s",
+                "verify: quarantined %d finding(s) outside the current verification "
+                "binding to %s",
                 len(stale_findings),
                 stale_path,
             )
@@ -6373,8 +6562,8 @@ async def run(
                 action="recover",
                 result="stale_findings_quarantined",
                 reason=(
-                    f"{len(stale_findings)} finding(s) referenced hypotheses outside "
-                    "the current accepted set"
+                    f"{len(stale_findings)} finding(s) did not match the complete "
+                    "current accepted hypothesis and verifier policy"
                 ),
                 artifact=stale_path,
                 details={
@@ -6385,9 +6574,8 @@ async def run(
             )
         open_cwe_findings = [
             finding
-            for finding in parsed
-            if finding.hypothesis.id in accepted_hypothesis_ids
-            and not finding.hypothesis.bug_class.is_known
+            for finding in resumable_findings
+            if not finding.hypothesis.bug_class.is_known
         ]
         if open_cwe_findings:
             quarantine_path = run_dir / "findings_open_cwe_quarantined.jsonl"
@@ -6415,9 +6603,7 @@ async def run(
                 },
             )
         unproven_php_object_findings: list[Finding] = []
-        for f in parsed:
-            if f.hypothesis.id not in accepted_hypothesis_ids:
-                continue
+        for f in resumable_findings:
             if not f.hypothesis.bug_class.is_known:
                 continue
             if f.hypothesis.bug_class == BugClass.PHP_OBJECT_INJECTION:
@@ -6605,9 +6791,9 @@ async def run(
                 atomic_write_json(
                     hyp_dir / OPEN_CWE_MANUAL_REVIEW_FILENAME,
                     {
-                        "schema_version": 1,
+                        "schema_version": VERIFICATION_CHECKPOINT_SCHEMA_VERSION,
+                        **verification_binding(hyp),
                         "status": "manual_review",
-                        "hypothesis_id": hyp.id,
                         "bug_class": hyp.bug_class.value,
                         "source": _OPEN_CWE_MANUAL_REVIEW_SOURCE,
                         "automatic_verification": False,
@@ -6655,14 +6841,12 @@ async def run(
             hyp_dir = verifications_dir / hyp.id
             error_path = hyp_dir / "error.log"
             iter_files = sorted(hyp_dir.glob("iter_*.py")) if hyp_dir.exists() else []
-            checkpoint_state = _attempt_checkpoint_state(hyp_dir)
+            checkpoint_state = _attempt_checkpoint_state(hyp_dir, hyp)
             # Only a clean iteration checkpoint is a terminal non-confirmation.
             # Exceptions and non-terminal/corrupt checkpoints take precedence even
-            # if one or more iteration scripts were written first.  Directories
-            # without attempts.json predate the checkpoint and retain the legacy
-            # iteration-only skip behavior.
+            # if one or more iteration scripts were written first.  Historical
+            # iteration-only directories and pre-policy attempt markers are stale.
             terminal_not_confirmed = checkpoint_state in {
-                None,
                 "not_confirmed",
                 "primitive_confirmed",
             }
@@ -6869,8 +7053,13 @@ async def run(
     atomic_write_json(
         complete_path,
         {
+            "schema_version": VERIFICATION_CHECKPOINT_SCHEMA_VERSION,
+            "verification_policy_version": VERIFICATION_POLICY_VERSION,
             "status": "complete",
             "accepted_hypothesis_ids": [hyp.id for hyp in triaged.accepted],
+            "accepted_hypothesis_digests": [
+                canonical_hypothesis_digest(hyp) for hyp in triaged.accepted
+            ],
             "finding_ids": [finding.id for finding in findings],
             "automatic_verification_hypothesis_ids": [
                 hyp.id for hyp in automatic_hypotheses

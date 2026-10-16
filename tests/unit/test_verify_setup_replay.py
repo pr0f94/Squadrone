@@ -334,6 +334,18 @@ def _non_full_compromise_upload_hypothesis() -> Hypothesis:
     return hypothesis
 
 
+def _potential_rce_upload_hypothesis() -> Hypothesis:
+    hypothesis = _non_full_compromise_upload_hypothesis()
+    hypothesis.impact_labels = ["potential_rce"]
+    hypothesis.evidence_summary = {
+        "code_execution_path": (
+            "attacker upload -> executable destination -> natural HTTP execution"
+        ),
+        "code_execution_sink": "WordPress serves and executes uploads/proof.php",
+    }
+    return hypothesis
+
+
 def _confirmation(
     iteration: int,
     *,
@@ -468,6 +480,71 @@ async def test_non_full_compromise_upload_keeps_historical_single_strategy_path(
         options["expected_executable_upload"] is False
         for options in sandbox.run_kwargs
     )
+
+
+@pytest.mark.asyncio
+async def test_potential_rce_upload_selects_trusted_executable_upload_path(
+    monkeypatch, tmp_path
+):
+    author_contexts: list[dict] = []
+
+    class FakePoCAuthor:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def write(self, **kwargs):
+            author_contexts.append(kwargs["extra_context"])
+            return "POTENTIAL_RCE_SCRIPT\n"
+
+    class ConfirmingSandbox(_Sandbox):
+        def __init__(self, path):
+            super().__init__(path)
+            partial = _observation(full_compromise=False)
+            self.results = iter([partial, partial])
+
+        async def run_poc(self, script_path, **kwargs):
+            self.executed_scripts.append(Path(script_path).read_text())
+            self.run_kwargs.append(kwargs)
+            return SandboxRunResult(
+                success=True,
+                output="SQUADRONE_RESULT={}",
+                elapsed=0,
+                observation=next(self.results).model_copy(deep=True),
+            )
+
+    monkeypatch.setattr(verify_stage, "PoCAuthorAgent", FakePoCAuthor)
+    sandbox = ConfirmingSandbox(tmp_path)
+
+    finding = await verify_stage._verify_one(
+        _potential_rce_upload_hypothesis(),
+        str(tmp_path),
+        str(tmp_path / "plugin.zip"),
+        "plugin",
+        _config(3),
+        object(),
+        tmp_path / "verification",
+        persistent_sb=sandbox,
+    )
+
+    assert finding is not None
+    assert len(author_contexts) == 1
+    assert "executable_upload_oracle" in author_contexts[0]
+    assert all(
+        options["expected_executable_upload"] is True
+        for options in sandbox.run_kwargs
+    )
+
+
+def test_potential_rce_upload_requires_both_source_execution_evidence_fields() -> None:
+    hypothesis = _potential_rce_upload_hypothesis()
+    assert verify_stage._has_source_validated_executable_upload_target(hypothesis)
+
+    for missing_key in ("code_execution_path", "code_execution_sink"):
+        incomplete = hypothesis.model_copy(deep=True)
+        incomplete.evidence_summary.pop(missing_key)
+        assert not verify_stage._has_source_validated_executable_upload_target(
+            incomplete
+        )
 
 
 @pytest.mark.asyncio

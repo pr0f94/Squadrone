@@ -1,0 +1,162 @@
+import re
+
+import requests
+
+from poc_result import emit_result
+from wp_login import wp_login, wp_rest_nonce
+
+
+TARGET = {{ target_url | tojson }}
+METHOD = {{ request_method | default("") | tojson }}
+ROUTE = {{ request_route | default("") | tojson }}
+DISPATCH = {{ request_dispatch | default({}) | tojson }}
+PREFLIGHTS = {{ verification_preflights | default([]) | tojson }}
+PARAM = {{ execution_parameter | default("") | tojson }}
+PARAM_LOCATION = {{ execution_parameter_location | default("") | tojson }}
+USERNAME = {{ test_username | default("") | tojson }}
+PASSWORD = {{ test_password | default("") | tojson }}
+ATTACKER_ROLE = {{ attacker_role | default("unknown") | tojson }}
+EXECUTION_ATTACK_PATH = {{ execution_attack_path | default("") | tojson }}
+EXECUTION_CONTROL_PATH = {{ execution_control_path | default("") | tojson }}
+
+# Replace these fail-closed values only after reviewing the exact command sink.
+# Each value must invoke PHP CLI on its corresponding parent-owned opaque path.
+# They must otherwise be identical; the private response marker is not available.
+ATTACK_VALUE = ""
+CONTROL_VALUE = ""
+MARKER_RE = re.compile(r"SQUADRONE_PHP_INCLUDE_[0-9a-f]{64}")
+
+
+def uses_rest_transport(route: str, dispatch: dict[str, str]) -> bool:
+    return route.startswith("/wp-json/") or bool(dispatch.get("query:rest_route"))
+
+
+def request_payload(value: str) -> tuple[dict[str, str], dict[str, str], dict]:
+    query: dict[str, str] = {}
+    form: dict[str, str] = {}
+    json_body: dict = {}
+    for located_name, dispatch_value in DISPATCH.items():
+        location, separator, name = located_name.partition(":")
+        if not separator or not name:
+            raise RuntimeError("invalid source-derived dispatch mapping")
+        {"query": query, "form": form, "json": json_body}[location][name] = dispatch_value
+    {"query": query, "form": form, "json": json_body}[PARAM_LOCATION][PARAM] = value
+    return query, form, json_body
+
+
+def send(session: requests.Session, value: str) -> requests.Response:
+    query, form, json_body = request_payload(value)
+    return session.request(
+        METHOD,
+        f"{TARGET}{ROUTE}",
+        params=query or None,
+        data=form or None,
+        json=json_body or None,
+        headers=HEADERS or None,
+        timeout=30,
+        allow_redirects=False,
+    )
+
+
+def run_preflights(session: requests.Session) -> list[requests.Response]:
+    responses = []
+    for preflight in PREFLIGHTS:
+        query = {
+            key.removeprefix("query:"): value
+            for key, value in preflight["dispatch"].items()
+        }
+        response = session.request(
+            preflight["method"],
+            f"{TARGET}{preflight['route']}",
+            params=query or None,
+            headers=HEADERS or None,
+            timeout=30,
+            allow_redirects=False,
+        )
+        if not 200 <= response.status_code < 300:
+            raise RuntimeError("source-grounded verification preflight failed")
+        responses.append(response)
+    return responses
+
+
+if (
+    not METHOD
+    or not ROUTE
+    or not PARAM
+    or PARAM_LOCATION not in {"query", "form", "json"}
+    or not EXECUTION_ATTACK_PATH
+    or not EXECUTION_CONTROL_PATH
+    or not ATTACK_VALUE
+    or not CONTROL_VALUE
+):
+    raise RuntimeError("source-grounded command transport and canary payloads are required")
+if (
+    ATTACK_VALUE.count(EXECUTION_ATTACK_PATH) != 1
+    or CONTROL_VALUE.count(EXECUTION_CONTROL_PATH) != 1
+    or EXECUTION_CONTROL_PATH in ATTACK_VALUE
+    or EXECUTION_ATTACK_PATH in CONTROL_VALUE
+    or ATTACK_VALUE.replace(EXECUTION_ATTACK_PATH, "{execution_path}")
+    != CONTROL_VALUE.replace(EXECUTION_CONTROL_PATH, "{execution_path}")
+):
+    raise RuntimeError("attack and control must differ only by their execution path")
+if "SQUADRONE_" in ATTACK_VALUE or "SQUADRONE_" in CONTROL_VALUE:
+    raise RuntimeError("a private execution marker must never be transmitted")
+
+session = requests.Session()
+HEADERS = {}
+authenticated_actor = ATTACKER_ROLE.lower() not in {
+    "unauthenticated",
+    "anonymous",
+    "guest",
+}
+if authenticated_actor:
+    login = wp_login(session, TARGET, USERNAME, PASSWORD)
+    if not login.success:
+        raise RuntimeError(f"attacker login failed: {login.reason}")
+if authenticated_actor and (
+    uses_rest_transport(ROUTE, DISPATCH)
+    or any(
+        uses_rest_transport(item["route"], item["dispatch"])
+        for item in PREFLIGHTS
+    )
+):
+    nonce = wp_rest_nonce(session, TARGET)
+    if not nonce.success:
+        raise RuntimeError(f"REST nonce acquisition failed: {nonce.reason}")
+    HEADERS["X-WP-Nonce"] = nonce.nonce
+
+preflight_responses = run_preflights(session)
+control_response = send(session, CONTROL_VALUE)
+attack_response = send(session, ATTACK_VALUE)
+control_markers = MARKER_RE.findall(control_response.text)
+attack_markers = MARKER_RE.findall(attack_response.text)
+attack_marker = attack_markers[0] if len(attack_markers) == 1 else ""
+attack_has_marker = len(attack_markers) == 1
+control_has_marker = bool(control_markers)
+observed = attack_has_marker and not control_has_marker
+
+emit_result(
+    verdict="vulnerable" if observed else "not_vulnerable",
+    oracle="response_marker",
+    attacker_role=ATTACKER_ROLE,
+    request={"method": METHOD, "url": f"{TARGET}{ROUTE}"},
+    attack={
+        "observed": observed,
+        "marker": attack_marker,
+        "marker_present": attack_has_marker,
+        "execution_path": EXECUTION_ATTACK_PATH,
+        "destination_value": ATTACK_VALUE,
+    },
+    control={
+        "observed": control_has_marker,
+        "marker_present": control_has_marker,
+        "execution_path": EXECUTION_CONTROL_PATH,
+        "destination_value": CONTROL_VALUE,
+    },
+    integrity="high" if observed else "none",
+    impact=(
+        "Attacker-controlled input executed as an operating-system command."
+        if observed
+        else "No attack-only command-execution canary was observed."
+    ),
+)

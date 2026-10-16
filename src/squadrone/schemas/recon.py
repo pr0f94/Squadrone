@@ -83,7 +83,13 @@ ReviewArea = Literal[
     "xss_lifecycle",
     "authentication",
 ]
-CoverageKind = Literal["entry_point", "sink", "storage_read", "storage_write"]
+CoverageKind = Literal[
+    "entry_point",
+    "review_anchor",
+    "sink",
+    "storage_read",
+    "storage_write",
+]
 CoverageStatus = Literal["candidate", "reviewed", "unreachable", "unreviewed"]
 
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from squadrone.agents.reporter import ReporterAgent
@@ -20,11 +22,12 @@ from squadrone.services import quality_gate as quality_gate_service
 from squadrone.services.budget import BudgetTracker
 from squadrone.services.quality_gate import (
     apply_quality_gate,
+    automatic_verifier_contract_violations,
     grade_finding_for_report,
     grade_hypothesis,
     infer_attacker_role,
-    reconcile_verified_impact,
     recompute_severity,
+    reconcile_verified_impact,
     severity_from_finding,
     validate_php_object_natural_finding_confirmation,
 )
@@ -564,6 +567,488 @@ def test_quality_gate_recognizes_public_upload_execution_impact():
     assert grade.evidence["impact_dimensions"]["integrity"] == "low"
 
 
+def test_second_order_sqli_requires_and_preserves_storage_evidence() -> None:
+    evidence = dict(_hypothesis().evidence_summary)
+    evidence.update(
+        {
+            "source": "POST form field sort_clause; plugin.php:10 — $_POST['sort_clause']",
+            "control": "The final SQL construction has no placeholder or allowlist",
+            "sink": "$wpdb->get_results($sql)",
+            "reachable_path": (
+                "low-privilege settings write -> option demo_sort -> scheduled report "
+                "-> $wpdb->get_results"
+            ),
+            "boundary": (
+                "A Subscriber controls SQL syntax executed later with the site's "
+                "database privileges."
+            ),
+            "impact": "The attacker can extract protected database values.",
+            "storage_writer": "POST /save -> update_option('demo_sort', $value)",
+            "storage_identity": "option:demo_sort",
+            "trigger": "GET /report -> get_option('demo_sort') -> query",
+            "write_success_marker": "FILTER_WRITE_CONFIRMED_7D3A",
+            "same_actor_lifecycle": True,
+            "verification_oracle": "timing",
+        }
+    )
+    hypothesis = _hypothesis(
+        bug_class=BugClass.SQLI,
+        specialist="injection_files",
+        injection_order="second",
+        storage_boundary="option",
+        security_outcome=SecurityOutcome(
+            confidentiality="high",
+            description="The attacker can extract protected database values.",
+        ),
+        evidence_summary=evidence,
+    )
+
+    grade = grade_hypothesis(hypothesis)
+
+    assert grade.accepted is True
+    assert grade.evidence["storage_writer"] == evidence["storage_writer"]
+    assert grade.evidence["storage_identity"] == "option:demo_sort"
+    assert grade.evidence["trigger"] == evidence["trigger"]
+    assert grade.evidence["write_success_marker"] == "FILTER_WRITE_CONFIRMED_7D3A"
+    assert grade.evidence["verification_oracle"] == "timing"
+
+    gated = apply_quality_gate(
+        TriagedArtifact(
+            plugin_slug="demo",
+            accepted=[hypothesis],
+            rejected=[],
+            merged=[],
+        )
+    )
+    resumed = TriagedArtifact.model_validate(gated.model_dump(mode="json"))
+    assert resumed.accepted[0].evidence_summary["verification_oracle"] == "timing"
+    assert automatic_verifier_contract_violations(resumed.accepted[0]) == []
+
+
+def test_second_order_sqli_binds_storage_identity_to_declared_boundary() -> None:
+    evidence = {
+        **_hypothesis().evidence_summary,
+        "source": "POST form field sort; plugin.php:10 — $_POST['sort']",
+        "storage_writer": "POST /save -> update_option",
+        "storage_identity": "metadata:post:7:demo_sort",
+        "trigger": "GET /report",
+        "write_success_marker": "FILTER_WRITE_CONFIRMED_7D3A",
+        "same_actor_lifecycle": True,
+        "verification_oracle": "timing",
+    }
+    hypothesis = _hypothesis(
+        bug_class=BugClass.SQLI,
+        specialist="injection_files",
+        entry_point="POST /save",
+        injection_order="second",
+        storage_boundary="option",
+        evidence_summary=evidence,
+    )
+
+    grade = grade_hypothesis(hypothesis)
+
+    assert grade.accepted is False
+    assert "second_order_sqli_storage_identity_invalid" in grade.rules
+
+
+@pytest.mark.parametrize(
+    ("storage_boundary", "storage_identity"),
+    [
+        ("option", "option:rapport_clé"),
+        ("metadata", "metadata:post:7:rapport_clé"),
+        ("transient", "transient:rapport:clé"),
+        ("custom_table", "custom_table:wp_reports:id:7"),
+        ("other", "other:queue:rapport_clé"),
+    ],
+)
+def test_second_order_sqli_accepts_exact_storage_identity_prefixes(
+    storage_boundary,
+    storage_identity,
+) -> None:
+    evidence = {
+        **_hypothesis().evidence_summary,
+        "source": "POST form field sort; plugin.php:10 — $_POST['sort']",
+        "storage_writer": "POST /save -> persistent writer",
+        "storage_identity": storage_identity,
+        "trigger": "GET /report",
+        "write_success_marker": "FILTER_WRITE_CONFIRMED_7D3A",
+        "same_actor_lifecycle": True,
+        "verification_oracle": "timing",
+    }
+    hypothesis = _hypothesis(
+        bug_class=BugClass.SQLI,
+        specialist="injection_files",
+        entry_point="POST /save",
+        injection_order="second",
+        storage_boundary=storage_boundary,
+        evidence_summary=evidence,
+    )
+
+    grade = grade_hypothesis(hypothesis)
+
+    assert "second_order_sqli_storage_identity_invalid" not in grade.rules
+
+
+def test_second_order_sqli_fails_closed_without_storage_evidence() -> None:
+    hypothesis = _hypothesis(
+        bug_class=BugClass.SQLI,
+        specialist="injection_files",
+        injection_order="second",
+        storage_boundary="custom_table",
+    )
+
+    grade = grade_hypothesis(hypothesis)
+
+    assert grade.accepted is False
+    assert "second_order_sqli_storage_evidence_missing" in grade.rules
+
+
+@pytest.mark.parametrize("injection_order", [None, "direct"])
+def test_non_second_order_hypothesis_rejects_reserved_storage_evidence(
+    injection_order,
+) -> None:
+    evidence = {
+        **_hypothesis().evidence_summary,
+        "storage_writer": "POST /save -> update_option",
+        "storage_identity": "option:demo_sort",
+        "trigger": "GET /report",
+        "write_success_marker": "FILTER_WRITE_CONFIRMED_7D3A",
+        "same_actor_lifecycle": True,
+        "verification_oracle": "timing",
+    }
+    hypothesis = _hypothesis(
+        bug_class=BugClass.SQLI,
+        specialist="injection_files",
+        injection_order=injection_order,
+        evidence_summary=evidence,
+    )
+
+    grade = grade_hypothesis(hypothesis)
+
+    assert grade.accepted is False
+    assert "second_order_sqli_evidence_inapplicable" in grade.rules
+    assert "second_order_sqli_evidence_inapplicable" in (
+        automatic_verifier_contract_violations(hypothesis)
+    )
+
+
+@pytest.mark.parametrize(
+    ("entry_point", "trigger", "expected_rule"),
+    [
+        (
+            "save_sort callback",
+            "GET /report -> render_report -> query",
+            "second_order_sqli_writer_transport_invalid",
+        ),
+        (
+            "POST /wp-admin/admin-ajax.php?action=save_sort",
+            "scheduled report job -> query",
+            "second_order_sqli_trigger_transport_unsupported",
+        ),
+        (
+            "POST /plugin//save?mode=sort",
+            "GET /report -> render_report -> query",
+            "second_order_sqli_writer_transport_invalid",
+        ),
+        (
+            "POST /plugin/save?mode=sort&mode=other",
+            "GET /report -> render_report -> query",
+            "second_order_sqli_writer_transport_invalid",
+        ),
+    ],
+)
+def test_second_order_sqli_requires_machine_readable_writer_and_trigger_transports(
+    entry_point: str,
+    trigger: str,
+    expected_rule: str,
+) -> None:
+    evidence = dict(_hypothesis().evidence_summary)
+    evidence.update(
+        {
+            "storage_writer": "POST writer stores the source-proven sort value",
+            "storage_identity": "option:demo_sort",
+            "trigger": trigger,
+            "write_success_marker": "FILTER_WRITE_CONFIRMED_7D3A",
+            "same_actor_lifecycle": True,
+            "verification_oracle": "timing",
+        }
+    )
+    hypothesis = _hypothesis(
+        bug_class=BugClass.SQLI,
+        specialist="injection_files",
+        entry_point=entry_point,
+        injection_order="second",
+        storage_boundary="option",
+        evidence_summary=evidence,
+    )
+
+    grade = grade_hypothesis(hypothesis)
+
+    assert grade.accepted is False
+    assert expected_rule in grade.rules
+
+
+def test_second_order_sqli_requires_one_exact_writer_wire_field() -> None:
+    source = _hypothesis()
+    evidence = {
+        **source.evidence_summary,
+        "source": "POST form field sort and POST form field mode",
+        "storage_writer": "POST writer stores a source-proven value",
+        "storage_identity": "option:demo_sort",
+        "trigger": "GET /report -> render_report -> query",
+        "write_success_marker": "FILTER_WRITE_CONFIRMED_7D3A",
+        "same_actor_lifecycle": True,
+        "verification_oracle": "timing",
+    }
+    hypothesis = _hypothesis(
+        bug_class=BugClass.SQLI,
+        specialist="injection_files",
+        entry_point="POST /wp-admin/admin-ajax.php?action=save_sort",
+        injection_order="second",
+        storage_boundary="option",
+        evidence_summary=evidence,
+    )
+
+    grade = grade_hypothesis(hypothesis)
+
+    assert grade.accepted is False
+    assert "second_order_sqli_writer_field_invalid" in grade.rules
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        None,
+        "success",
+        "aaaaaaaa",
+        " confirmed-write",
+        "confirmed-write ",
+        "stored-✓-confirmed",
+        "x" * 257,
+    ],
+)
+def test_second_order_sqli_requires_a_specific_ascii_write_success_marker(
+    marker,
+) -> None:
+    source = _hypothesis()
+    evidence = {
+        **source.evidence_summary,
+        "source": "POST form field sort; plugin.php:10 — $_POST['sort']",
+        "storage_writer": "POST writer stores a source-proven value",
+        "storage_identity": "option:demo_sort",
+        "trigger": "GET /report -> render_report -> query",
+        "write_success_marker": marker,
+        "same_actor_lifecycle": True,
+        "verification_oracle": "timing",
+    }
+    hypothesis = _hypothesis(
+        bug_class=BugClass.SQLI,
+        specialist="injection_files",
+        entry_point="POST /wp-admin/admin-ajax.php?action=save_sort",
+        injection_order="second",
+        storage_boundary="option",
+        evidence_summary=evidence,
+    )
+
+    grade = grade_hypothesis(hypothesis)
+
+    assert grade.accepted is False
+    assert "second_order_sqli_write_success_marker_invalid" in grade.rules
+
+
+def test_potential_rce_label_requires_and_preserves_execution_evidence() -> None:
+    evidence = dict(_hypothesis().evidence_summary)
+    hypothesis = _hypothesis(
+        bug_class=BugClass.ARBITRARY_FILE_WRITE,
+        specialist="injection_files",
+        impact_labels=["potential_rce"],
+        evidence_summary=evidence,
+    )
+
+    rejected = grade_hypothesis(hypothesis)
+    assert rejected.accepted is False
+    assert "potential_rce_execution_evidence_missing" in rejected.rules
+
+    evidence.update(
+        {
+            "code_execution_path": (
+                "upload route -> public .php destination -> HTTP execution"
+            ),
+            "code_execution_sink": "server executes uploads/proof.php",
+        }
+    )
+    accepted = grade_hypothesis(
+        hypothesis.model_copy(update={"evidence_summary": evidence})
+    )
+
+    assert accepted.accepted is True
+    assert accepted.evidence["code_execution_path"] == evidence["code_execution_path"]
+    assert accepted.evidence["code_execution_sink"] == evidence["code_execution_sink"]
+
+
+@pytest.mark.parametrize(
+    ("bug_class", "entry_point", "source", "expected_rule"),
+    [
+        (
+            BugClass.COMMAND_INJECTION,
+            "command callback",
+            "POST form field command",
+            "execution_transport_invalid",
+        ),
+        (
+            BugClass.PHP_CODE_INJECTION,
+            "POST /evaluate",
+            "$_REQUEST['code']",
+            "execution_source_field_invalid",
+        ),
+    ],
+)
+def test_execution_candidates_require_exact_http_transport_and_wire_field(
+    bug_class,
+    entry_point,
+    source,
+    expected_rule,
+) -> None:
+    evidence = {
+        **_hypothesis().evidence_summary,
+        "source": source,
+    }
+    hypothesis = _hypothesis(
+        bug_class=bug_class,
+        specialist="injection_files",
+        entry_point=entry_point,
+        evidence_summary=evidence,
+    )
+
+    grade = grade_hypothesis(hypothesis)
+
+    assert grade.accepted is False
+    assert expected_rule in grade.rules
+
+
+def test_potential_rce_label_is_restricted_to_arbitrary_file_write() -> None:
+    evidence = {
+        **_hypothesis().evidence_summary,
+        "code_execution_path": "request -> shell wrapper -> exec",
+        "code_execution_sink": "exec($command)",
+    }
+    with pytest.raises(ValueError, match="exact CWE-434"):
+        _hypothesis(
+            bug_class=BugClass.COMMAND_INJECTION,
+            specialist="injection_files",
+            impact_labels=["potential_rce"],
+            evidence_summary=evidence,
+        )
+
+
+def test_execution_evidence_requires_potential_rce_label() -> None:
+    evidence = {
+        **_hypothesis().evidence_summary,
+        "code_execution_path": "upload -> executable destination -> HTTP request",
+        "code_execution_sink": "server executes uploads/proof.php",
+    }
+    hypothesis = _hypothesis(
+        bug_class=BugClass.ARBITRARY_FILE_WRITE,
+        specialist="injection_files",
+        evidence_summary=evidence,
+    )
+
+    grade = grade_hypothesis(hypothesis)
+
+    assert grade.accepted is False
+    assert "potential_rce_evidence_without_label" in grade.rules
+
+
+def test_quality_gate_preserves_canonical_ordered_verification_preflights() -> None:
+    evidence = {
+        **_hypothesis().evidence_summary,
+        "verification_preflights": [
+            "GET /wp-admin/admin.php?page=prepare&item=7",
+            "HEAD /wp-json/example/v1/state?id=7",
+        ],
+    }
+    hypothesis = _hypothesis(
+        bug_class=BugClass.COMMAND_INJECTION,
+        specialist="injection_files",
+        evidence_summary=evidence,
+    )
+
+    grade = grade_hypothesis(hypothesis)
+
+    assert grade.accepted is True
+    assert grade.evidence["verification_preflights"] == evidence[
+        "verification_preflights"
+    ]
+
+
+@pytest.mark.parametrize(
+    "preflights",
+    [
+        [],
+        ["POST /wp-admin/admin.php?page=prepare"],
+        ["GET /prepare", "GET /prepare"],
+        ["GET /prepare then visit the command route"],
+        ["GET https://example.test/prepare"],
+        ["GET /prepare?flag"],
+        ["GET /prépare"],
+        ["GET /prepare"] * 9,
+        "GET /prepare",
+    ],
+)
+def test_quality_gate_rejects_noncanonical_verification_preflights(
+    preflights,
+) -> None:
+    evidence = {
+        **_hypothesis().evidence_summary,
+        "verification_preflights": preflights,
+    }
+    hypothesis = _hypothesis(
+        bug_class=BugClass.COMMAND_INJECTION,
+        specialist="injection_files",
+        evidence_summary=evidence,
+    )
+
+    grade = grade_hypothesis(hypothesis)
+
+    assert grade.accepted is False
+    assert "verification_preflights_invalid" in grade.rules
+
+
+def test_quality_gate_rejects_preflights_for_unrelated_bug_classes() -> None:
+    evidence = {
+        **_hypothesis().evidence_summary,
+        "verification_preflights": ["GET /prepare"],
+    }
+
+    grade = grade_hypothesis(_hypothesis(evidence_summary=evidence))
+
+    assert grade.accepted is False
+    assert "verification_preflights_invalid" in grade.rules
+
+
+def test_quality_gate_rejects_canonically_duplicate_preflights() -> None:
+    evidence = {
+        "attacker_role": "subscriber",
+        "source": "POST form field command",
+        "control": "No shell escaping",
+        "reachable_path": "request -> system",
+        "boundary": "A subscriber crosses the server command boundary.",
+        "impact": "The subscriber can execute an operating-system command.",
+        "verification_preflights": [
+            "GET /prepare?a=1&b=2",
+            "GET /prepare?b=2&a=1",
+        ],
+    }
+    hypothesis = _hypothesis(
+        bug_class=BugClass.COMMAND_INJECTION,
+        evidence_summary=evidence,
+    )
+
+    grade = grade_hypothesis(hypothesis)
+
+    assert "verification_preflights_invalid" in grade.rules
+
+
 def test_quality_gate_recognizes_browser_origin_as_xss_security_boundary():
     hypothesis = _hypothesis(
         bug_class=BugClass.XSS_REFLECTED,
@@ -665,6 +1150,383 @@ def test_apply_quality_gate_moves_invalid_candidate_to_rejected():
 
     assert [hypothesis.id for hypothesis in gated.accepted] == ["h-1"]
     assert gated.rejected[0]["hypothesis_id"] == "h-2"
+
+
+def _execution_candidate(
+    *,
+    source: object = "POST form field command; demo.php:10 — $_POST['command']",
+    entry_point: str = "POST /execute",
+    bug_class: BugClass = BugClass.COMMAND_INJECTION,
+) -> Hypothesis:
+    evidence = {**_hypothesis().evidence_summary, "source": source}
+    return _hypothesis(
+        bug_class=bug_class,
+        specialist="injection_files",
+        entry_point=entry_point,
+        evidence_summary=evidence,
+    )
+
+
+def _second_order_candidate(
+    *,
+    source: object = "POST form field sort; demo.php:10 — $_POST['sort']",
+    entry_point: str = "POST /save",
+    trigger: object = "GET /report",
+    same_actor: object = True,
+    oracle: object = "timing",
+) -> Hypothesis:
+    evidence = {
+        **_hypothesis().evidence_summary,
+        "source": source,
+        "storage_writer": "POST writer stores the source-proven sort value",
+        "storage_identity": "option:demo_sort",
+        "trigger": trigger,
+        "write_success_marker": "FILTER_WRITE_CONFIRMED_7D3A",
+        "same_actor_lifecycle": same_actor,
+        "verification_oracle": oracle,
+    }
+    return _hypothesis(
+        bug_class=BugClass.SQLI,
+        specialist="injection_files",
+        entry_point=entry_point,
+        injection_order="second",
+        storage_boundary="option",
+        evidence_summary=evidence,
+    )
+
+
+def _apply_one(hypothesis: Hypothesis, *, artifact_path=None) -> TriagedArtifact:
+    return apply_quality_gate(
+        TriagedArtifact(
+            plugin_slug="demo",
+            accepted=[hypothesis],
+            rejected=[],
+            merged=[],
+        ),
+        artifact_path=artifact_path,
+    )
+
+
+_UNSUPPORTED_SOURCE_FIELDS = (
+    "demo.php:10 — $_POST['settings']['sort']",
+    "POST form field settings[sort]",
+    "POST form field settings%5Bsort%5D",
+    "JSON field settings.sort",
+    "demo.php:10 — $_POST['settings.sort']",
+    "demo.php:10 — $_POST['settings[sort]']",
+    "demo.php:10 — $_POST['settings%5Bsort%5D']",
+    "demo.php:10 — $_POST['settings'] /* reviewed chain */ ['sort']",
+    "POST form field settings; demo.php:10 — $_POST['settings']['sort']",
+    "request header X-Command; demo.php:10 — $_SERVER['HTTP_X_COMMAND']",
+    "header parameter X-Command",
+    "cookie command; demo.php:10 — $_COOKIE['command']",
+    "cookie parameter command",
+    "path parameter command",
+    "multipart file field upload",
+    "multipart form field upload",
+    "raw request body",
+    "raw body parameter command",
+    "XML request body",
+)
+
+
+@pytest.mark.parametrize("source", _UNSUPPORTED_SOURCE_FIELDS)
+@pytest.mark.parametrize(
+    "bug_class",
+    [BugClass.COMMAND_INJECTION, BugClass.PHP_CODE_INJECTION],
+)
+def test_quality_gate_routes_one_exact_unsupported_execution_field_to_manual(
+    source: str,
+    bug_class: BugClass,
+    tmp_path,
+) -> None:
+    hypothesis = _execution_candidate(source=source, bug_class=bug_class)
+    original_payload = hypothesis.model_dump(mode="json")
+    decision_path = tmp_path / "quality.json"
+
+    assert grade_hypothesis(hypothesis).rules == [
+        "execution_source_field_unsupported"
+    ]
+    gated = _apply_one(hypothesis, artifact_path=decision_path)
+
+    assert gated.accepted == []
+    assert gated.rejected == []
+    assert gated.manual_review[0]["rules"] == [
+        "execution_source_field_unsupported"
+    ]
+    assert gated.manual_review[0]["hypothesis"] == original_payload
+    assert json.loads(decision_path.read_text())[0]["disposition"] == "manual_review"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "POST form field command and POST form field mode",
+        "$_REQUEST['command']",
+        "query or form parameter command",
+        "",
+    ],
+)
+def test_quality_gate_rejects_missing_or_ambiguous_execution_fields(
+    source: object,
+) -> None:
+    hypothesis = _execution_candidate(source=source)
+
+    grade = grade_hypothesis(hypothesis)
+    gated = _apply_one(hypothesis)
+
+    assert "execution_source_field_invalid" in grade.rules
+    assert gated.manual_review == []
+    assert gated.rejected[0]["hypothesis_id"] == hypothesis.id
+
+
+def test_quality_gate_rejects_execution_field_dispatch_conflict() -> None:
+    hypothesis = _execution_candidate(
+        source="command query parameter",
+        entry_point="POST /execute?command=fixed",
+    )
+
+    grade = grade_hypothesis(hypothesis)
+    gated = _apply_one(hypothesis)
+
+    assert grade.rules == ["execution_source_field_dispatch_conflict"]
+    assert gated.manual_review == []
+    assert gated.rejected[0]["hypothesis_id"] == hypothesis.id
+
+
+@pytest.mark.parametrize("entry_point", ["command callback", "POST execute", ""])
+def test_quality_gate_rejects_malformed_execution_transport(
+    entry_point: str,
+) -> None:
+    hypothesis = _execution_candidate(entry_point=entry_point)
+
+    grade = grade_hypothesis(hypothesis)
+    gated = _apply_one(hypothesis)
+
+    assert "execution_transport_invalid" in grade.rules
+    assert gated.manual_review == []
+    assert gated.rejected[0]["hypothesis_id"] == hypothesis.id
+
+
+@pytest.mark.parametrize("source", _UNSUPPORTED_SOURCE_FIELDS)
+def test_quality_gate_routes_exact_unsupported_second_order_writer_field_manual(
+    source: str,
+) -> None:
+    hypothesis = _second_order_candidate(source=source)
+    original_payload = hypothesis.model_dump(mode="json")
+
+    assert grade_hypothesis(hypothesis).rules == [
+        "second_order_sqli_writer_field_unsupported"
+    ]
+    gated = _apply_one(hypothesis)
+
+    assert gated.rejected == []
+    assert gated.manual_review[0]["hypothesis"] == original_payload
+    assert gated.manual_review[0]["rules"] == [
+        "second_order_sqli_writer_field_unsupported"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("updates", "rule"),
+    [
+        ({"same_actor_lifecycle": None}, "second_order_sqli_same_actor_invalid"),
+        ({"same_actor_lifecycle": "false"}, "second_order_sqli_same_actor_invalid"),
+        ({"verification_oracle": None}, "second_order_sqli_oracle_invalid"),
+        ({"verification_oracle": "body_marker"}, "second_order_sqli_oracle_invalid"),
+    ],
+)
+def test_quality_gate_rejects_missing_or_malformed_second_order_values(
+    updates: dict[str, object],
+    rule: str,
+) -> None:
+    hypothesis = _second_order_candidate()
+    hypothesis.evidence_summary = {**hypothesis.evidence_summary, **updates}
+
+    grade = grade_hypothesis(hypothesis)
+    gated = _apply_one(hypothesis)
+
+    assert rule in grade.rules
+    assert gated.manual_review == []
+    assert gated.rejected[0]["hypothesis_id"] == hypothesis.id
+
+
+@pytest.mark.parametrize(
+    ("same_actor", "oracle", "rule"),
+    [
+        (False, "timing", "second_order_sqli_different_actor_manual"),
+        (True, "response_marker", "second_order_sqli_response_marker_manual"),
+    ],
+)
+def test_quality_gate_routes_explicit_second_order_manual_contracts(
+    same_actor: bool,
+    oracle: str,
+    rule: str,
+) -> None:
+    hypothesis = _second_order_candidate(same_actor=same_actor, oracle=oracle)
+    original_payload = hypothesis.model_dump(mode="json")
+
+    assert grade_hypothesis(hypothesis).rules == [rule]
+    gated = _apply_one(hypothesis)
+
+    assert gated.rejected == []
+    assert gated.manual_review[0]["rules"] == [rule]
+    assert gated.manual_review[0]["hypothesis"] == original_payload
+
+
+@pytest.mark.parametrize(
+    ("entry_point", "trigger", "rule"),
+    [
+        ("save sort callback", "GET /report", "second_order_sqli_writer_transport_invalid"),
+        ("POST /save", "later report trigger", "second_order_sqli_trigger_transport_invalid"),
+        ("POST /save", "run report command", "second_order_sqli_trigger_transport_invalid"),
+        ("POST /save", None, "second_order_sqli_trigger_transport_invalid"),
+    ],
+)
+def test_quality_gate_rejects_malformed_or_non_http_second_order_routes(
+    entry_point: str,
+    trigger: object,
+    rule: str,
+) -> None:
+    hypothesis = _second_order_candidate(
+        entry_point=entry_point,
+        trigger=trigger,
+    )
+
+    grade = grade_hypothesis(hypothesis)
+    gated = _apply_one(hypothesis)
+
+    assert rule in grade.rules
+    assert gated.manual_review == []
+    assert gated.rejected[0]["hypothesis_id"] == hypothesis.id
+
+
+def test_quality_gate_rejects_second_order_writer_dispatch_conflict() -> None:
+    hypothesis = _second_order_candidate(
+        source="sort query parameter",
+        entry_point="POST /save?sort=fixed",
+    )
+
+    grade = grade_hypothesis(hypothesis)
+    gated = _apply_one(hypothesis)
+
+    assert grade.rules == ["second_order_sqli_writer_field_dispatch_conflict"]
+    assert gated.manual_review == []
+    assert gated.rejected[0]["hypothesis_id"] == hypothesis.id
+
+
+def test_quality_gate_preserves_payload_for_multiple_explicit_manual_reasons() -> None:
+    hypothesis = _second_order_candidate(
+        same_actor=False,
+        oracle="response_marker",
+        trigger="scheduled report job -> query",
+    )
+    original_payload = hypothesis.model_dump(mode="json")
+    expected_rules = {
+        "second_order_sqli_different_actor_manual",
+        "second_order_sqli_response_marker_manual",
+        "second_order_sqli_trigger_transport_unsupported",
+    }
+
+    assert set(grade_hypothesis(hypothesis).rules) == expected_rules
+    gated = _apply_one(hypothesis)
+
+    assert gated.rejected == []
+    assert set(gated.manual_review[0]["rules"]) == expected_rules
+    assert gated.manual_review[0]["hypothesis"] == original_payload
+
+
+@pytest.mark.parametrize(
+    ("same_actor", "oracle", "trigger", "expected_rules"),
+    [
+        (
+            True,
+            "timing",
+            "scheduled report job -> query",
+            {"second_order_sqli_trigger_transport_unsupported"},
+        ),
+        (
+            True,
+            "timing",
+            "CLI report command -> query",
+            {"second_order_sqli_trigger_transport_unsupported"},
+        ),
+        (
+            False,
+            "response_marker",
+            "GET /report",
+            {
+                "second_order_sqli_different_actor_manual",
+                "second_order_sqli_response_marker_manual",
+            },
+        ),
+        (
+            False,
+            "timing",
+            "scheduled report job -> query",
+            {
+                "second_order_sqli_different_actor_manual",
+                "second_order_sqli_trigger_transport_unsupported",
+            },
+        ),
+        (
+            True,
+            "response_marker",
+            "CLI report command -> query",
+            {
+                "second_order_sqli_response_marker_manual",
+                "second_order_sqli_trigger_transport_unsupported",
+            },
+        ),
+    ],
+)
+def test_quality_gate_routes_exact_non_http_trigger_manual_pairwise(
+    same_actor: bool,
+    oracle: str,
+    trigger: str,
+    expected_rules: set[str],
+) -> None:
+    hypothesis = _second_order_candidate(
+        same_actor=same_actor,
+        oracle=oracle,
+        trigger=trigger,
+    )
+    original_payload = hypothesis.model_dump(mode="json")
+
+    assert set(grade_hypothesis(hypothesis).rules) == expected_rules
+    gated = _apply_one(hypothesis)
+
+    assert gated.rejected == []
+    assert set(gated.manual_review[0]["rules"]) == expected_rules
+    assert gated.manual_review[0]["hypothesis"] == original_payload
+
+
+@pytest.mark.parametrize(
+    ("same_actor", "oracle", "trigger", "reject_rule"),
+    [
+        (None, "response_marker", "GET /report", "second_order_sqli_same_actor_invalid"),
+        (False, None, "GET /report", "second_order_sqli_oracle_invalid"),
+        (False, "timing", "later trigger", "second_order_sqli_trigger_transport_invalid"),
+    ],
+)
+def test_quality_gate_does_not_manual_route_when_contract_is_also_invalid(
+    same_actor: object,
+    oracle: object,
+    trigger: object,
+    reject_rule: str,
+) -> None:
+    hypothesis = _second_order_candidate(
+        same_actor=same_actor,
+        oracle=oracle,
+        trigger=trigger,
+    )
+
+    grade = grade_hypothesis(hypothesis)
+    gated = _apply_one(hypothesis)
+
+    assert reject_rule in grade.rules
+    assert gated.manual_review == []
+    assert gated.rejected[0]["hypothesis_id"] == hypothesis.id
 
 
 def test_recompute_severity_maps_owasp_without_pre_poc_score():

@@ -29,7 +29,8 @@ RIPGREP_PATTERNS: dict[str, str] = {
     "implicit_deserialization": r"(?i:\bupdate_metadata)\s*\(",
     "file_put_contents": (
         r"(?i:\b(?:file_put_contents|fwrite|fputs|fopen|copy|rename|touch|"
-        r"symlink|link|extractTo)\s*\(|->\s*put_contents\s*\()"
+        r"symlink|link|extractTo|stream_copy_to_stream)\s*\(|"
+        r"->\s*(?:put_contents|move|copy)\s*\()"
     ),
     "move_uploaded_file": (
         r"(?i:\b(?:move_uploaded_file|wp_handle_upload|media_handle_upload|"
@@ -46,7 +47,38 @@ RIPGREP_PATTERNS: dict[str, str] = {
     ),
     "include_require": r"(?i:\b(?:include|require)(?:_once)?\b)",
     "eval": r"(?i:\beval\b)",
-    "shell_exec": r"\b(?:shell_exec|exec|system|passthru|popen|proc_open)\s*\(",
+    "shell_exec": (
+        r"(?i:(?:^|[^>:A-Za-z0-9_$])\b(?:shell_exec|exec|system|passthru|"
+        r"popen|proc_open|pcntl_exec|expect_popen)\s*\()"
+    ),
+    "php_backticks": r"`[^`\r\n]{0,2000}`",
+    "dynamic_callables": (
+        r"(?i:\b(?:call_user_func|call_user_func_array|forward_static_call|"
+        r"forward_static_call_array|ReflectionFunction|ReflectionMethod)\s*\()"
+    ),
+    "command_wrappers": (
+        r"(?i:\bnew\s+(?:\\?[A-Za-z_][A-Za-z0-9_]*\\)*Process\s*\(|"
+        r"\b(?:Process|WP_CLI)\s*::\s*(?:fromShellCommandline|runcommand|"
+        r"launch|launch_self)\s*\()"
+    ),
+    "archive_extract": (
+        r"(?i:\b(?:unzip_file|_unzip_file_ziparchive|_unzip_file_pclzip)\s*\(|"
+        r"\bnew\s+(?:\\?[A-Za-z_][A-Za-z0-9_]*\\)*"
+        r"(?:PclZip|Archive_Tar|ZipArchive|PharData)\s*\(|"
+        r"\$(?:(?:archive|zip|tar|phar)[A-Za-z0-9_]*|"
+        r"[A-Za-z_][A-Za-z0-9_]*(?:archive|zip|tar|phar)[A-Za-z0-9_]*)\s*"
+        r"->\s*(?:extract|extractByIndex|extractModify|extractTo)\s*\()"
+    ),
+    "upload_policy": (
+        r"(?i:\b(?:upload_mimes|mime_types|ext2type|wp_check_filetype_and_ext|"
+        r"wp_handle_(?:upload|sideload)_(?:prefilter|overrides)|"
+        r"pre_move_uploaded_file|sanitize_file_name(?:_chars)?|upload_dir)\b)"
+    ),
+    "persistent_reads": (
+        r"(?i:\b(?:get_option|get_site_option|get_transient|get_site_transient|"
+        r"get_metadata|get_[A-Za-z_][A-Za-z0-9_]*_meta)\s*\(|"
+        r"\$wpdb\s*->\s*(?:get_results|get_row|get_var|get_col)\s*\()"
+    ),
     "wp_remote": r"\bwp_remote_(?:get|post|request|head)\s*\(",
     "xml_parsers": r"\b(?:simplexml_load_string|DOMDocument|SimpleXMLElement)\b",
     "current_user_can": r"\bcurrent_user_can\s*\(",
@@ -54,31 +86,124 @@ RIPGREP_PATTERNS: dict[str, str] = {
     "user_input": r"\$_(?:GET|POST|REQUEST|FILES|COOKIE)\b",
 }
 
-async def _ripgrep(pattern: str, plugin_path: Path) -> list[str]:
+_PHP_ONLY_RIPGREP_PATTERNS = frozenset(
+    {
+        "shell_exec",
+        "php_backticks",
+        "dynamic_callables",
+        "command_wrappers",
+        "archive_extract",
+        "upload_policy",
+        "persistent_reads",
+    }
+)
+_PHP_SOURCE_SUFFIXES = frozenset({".php", ".phtml", ".inc"})
+_RAW_GREP_HIT_LIMITS = {
+    # These navigation-only inventories can be extremely common in large
+    # plugins. Deterministic coverage remains authoritative beyond this bound.
+    "persistent_reads": 2_000,
+    "php_backticks": 1_000,
+}
+
+async def _ripgrep(
+    pattern_name: str,
+    pattern: str,
+    plugin_path: Path,
+    included_paths: set[str] | None = None,
+) -> list[str]:
+    command = [
+        "rg",
+        "-n",
+        "--no-heading",
+        "--color=never",
+        "--max-columns=400",
+        "--max-columns-preview",
+    ]
+    if pattern_name in _PHP_ONLY_RIPGREP_PATTERNS:
+        for suffix in sorted(_PHP_SOURCE_SUFFIXES):
+            command.extend(("--iglob", f"*{suffix}"))
+    command.extend(("-e", pattern, str(plugin_path)))
     try:
         proc = await asyncio.create_subprocess_exec(
-            "rg", "-n", "--no-heading", "--color=never", "-e", pattern, str(plugin_path),
+            *command,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            # Results are streamed so capped inventories do not first buffer
+            # an unbounded stdout payload.  Leaving a second PIPE unread while
+            # waiting for stdout EOF can deadlock when rg emits enough
+            # diagnostics to fill the stderr pipe, so discard diagnostics that
+            # this navigation-only inventory never consumes.
+            stderr=asyncio.subprocess.DEVNULL,
         )
     except FileNotFoundError:
         logger.warning("ripgrep ('rg') not found on PATH — install with: brew install ripgrep")
         return []
-    stdout, _ = await proc.communicate()
-    if proc.returncode not in (0, 1):
+    if proc.stdout is None:
+        await proc.wait()
         return []
-    out = stdout.decode("utf-8", errors="replace")
     base = str(plugin_path) + "/"
-    hits = []
-    for line in out.splitlines():
-        if line.startswith(base):
-            line = line[len(base):]
-        hits.append(line[:400])
+    hits: list[str] = []
+    limit = _RAW_GREP_HIT_LIMITS.get(pattern_name)
+    capped = False
+    try:
+        while True:
+            raw_line = await proc.stdout.readline()
+            if not raw_line:
+                break
+            line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+            line = line.removeprefix(base)
+            relative_path = line.split(":", 1)[0]
+            if included_paths is not None and relative_path not in included_paths:
+                continue
+            hits.append(line[:400])
+            if limit is None or len(hits) < limit:
+                continue
+            capped = True
+            if proc.returncode is None:
+                try:
+                    proc.terminate()
+                except ProcessLookupError:
+                    pass
+            break
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except TimeoutError:
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+            await proc.wait()
+    finally:
+        # Cancellation or a decoding/stream error must not orphan rg.
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.wait()
+    if not capped and proc.returncode not in (0, 1):
+        return []
     return hits
 
 
-def _filter_included(hits: list[str], included_paths: set[str]) -> list[str]:
-    return [hit for hit in hits if hit.split(":", 1)[0] in included_paths]
+def _filter_included(
+    pattern_name: str,
+    hits: list[str],
+    included_paths: set[str],
+) -> list[str]:
+    filtered = []
+    php_only = pattern_name in _PHP_ONLY_RIPGREP_PATTERNS
+    limit = _RAW_GREP_HIT_LIMITS.get(pattern_name)
+    for hit in hits:
+        relative_path = hit.split(":", 1)[0]
+        if relative_path not in included_paths:
+            continue
+        if php_only and Path(relative_path).suffix.lower() not in _PHP_SOURCE_SUFFIXES:
+            continue
+        filtered.append(hit)
+        if limit is not None and len(filtered) >= limit:
+            break
+    return filtered
 
 
 async def run(
@@ -98,10 +223,21 @@ async def run(
 
     logger.info("recon: ripgrep over %s", plugin_path)
     pattern_results = await asyncio.gather(
-        *[_ripgrep(pat, plugin_path) for pat in RIPGREP_PATTERNS.values()]
+        *(
+            _ripgrep(
+                pattern_name,
+                pattern,
+                plugin_path,
+                production_paths,
+            )
+            for pattern_name, pattern in RIPGREP_PATTERNS.items()
+        )
     )
     raw_grep_hits = dict(zip(RIPGREP_PATTERNS.keys(), pattern_results))
-    raw_grep_hits = {key: _filter_included(hits, production_paths) for key, hits in raw_grep_hits.items()}
+    raw_grep_hits = {
+        key: _filter_included(key, hits, production_paths)
+        for key, hits in raw_grep_hits.items()
+    }
 
     file_tree = coverage.production_files + coverage.dependency_files
 

@@ -85,7 +85,11 @@ Leave the three submitter fields as literal placeholders for the researcher to f
   `Path Traversal`, `Local File Inclusion (LFI)`, `Arbitrary File Upload`, `Arbitrary File Read`,
   `Arbitrary File Deletion`, `Remote Code Execution (RCE)`, `PHP Object Injection`,
   `Information Disclosure`, `Open Redirect`, `Insecure Deserialization`.
-  Pick exactly one.
+  Pick exactly one from the finding's root-cause `root_cause_cwe` and
+  `vulnerability_type`, not from a downstream outcome or `impact_labels`.
+  For example, a CWE-434 arbitrary file upload remains `Arbitrary File Upload`
+  even when clean verification demonstrates resulting code execution; describe
+  that execution under Impact rather than reclassifying the root cause as RCE.
 
 ## Vulnerability description
 
@@ -100,11 +104,19 @@ The exact file path and line number of the sink, with a short PHP code block quo
 ### Taint flow
 Numbered steps from entry point to sink, limited to the critic-approved path and
 steps supported by the supplied source and finding evidence.
+When `injection_order` is `second`, identify the attacker-reachable write
+request, exact `storage_boundary` and stored identity, later trigger/read, and
+final SQL sink as distinct steps, and state that the same attacker identity
+performs both requests. Do not collapse the two request lifecycles
+into a direct-request SQLi description.
 
 ### Impact
 Concrete impact in WordPress context, limited to the clean confirmation
 observation. Reproduce `FINDING.cvss_vector` and `FINDING.cvss_estimate` exactly;
 do not invent or recompute a score. Patchstack has no blanket 6.5 minimum.
+An `impact_labels` value such as `potential_rce` is navigation metadata, not
+runtime proof; report RCE only when the clean confirmation observation measured
+server-side execution.
 
 ### Code references
 Bullet list of `https://plugins.trac.wordpress.org/browser/<slug>/tags/<version>/<file>#L<line>` URLs. One per file involved in the taint path.

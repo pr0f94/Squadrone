@@ -19,6 +19,7 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.syntax import Syntax
 from rich.table import Table
+from rich.text import Text
 
 from .services.artifacts import atomic_write_json
 from .services.sqlite import connect_sqlite
@@ -99,6 +100,279 @@ STAGE_DESCRIPTIONS = {
     "dedup": "Comparing confirmed findings against known vulnerability databases.",
     "report": "Writing private disclosure-ready report drafts for confirmed findings.",
 }
+
+
+_CANDIDATE_TYPE_LABELS = {
+    "CWE-862": "Missing Authorization",
+    "CWE-352": "CSRF",
+    "CWE-89": "SQLi",
+    "CWE-78": "Command Injection",
+    "CWE-94": "PHP Code Injection",
+    "CWE-22": "Path Traversal",
+    "CWE-434": "File Write",
+    "CWE-918": "SSRF",
+    "CWE-611": "XXE",
+    "CWE-502": "PHP Object Injection",
+    "CWE-79:reflected": "Reflected XSS",
+    "CWE-79:stored": "Stored XSS",
+    "CWE-601": "Open Redirect",
+    "CWE-639": "IDOR",
+    "CWE-327": "Weak Crypto",
+    "CWE-338": "Weak PRNG",
+    "CWE-915": "Mass Assignment",
+    "CWE-287": "Auth Bypass",
+    "CWE-306": "Missing Authentication",
+    "CWE-640": "Password Recovery",
+    "CWE-384": "Session Fixation",
+    "CWE-307": "Missing Rate Limit",
+    "CWE-400": "Resource Exhaustion",
+    "CWE-840": "Logic Flaw",
+}
+
+
+def _single_line(value: Any) -> str:
+    return " ".join(str(value or "").split())
+
+
+def _candidate_type_label(hypothesis: Any | None) -> str:
+    if hypothesis is None:
+        return "Unknown"
+    bug_class = getattr(hypothesis, "bug_class", "")
+    bug_class_value = str(getattr(bug_class, "value", bug_class) or "")
+    label = _CANDIDATE_TYPE_LABELS.get(bug_class_value)
+    if label is None:
+        vulnerability_type = _single_line(
+            getattr(hypothesis, "vulnerability_type", "")
+        )
+        label = (
+            vulnerability_type.replace("_", " ").title()
+            if vulnerability_type and vulnerability_type != "unclassified_cwe"
+            else bug_class_value or "Unknown"
+        )
+    if bug_class_value == "CWE-89" and getattr(
+        hypothesis, "injection_order", None
+    ) == "second":
+        return "SQLi/2nd"
+    if "potential_rce" in (getattr(hypothesis, "impact_labels", None) or []):
+        return f"{label}/RCE"
+    return label
+
+
+def _truncate_candidate_description(value: Any, *, limit: int = 140) -> str:
+    text = _single_line(value)
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def _candidate_description(
+    hypothesis: Any | None,
+    fallback: Any = "",
+    *,
+    prefer_fallback: bool = False,
+) -> str:
+    fallback_text = _single_line(fallback)
+    if prefer_fallback and fallback_text:
+        return _truncate_candidate_description(fallback_text)
+    if hypothesis is not None:
+        outcome = getattr(hypothesis, "security_outcome", None)
+        description = _single_line(getattr(outcome, "description", ""))
+        if description:
+            return _truncate_candidate_description(description)
+        evidence = getattr(hypothesis, "evidence_summary", None)
+        if isinstance(evidence, dict):
+            impact = _single_line(evidence.get("impact"))
+            if impact:
+                return _truncate_candidate_description(impact)
+        reasoning = _single_line(getattr(hypothesis, "reasoning", ""))
+        if reasoning:
+            return _truncate_candidate_description(reasoning)
+        sink = _single_line(getattr(hypothesis, "sink", ""))
+        if sink:
+            return _truncate_candidate_description(sink)
+    return (
+        _truncate_candidate_description(fallback_text)
+        if fallback_text
+        else "No concise description available."
+    )
+
+
+def _candidate_feed_line(
+    *,
+    marker: str,
+    style: str,
+    hypothesis_id: str,
+    hypothesis: Any | None,
+    description_fallback: Any = "",
+    prefer_description_fallback: bool = False,
+    target_id: str = "",
+    batch_prefix: str | None = None,
+) -> Text:
+    line = Text(no_wrap=True, overflow="ellipsis")
+    if batch_prefix:
+        line.append(f"{batch_prefix} ", style="dim")
+    line.append(f"{marker} ", style=style)
+    line.append(_candidate_type_label(hypothesis), style=f"bold {style}")
+    line.append(f" [{hypothesis_id or 'unknown'}]", style="dim")
+    if target_id:
+        line.append(f" → [{target_id}]", style="dim")
+    line.append(" — ", style="dim")
+    line.append(
+        _candidate_description(
+            hypothesis,
+            description_fallback,
+            prefer_fallback=prefer_description_fallback,
+        )
+    )
+    return line
+
+
+def _print_candidate_feed_text(line: Text) -> None:
+    """Crop one feed row to the active terminal instead of wrapping it."""
+    line.truncate(max(console.width, 1), overflow="ellipsis")
+    console.print(line)
+
+
+def _print_triage_candidate_feed(
+    run_dir: Path,
+    *,
+    batch_prefix: str | None = None,
+) -> bool:
+    """Print the finalized triage dispositions as one compact line per candidate."""
+    from .schemas.hypothesis import Hypothesis, TriagedArtifact
+
+    triaged_path = run_dir / "triaged.json"
+    if not triaged_path.exists():
+        return False
+    try:
+        triaged = TriagedArtifact.from_json_file(str(triaged_path))
+    except Exception as exc:
+        logging.getLogger(__name__).debug(
+            "could not render verbose triage candidates from %s: %s",
+            triaged_path,
+            exc,
+        )
+        return False
+
+    hypotheses_by_id: dict[str, Hypothesis] = {
+        hypothesis.id: hypothesis for hypothesis in triaged.accepted
+    }
+    hypotheses_path = run_dir / "hypotheses.jsonl"
+    if hypotheses_path.exists():
+        try:
+            hypothesis_lines = hypotheses_path.read_text(errors="replace").splitlines()
+        except OSError:
+            hypothesis_lines = []
+        for raw_line in hypothesis_lines:
+            if not raw_line.strip():
+                continue
+            try:
+                hypothesis = Hypothesis.model_validate_json(raw_line)
+            except Exception:
+                continue
+            hypotheses_by_id.setdefault(hypothesis.id, hypothesis)
+
+    def item_hypothesis(item: dict[str, Any]) -> Hypothesis | None:
+        raw_hypothesis = item.get("hypothesis")
+        if isinstance(raw_hypothesis, dict):
+            try:
+                return Hypothesis.model_validate(raw_hypothesis)
+            except Exception:
+                pass
+        return hypotheses_by_id.get(str(item.get("hypothesis_id") or ""))
+
+    summary = Text(no_wrap=True, overflow="ellipsis")
+    if batch_prefix:
+        summary.append(f"{batch_prefix} ", style="dim")
+    summary.append("Candidates", style="bold")
+    for marker, label, count, style in (
+        ("✓", "Accepted", len(triaged.accepted), "green"),
+        ("◌", "Manual", len(triaged.manual_review), "yellow"),
+        ("↷", "Deferred", len(triaged.deferred), "cyan"),
+        ("✕", "Rejected", len(triaged.rejected), "red"),
+        ("↪", "Merged", len(triaged.merged), "magenta"),
+    ):
+        summary.append(" · ", style="dim")
+        summary.append(f"{marker} {label} {count}", style=style)
+    _print_candidate_feed_text(summary)
+
+    for hypothesis in triaged.accepted:
+        _print_candidate_feed_text(
+            _candidate_feed_line(
+                marker="✓",
+                style="green",
+                hypothesis_id=hypothesis.id,
+                hypothesis=hypothesis,
+                batch_prefix=batch_prefix,
+            )
+        )
+    for item in triaged.manual_review:
+        _print_candidate_feed_text(
+            _candidate_feed_line(
+                marker="◌",
+                style="yellow",
+                hypothesis_id=str(item.get("hypothesis_id") or ""),
+                hypothesis=item_hypothesis(item),
+                description_fallback=item.get("reason"),
+                batch_prefix=batch_prefix,
+            )
+        )
+    for item in triaged.deferred:
+        _print_candidate_feed_text(
+            _candidate_feed_line(
+                marker="↷",
+                style="cyan",
+                hypothesis_id=str(item.get("hypothesis_id") or ""),
+                hypothesis=item_hypothesis(item),
+                description_fallback=item.get("reason"),
+                batch_prefix=batch_prefix,
+            )
+        )
+    for item in triaged.rejected:
+        hypothesis_id = str(
+            item.get("hypothesis_id")
+            or item.get("id")
+            or item.get("rejected_id")
+            or ""
+        )
+        _print_candidate_feed_text(
+            _candidate_feed_line(
+                marker="✕",
+                style="red",
+                hypothesis_id=hypothesis_id,
+                hypothesis=hypotheses_by_id.get(hypothesis_id),
+                description_fallback=item.get("reason") or item.get("rationale"),
+                prefer_description_fallback=True,
+                batch_prefix=batch_prefix,
+            )
+        )
+    for item in triaged.merged:
+        hypothesis_id = str(
+            item.get("merged_from_id")
+            or item.get("from")
+            or item.get("hypothesis_id")
+            or item.get("source_id")
+            or ""
+        )
+        target_id = str(
+            item.get("kept_id")
+            or item.get("into")
+            or item.get("target_id")
+            or ""
+        )
+        _print_candidate_feed_text(
+            _candidate_feed_line(
+                marker="↪",
+                style="magenta",
+                hypothesis_id=hypothesis_id,
+                hypothesis=hypotheses_by_id.get(hypothesis_id),
+                description_fallback=item.get("reason") or item.get("rationale"),
+                prefer_description_fallback=True,
+                target_id=target_id,
+                batch_prefix=batch_prefix,
+            )
+        )
+    return True
 
 
 def _fmt_money(value: Any) -> str:
@@ -322,6 +596,13 @@ async def _run_scan_cli(
     )
 
     _print_scan_result(result)
+    if verbose and triage_only and result.status == "complete":
+        try:
+            run_dir = _run_dir(result.run_id)
+        except FileNotFoundError:
+            pass
+        else:
+            _print_triage_candidate_feed(run_dir, batch_prefix=batch_prefix)
     return result
 
 
@@ -915,6 +1196,23 @@ def review(run_id: str = typer.Argument(..., help="Run ID to review")) -> None:
             f"[b]vulnerability:[/b] {f.hypothesis.vulnerability_type} "
             f"({f.hypothesis.root_cause_cwe})"
         )
+        characteristics = [
+            *(
+                [f"injection_order={f.hypothesis.injection_order}"]
+                if f.hypothesis.injection_order
+                else []
+            ),
+            *(
+                [f"storage_boundary={f.hypothesis.storage_boundary}"]
+                if f.hypothesis.storage_boundary
+                else []
+            ),
+            *(f"impact={label}" for label in f.hypothesis.impact_labels),
+        ]
+        if characteristics:
+            console.print(
+                "[b]characteristics:[/b] " + ", ".join(characteristics)
+            )
         console.print(f"[b]confidence:[/b] {f.hypothesis.confidence.value}")
         console.print(
             f"[b]entry:[/b] {f.hypothesis.entry_point}  [b]sink:[/b] {f.hypothesis.sink}"

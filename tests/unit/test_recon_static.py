@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
+import sys
+
+import pytest
 
 from squadrone.services import recon_helpers
+from squadrone.stages import recon as recon_stage
 
 
 def test_extract_static_callbacks_and_edges(tmp_path: Path):
@@ -77,3 +82,53 @@ def test_static_edges_follow_helpers_and_keep_ambiguous_method_definitions(tmp_p
         if edge["caller"] == "prepare_upload" and edge["callee"] == "upload_file"
     }
     assert upload_definitions == {"files-a.php", "files-b.php"}
+
+
+@pytest.mark.asyncio
+async def test_streaming_ripgrep_cannot_deadlock_on_unread_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A diagnostic flood must not fill a pipe that recon never consumes."""
+    original_spawn = asyncio.create_subprocess_exec
+    spawned: list[asyncio.subprocess.Process] = []
+    hit = f"{tmp_path}/plugin.php:7:system($command);\n"
+    child_source = (
+        "import sys\n"
+        "sys.stderr.write('x' * (2 * 1024 * 1024))\n"
+        "sys.stderr.flush()\n"
+        f"sys.stdout.write({hit!r})\n"
+        "sys.stdout.flush()\n"
+    )
+
+    async def _spawn_noisy_rg(*_args: object, **kwargs: object):
+        assert kwargs.get("stderr") == asyncio.subprocess.DEVNULL
+        process = await original_spawn(
+            sys.executable,
+            "-c",
+            child_source,
+            stdout=kwargs.get("stdout"),
+            stderr=kwargs.get("stderr"),
+        )
+        spawned.append(process)
+        return process
+
+    monkeypatch.setattr(
+        recon_stage.asyncio,
+        "create_subprocess_exec",
+        _spawn_noisy_rg,
+    )
+
+    hits = await asyncio.wait_for(
+        recon_stage._ripgrep(
+            "shell_exec",
+            "ignored-for-test",
+            tmp_path,
+            {"plugin.php"},
+        ),
+        timeout=3,
+    )
+
+    assert hits == ["plugin.php:7:system($command);"]
+    assert len(spawned) == 1
+    assert spawned[0].returncode == 0

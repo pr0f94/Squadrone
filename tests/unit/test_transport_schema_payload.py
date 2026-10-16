@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from pydantic import BaseModel, RootModel
 
@@ -10,6 +12,7 @@ from squadrone.agents.transport.litellm_transport import (
     LiteLLMTransport,
     _normalise_schema_payload,
 )
+from squadrone.schemas.hypothesis import SpecialistReviewArtifact
 
 
 class _Item(BaseModel):
@@ -231,3 +234,72 @@ async def test_schema_retry_requests_a_complete_canonical_object(monkeypatch, tm
     assert "Preserve every valid value" in retry_instruction
     assert "exact canonical schema field names" in retry_instruction
     assert "complete corrected JSON object" in retry_instruction
+
+
+@pytest.mark.asyncio
+async def test_schema_retry_repairs_all_sqli_only_fields_on_stored_xss(
+    monkeypatch,
+    tmp_path,
+):
+    hypothesis = {
+        "id": "b005-001",
+        "specialist": "xss_lifecycle",
+        "bug_class": "CWE-79:stored",
+        "entry_point": "wp_ajax_add-meta",
+        "file": "classes/email-templates.php",
+        "line": 140,
+        "sink": "echo hidden input",
+        "taint_path": ["post meta", "hidden input"],
+        "reasoning": "Stored metadata reaches an HTML attribute without escaping.",
+        "confidence": "high",
+        "preconditions": "Editor stores metadata; administrator views template.",
+        "affected_versions": "2.5.7",
+        "injection_order": "second",
+        "storage_boundary": "metadata",
+    }
+    corrected = {
+        **hypothesis,
+        "injection_order": None,
+        "storage_boundary": None,
+    }
+    responses = iter(
+        [
+            json.dumps({"hypotheses": [hypothesis], "coverage": []}),
+            json.dumps({"hypotheses": [corrected], "coverage": []}),
+        ]
+    )
+    requests = []
+
+    async def fake_call_llm(**kwargs):
+        requests.append(kwargs["messages"])
+        return {
+            "choices": [{"message": {"content": next(responses)}}],
+            "usage": {},
+        }
+
+    monkeypatch.setattr(
+        "squadrone.agents.transport.litellm_transport.call_llm",
+        fake_call_llm,
+    )
+    runtime = AgentRuntime(run_dir=str(tmp_path))
+
+    result = await LiteLLMTransport().run_agent(
+        runtime=runtime,
+        agent_name="xss_lifecycle.b005",
+        model="test-model",
+        messages=[{"role": "user", "content": "Return review artifact"}],
+        tools=[],
+        max_iterations=1,
+        output_schema=SpecialistReviewArtifact,
+        tool_handlers=None,
+        force_finalise_after=None,
+        max_tokens=100,
+    )
+
+    retry_instruction = requests[1][-1]["content"]
+    candidate = result.output.hypotheses[0]
+    assert candidate.bug_class.value == "CWE-79:stored"
+    assert candidate.injection_order is None
+    assert candidate.storage_boundary is None
+    assert "injection_order and storage_boundary" in retry_instruction
+    assert "both to null" in retry_instruction

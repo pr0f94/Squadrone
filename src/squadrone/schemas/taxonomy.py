@@ -45,6 +45,14 @@ PATCHSTACK_POLICIES = frozenset(
 # do not inherit an automatic oracle or disclosure policy.
 OPEN_CWE_POC_TEMPLATE = "generic_open_cwe.py.j2"
 
+# Direct CWE-89 supports both timing and response-marker observations, but the
+# stored write/read lifecycle has a narrower automatic trust boundary.  A
+# second-order marker can be synthesized by response normalization or
+# reassembly without proving that the database evaluated attacker-controlled
+# SQL.  Keep those leads for manual review; automatic second-order confirmation
+# is restricted to latency measured by the parent-owned proxy.
+SECOND_ORDER_SQLI_AUTOMATIC_ORACLES = frozenset({"timing"})
+
 
 @dataclass(frozen=True)
 class CriticEvidenceRequirement:
@@ -276,7 +284,7 @@ _KNOWN_CWE_REGISTRY: dict[BugClass, KnownCWEProfile] = {
         "database_injection",
         "sql_injection",
         "injection_files",
-        surfaces=("sql_query", "sql_write"),
+        surfaces=("sql_query", "sql_write", "persistent_sql_operand"),
         owasp="A03:2021-Injection",
         template="sqli_timebased.py.j2",
         oracles=("response_marker", "timing"),
@@ -288,11 +296,11 @@ _KNOWN_CWE_REGISTRY: dict[BugClass, KnownCWEProfile] = {
         "command_code_injection",
         "command_injection",
         "injection_files",
-        surfaces=("command_execution",),
+        surfaces=("command_execution", "command_wrapper"),
         owasp="A03:2021-Injection",
-        template="auth_bypass.py.j2",
-        template_fit="generic",
-        oracles=("file_effect", "response_marker", "state_change"),
+        template="command_injection.py.j2",
+        template_fit="narrow",
+        oracles=("response_marker",),
         wordfence="direct",
         patchstack="direct",
         analysis="partial",
@@ -303,11 +311,11 @@ _KNOWN_CWE_REGISTRY: dict[BugClass, KnownCWEProfile] = {
         "command_code_injection",
         "php_code_injection",
         "injection_files",
-        surfaces=("php_code_execution",),
+        surfaces=("php_code_execution", "dynamic_callable"),
         owasp="A03:2021-Injection",
-        template="auth_bypass.py.j2",
-        template_fit="generic",
-        oracles=("file_effect", "response_marker", "state_change"),
+        template="php_code_injection.py.j2",
+        template_fit="narrow",
+        oracles=("response_marker",),
         wordfence="direct",
         patchstack="direct",
         analysis="partial",
@@ -330,7 +338,14 @@ _KNOWN_CWE_REGISTRY: dict[BugClass, KnownCWEProfile] = {
         "file_access",
         "arbitrary_file_upload_or_write",
         "injection_files",
-        surfaces=("file_upload", "file_write", "file_delete", "file_read"),
+        surfaces=(
+            "file_upload",
+            "file_write",
+            "file_delete",
+            "file_read",
+            "archive_extract",
+            "upload_policy",
+        ),
         owasp="A01:2021-Broken Access Control",
         template="file_upload.py.j2",
         template_fit="narrow",

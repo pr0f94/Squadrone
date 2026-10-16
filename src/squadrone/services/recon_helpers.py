@@ -369,11 +369,19 @@ def _build_function_definitions(
     return definitions
 
 
+def build_function_definitions(
+    plugin_dir: Path,
+    php_files: list[str] | None = None,
+) -> dict[str, list[tuple[str, int]]]:
+    """Return all named PHP function/method definitions grouped by name."""
+    return _build_function_definitions(plugin_dir, php_files)
+
+
 def build_function_def_map(plugin_dir: Path, php_files: list[str] | None = None) -> dict[str, str]:
     """Walk PHP files, return {function_name: 'file:line'} of every top-level function definition."""
     return {
         name: f"{locations[0][0]}:{locations[0][1]}"
-        for name, locations in _build_function_definitions(plugin_dir, php_files).items()
+        for name, locations in build_function_definitions(plugin_dir, php_files).items()
         if locations
     }
 

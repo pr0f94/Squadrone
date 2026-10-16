@@ -8,10 +8,13 @@ import pytest
 from squadrone.agents.poc_author import (
     _BUG_CLASS_TEMPLATE,
     _OPEN_CWE_TEMPLATE,
+    _SECOND_ORDER_SQLI_TEMPLATE,
+    _explicit_request_field,
     _infer_injectable_parameter,
     _parse_entry_point_transport,
     _render_template,
     _select_template,
+    _verification_preflight_transports,
 )
 from squadrone.agents.prompts_io import load_prompt
 from squadrone.schemas import (
@@ -22,10 +25,16 @@ from squadrone.schemas import (
     PoCObservation,
 )
 from squadrone.schemas.finding import PoCAttempt, PoCStatus
+from squadrone.services.http_transport import canonical_http_transport_key
+from squadrone.services.request_fields import classify_request_field_source
 
 
 def test_all_poc_templates_render_as_valid_python() -> None:
-    template_names = {*_BUG_CLASS_TEMPLATE.values(), _OPEN_CWE_TEMPLATE}
+    template_names = {
+        *_BUG_CLASS_TEMPLATE.values(),
+        _OPEN_CWE_TEMPLATE,
+        _SECOND_ORDER_SQLI_TEMPLATE,
+    }
 
     for template_name in template_names:
         rendered = _render_template(
@@ -34,6 +43,10 @@ def test_all_poc_templates_render_as_valid_python() -> None:
             target_url="http://127.0.0.1",
             ajax_action="test_action",
             injectable_param="id",
+            execution_parameter="command",
+            execution_parameter_location="form",
+            second_order_write_parameter="stored_filter",
+            second_order_write_location="form",
             test_username="subscriber_user",
             test_password="password",
             extra_params="",
@@ -64,6 +77,20 @@ def test_entry_point_transport_parses_explicit_http_route_and_query_dispatch() -
             "query:tab": "event_edit",
         },
     }
+
+
+def test_entry_point_transport_preserves_a_meaningful_trailing_slash() -> None:
+    without_slash = _parse_entry_point_transport("POST /plugin/run")
+    with_slash = _parse_entry_point_transport("POST /plugin/run/")
+
+    assert with_slash == {
+        "method": "POST",
+        "route": "/plugin/run/",
+        "dispatch": {},
+    }
+    assert canonical_http_transport_key(with_slash) != canonical_http_transport_key(
+        without_slash
+    )
 
 
 @pytest.mark.parametrize(
@@ -111,6 +138,211 @@ def test_injectable_parameter_seed_uses_only_explicit_structured_names(
 
 
 @pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("POST form field command; plugin.php:10 — $_POST['command']", ("command", "form")),
+        ("query parameter target; plugin.php:10 — $_GET['target']", ("target", "query")),
+        ("JSON field callback; plugin.php:10", ("callback", "json")),
+        ("POST query parameter post; plugin.php:10", ("post", "query")),
+        ("request parameter ambiguous; plugin.php:10 — $_REQUEST['ambiguous']", ("", "")),
+    ],
+)
+def test_explicit_request_field_preserves_only_source_cited_location(
+    source: str,
+    expected: tuple[str, str],
+) -> None:
+    hypothesis = Hypothesis(
+        id="request-field",
+        specialist="injection_files",
+        bug_class=BugClass.COMMAND_INJECTION,
+        entry_point="POST /wp-admin/admin-ajax.php",
+        file="plugin.php",
+        line=20,
+        sink="system",
+        sink_code="system($command)",
+        taint_path=["external request", "system"],
+        reasoning="An external value reaches a command sink.",
+        confidence=Confidence.HIGH,
+        preconditions="subscriber",
+        affected_versions="<= 1.0",
+        evidence_summary={"source": source},
+    )
+
+    assert _explicit_request_field(hypothesis) == expected
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("$_GET['target']", ("target", "query")),
+        ("$_POST['command']", ("command", "form")),
+        ("target query parameter", ("target", "query")),
+        ("POST form field command", ("command", "form")),
+        ("JSON field callback", ("callback", "json")),
+    ],
+)
+def test_quality_gate_supported_source_matches_poc_author_field_location(
+    source: str,
+    expected: tuple[str, str],
+) -> None:
+    classification = classify_request_field_source(source)
+    hypothesis = Hypothesis(
+        id="consistent-request-field",
+        specialist="injection_files",
+        bug_class=BugClass.COMMAND_INJECTION,
+        entry_point="POST /run",
+        file="plugin.php",
+        line=20,
+        sink="system",
+        sink_code="system($value)",
+        taint_path=[source, "system"],
+        reasoning="One exact request field reaches a command sink.",
+        confidence=Confidence.HIGH,
+        preconditions="subscriber",
+        affected_versions="<= 1.0",
+        evidence_summary={"source": source},
+    )
+
+    assert classification.disposition == "supported"
+    assert (classification.name, classification.location) == expected
+    assert _explicit_request_field(hypothesis) == expected
+
+
+def test_explicit_request_field_fails_closed_for_multiple_source_fields() -> None:
+    hypothesis = Hypothesis(
+        id="ambiguous-request-field",
+        specialist="injection_files",
+        bug_class=BugClass.COMMAND_INJECTION,
+        entry_point="POST /wp-admin/admin-ajax.php",
+        file="plugin.php",
+        line=20,
+        sink="system",
+        sink_code="system($command)",
+        taint_path=["$_POST['command']", "system"],
+        reasoning="One of two request fields may reach a command sink.",
+        confidence=Confidence.HIGH,
+        preconditions="subscriber",
+        affected_versions="<= 1.0",
+        evidence_summary={
+            "source": "POST form field command and POST form field mode"
+        },
+    )
+
+    assert _explicit_request_field(hypothesis) == ("", "")
+
+
+def test_explicit_request_field_detects_mixed_source_grammars_as_ambiguous() -> None:
+    hypothesis = Hypothesis(
+        id="mixed-request-fields",
+        specialist="injection_files",
+        bug_class=BugClass.COMMAND_INJECTION,
+        entry_point="POST /run",
+        file="plugin.php",
+        line=20,
+        sink="system",
+        sink_code="system($command)",
+        taint_path=["request", "system"],
+        reasoning="One of two named fields may reach a command sink.",
+        confidence=Confidence.HIGH,
+        preconditions="subscriber",
+        affected_versions="<= 1.0",
+        evidence_summary={
+            "source": "alpha query parameter and POST form field beta",
+        },
+    )
+
+    assert _explicit_request_field(hypothesis) == ("", "")
+
+
+def test_explicit_request_field_treats_php_superglobals_as_case_sensitive() -> None:
+    hypothesis = Hypothesis(
+        id="case-sensitive-superglobal",
+        specialist="injection_files",
+        bug_class=BugClass.COMMAND_INJECTION,
+        entry_point="POST /run",
+        file="plugin.php",
+        line=20,
+        sink="system",
+        sink_code="system($command)",
+        taint_path=["request", "system"],
+        reasoning="A lower-case local variable must not become a superglobal source.",
+        confidence=Confidence.HIGH,
+        preconditions="subscriber",
+        affected_versions="<= 1.0",
+        evidence_summary={"source": "$_post['command']"},
+    )
+
+    assert _explicit_request_field(hypothesis) == ("", "")
+
+
+def test_explicit_request_field_fails_closed_for_nested_php_indexing() -> None:
+    hypothesis = Hypothesis(
+        id="nested-request-field",
+        specialist="injection_files",
+        bug_class=BugClass.SQLI,
+        entry_point="POST /run",
+        file="plugin.php",
+        line=20,
+        sink="$wpdb->query",
+        sink_code="$wpdb->query($sql)",
+        taint_path=["$_POST['flat_fallback']", "$wpdb->query"],
+        reasoning="A nested request value reaches a SQL sink.",
+        confidence=Confidence.HIGH,
+        preconditions="subscriber",
+        affected_versions="<= 1.0",
+        evidence_summary={
+            "source": "POST form field settings — $_POST['settings']['sort']"
+        },
+    )
+
+    assert _explicit_request_field(hypothesis) == ("", "")
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "$_COOKIE['command']",
+        "$_SERVER['HTTP_X_COMMAND']",
+        "$_FILES['upload']['tmp_name']",
+        "php://input",
+        "POST form field settings[command]",
+        "POST form field settings%5Bcommand%5D",
+        "JSON field settings.sort",
+        "$_POST['settings.sort']",
+        "$_POST['settings[command]']",
+        "$_POST['settings%5Bcommand%5D']",
+        "$_POST['settings'] /* reviewed chain */ ['command']",
+        "POST form field settings; $_POST['settings']['command']",
+        "multipart form field upload",
+        "raw body parameter command",
+        "header parameter X-Command",
+        "cookie parameter command",
+    ],
+)
+def test_explicit_unsupported_source_never_falls_back_to_flat_taint_field(
+    source: str,
+) -> None:
+    hypothesis = Hypothesis(
+        id="unsupported-request-field",
+        specialist="injection_files",
+        bug_class=BugClass.COMMAND_INJECTION,
+        entry_point="POST /run",
+        file="plugin.php",
+        line=20,
+        sink="system",
+        sink_code="system($_POST['command'])",
+        taint_path=["$_POST['command']", "system"],
+        reasoning="An unsupported ingress reaches a command sink.",
+        confidence=Confidence.HIGH,
+        preconditions="subscriber",
+        affected_versions="<= 1.0",
+        evidence_summary={"source": source},
+    )
+
+    assert _explicit_request_field(hypothesis) == ("", "")
+
+
+@pytest.mark.parametrize(
     ("entry_point", "route", "action"),
     [
         ("wp_ajax_update_record", "/wp-admin/admin-ajax.php", "update_record"),
@@ -148,7 +380,11 @@ def test_entry_point_transport_parses_wordpress_hook_forms(
         "POST /wp-admin/admin.php?page=one&page=two",
         "POST /wp-admin/admin.php?page",
         "POST /a/../upload",
+        "POST /a/./upload/",
         "POST /a//upload",
+        r"POST /a\\upload",
+        "POST /a/%2e%2e/upload",
+        "POST /upload%2fproof",
         "POST /upload?name=%FF",
         "POST /upload?name=%00",
     ],
@@ -362,6 +598,459 @@ def test_missing_authentication_uses_state_change_template() -> None:
         _BUG_CLASS_TEMPLATE[BugClass.MISSING_AUTH_CRITICAL_FUNCTION.value]
         == "state_change.py.j2"
     )
+
+
+def test_exact_second_order_sqli_characteristic_selects_dedicated_template() -> None:
+    assert (
+        _select_template(
+            BugClass.SQLI.value,
+            "second",
+        )
+        == _SECOND_ORDER_SQLI_TEMPLATE
+    )
+
+
+@pytest.mark.parametrize(
+    "injection_order",
+    [
+        None,
+        "first",
+        "direct",
+        "Second",
+        "second ",
+    ],
+)
+def test_direct_sqli_template_is_preserved_without_exact_second_order_evidence(
+    injection_order: str | None,
+) -> None:
+    assert (
+        _select_template(BugClass.SQLI.value, injection_order)
+        == _BUG_CLASS_TEMPLATE[BugClass.SQLI.value]
+    )
+
+
+def test_second_order_marker_does_not_override_another_bug_class() -> None:
+    assert (
+        _select_template(
+            BugClass.SSRF.value,
+            "second",
+        )
+        == _BUG_CLASS_TEMPLATE[BugClass.SSRF.value]
+    )
+
+
+def test_second_order_sqli_template_is_two_stage_and_fail_closed() -> None:
+    rendered = _render_template(
+        _SECOND_ORDER_SQLI_TEMPLATE,
+        target_url="http://127.0.0.1",
+        attacker_role="subscriber",
+        test_username="subscriber_user",
+        test_password="password",
+        request_method="POST",
+        request_route="/wp-admin/admin-ajax.php",
+        request_dispatch={"form:action": "store_filter"},
+        second_order_write_parameter="stored_filter",
+        second_order_write_success_marker="Filter stored successfully",
+        verification_preflights=[
+            {
+                "method": "GET",
+                "route": "/wp-admin/admin.php",
+                "dispatch": {"query:page": "prepare_filter"},
+            }
+        ],
+    )
+
+    ast.parse(rendered, filename=_SECOND_ORDER_SQLI_TEMPLATE)
+    assert 'WRITE_METHOD = "POST"' in rendered
+    assert 'WRITE_ROUTE = "/wp-admin/admin-ajax.php"' in rendered
+    assert 'WRITE_VALUE_PARAMETER = "stored_filter"' in rendered
+    assert 'TRIGGER_METHOD = ""' in rendered
+    assert 'TRIGGER_ROUTE = ""' in rendered
+    assert "SOURCE_GROUNDED = False" in rendered
+    assert "MIN_TIMING_SAMPLES = 6" in rendered
+    assert "def _run_sequence(" in rendered
+    assert 'if _sample_index % 2 == 0' in rendered
+    assert '("control", "attack")' in rendered
+    assert '("attack", "control")' in rendered
+    assert "def _timing_differential_confirmed(" in rendered
+    assert 'for required_order in ("control_attack", "attack_control")' in rendered
+    assert 'WRITE_SUCCESS_MARKER = "Filter stored successfully"' in rendered
+    assert "_contains_marker(transmitted_contract, WRITE_SUCCESS_MARKER)" in rendered
+    assert "writer success marker must not be transmitted by the PoC" in rendered
+    assert "ATTACK_STORAGE_BINDING" in rendered
+    assert "CONTROL_STORAGE_BINDING" in rendered
+    assert '"route": "/wp-admin/admin.php"' in rendered
+    assert rendered.index("preflight_responses = _run_preflights(") < rendered.index(
+        "control_results = []"
+    )
+    assert "wp_rest_nonce" in rendered
+    assert 'headers["X-WP-Nonce"] = nonce.nonce' in rendered
+    assert "if authenticated_actor and (" in rendered
+    assert "_uses_rest_transport(WRITE_ROUTE, WRITE_DISPATCH)" in rendered
+    assert "_uses_rest_transport(TRIGGER_ROUTE, TRIGGER_DISPATCH)" in rendered
+    assert '_uses_rest_transport(item["route"], item["dispatch"])' in rendered
+    assert 'ORACLE = "timing"' in rendered
+    assert "RESPONSE_MARKER" not in rendered
+    assert 'oracle="timing"' in rendered
+    assert 'verdict="not_vulnerable"' in rendered
+    assert "$wpdb" not in rendered
+    assert "wp db query" not in rendered
+
+
+@pytest.mark.parametrize("status_code", [201, 302])
+def test_second_order_writer_receipt_accepts_success_status_with_body_marker(
+    status_code: int,
+) -> None:
+    rendered = _render_template(
+        _SECOND_ORDER_SQLI_TEMPLATE,
+        target_url="http://127.0.0.1",
+        attacker_role="subscriber",
+        request_method="POST",
+        request_route="/store",
+        request_dispatch={},
+        second_order_write_parameter="stored_filter",
+        second_order_write_location="form",
+        second_order_write_success_marker="Filter stored successfully",
+    )
+    tree = ast.parse(rendered, filename=_SECOND_ORDER_SQLI_TEMPLATE)
+    selected = [
+        node
+        for node in tree.body
+        if (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "WRITE_SUCCESS_MARKER"
+                for target in node.targets
+            )
+        )
+        or (isinstance(node, ast.FunctionDef) and node.name == "_write_confirmed")
+    ]
+    namespace: dict[str, object] = {}
+    exec(compile(ast.Module(body=selected, type_ignores=[]), "<receipt>", "exec"), namespace)
+    response = SimpleNamespace(
+        status_code=status_code,
+        text="prefix Filter stored successfully suffix",
+    )
+
+    assert namespace["_write_confirmed"](response) is True
+
+
+def test_second_order_writer_receipt_rejects_success_without_body_marker() -> None:
+    rendered = _render_template(
+        _SECOND_ORDER_SQLI_TEMPLATE,
+        target_url="http://127.0.0.1",
+        attacker_role="subscriber",
+        request_method="POST",
+        request_route="/store",
+        request_dispatch={},
+        second_order_write_parameter="stored_filter",
+        second_order_write_location="form",
+        second_order_write_success_marker="Filter stored successfully",
+    )
+    tree = ast.parse(rendered, filename=_SECOND_ORDER_SQLI_TEMPLATE)
+    selected = [
+        node
+        for node in tree.body
+        if (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "WRITE_SUCCESS_MARKER"
+                for target in node.targets
+            )
+        )
+        or (isinstance(node, ast.FunctionDef) and node.name == "_write_confirmed")
+    ]
+    namespace: dict[str, object] = {}
+    exec(compile(ast.Module(body=selected, type_ignores=[]), "<receipt>", "exec"), namespace)
+
+    assert namespace["_write_confirmed"](
+        SimpleNamespace(status_code=201, text="stored without the receipt")
+    ) is False
+
+
+def test_second_order_template_gates_plain_permalink_rest_nonce_by_actor() -> None:
+    rendered = _render_template(
+        _SECOND_ORDER_SQLI_TEMPLATE,
+        target_url="http://127.0.0.1",
+        attacker_role="unauthenticated",
+        request_method="POST",
+        request_route="/",
+        request_dispatch={"query:rest_route": "/example/v1/store"},
+        second_order_write_parameter="stored_filter",
+        second_order_write_location="form",
+        second_order_write_success_marker="Filter stored successfully",
+    )
+
+    ast.parse(rendered, filename=_SECOND_ORDER_SQLI_TEMPLATE)
+    assert 'ATTACKER_ROLE = "unauthenticated"' in rendered
+    assert '"query:rest_route": "/example/v1/store"' in rendered
+    assert 'dispatch.get("query:rest_route")' in rendered
+    assert "if authenticated_actor and (" in rendered
+    assert "_uses_rest_transport(WRITE_ROUTE, WRITE_DISPATCH)" in rendered
+
+
+@pytest.mark.parametrize(
+    ("bug_class", "template_name", "impact_text"),
+    [
+        (
+            BugClass.COMMAND_INJECTION,
+            "command_injection.py.j2",
+            "operating-system command",
+        ),
+        (
+            BugClass.PHP_CODE_INJECTION,
+            "php_code_injection.py.j2",
+            "PHP syntax executed",
+        ),
+    ],
+)
+def test_execution_templates_use_source_bound_fail_closed_differential_markers(
+    bug_class: BugClass,
+    template_name: str,
+    impact_text: str,
+) -> None:
+    attack_path = "/var/lib/squadrone/php-include/" + "a" * 64 + ".php"
+    control_path = "/var/lib/squadrone/php-include/" + "b" * 64 + ".php"
+    assert _select_template(bug_class.value) == template_name
+    rendered = _render_template(
+        template_name,
+        target_url="http://127.0.0.1",
+        attacker_role="subscriber",
+        test_username="subscriber_user",
+        test_password="password",
+        request_method="POST",
+        request_route="/wp-admin/admin-ajax.php",
+        request_dispatch={"form:action": "run_task"},
+        execution_parameter="command",
+        execution_parameter_location="form",
+        execution_attack_path=attack_path,
+        execution_control_path=control_path,
+        execution_header_name="X-Squadrone-PHP-Include-Receipt",
+        verification_preflights=[
+            {
+                "method": "HEAD",
+                "route": "/wp-json/example/v1/state",
+                "dispatch": {"query:id": "7"},
+            }
+        ],
+    )
+
+    ast.parse(rendered, filename=template_name)
+    assert 'METHOD = "POST"' in rendered
+    assert 'ROUTE = "/wp-admin/admin-ajax.php"' in rendered
+    assert 'PARAM = "command"' in rendered
+    assert 'PARAM_LOCATION = "form"' in rendered
+    assert 'ATTACK_VALUE = ""' in rendered
+    assert 'CONTROL_VALUE = ""' in rendered
+    assert f'EXECUTION_ATTACK_PATH = "{attack_path}"' in rendered
+    assert f'EXECUTION_CONTROL_PATH = "{control_path}"' in rendered
+    assert "EXECUTION_MARKER" not in rendered
+    assert '"SQUADRONE_" in ATTACK_VALUE' in rendered
+    assert 'replace(EXECUTION_ATTACK_PATH, "{execution_path}")' in rendered
+    assert rendered.index("control_response = send(") < rendered.index(
+        "attack_response = send("
+    )
+    assert "attack_has_marker and not control_has_marker" in rendered
+    assert '"method": "HEAD"' in rendered
+    assert '"route": "/wp-json/example/v1/state"' in rendered
+    assert '"query:id": "7"' in rendered
+    assert rendered.index("preflight_responses = run_preflights(") < rendered.index(
+        "control_response = send("
+    )
+    assert "wp_rest_nonce" in rendered
+    assert 'HEADERS["X-WP-Nonce"] = nonce.nonce' in rendered
+    assert "if authenticated_actor and (" in rendered
+    assert "uses_rest_transport(ROUTE, DISPATCH)" in rendered
+    assert 'uses_rest_transport(item["route"], item["dispatch"])' in rendered
+    assert 'oracle="response_marker"' in rendered
+    assert 'integrity="high" if observed else "none"' in rendered
+    assert impact_text in rendered
+    if bug_class == BugClass.COMMAND_INJECTION:
+        assert "MARKER_RE.findall(attack_response.text)" in rendered
+    else:
+        assert 'EXECUTION_HEADER_NAME = "X-Squadrone-PHP-Include-Receipt"' in rendered
+        assert "attack_response.headers.get(EXECUTION_HEADER_NAME" in rendered
+        assert "attack_response.text" not in rendered
+
+
+@pytest.mark.parametrize(
+    "template_name",
+    ["command_injection.py.j2", "php_code_injection.py.j2"],
+)
+def test_execution_templates_do_not_guess_an_unproven_request_field(
+    template_name: str,
+) -> None:
+    rendered = _render_template(
+        template_name,
+        target_url="http://127.0.0.1",
+        attacker_role="unauthenticated",
+        request_method="POST",
+        request_route="/run",
+        request_dispatch={},
+    )
+
+    assert 'PARAM = ""' in rendered
+    assert 'PARAM_LOCATION = ""' in rendered
+    assert "not PARAM" in rendered
+    assert 'PARAM_LOCATION not in {"query", "form", "json"}' in rendered
+
+
+@pytest.mark.parametrize(
+    "template_name",
+    ["command_injection.py.j2", "php_code_injection.py.j2"],
+)
+def test_execution_templates_gate_plain_permalink_rest_nonce_by_actor(
+    template_name: str,
+) -> None:
+    rendered = _render_template(
+        template_name,
+        target_url="http://127.0.0.1",
+        attacker_role="unauthenticated",
+        request_method="POST",
+        request_route="/",
+        request_dispatch={"query:rest_route": "/example/v1/run"},
+        execution_parameter="command",
+        execution_parameter_location="form",
+    )
+
+    ast.parse(rendered, filename=template_name)
+    assert 'ATTACKER_ROLE = "unauthenticated"' in rendered
+    assert '"query:rest_route": "/example/v1/run"' in rendered
+    assert 'dispatch.get("query:rest_route")' in rendered
+    assert "if authenticated_actor and (" in rendered
+
+
+def test_verification_preflight_rendering_fails_closed_for_invalid_evidence() -> None:
+    hypothesis = Hypothesis(
+        id="invalid-preflight",
+        specialist="injection_files",
+        bug_class=BugClass.COMMAND_INJECTION,
+        entry_point="POST /run",
+        file="plugin.php",
+        line=20,
+        sink="system",
+        sink_code="system($_POST['command'])",
+        taint_path=["$_POST['command']", "system"],
+        reasoning="External input reaches an operating-system command sink.",
+        confidence=Confidence.HIGH,
+        preconditions="subscriber",
+        affected_versions="<= 1.0",
+        evidence_summary={
+            "verification_preflights": ["GET /prépare"],
+        },
+    )
+
+    assert _verification_preflight_transports(hypothesis) == []
+
+
+def test_verification_preflight_rendering_rejects_normalized_duplicates() -> None:
+    hypothesis = Hypothesis(
+        id="duplicate-preflight",
+        specialist="injection_files",
+        bug_class=BugClass.COMMAND_INJECTION,
+        entry_point="POST /run",
+        file="plugin.php",
+        line=20,
+        sink="system",
+        sink_code="system($_POST['command'])",
+        taint_path=["$_POST['command']", "system"],
+        reasoning="External input reaches an operating-system command sink.",
+        confidence=Confidence.HIGH,
+        preconditions="subscriber",
+        affected_versions="<= 1.0",
+        evidence_summary={
+            "verification_preflights": [
+                "GET /prepare?a=1&b=2",
+                "GET /prepare?b=2&a=1",
+            ],
+        },
+    )
+
+    assert _verification_preflight_transports(hypothesis) == []
+
+
+def test_poc_author_prompt_requires_execution_only_command_and_php_proof() -> None:
+    prompt = " ".join(load_prompt("poc_author").split())
+
+    assert "OS command injection (CWE-78)" in prompt
+    assert "parent-supplied opaque canary path" in prompt
+    assert "Send the benign control first" in prompt
+    assert "fresh private marker is withheld from the model" in prompt
+    assert "Reflection, raw file contents, an error message" in prompt
+    assert "PHP code injection (CWE-94)" in prompt
+    assert "accept the fresh private marker only from the named response header" in prompt
+    assert "raw file read" in prompt
+
+
+@pytest.mark.asyncio
+async def test_second_order_sqli_author_receives_dedicated_scaffold_and_rules() -> None:
+    captured = {}
+
+    class FakeRuntime:
+        async def run(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(output="import requests\n")
+
+    from squadrone.agents.poc_author import PoCAuthorAgent
+
+    author = PoCAuthorAgent(FakeRuntime(), model="test-model")
+    await author.write(
+        hypothesis=Hypothesis(
+            id="second-order-sqli",
+            specialist="injection_files",
+            bug_class=BugClass.SQLI,
+            entry_point="wp_ajax_store_filter",
+            file="plugin.php",
+            line=90,
+            sink="$wpdb->get_results",
+            sink_code="$wpdb->get_results($sql);",
+            taint_path=[
+                "$_POST['stored_filter']",
+                "update_option",
+                "later get_option",
+                "$wpdb->get_results",
+            ],
+            reasoning="A stored filter is later concatenated into SQL.",
+            confidence=Confidence.HIGH,
+            preconditions="subscriber",
+            affected_versions="<= 1.0",
+            injection_order="second",
+            storage_boundary="option",
+            evidence_summary={
+                "source": "stored_filter form parameter",
+                "storage_writer": (
+                    "POST /wp-admin/admin-ajax.php?action=store_filter"
+                ),
+                "storage_identity": "option:stored_filter",
+                "trigger": "GET /report?view=stored_filter",
+                "write_success_marker": "Filter stored successfully",
+                "same_actor_lifecycle": True,
+                "verification_oracle": "timing",
+                "verification_preflights": [
+                    "GET /wp-admin/admin.php?page=prepare_filter"
+                ],
+            },
+        ),
+        target_url="http://127.0.0.1:8100",
+        previous_attempts=[],
+    )
+
+    prompt = captured["messages"][1]["content"]
+    system_prompt = captured["messages"][0]["content"]
+    assert f"TEMPLATE ({_SECOND_ORDER_SQLI_TEMPLATE})" in prompt
+    assert 'WRITE_VALUE_PARAMETER = "stored_filter"' in prompt
+    assert 'WRITE_VALUE_LOCATION = "form"' in prompt
+    assert 'WRITE_DISPATCH = {"form:action": "store_filter"}' in prompt
+    assert 'WRITE_SUCCESS_MARKER = "Filter stored successfully"' in prompt
+    assert '"route": "/wp-admin/admin.php"' in prompt
+    assert '"query:page": "prepare_filter"' in prompt
+    assert "legitimate attacker-reachable" in system_prompt
+    assert "separate comparable" in system_prompt
+    assert "Never substitute `wp db query`" in system_prompt
+    assert "proof is timing-only" in system_prompt
+    assert "response-marker-only leads" in system_prompt
 
 
 @pytest.mark.parametrize("bug_class", ["CWE-1234", "CWE-9999"])

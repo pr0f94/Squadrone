@@ -64,6 +64,15 @@ def root_cause_cwe_for(bug_class: BugClass) -> str:
 
 
 ImpactLevel = Literal["none", "low", "high"]
+InjectionOrder = Literal["direct", "second"]
+StorageBoundary = Literal[
+    "option",
+    "metadata",
+    "transient",
+    "custom_table",
+    "other",
+]
+ImpactLabel = Literal["potential_rce"]
 
 
 class SecurityOutcome(JSONFileMixin):
@@ -168,6 +177,12 @@ class Hypothesis(JSONFileMixin):
     affected_versions: _StrLike
     root_cause_cwe: str = ""
     vulnerability_type: str = ""
+    # Optional analysis characteristics make high-impact outcomes and stored
+    # SQL flows visible without changing their root-cause CWE. Historical
+    # artifacts omit these fields and remain valid.
+    injection_order: InjectionOrder | None = None
+    storage_boundary: StorageBoundary | None = None
+    impact_labels: list[ImpactLabel] = Field(default_factory=list)
     security_outcome: SecurityOutcome = Field(default_factory=SecurityOutcome)
     # Populated by the triage stage. Empty for hypotheses produced before scope filtering ran;
     # may contain "wordfence", "patchstack", or both. Routing/report stages should respect this.
@@ -300,6 +315,27 @@ class Hypothesis(JSONFileMixin):
                     "php_object_gadget_recipe requires exact "
                     "evidence_summary.usable_gadget=true"
                 )
+        if self.bug_class != BugClass.SQLI and (
+            self.injection_order is not None or self.storage_boundary is not None
+        ):
+            raise ValueError(
+                "injection_order and storage_boundary are valid only for CWE-89 "
+                "hypotheses; omit both fields or set both to null"
+            )
+        if self.storage_boundary is not None and self.injection_order != "second":
+            raise ValueError(
+                "storage_boundary requires injection_order='second'"
+            )
+        if self.injection_order == "second" and self.storage_boundary is None:
+            raise ValueError(
+                "second-order SQL injection requires an exact storage_boundary"
+            )
+        if len(self.impact_labels) != len(set(self.impact_labels)):
+            raise ValueError("impact_labels must not contain duplicates")
+        if self.impact_labels and self.bug_class != BugClass.ARBITRARY_FILE_WRITE:
+            raise ValueError(
+                "potential_rce impact label is valid only for exact CWE-434"
+            )
         return self
 
     def refresh_derived_taxonomy(self) -> None:

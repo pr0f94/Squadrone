@@ -9,6 +9,9 @@ from squadrone.agents.developer import RequestedSetupPlan, SetupPlan
 from squadrone.schemas.config import PipelineConfig
 from squadrone.schemas.hypothesis import BugClass, Confidence, Hypothesis
 from squadrone.services.sandbox import SandboxRunResult
+from squadrone.services.verification_checkpoint import (
+    VERIFICATION_CHECKPOINT_SCHEMA_VERSION,
+)
 from squadrone.stages import verify as verify_stage
 from squadrone.stages.verify import (
     _build_setup_code_context,
@@ -1217,7 +1220,10 @@ async def test_verification_rejects_success_after_indirect_managed_state_drift(
     assert checkpoint["results"][0]["setup_round_rolled_back"] is True
     assert checkpoint["results"][0]["setup_state_committed"] is False
     attempts_checkpoint = json.loads((poc_dir / "attempts.json").read_text())
-    assert attempts_checkpoint["schema_version"] == 1
+    assert (
+        attempts_checkpoint["schema_version"]
+        == VERIFICATION_CHECKPOINT_SCHEMA_VERSION
+    )
     assert attempts_checkpoint["hypothesis_id"] == "h"
     assert attempts_checkpoint["status"] == "not_confirmed"
     assert len(attempts_checkpoint["attempts"]) == 1

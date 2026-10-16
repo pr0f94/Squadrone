@@ -41,6 +41,7 @@ from ..services.console_format import (
 from ..services.artifacts import atomic_write_jsonl
 from ..services.decision_ledger import append_decision
 from ..services.quality_gate import (
+    POTENTIAL_RCE_EVIDENCE_KEYS,
     apply_quality_gate,
     infer_attacker_role,
     rank_hypothesis,
@@ -1447,6 +1448,7 @@ def _validate_critic_accounting(
             raise ValueError(
                 "critic merge must reference a kept_id present in accepted"
             )
+    input_by_id = {hypothesis.id: hypothesis for hypothesis in hypotheses.hypotheses}
     for item in triaged.manual_review:
         hypothesis_id = str(item.get("hypothesis_id") or "")
         payload = item.get("hypothesis")
@@ -1460,8 +1462,13 @@ def _validate_critic_accounting(
             raise ValueError(
                 f"manual-review item id {hypothesis_id!r} does not match its payload"
             )
+        if manual_hypothesis.model_dump(mode="json") != input_by_id[
+            hypothesis_id
+        ].model_dump(mode="json"):
+            raise ValueError(
+                f"manual-review item {hypothesis_id!r} changed its hypothesis payload"
+            )
 
-    input_by_id = {hypothesis.id: hypothesis for hypothesis in hypotheses.hypotheses}
     repairs_by_id = {}
     for repair in triaged.source_anchor_repairs:
         if repair.hypothesis_id in repairs_by_id:
@@ -1485,6 +1492,70 @@ def _validate_critic_accounting(
 
     for accepted_hypothesis in triaged.accepted:
         original = input_by_id[accepted_hypothesis.id]
+        original_labels = set(original.impact_labels)
+        accepted_labels = set(accepted_hypothesis.impact_labels)
+        removed_potential_rce = (
+            "potential_rce" in original_labels
+            and "potential_rce" not in accepted_labels
+        )
+        verifier_contract_pairs = {
+            "injection_order": (
+                original.injection_order,
+                accepted_hypothesis.injection_order,
+            ),
+            "storage_boundary": (
+                original.storage_boundary,
+                accepted_hypothesis.storage_boundary,
+            ),
+        }
+        original_evidence = original.evidence_summary or {}
+        accepted_evidence = accepted_hypothesis.evidence_summary or {}
+        for evidence_key in (
+            "storage_writer",
+            "storage_identity",
+            "trigger",
+            "write_success_marker",
+            "same_actor_lifecycle",
+            "verification_oracle",
+            "code_execution_path",
+            "code_execution_sink",
+            "verification_preflights",
+        ):
+            if (
+                removed_potential_rce
+                and evidence_key
+                in {"code_execution_path", "code_execution_sink"}
+                and evidence_key in original_evidence
+                and evidence_key not in accepted_evidence
+            ):
+                # The critic may atomically downgrade a valid base file-write
+                # candidate by removing an unproven executable amplification
+                # and both evidence fields owned by that label.
+                continue
+            # Presence is part of the contract: missing, null, and an empty
+            # container must not become interchangeable at the critic boundary.
+            verifier_contract_pairs[evidence_key] = (
+                (
+                    evidence_key in original_evidence,
+                    original_evidence.get(evidence_key),
+                ),
+                (
+                    evidence_key in accepted_evidence,
+                    accepted_evidence.get(evidence_key),
+                ),
+            )
+        changed_contract_fields = [
+            name
+            for name, values in verifier_contract_pairs.items()
+            if values[0] != values[1]
+        ]
+        added_impact_labels = accepted_labels - original_labels
+        if added_impact_labels:
+            changed_contract_fields.append("impact_labels")
+        if removed_potential_rce and POTENTIAL_RCE_EVIDENCE_KEYS.intersection(
+            accepted_evidence
+        ):
+            changed_contract_fields.append("potential_rce_evidence")
         original_anchor = _anchor(original)
         accepted_anchor = _anchor(accepted_hypothesis)
         anchor_changed = accepted_anchor != original_anchor
@@ -1499,6 +1570,11 @@ def _validate_critic_accounting(
             raise ValueError(
                 f"critic returned a source-anchor repair for unchanged hypothesis "
                 f"{accepted_hypothesis.id!r}"
+            )
+        if recorded_repair is None and changed_contract_fields:
+            raise ValueError(
+                f"critic accepted item {accepted_hypothesis.id!r} changed verifier "
+                "contract fields: " + ", ".join(changed_contract_fields)
             )
         if recorded_repair is not None:
             if (
@@ -1525,6 +1601,18 @@ def _validate_critic_accounting(
                 "specialist": (original.specialist, accepted_hypothesis.specialist),
                 "bug_class": (original.bug_class, accepted_hypothesis.bug_class),
                 "entry_point": (original.entry_point, accepted_hypothesis.entry_point),
+                "injection_order": (
+                    original.injection_order,
+                    accepted_hypothesis.injection_order,
+                ),
+                "storage_boundary": (
+                    original.storage_boundary,
+                    accepted_hypothesis.storage_boundary,
+                ),
+                "impact_labels": (
+                    original.impact_labels,
+                    accepted_hypothesis.impact_labels,
+                ),
                 "preconditions": (
                     original.preconditions,
                     accepted_hypothesis.preconditions,
@@ -1568,6 +1656,31 @@ def _validate_critic_accounting(
                     ),
                 ),
             }
+            for evidence_key in (
+                "storage_writer",
+                "storage_identity",
+                "trigger",
+                "write_success_marker",
+                "same_actor_lifecycle",
+                "verification_oracle",
+                "code_execution_path",
+                "code_execution_sink",
+                "verification_preflights",
+            ):
+                original_evidence = original.evidence_summary or {}
+                accepted_evidence = accepted_hypothesis.evidence_summary or {}
+                # Keep both presence and the uncoerced JSON value invariant. Missing,
+                # null, and an empty container have different downstream contracts.
+                invariant_pairs[evidence_key] = (
+                    (
+                        evidence_key in original_evidence,
+                        original_evidence.get(evidence_key),
+                    ),
+                    (
+                        evidence_key in accepted_evidence,
+                        accepted_evidence.get(evidence_key),
+                    ),
+                )
             changed_claim_fields = [
                 name
                 for name, values in invariant_pairs.items()
@@ -1790,13 +1903,13 @@ async def run(
     _validate_critic_accounting(hypotheses, triaged, plugin_path=plugin_path)
     run_dir = Path(runs_root) / run_id
     for h in triaged.accepted:
-        logger.info(format_triage_accept(h))
+        logger.debug(format_triage_accept(h))
     for rejection in triaged.rejected:
-        logger.info(format_triage_reject(rejection))
+        logger.debug(format_triage_reject(rejection))
     for merge in triaged.merged:
-        logger.info(format_triage_merge(merge))
+        logger.debug(format_triage_merge(merge))
     for item in triaged.manual_review:
-        logger.info(
+        logger.debug(
             "triage: manual review %s — %s",
             item.get("hypothesis_id"),
             item.get("reason"),
@@ -1860,11 +1973,25 @@ async def run(
         try:
             for decision in json.loads(quality_path.read_text()):
                 accepted = bool(decision.get("accepted"))
+                disposition = str(decision.get("disposition") or "")
+                manual_review = disposition == "manual_review"
                 append_decision(
                     run_dir,
                     stage="quality_gate",
-                    action="accept" if accepted else "reject",
-                    result="accepted" if accepted else "rejected",
+                    action=(
+                        "accept"
+                        if accepted
+                        else "manual_review"
+                        if manual_review
+                        else "reject"
+                    ),
+                    result=(
+                        "accepted"
+                        if accepted
+                        else "manual_review"
+                        if manual_review
+                        else "rejected"
+                    ),
                     hypothesis_id=str(decision.get("hypothesis_id") or ""),
                     reason=str(decision.get("reason") or ""),
                     artifact=quality_path,

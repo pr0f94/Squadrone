@@ -16,6 +16,12 @@ from squadrone.schemas.hypothesis import (
     Hypothesis,
     TriagedArtifact,
 )
+from squadrone.services.verification_checkpoint import (
+    VERIFICATION_CHECKPOINT_SCHEMA_VERSION,
+    VERIFICATION_POLICY_VERSION,
+    canonical_hypothesis_digest,
+    verification_binding,
+)
 from squadrone.stages import verify as verify_stage
 
 
@@ -47,6 +53,8 @@ def _finding(finding_id: str, hypothesis: Hypothesis) -> Finding:
     return Finding(
         id=finding_id,
         hypothesis=hypothesis,
+        verification_policy_version=VERIFICATION_POLICY_VERSION,
+        hypothesis_digest=canonical_hypothesis_digest(hypothesis),
         poc_status=PoCStatus.SUCCESS,
         poc_script_path="iter_1.py",
         poc_attempts=[],
@@ -75,10 +83,12 @@ def _write_attempt_checkpoint(
     hyp_dir: Path,
     *,
     status: str,
+    hypothesis: Hypothesis | None = None,
     hypothesis_id: str | None = None,
     attempts: list[dict] | None = None,
-    schema_version: int = 1,
+    schema_version: int = VERIFICATION_CHECKPOINT_SCHEMA_VERSION,
 ) -> None:
+    hypothesis = hypothesis or _hyp(hyp_dir.name)
     default_attempt = {
         "iteration": 1,
         "phase": "confirmation" if status == "confirmed" else "attack",
@@ -90,12 +100,37 @@ def _write_attempt_checkpoint(
         json.dumps(
             {
                 "schema_version": schema_version,
-                "hypothesis_id": hypothesis_id or hyp_dir.name,
+                **verification_binding(hypothesis),
+                "hypothesis_id": hypothesis_id or hypothesis.id,
                 "status": status,
                 "attempts": attempts if attempts is not None else [default_attempt],
             }
         )
     )
+
+
+def _complete_marker(
+    triaged: TriagedArtifact,
+    findings: list[Finding] | None = None,
+) -> dict:
+    findings = findings or []
+    return {
+        "schema_version": VERIFICATION_CHECKPOINT_SCHEMA_VERSION,
+        "verification_policy_version": VERIFICATION_POLICY_VERSION,
+        "status": "complete",
+        "accepted_hypothesis_ids": [hyp.id for hyp in triaged.accepted],
+        "accepted_hypothesis_digests": [
+            canonical_hypothesis_digest(hyp) for hyp in triaged.accepted
+        ],
+        "finding_ids": [finding.id for finding in findings],
+        "automatic_verification_hypothesis_ids": [
+            hyp.id for hyp in triaged.accepted if hyp.bug_class.is_known
+        ],
+        "manual_review_hypothesis_ids": [
+            hyp.id for hyp in triaged.accepted if not hyp.bug_class.is_known
+        ],
+        "submission_scope_enforced": triaged.submission_scope_enforced,
+    }
 
 
 @pytest.mark.parametrize("status", ["in_progress", "not_confirmed", "confirmed"])
@@ -107,14 +142,18 @@ def test_attempt_checkpoint_state_accepts_known_statuses(
     hyp_dir.mkdir()
     _write_attempt_checkpoint(hyp_dir, status=status)
 
-    assert verify_stage._attempt_checkpoint_state(hyp_dir) == status
+    hypothesis = _hyp("candidate")
+    assert verify_stage._attempt_checkpoint_state(hyp_dir, hypothesis) == status
 
 
-def test_attempt_checkpoint_state_preserves_historical_absence(tmp_path: Path) -> None:
+def test_attempt_checkpoint_state_rejects_historical_absence(tmp_path: Path) -> None:
     hyp_dir = tmp_path / "candidate"
     hyp_dir.mkdir()
 
-    assert verify_stage._attempt_checkpoint_state(hyp_dir) is None
+    assert (
+        verify_stage._attempt_checkpoint_state(hyp_dir, _hyp("candidate"))
+        == "incomplete"
+    )
 
 
 @pytest.mark.parametrize(
@@ -124,7 +163,7 @@ def test_attempt_checkpoint_state_preserves_historical_absence(tmp_path: Path) -
         json.dumps([]),
         json.dumps(
             {
-                "schema_version": 2,
+                "schema_version": 999,
                 "hypothesis_id": "candidate",
                 "status": "not_confirmed",
                 "attempts": [{"iteration": 1}],
@@ -187,7 +226,10 @@ def test_attempt_checkpoint_state_rejects_untrusted_payloads(
     hyp_dir.mkdir()
     (hyp_dir / "attempts.json").write_text(payload)
 
-    assert verify_stage._attempt_checkpoint_state(hyp_dir) == "incomplete"
+    assert (
+        verify_stage._attempt_checkpoint_state(hyp_dir, _hyp("candidate"))
+        == "incomplete"
+    )
 
 
 async def _run(
@@ -209,6 +251,30 @@ async def _run(
 
 
 @pytest.mark.asyncio
+async def test_verify_rejects_resumed_direct_sqli_with_reserved_lifecycle_metadata(
+    tmp_path: Path,
+) -> None:
+    hypothesis = _hyp("legacy-sqli", BugClass.SQLI).model_copy(deep=True)
+    hypothesis.evidence_summary.update(
+        storage_writer="POST /save -> update_option",
+        storage_identity="option:demo_sort",
+        trigger="GET /report",
+        write_success_marker="FILTER_WRITE_CONFIRMED_7D3A",
+        same_actor_lifecycle=True,
+        verification_oracle="timing",
+    )
+    triaged = TriagedArtifact(
+        plugin_slug="demo",
+        accepted=[hypothesis],
+        rejected=[],
+        merged=[],
+    )
+
+    with pytest.raises(ValueError, match="rerun triage"):
+        await _run(tmp_path, triaged)
+
+
+@pytest.mark.asyncio
 async def test_ordinary_resume_skips_confirmed_and_clean_not_confirmed(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -220,6 +286,11 @@ async def test_ordinary_resume_skips_confirmed_and_clean_not_confirmed(
     rejected_dir = run_dir / "verifications" / rejected.id
     rejected_dir.mkdir(parents=True)
     (rejected_dir / "iter_1.py").write_text("# prior clean attempt")
+    _write_attempt_checkpoint(
+        rejected_dir,
+        status="not_confirmed",
+        hypothesis=rejected,
+    )
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "findings.jsonl").write_text(
         _finding("f-old", confirmed).model_dump_json() + "\n"
@@ -244,6 +315,101 @@ async def test_ordinary_resume_skips_confirmed_and_clean_not_confirmed(
     marker = json.loads((run_dir / verify_stage.VERIFY_COMPLETE_FILENAME).read_text())
     assert marker["accepted_hypothesis_ids"] == ["confirmed", "rejected"]
     assert marker["submission_scope_enforced"] is True
+
+
+@pytest.mark.asyncio
+async def test_ordinary_resume_retries_same_id_changed_confirmed_finding(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_zip(monkeypatch, tmp_path)
+    old_hypothesis = _hyp("same-id")
+    current_hypothesis = old_hypothesis.model_copy(
+        update={"entry_point": "wp_ajax_changed"},
+        deep=True,
+    )
+    run_dir = tmp_path / "runs" / "run-1"
+    run_dir.mkdir(parents=True)
+    stale = _finding("f-stale", old_hypothesis)
+    (run_dir / "findings.jsonl").write_text(stale.model_dump_json() + "\n")
+    replacement = _finding("f-current", current_hypothesis)
+    calls: list[str] = []
+
+    async def retry(*args, poc_dir: Path, **_kwargs):
+        calls.append(args[0].entry_point)
+        (poc_dir / "iter_1.py").write_text("# current verification")
+        return replacement
+
+    monkeypatch.setattr(verify_stage, "_verify_one", retry)
+
+    findings = await _run(
+        tmp_path,
+        TriagedArtifact(
+            plugin_slug="plugin",
+            accepted=[current_hypothesis],
+            rejected=[],
+            merged=[],
+        ),
+    )
+
+    assert calls == ["wp_ajax_changed"]
+    assert [finding.id for finding in findings] == ["f-current"]
+    quarantined = [
+        Finding.model_validate_json(line)
+        for line in (run_dir / "findings_stale.jsonl").read_text().splitlines()
+    ]
+    assert [finding.id for finding in quarantined] == ["f-stale"]
+
+
+@pytest.mark.asyncio
+async def test_ordinary_resume_retries_same_id_changed_terminal_negative(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_zip(monkeypatch, tmp_path)
+    old_hypothesis = _hyp("same-id")
+    current_hypothesis = old_hypothesis.model_copy(
+        update={"file": "changed.php", "line": 44},
+        deep=True,
+    )
+    run_dir = tmp_path / "runs" / "run-1"
+    hyp_dir = run_dir / "verifications" / current_hypothesis.id
+    hyp_dir.mkdir(parents=True)
+    (hyp_dir / "iter_1.py").write_text("# prior terminal negative")
+    _write_attempt_checkpoint(
+        hyp_dir,
+        status="not_confirmed",
+        hypothesis=old_hypothesis,
+    )
+    replacement = _finding("f-current", current_hypothesis)
+    calls: list[str] = []
+
+    async def retry(*args, poc_dir: Path, **_kwargs):
+        calls.append(args[0].file)
+        assert not (poc_dir / "attempts.json").exists()
+        (poc_dir / "iter_1.py").write_text("# current verification")
+        return replacement
+
+    monkeypatch.setattr(verify_stage, "_verify_one", retry)
+
+    findings = await _run(
+        tmp_path,
+        TriagedArtifact(
+            plugin_slug="plugin",
+            accepted=[current_hypothesis],
+            rejected=[],
+            merged=[],
+        ),
+    )
+
+    assert calls == ["changed.php"]
+    assert [finding.id for finding in findings] == ["f-current"]
+    archived = list(
+        (run_dir / "verify_archive").glob(
+            "*/verifications/same-id/attempts.json"
+        )
+    )
+    assert len(archived) == 1
 
 
 @pytest.mark.asyncio
@@ -754,41 +920,119 @@ def test_verify_checkpoint_mode_and_candidate_set_must_match_triage(
     )
     marker_path = run_dir / verify_stage.VERIFY_COMPLETE_FILENAME
 
-    marker_path.write_text(
-        json.dumps(
-            {
-                "accepted_hypothesis_ids": ["candidate"],
-                "finding_ids": [],
-                "submission_scope_enforced": False,
-            }
-        )
-    )
+    marker = _complete_marker(local_triage)
+    marker_path.write_text(json.dumps(marker))
     assert orchestrator._verify_checkpoint_matches_triage(run_dir, local_triage)
 
-    marker_path.write_text(
+    marker["submission_scope_enforced"] = True
+    marker_path.write_text(json.dumps(marker))
+    assert not orchestrator._verify_checkpoint_matches_triage(run_dir, local_triage)
+
+    marker = _complete_marker(local_triage)
+    marker["accepted_hypothesis_ids"] = ["different"]
+    marker_path.write_text(json.dumps(marker))
+    assert not orchestrator._verify_checkpoint_matches_triage(run_dir, local_triage)
+
+
+@pytest.mark.parametrize(
+    "changed_fields",
+    [
+        {"entry_point": "wp_ajax_changed"},
+        {"file": "includes/changed.php", "line": 77},
+        {
+            "evidence_summary": {
+                "request_field": "changed_field",
+                "verification_oracle": "response_marker",
+            }
+        },
+    ],
+    ids=["entry-point", "source", "contract"],
+)
+def test_verify_complete_marker_rejects_same_id_changed_hypothesis_payload(
+    tmp_path: Path,
+    changed_fields: dict,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "findings.jsonl").write_text("")
+    original = _hyp("same-id")
+    original_triage = TriagedArtifact(
+        plugin_slug="plugin",
+        accepted=[original],
+        rejected=[],
+        merged=[],
+    )
+    (run_dir / verify_stage.VERIFY_COMPLETE_FILENAME).write_text(
+        json.dumps(_complete_marker(original_triage))
+    )
+    changed = original.model_copy(update=changed_fields, deep=True)
+    changed_triage = original_triage.model_copy(update={"accepted": [changed]})
+
+    assert not orchestrator._verify_checkpoint_matches_triage(
+        run_dir,
+        changed_triage,
+    )
+
+
+def test_verify_complete_marker_correlates_finding_payload_not_only_id(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    original = _hyp("same-id")
+    current = original.model_copy(update={"sink": "changed sink"}, deep=True)
+    stale_finding = _finding("f-stale", original)
+    (run_dir / "findings.jsonl").write_text(
+        stale_finding.model_dump_json() + "\n"
+    )
+    triaged = TriagedArtifact(
+        plugin_slug="plugin",
+        accepted=[current],
+        rejected=[],
+        merged=[],
+    )
+    (run_dir / verify_stage.VERIFY_COMPLETE_FILENAME).write_text(
+        json.dumps(_complete_marker(triaged, [stale_finding]))
+    )
+
+    assert not orchestrator._verify_checkpoint_matches_triage(run_dir, triaged)
+
+
+@pytest.mark.parametrize(
+    "bug_class",
+    [BugClass.COMMAND_INJECTION, BugClass.PHP_CODE_INJECTION],
+)
+def test_pre_policy_execution_complete_marker_is_stale(
+    tmp_path: Path,
+    bug_class: BugClass,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "findings.jsonl").write_text("")
+    hypothesis = _hyp("execution", bug_class)
+    triaged = TriagedArtifact(
+        plugin_slug="plugin",
+        accepted=[hypothesis],
+        rejected=[],
+        merged=[],
+    )
+    (run_dir / verify_stage.VERIFY_COMPLETE_FILENAME).write_text(
         json.dumps(
             {
-                "accepted_hypothesis_ids": ["candidate"],
+                "status": "complete",
+                "accepted_hypothesis_ids": [hypothesis.id],
                 "finding_ids": [],
+                "automatic_verification_hypothesis_ids": [hypothesis.id],
+                "manual_review_hypothesis_ids": [],
                 "submission_scope_enforced": True,
             }
         )
     )
-    assert not orchestrator._verify_checkpoint_matches_triage(run_dir, local_triage)
 
-    marker_path.write_text(
-        json.dumps(
-            {
-                "accepted_hypothesis_ids": ["different"],
-                "finding_ids": [],
-                "submission_scope_enforced": False,
-            }
-        )
-    )
-    assert not orchestrator._verify_checkpoint_matches_triage(run_dir, local_triage)
+    assert not orchestrator._verify_checkpoint_matches_triage(run_dir, triaged)
 
 
-def test_historical_verify_marker_defaults_to_enforced_scope(tmp_path: Path) -> None:
+def test_historical_verify_marker_is_stale_for_all_scope_modes(tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     (run_dir / "findings.jsonl").write_text("")
@@ -806,8 +1050,40 @@ def test_historical_verify_marker_defaults_to_enforced_scope(tmp_path: Path) -> 
     )
     local_only = enforced.model_copy(update={"submission_scope_enforced": False})
 
-    assert orchestrator._verify_checkpoint_matches_triage(run_dir, enforced)
+    assert not orchestrator._verify_checkpoint_matches_triage(run_dir, enforced)
     assert not orchestrator._verify_checkpoint_matches_triage(run_dir, local_only)
+
+
+def test_open_cwe_manual_marker_requires_current_binding(tmp_path: Path) -> None:
+    hypothesis = _open_hyp("open-cwe")
+    hyp_dir = tmp_path / hypothesis.id
+    scaffold = hyp_dir / "manual_scaffold"
+    scaffold.mkdir(parents=True)
+    (scaffold / "README.md").write_text("manual")
+    (scaffold / "context.json").write_text("{}")
+    marker_path = hyp_dir / verify_stage.OPEN_CWE_MANUAL_REVIEW_FILENAME
+    marker = {
+        "schema_version": 1,
+        "status": "manual_review",
+        "hypothesis_id": hypothesis.id,
+        "bug_class": hypothesis.bug_class.value,
+        "source": "verify_open_cwe",
+    }
+    marker_path.write_text(json.dumps(marker))
+    assert not verify_stage._open_cwe_manual_checkpoint_matches(
+        hyp_dir,
+        hypothesis,
+    )
+
+    marker = {
+        "schema_version": VERIFICATION_CHECKPOINT_SCHEMA_VERSION,
+        **verification_binding(hypothesis),
+        "status": "manual_review",
+        "bug_class": hypothesis.bug_class.value,
+        "source": "verify_open_cwe",
+    }
+    marker_path.write_text(json.dumps(marker))
+    assert verify_stage._open_cwe_manual_checkpoint_matches(hyp_dir, hypothesis)
 
 
 def test_verify_checkpoint_requires_manual_resolution_for_open_cwe(
@@ -825,16 +1101,13 @@ def test_verify_checkpoint_requires_manual_resolution_for_open_cwe(
         merged=[],
     )
     marker_path = run_dir / verify_stage.VERIFY_COMPLETE_FILENAME
-    marker = {
-        "accepted_hypothesis_ids": [hypothesis.id],
-        "finding_ids": [],
-        "submission_scope_enforced": True,
-    }
+    marker = _complete_marker(triaged)
+    marker["manual_review_hypothesis_ids"] = []
     marker_path.write_text(json.dumps(marker))
 
     assert not orchestrator._verify_checkpoint_matches_triage(run_dir, triaged)
 
-    marker["manual_review_hypothesis_ids"] = [hypothesis.id]
+    marker = _complete_marker(triaged)
     marker_path.write_text(json.dumps(marker))
     assert orchestrator._verify_checkpoint_matches_triage(run_dir, triaged)
 
@@ -853,20 +1126,14 @@ def test_verify_checkpoint_rejects_finding_outside_accepted_set(tmp_path: Path) 
     (run_dir / "findings.jsonl").write_text(
         _finding("f-stale", stale).model_dump_json() + "\n"
     )
-    (run_dir / verify_stage.VERIFY_COMPLETE_FILENAME).write_text(
-        json.dumps(
-            {
-                "accepted_hypothesis_ids": ["current"],
-                "finding_ids": ["f-stale"],
-                "submission_scope_enforced": True,
-            }
-        )
-    )
     triaged = TriagedArtifact(
         plugin_slug="plugin",
         accepted=[current],
         rejected=[],
         merged=[],
+    )
+    (run_dir / verify_stage.VERIFY_COMPLETE_FILENAME).write_text(
+        json.dumps(_complete_marker(triaged, [_finding("f-stale", stale)]))
     )
 
     assert not orchestrator._verify_checkpoint_matches_triage(run_dir, triaged)

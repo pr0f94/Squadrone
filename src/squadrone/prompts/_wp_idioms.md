@@ -65,6 +65,26 @@ calls. The list below is a defensive reference, not exhaustive.
   `'manage_options'` ≈ admin. Plugin-specific helpers (e.g. `User::Access('manage')`
   in wp-statistics) often wrap this with their own naming.
 
+## Process execution and dynamic callables
+
+- `is_callable()`, `method_exists()`, and `function_exists()` establish existence,
+  not authorization or safety. When external input selects a callable, enumerate
+  the complete reachable target set and trace the selected target's arguments and
+  terminal effect.
+- PHP process APIs do not all have the same boundary. A command string can be
+  interpreted by a shell, while supported structured argument-array forms avoid
+  shell parsing but still pass attacker values to the invoked program. Verify the
+  exact PHP version, sink signature, and argument form before deciding CWE-78.
+- `escapeshellarg()` is evidence for one shell-argument boundary, not proof that
+  the invoked program treats the resulting value as harmless data. A leading
+  dash can still select a program option. Conversely, theoretical option control
+  is not a vulnerability without identifying the exact option grammar and a
+  concrete protected effect.
+- `escapeshellcmd()` does not make an arbitrary command template universally
+  safe. Inspect the completed command, quoting, whitespace, and the invoked
+  program's parser. Do not claim injection merely because this helper is imperfect;
+  demonstrate attacker-controlled command or option semantics at the real sink.
+
 ## Database
 
 - `$wpdb->prepare($sql, ...$args)` with `%s`/`%d`/`%f` placeholders is correctly
@@ -72,6 +92,23 @@ calls. The list below is a defensive reference, not exhaustive.
   re-concatenated with attacker-controlled bytes.
 - `$wpdb->insert/update/delete` with `format` arrays is parameterised.
 - `dbDelta` is for schema migrations, not user data — not an SQLi sink.
+- Parameterization is evaluated at the final query construction, not when a value
+  was first stored. A value safely inserted with `$wpdb->insert()`,
+  `update_option()`, a metadata API, or a prepared INSERT can still become
+  second-order SQLi if a later query concatenates the retrieved bytes. The reverse
+  is also true: a hostile-looking stored value is safe from SQL syntax injection
+  when the later query binds it through the correct placeholder.
+- `get_option()`, metadata reads, transient reads, and custom-table reads do not
+  by themselves establish either attacker control or SQL safety. Bind the exact
+  storage tuple across a source-proven external writer and the later reader, and
+  trace option/meta sanitizers, serialization, slashing, decoding, casts, and
+  query-time transforms. Different site/network scopes, object IDs, keys, rows,
+  columns, or serialized members are different tuples.
+- An option or metadata value that only an administrator can set is not a
+  low-privilege second-order source merely because a lower-privilege request can
+  trigger the later query. Search for generic key writers, imports, legacy
+  endpoints, scheduled workflows, and normal editing paths before concluding
+  which roles can write the exact tuple.
 
 ## User metadata and protected attributes
 
@@ -205,6 +242,31 @@ calls. The list below is a defensive reference, not exhaustive.
   (registration form avatar uploads, etc.) is NOT inherently a missing-authz
   bug — frame as "anonymous file write that doesn't honour `users_can_register=0`"
   or "stored XSS chain via uploaded SVG when SVG enabled" instead.
+- `test_form => false` disables the originating-form check, not the type check.
+  A source-proven `test_type => false`, an action-specific overrides filter, a
+  changed MIME map, or an `unfiltered_upload` path can materially change the type
+  boundary; read the applicable WordPress version and every shipped filter on the
+  selected call before relying on the default.
+- `wp_handle_upload` and `wp_handle_sideload` have action-specific prefilter and
+  overrides hooks. Plugins can also change `upload_mimes`,
+  `wp_check_filetype_and_ext`, filename sanitization, and upload-directory
+  behavior. A safe default core contract is not counterevidence when the plugin's
+  active filter changes that exact request, and a filter registered only for a
+  different action or admin workflow does not affect the selected request.
+- Client-supplied MIME is not content proof. Bind the final stored filename and
+  bytes after WordPress's proper-filename correction, plugin renaming, and all
+  copies/moves. A double extension or unusual case is relevant only if it survives
+  those transforms and the actual web server or later include interprets it.
+- Archive upload validation covers only the outer file unless the extraction path
+  independently validates every member. Inspect `unzip_file`, `extractTo`,
+  PclZip/Archive_Tar adapters, or custom member loops for traversal, absolute
+  paths, links, overwrite, containment, and post-extraction type checks. Verify
+  the exact library and WordPress version; do not assume archives are either safe
+  or vulnerable from the API name alone.
+- A web-accessible uploaded `.php` name is not by itself RCE. Prove that exact
+  attacker-controlled bytes were written and that the target server executes the
+  final path or a natural application include reaches it. Otherwise report only
+  the source-proven file effect and keep execution as a narrow runtime gap.
 
 ## When to call read_plugin_file / grep
 

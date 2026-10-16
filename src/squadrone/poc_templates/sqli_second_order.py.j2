@@ -1,0 +1,414 @@
+import statistics
+import time
+
+import requests
+
+from poc_result import emit_result
+from wp_login import wp_login, wp_rest_nonce
+
+
+TARGET = {{ target_url | tojson }}
+ATTACKER_ROLE = {{ attacker_role | default("unknown") | tojson }}
+USERNAME = {{ test_username | default("") | tojson }}
+PASSWORD = {{ test_password | default("") | tojson }}
+
+# The hypothesis entry point is only a source-reviewed seed for the legitimate
+# storage writer. Verify every field against plugin source before setting
+# SOURCE_GROUNDED = True. Never replace this writer with a direct database,
+# option, metadata, or filesystem mutation.
+WRITE_METHOD = {{ request_method | default("") | tojson }}
+WRITE_ROUTE = {{ request_route | default("") | tojson }}
+WRITE_DISPATCH = {{ request_dispatch | default({}) | tojson }}
+PREFLIGHTS = {{ verification_preflights | default([]) | tojson }}
+WRITE_VALUE_PARAMETER = {{ second_order_write_parameter | default("") | tojson }}
+WRITE_VALUE_LOCATION = {{ second_order_write_location | default("") | tojson }}
+
+# Fill these only from the natural source-grounded request that later reads the
+# stored value and reaches the cited SQL sink. This is intentionally not guessed
+# from the storage entry point.
+TRIGGER_METHOD = ""
+TRIGGER_ROUTE = ""
+TRIGGER_DISPATCH = {}
+
+# Located fields use "query:name", "form:name", or "json:name" keys. Attack
+# and control must bind the same source-reviewed storage identity; only the
+# stored value field may differ between the two complete sequences.
+ATTACK_WRITE_FIELDS = {}
+CONTROL_WRITE_FIELDS = {}
+ATTACK_TRIGGER_FIELDS = {}
+CONTROL_TRIGGER_FIELDS = {}
+ATTACK_STORAGE_BINDING = ""
+CONTROL_STORAGE_BINDING = ""
+
+# Use deterministic values. ATTACK_STORED_VALUE must be the SQLi value delivered
+# through WRITE_ROUTE; CONTROL_STORED_VALUE must be a benign value accepted by
+# the same writer. WRITE_SUCCESS_MARKER must prove that the real writer accepted
+# and persisted each value. Keep _write_confirmed unchanged: the exact marker
+# must occur in the response body of every source-proven successful 2xx/3xx
+# writer response, because the parent verifier independently captures that body.
+ATTACK_STORED_VALUE = ""
+CONTROL_STORED_VALUE = ""
+WRITE_SUCCESS_MARKER = {{ second_order_write_success_marker | default("") | tojson }}
+
+# Automatic second-order confirmation uses only trigger latency measured by the
+# parent-owned proxy. Response-marker-only leads belong in manual review because
+# response normalization/reassembly cannot establish database evaluation.
+ORACLE = "timing"
+MIN_TIMING_SAMPLES = 6
+SOURCE_GROUNDED = False
+
+
+def _contains_marker(value, marker):
+    if isinstance(value, dict):
+        return any(
+            _contains_marker(key, marker) or _contains_marker(item, marker)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(_contains_marker(item, marker) for item in value)
+    return isinstance(value, str) and bool(marker) and marker in value
+
+
+def _endpoint(route):
+    if not route.startswith("/") or route.startswith("//"):
+        raise RuntimeError("transport route is not an origin-relative path")
+    return f"{TARGET.rstrip('/')}{route}"
+
+
+def _split_located_fields(fields):
+    query = {}
+    form = {}
+    json_body = {}
+    destinations = {"query": query, "form": form, "json": json_body}
+    for located_name, value in fields.items():
+        location, separator, name = located_name.partition(":")
+        if not separator or location not in destinations or not name:
+            raise RuntimeError(f"unsupported source-grounded field: {located_name!r}")
+        if name in destinations[location]:
+            raise RuntimeError(f"duplicate source-grounded field: {located_name!r}")
+        destinations[location][name] = value
+    return query, form, json_body
+
+
+def _with_stored_value(fields, value):
+    located_name = f"{WRITE_VALUE_LOCATION}:{WRITE_VALUE_PARAMETER}"
+    merged = dict(fields)
+    if located_name in merged and merged[located_name] != value:
+        raise RuntimeError("stored-value field conflicts with the source envelope")
+    merged[located_name] = value
+    return merged
+
+
+def _send(session, method, route, fields, headers):
+    query, form, json_body = _split_located_fields(fields)
+    started = time.monotonic()
+    response = session.request(
+        method,
+        _endpoint(route),
+        params=query or None,
+        data=form or None,
+        json=json_body or None,
+        headers=headers or None,
+        timeout=30,
+        allow_redirects=False,
+    )
+    return response, time.monotonic() - started
+
+
+def _write_confirmed(response):
+    return bool(
+        200 <= response.status_code < 400
+        and WRITE_SUCCESS_MARKER
+        and WRITE_SUCCESS_MARKER in response.text
+    )
+
+
+def _timing_differential_confirmed(attack_samples, control_samples):
+    # Each ordering must independently satisfy the full timing threshold. This
+    # prevents a target that merely delays every second trigger from looking
+    # vulnerable when one arm always runs second.
+    return bool(
+        len(attack_samples) >= 3
+        and len(control_samples) == len(attack_samples)
+        and statistics.median(attack_samples) - statistics.median(control_samples)
+        >= 3.0
+        and statistics.median(attack_samples)
+        >= max(2.0, statistics.median(control_samples) * 2.0)
+    )
+
+
+def _uses_rest_transport(route, dispatch):
+    return route.startswith("/wp-json/") or bool(dispatch.get("query:rest_route"))
+
+
+def _new_session():
+    session = requests.Session()
+    authenticated_actor = ATTACKER_ROLE.lower() not in {
+        "unauthenticated",
+        "anonymous",
+        "guest",
+    }
+    if authenticated_actor:
+        login = wp_login(session, TARGET, USERNAME, PASSWORD)
+        if not login.success:
+            raise RuntimeError(f"attacker login failed: {login.reason}")
+    headers = {}
+    if authenticated_actor and (
+        _uses_rest_transport(WRITE_ROUTE, WRITE_DISPATCH)
+        or _uses_rest_transport(TRIGGER_ROUTE, TRIGGER_DISPATCH)
+        or any(
+            _uses_rest_transport(item["route"], item["dispatch"])
+            for item in PREFLIGHTS
+        )
+    ):
+        nonce = wp_rest_nonce(session, TARGET)
+        if not nonce.success:
+            raise RuntimeError(f"REST nonce acquisition failed: {nonce.reason}")
+        headers["X-WP-Nonce"] = nonce.nonce
+    return session, headers
+
+
+def _run_preflights(session, headers):
+    responses = []
+    for preflight in PREFLIGHTS:
+        query = {
+            key.removeprefix("query:"): value
+            for key, value in preflight["dispatch"].items()
+        }
+        response = session.request(
+            preflight["method"],
+            _endpoint(preflight["route"]),
+            params=query or None,
+            headers=headers or None,
+            timeout=30,
+            allow_redirects=False,
+        )
+        if not 200 <= response.status_code < 300:
+            raise RuntimeError("source-grounded verification preflight failed")
+        responses.append(response)
+    return responses
+
+
+def _run_sequence(
+    session,
+    headers,
+    stored_value,
+    write_fields,
+    trigger_fields,
+):
+    # Each arm uses the real low-privilege write path immediately before the
+    # natural trigger. Only trigger latency is used by the timing oracle.
+    write_envelope = dict(WRITE_DISPATCH)
+    write_envelope.update(write_fields)
+    write_envelope = _with_stored_value(write_envelope, stored_value)
+    write_response, _write_elapsed = _send(
+        session,
+        WRITE_METHOD,
+        WRITE_ROUTE,
+        write_envelope,
+        headers,
+    )
+    if not _write_confirmed(write_response):
+        return {
+            "write_confirmed": False,
+            "write_status": write_response.status_code,
+            "trigger_status": None,
+            "trigger_elapsed": None,
+        }
+
+    trigger_envelope = dict(TRIGGER_DISPATCH)
+    trigger_envelope.update(trigger_fields)
+    trigger_response, trigger_elapsed = _send(
+        session,
+        TRIGGER_METHOD,
+        TRIGGER_ROUTE,
+        trigger_envelope,
+        headers,
+    )
+    return {
+        "write_confirmed": True,
+        "write_status": write_response.status_code,
+        "trigger_status": trigger_response.status_code,
+        "trigger_elapsed": trigger_elapsed,
+    }
+
+
+ready = bool(
+    SOURCE_GROUNDED
+    and WRITE_METHOD
+    and WRITE_ROUTE
+    and WRITE_VALUE_PARAMETER
+    and WRITE_VALUE_LOCATION in {"query", "form", "json"}
+    and TRIGGER_METHOD
+    and TRIGGER_ROUTE
+    and ATTACK_STORAGE_BINDING
+    and CONTROL_STORAGE_BINDING
+    and ATTACK_STORAGE_BINDING == CONTROL_STORAGE_BINDING
+    and ATTACK_STORED_VALUE
+    and CONTROL_STORED_VALUE
+    and ATTACK_STORED_VALUE != CONTROL_STORED_VALUE
+    and WRITE_SUCCESS_MARKER
+    and ORACLE == "timing"
+    and MIN_TIMING_SAMPLES >= 6
+)
+
+trigger_url = (
+    _endpoint(TRIGGER_ROUTE)
+    if TRIGGER_ROUTE.startswith("/") and not TRIGGER_ROUTE.startswith("//")
+    else TARGET
+)
+if not ready:
+    emit_result(
+        verdict="not_vulnerable",
+        oracle="timing",
+        attacker_role=ATTACKER_ROLE,
+        request={"method": TRIGGER_METHOD or "POST", "url": trigger_url},
+        attack={"observed": False, "samples_seconds": []},
+        control={"observed": False, "samples_seconds": []},
+        impact=(
+            "Second-order SQLi scaffold remains fail-closed until both the "
+            "legitimate writer and natural trigger transports are source-grounded."
+        ),
+    )
+    raise SystemExit(0)
+transmitted_contract = [
+    WRITE_METHOD,
+    WRITE_ROUTE,
+    WRITE_DISPATCH,
+    WRITE_VALUE_PARAMETER,
+    WRITE_VALUE_LOCATION,
+    TRIGGER_METHOD,
+    TRIGGER_ROUTE,
+    TRIGGER_DISPATCH,
+    ATTACK_STORED_VALUE,
+    CONTROL_STORED_VALUE,
+    ATTACK_WRITE_FIELDS,
+    CONTROL_WRITE_FIELDS,
+    ATTACK_TRIGGER_FIELDS,
+    CONTROL_TRIGGER_FIELDS,
+    PREFLIGHTS,
+]
+if _contains_marker(transmitted_contract, WRITE_SUCCESS_MARKER):
+    raise RuntimeError("writer success marker must not be transmitted by the PoC")
+shared_session, shared_headers = _new_session()
+preflight_responses = _run_preflights(shared_session, shared_headers)
+attack_results = []
+control_results = []
+
+# Alternate which complete arm runs first. Every timing sample still has a fresh
+# legitimate write immediately before its natural trigger, while both
+# control-then-attack and attack-then-control orderings receive at least three
+# samples without reducing the historical three-sample minimum for either
+# ordering. The parent verifier independently enforces this same order.
+sample_orders = []
+for _sample_index in range(MIN_TIMING_SAMPLES):
+    _arm_order = (
+        ("control", "attack")
+        if _sample_index % 2 == 0
+        else ("attack", "control")
+    )
+    sample_orders.append("_".join(_arm_order))
+    for _arm_name in _arm_order:
+        if _arm_name == "control":
+            control_results.append(
+                _run_sequence(
+                    shared_session,
+                    shared_headers,
+                    CONTROL_STORED_VALUE,
+                    CONTROL_WRITE_FIELDS,
+                    CONTROL_TRIGGER_FIELDS,
+                )
+            )
+        else:
+            attack_results.append(
+                _run_sequence(
+                    shared_session,
+                    shared_headers,
+                    ATTACK_STORED_VALUE,
+                    ATTACK_WRITE_FIELDS,
+                    ATTACK_TRIGGER_FIELDS,
+                )
+            )
+
+proof_complete = all(
+    result["write_confirmed"] and result["trigger_status"] is not None
+    for result in [*attack_results, *control_results]
+)
+attack_samples = [
+    result["trigger_elapsed"]
+    for result in attack_results
+    if result["trigger_elapsed"] is not None
+]
+control_samples = [
+    result["trigger_elapsed"]
+    for result in control_results
+    if result["trigger_elapsed"] is not None
+]
+order_differentials_confirmed = all(
+    _timing_differential_confirmed(
+        [
+            attack_results[index]["trigger_elapsed"]
+            for index, order in enumerate(sample_orders)
+            if order == required_order
+            and attack_results[index]["trigger_elapsed"] is not None
+        ],
+        [
+            control_results[index]["trigger_elapsed"]
+            for index, order in enumerate(sample_orders)
+            if order == required_order
+            and control_results[index]["trigger_elapsed"] is not None
+        ],
+    )
+    for required_order in ("control_attack", "attack_control")
+)
+
+confirmed = bool(
+    proof_complete
+    and len(attack_samples) >= 6
+    and len(control_samples) == len(attack_samples)
+    and _timing_differential_confirmed(attack_samples, control_samples)
+    and order_differentials_confirmed
+)
+attack_observation = {
+    "observed": confirmed,
+    "samples_seconds": attack_samples,
+}
+control_observation = {
+    "observed": False,
+    "samples_seconds": control_samples,
+}
+
+write_request = {"method": WRITE_METHOD, "url": _endpoint(WRITE_ROUTE)}
+trigger_request = {"method": TRIGGER_METHOD, "url": trigger_url}
+attack_observation.update(
+    {
+        "write_confirmed": all(item["write_confirmed"] for item in attack_results),
+        "write_request": write_request,
+        "trigger_request": trigger_request,
+        "storage_binding": ATTACK_STORAGE_BINDING,
+    }
+)
+control_observation.update(
+    {
+        "write_confirmed": all(item["write_confirmed"] for item in control_results),
+        "write_request": write_request,
+        "trigger_request": trigger_request,
+        "storage_binding": CONTROL_STORAGE_BINDING,
+    }
+)
+
+emit_result(
+    verdict="vulnerable" if confirmed else "not_vulnerable",
+    oracle=ORACLE,
+    attacker_role=ATTACKER_ROLE,
+    request=trigger_request,
+    attack=attack_observation,
+    control=control_observation,
+    confidentiality="high" if confirmed else "none",
+    impact=(
+        "A value submitted through the legitimate low-privilege writer later "
+        "changes execution of the natural SQL trigger."
+        if confirmed
+        else "No repeatable attack-only second-order SQL effect was measured."
+    ),
+)

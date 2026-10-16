@@ -41,9 +41,14 @@ A repair is deliberately narrow:
   preconditions, affected versions, attacker role, boundary, and impact;
 - copy invariant claim values byte-for-byte rather than paraphrasing, expanding,
   correcting, or normalizing them: `specialist`, `bug_class`, `entry_point`,
-  `preconditions`, `affected_versions`, `security_outcome`, and
+  `injection_order`, `storage_boundary`, `impact_labels`, `preconditions`,
+  `affected_versions`, `security_outcome`, and
   `evidence_summary.attacker_role`, `.source`, `.control`, `.boundary`, and
-  `.impact` are compared exactly by the runner;
+  `.impact` are compared exactly by the runner. The presence and raw JSON value
+  of `evidence_summary.storage_writer`, `.storage_identity`, `.trigger`,
+  `.write_success_marker`, `.same_actor_lifecycle`, `.verification_oracle`, `.code_execution_path`,
+  `.code_execution_sink`, and
+  `.verification_preflights` are also immutable;
 - select an operation in the same source file and within 15 lines of the
   original citation, after reading and proving that exact branch;
 - update `file`, `line`, `sink`, `sink_code`, the terminal `taint_path` step,
@@ -130,10 +135,17 @@ a public workflow can obtain and preserve those exact values for attack and
 control. Their absence from the single immutable `entry_point` is not itself a
 reason for rejection or manual review. Require the immutable hypothesis to name
 the acquisition prerequisite and provenance, but do not ask the critic to
-predict runner support; trusted automatic verification must fail closed when it
-cannot represent the transport. When true duplicate paths are otherwise equally
-proved, retain the stable standard WordPress hook and form-field path over one
-with those runtime-generated prerequisites.
+predict runner support. Trusted automatic verification must fail closed when it
+cannot represent the transport, but that limitation is a routing decision, not
+source counterevidence. When an otherwise source-valid CWE-78, CWE-94, or
+second-order CWE-89 path uses a header, cookie, path parameter, raw body, XML
+body, multipart field, or nested field that automatic verification cannot
+represent, put the complete unchanged hypothesis in `manual_review`; do not
+reject or normalize its technically valid transport as invalid. Apply the same
+manual-review disposition to a source-valid second-order lifecycle whose writer
+and trigger require different actor identities. When true duplicate paths are
+otherwise equally proved, retain the stable standard WordPress hook and
+form-field path over one with those runtime-generated prerequisites.
 For a natural deserialization gadget, independently confirm its shipped class
 is loaded or autoloadable, its required serialized property names and visibility
 encoding survive the proven ingress transforms, and its magic method reaches
@@ -214,6 +226,55 @@ inside fixed PHP, a parse error, or submitted PHP merely reflected in a response
 is not code-execution evidence. Reject outcome-only relabeling of command
 injection, executable upload, file inclusion, or object-injection chains as
 CWE-94; retain their actual root-cause class.
+For a CWE-89 candidate with `injection_order: second`, independently prove both
+request lifecycles and the storage identity joining them. The first lifecycle
+must let the claimed attacker write the exact option, metadata tuple, transient,
+or custom-table field through a normal shipped entry point. Trace every
+transformation into storage. The second lifecycle must read that same identity
+and place its value into executable SQL syntax without a placeholder, strict
+type conversion, or finite allowlist at the final query construction. A
+parameterized `INSERT`/`UPDATE` is not counterevidence because it protects the
+storage write, not the later query; conversely, a prepared final query defeats
+the SQL-injection claim. Require `storage_boundary` to name the proven boundary
+and keep the writer and trigger lifecycles explicitly distinguished in
+`taint_path`, `reachable_path`, and `preconditions` (they may share a WordPress
+dispatcher URL when their source-proven dispatch fields differ). Reject a
+candidate inferred from a storage read alone, an
+unrelated writer, an identity/key mismatch, or an attacker who cannot reach the
+writer under the claimed shipped configuration.
+Require `evidence_summary.same_actor_lifecycle` to be exactly `true` only when
+the same attacker identity can perform both the legitimate write and natural
+trigger. Route a source-valid different-actor or more-privileged-trigger chain
+to `manual_review`; do not accept it for the one-session automatic verifier and
+do not reject the underlying lead merely because automation cannot prove it.
+Require `evidence_summary.verification_oracle` to be exactly `timing` before
+accepting a second-order candidate for automatic verification, and independently
+confirm that the natural trigger can evaluate a stored delay expression. If the
+source-valid effect is response-marker-only, retain the unchanged candidate with
+`verification_oracle: "response_marker"` in `manual_review`; response
+normalization or reassembly is not trusted proof of database evaluation.
+Require `evidence_summary.write_success_marker` to quote one exact response body
+fragment that source emits only after the writer successfully persists the
+supplied value. It must be trimmed printable ASCII, 8–256 characters, contain at
+least five distinct non-space characters case-insensitively, and must not be a
+generic token such as `1`, `ok`, `saved`, `success`, `true`, or `updated`.
+Reject a status-only claim, response header, cookie, redirect location, generic
+response text, marker emitted before or independently of the storage call, or a
+marker not present in the response body of every successful writer branch used
+by the claimed lifecycle.
+When `verification_preflights` is present for CWE-78, CWE-94, or second-order
+CWE-89, independently confirm that each ordered GET/HEAD is a source-proven,
+read-only prerequisite of that exact route (such as the plugin form that emits
+its nonce). Reject undeclared alternatives, state-changing reads, duplicate or
+unused entries, prose/absolute URLs, non-literal dispatch, and preflights added
+only to make arbitrary PoC traffic appear trusted. Core login and REST identity
+setup do not belong in this list.
+Treat `impact_labels` as display metadata, never as proof. Retain
+`potential_rce` only for exact CWE-434 and only when the reviewed source path contains a concrete reachable
+server-side execution operation after the root-cause sink; remove the label when
+the hypothesis proves only file write/read, inclusion, deserialization, or
+authorization without that execution path. Do not change the root-cause CWE to
+match an impact label.
 Before rejecting a PHP `include`/`require` candidate as contained, evaluate the
 exact completed path under PHP include-path semantics. A fixed filename prefix
 or suffix, or a review-time `file_exists`, `realpath`, or

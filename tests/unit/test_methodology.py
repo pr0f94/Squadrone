@@ -641,6 +641,145 @@ def test_injection_prompt_separates_query_safety_from_object_authorization():
     assert "ownership predicate in a sibling or alternate caller" in prompt
 
 
+def test_injection_prompt_traces_indirect_command_dispatch_without_sink_only_false_positives():
+    prompt = " ".join(
+        (
+            load_prompt("specialists/injection_files")
+            + "\n"
+            + load_prompt("_wp_idioms")
+        ).split()
+    )
+
+    assert "direct process functions and indirect callable dispatch" in prompt
+    assert "`call_user_func`, `call_user_func_array`" in prompt
+    assert "variable functions such as `$function($arg)`" in prompt
+    assert "`ReflectionFunction` invocation" in prompt
+    assert "both the callable/command name and every argument" in prompt
+    assert "one shell-parsed string or a structured argument vector" in prompt
+    assert "`is_callable()` or `method_exists()`" in prompt
+    assert "strict finite map" in prompt
+    assert "`escapeshellarg()`" in prompt
+    assert "leading-dash value" in prompt
+    assert "`escapeshellcmd()`" in prompt
+    assert "fixed command" in prompt
+    assert "Anchor `sink_code` at the real terminal operation" in prompt
+    assert "target set cannot be bounded" in prompt
+
+
+def test_injection_prompt_requires_complete_upload_policy_archive_and_execution_trace():
+    prompt = " ".join(
+        (
+            load_prompt("specialists/injection_files")
+            + "\n"
+            + load_prompt("_wp_idioms")
+        ).split()
+    )
+
+    assert "complete this source checklist" in prompt
+    assert "final basename, extension, directory, and bytes" in prompt
+    assert "multiple suffixes" in prompt
+    assert "`test_type`" in prompt
+    assert "`unfiltered_upload`" in prompt
+    assert "`upload_mimes`" in prompt
+    assert "`wp_check_filetype_and_ext`" in prompt
+    assert "`wp_handle_upload_prefilter`" in prompt
+    assert "`wp_handle_sideload_prefilter`" in prompt
+    assert "`wp_handle_upload_overrides`" in prompt
+    assert "`pre_move_uploaded_file`" in prompt
+    assert "`WP_Filesystem` copy/move/put methods" in prompt
+    assert "`extractTo`, `unzip_file`, PclZip/Archive_Tar-style adapters" in prompt
+    assert "canonical destination containment" in prompt
+    assert "per-member extension/type checks" in prompt
+    assert "does not by itself prove server-side execution" in prompt
+    assert "`impact_labels` to exactly `[\"potential_rce\"]`" in prompt
+    assert "`evidence_summary.code_execution_path`" in prompt
+    assert "`evidence_summary.code_execution_sink`" in prompt
+    assert "Do not add that label for a mere upload/write primitive" in prompt
+    assert "inferred web-server behavior without a source-grounded execution sink" in prompt
+    assert "do not inflate confidentiality, integrity, or availability" in prompt
+
+
+def test_injection_prompt_requires_exact_second_order_sqli_lifecycle_and_tuple():
+    prompt = " ".join(load_prompt("specialists/injection_files").split())
+
+    assert "decide whether the candidate is direct or second-order" in prompt
+    assert "persistent or deferred storage write/read boundary" in prompt
+    assert "start at the exact `$wpdb` query sink" in prompt
+    assert "Bind the stored identity across the lifecycle" in prompt
+    assert "ordinary/site/network scope and exact option name" in prompt
+    assert "metadata type, object ID, subtype when relevant, and exact key" in prompt
+    assert "custom tables: table, selected row identity, and exact value column" in prompt
+    assert "inventory every attacker-reachable writer to that exact tuple" in prompt
+    assert "A sanitizer on one writer does not protect a sibling writer" in prompt
+    assert "return `unreviewed` and name that branch" in prompt
+    assert "Set `injection_order` to `second`" in prompt
+    assert "external read, storage write, bound tuple, storage read" in prompt
+    assert "`storage_writer`" in prompt
+    assert "`storage_identity`" in prompt
+    assert "`trigger`" in prompt
+    assert "`write_success_marker`" in prompt
+    assert "`verification_oracle`" in prompt
+    assert "Automatic second-order verification is timing-only" in prompt
+    assert "response-marker-only lead for manual review" in prompt
+    assert "emitted only after the real writer successfully persists" in prompt
+    assert "later request, optional UI block, or deferred job" in prompt
+    assert "matching `$wpdb->prepare()` placeholder" in prompt
+    assert "writer and reader use different option scopes" in prompt
+    assert "Initial storage through `update_option()`" in prompt
+    assert "For direct CWE-89, set `injection_order` to `direct`" in prompt
+
+
+def test_shared_specialist_contract_declares_optional_lifecycle_metadata():
+    prompt = " ".join(load_prompt("specialists/_shared_rules").split())
+
+    assert "backward-compatible lifecycle fields" in prompt
+    assert "`injection_order`: `direct`, `second`, or `null`" in prompt
+    assert "`storage_boundary`: `option`, `metadata`, `transient`, `custom_table`" in prompt
+    assert "`impact_labels`" in prompt
+    assert "only currently supported member is the executable-outcome label" in prompt
+    assert "must set `injection_order` to `second`" in prompt
+    assert "must set a non-null `storage_boundary`" in prompt
+    assert '`impact_labels: ["potential_rce"]`' in prompt
+    assert "optional globally but mandatory for the family" in prompt
+    assert "`storage_writer`" in prompt
+    assert "`storage_identity`" in prompt
+    assert "`trigger`" in prompt
+    assert "`write_success_marker`" in prompt
+    assert "`same_actor_lifecycle` to a boolean" in prompt
+    assert "`verification_oracle` to `timing` or `response_marker`" in prompt
+    assert "Only `same_actor_lifecycle: true` together" in prompt
+    assert "`code_execution_path`" in prompt
+    assert "`code_execution_sink`" in prompt
+    assert "Do not emit it for a mere upload/write primitive" in prompt
+    assert "These labels are metadata, not proof" in prompt
+    assert "only the three declared optional lifecycle keys" in prompt
+    assert "not universal placeholders" in prompt
+
+
+def test_injection_prompts_preserve_valid_but_unsupported_verifier_transports():
+    shared = " ".join(load_prompt("specialists/_shared_rules").split())
+    specialist = " ".join(load_prompt("specialists/injection_files").split())
+    critic = " ".join(load_prompt("critic").split())
+
+    for prompt in (shared, specialist, critic):
+        for transport in (
+            "header",
+            "cookie",
+            "path",
+            "raw",
+            "XML",
+            "multipart",
+            "nested",
+        ):
+            assert transport in prompt
+        assert "manual_review" in prompt
+        assert "different actor" in prompt or "different-actor" in prompt
+
+    assert "do not reject" in shared
+    assert "not rejection as an invalid transport" in specialist
+    assert "complete unchanged hypothesis" in critic
+
+
 def test_authorization_prompt_requires_route_local_object_binding():
     prompt = " ".join(load_prompt("specialists/authorization_workflows").split())
 
@@ -1010,10 +1149,10 @@ def test_injection_batches_isolate_variable_php_include_sinks():
     batches = _build_review_batches(targets, "injection_files")
 
     assert sum(len(batch) for batch in batches) == len(targets)
-    assert batches[0] == [targets[1]]
     assert next(batch for batch in batches if batch[0].id == "variable-include") == [
         targets[1]
     ]
+    assert batches[0][0] == targets[0]
     ordinary = [
         item.id
         for batch in batches
@@ -1242,6 +1381,187 @@ def test_pre_verifier_dedup_preserves_distinct_paths_to_same_sink_and_cwe():
     deduped, merged = _pre_verifier_dedup([replay, bootstrap])
 
     assert [hypothesis.id for hypothesis in deduped] == ["replay", "bootstrap"]
+    assert merged == {}
+
+
+def test_pre_verifier_dedup_preserves_distinct_second_order_storage_identity():
+    base = _hypothesis("stored-a", bug_class=BugClass.SQLI).model_copy(
+        update={
+            "specialist": "injection_files",
+            "injection_order": "second",
+            "storage_boundary": "option",
+            "evidence_summary": {
+                "source": "POST form field sort",
+                "control": "no final query placeholder",
+                "boundary": "database query syntax",
+                "storage_writer": "POST /save -> update_option",
+                "storage_identity": "option:report_sort_a",
+                "trigger": "GET /report -> get_option -> query",
+                "write_success_marker": "SORT_WRITE_CONFIRMED_7D3A",
+                "same_actor_lifecycle": True,
+                "verification_oracle": "timing",
+            },
+        }
+    )
+    other_tuple = base.model_copy(
+        update={
+            "id": "stored-b",
+            "evidence_summary": {
+                **base.evidence_summary,
+                "storage_identity": "option:report_sort_b",
+            },
+        }
+    )
+
+    deduped, merged = _pre_verifier_dedup([base, other_tuple])
+
+    assert [hypothesis.id for hypothesis in deduped] == ["stored-a", "stored-b"]
+    assert merged == {}
+
+
+def test_pre_verifier_dedup_preserves_distinct_writer_success_markers():
+    base = _hypothesis("stored-a", bug_class=BugClass.SQLI).model_copy(
+        update={
+            "specialist": "injection_files",
+            "injection_order": "second",
+            "storage_boundary": "option",
+            "evidence_summary": {
+                "source": "POST form field sort",
+                "control": "no final query placeholder",
+                "boundary": "database query syntax",
+                "storage_writer": "POST /save -> update_option",
+                "storage_identity": "option:report_sort",
+                "trigger": "GET /report -> get_option -> query",
+                "write_success_marker": "SORT_WRITE_CONFIRMED_A1B2",
+                "same_actor_lifecycle": True,
+                "verification_oracle": "timing",
+            },
+        }
+    )
+    other_marker = base.model_copy(
+        update={
+            "id": "stored-b",
+            "evidence_summary": {
+                **base.evidence_summary,
+                "write_success_marker": "SORT_WRITE_CONFIRMED_C3D4",
+            },
+        }
+    )
+
+    deduped, merged = _pre_verifier_dedup([base, other_marker])
+
+    assert [hypothesis.id for hypothesis in deduped] == ["stored-a", "stored-b"]
+    assert merged == {}
+
+
+def test_pre_verifier_dedup_preserves_distinct_ordered_verification_preflights():
+    base = _hypothesis("preflight-a", bug_class=BugClass.COMMAND_INJECTION).model_copy(
+        update={
+            "specialist": "injection_files",
+            "evidence_summary": {
+                "source": "POST form field command",
+                "control": "no shell escaping",
+                "boundary": "operating system command execution",
+                "verification_preflights": [
+                    "GET /wp-admin/admin.php?page=prepare",
+                    "HEAD /wp-json/example/v1/state?id=7",
+                ],
+            },
+        }
+    )
+    different_order = base.model_copy(
+        update={
+            "id": "preflight-b",
+            "evidence_summary": {
+                **base.evidence_summary,
+                "verification_preflights": [
+                    "HEAD /wp-json/example/v1/state?id=7",
+                    "GET /wp-admin/admin.php?page=prepare",
+                ],
+            },
+        }
+    )
+
+    deduped, merged = _pre_verifier_dedup([base, different_order])
+
+    assert [hypothesis.id for hypothesis in deduped] == [
+        "preflight-a",
+        "preflight-b",
+    ]
+    assert merged == {}
+
+
+@pytest.mark.parametrize(
+    ("evidence_key", "valid_value", "invalid_value"),
+    [
+        ("verification_preflights", ["GET /plugin/form"], None),
+        ("storage_identity", "42", 42),
+        ("code_execution_path", "", None),
+    ],
+)
+def test_pre_verifier_dedup_preserves_raw_verifier_contract_evidence(
+    evidence_key,
+    valid_value,
+    invalid_value,
+):
+    base = _hypothesis("contract-a", bug_class=BugClass.COMMAND_INJECTION).model_copy(
+        update={
+            "specialist": "injection_files",
+            "evidence_summary": {
+                "source": "POST form field command",
+                "control": "no shell escaping",
+                "boundary": "operating system command execution",
+                evidence_key: valid_value,
+            },
+        }
+    )
+    different_raw_contract = base.model_copy(
+        update={
+            "id": "contract-b",
+            "confidence": Confidence.HIGH,
+            "evidence_summary": {
+                **base.evidence_summary,
+                evidence_key: invalid_value,
+            },
+        }
+    )
+
+    deduped, merged = _pre_verifier_dedup([base, different_raw_contract])
+
+    assert [hypothesis.id for hypothesis in deduped] == [
+        "contract-a",
+        "contract-b",
+    ]
+    assert merged == {}
+
+
+def test_pre_verifier_dedup_distinguishes_missing_and_null_contract_evidence():
+    base = _hypothesis("contract-a", bug_class=BugClass.COMMAND_INJECTION).model_copy(
+        update={
+            "specialist": "injection_files",
+            "evidence_summary": {
+                "source": "POST form field command",
+                "control": "no shell escaping",
+                "boundary": "operating system command execution",
+            },
+        }
+    )
+    explicit_null = base.model_copy(
+        update={
+            "id": "contract-b",
+            "evidence_summary": {
+                **base.evidence_summary,
+                "verification_preflights": None,
+            },
+        }
+    )
+
+    deduped, merged = _pre_verifier_dedup([base, explicit_null])
+
+    assert [hypothesis.id for hypothesis in deduped] == [
+        "contract-a",
+        "contract-b",
+    ]
     assert merged == {}
 
 

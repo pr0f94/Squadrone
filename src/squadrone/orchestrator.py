@@ -30,6 +30,12 @@ from .services.budget import BudgetExceededError, BudgetTracker
 from .services.decision_ledger import append_decision
 from .services.llm import init_cache
 from .services.sqlite import connect_sqlite
+from .services.verification_checkpoint import (
+    VERIFICATION_CHECKPOINT_SCHEMA_VERSION,
+    VERIFICATION_POLICY_VERSION,
+    canonical_hypothesis_digest,
+    finding_verification_binding_matches,
+)
 from .stages import dedup as dedup_stage
 from .stages import hypothesis as hypothesis_stage
 from .stages import intake as intake_stage
@@ -93,22 +99,28 @@ def _emit_triage_manual_review_queue(
     import json as _json
 
     marker_path = run_dir / "manual_review_queued.json"
-    queued_ids: set[str] = set()
+    queued_fingerprints: dict[str, str] = {}
     if marker_path.exists():
         try:
             data = _json.loads(marker_path.read_text())
-            queued_ids = {str(x) for x in data.get("hypothesis_ids", [])}
+            if (
+                data.get("policy_version")
+                == verify_helpers.MANUAL_REVIEW_QUEUE_POLICY_VERSION
+                and isinstance(data.get("fingerprints"), dict)
+            ):
+                queued_fingerprints = {
+                    str(hypothesis_id): str(fingerprint)
+                    for hypothesis_id, fingerprint in data["fingerprints"].items()
+                    if isinstance(fingerprint, str)
+                }
         except Exception:
-            queued_ids = set()
+            queued_fingerprints = {}
 
     queued = 0
     already_queued = 0
     unavailable = 0
     for item in triaged.manual_review:
         item_id = str(item.get("hypothesis_id") or "")
-        if item_id and item_id in queued_ids:
-            already_queued += 1
-            continue
         hyp = _hypothesis_from_manual_item(item)
         if hyp is None:
             append_decision(
@@ -122,11 +134,20 @@ def _emit_triage_manual_review_queue(
             )
             unavailable += 1
             continue
-        hyp_dir = run_dir / "verifications" / hyp.id
-        hyp_dir.mkdir(parents=True, exist_ok=True)
         reason = str(
             item.get("reason") or "triage/manual quality gate requested manual review"
         )
+        source = str(item.get("source") or "triage")
+        fingerprint = verify_helpers.manual_review_queue_fingerprint(
+            hyp,
+            reason,
+            source,
+        )
+        if item_id and queued_fingerprints.get(item_id) == fingerprint:
+            already_queued += 1
+            continue
+        hyp_dir = run_dir / "verifications" / hyp.id
+        hyp_dir.mkdir(parents=True, exist_ok=True)
         verify_helpers.write_manual_scaffold(
             hyp,
             hyp_dir,
@@ -147,7 +168,7 @@ def _emit_triage_manual_review_queue(
         )
         if not was_queued:
             already_queued += 1
-            queued_ids.add(hyp.id)
+            queued_fingerprints[hyp.id] = fingerprint
             continue
         append_decision(
             run_dir,
@@ -159,9 +180,15 @@ def _emit_triage_manual_review_queue(
             artifact=hyp_dir / "manual_scaffold",
         )
         queued += 1
-        queued_ids.add(hyp.id)
-    if queued:
-        atomic_write_json(marker_path, {"hypothesis_ids": sorted(queued_ids)})
+        queued_fingerprints[hyp.id] = fingerprint
+    if triaged.manual_review:
+        atomic_write_json(
+            marker_path,
+            {
+                "policy_version": verify_helpers.MANUAL_REVIEW_QUEUE_POLICY_VERSION,
+                "fingerprints": dict(sorted(queued_fingerprints.items())),
+            },
+        )
     return {
         "manual_queued": queued,
         "already_queued": already_queued,
@@ -298,7 +325,7 @@ def _verify_checkpoint_matches_triage(
     run_dir: Path,
     triaged: TriagedArtifact,
 ) -> bool:
-    """Reject complete markers produced for another scope mode or candidate set."""
+    """Accept only a complete marker bound to this exact verification input."""
     if not _verify_checkpoint_complete(run_dir):
         return False
     try:
@@ -309,19 +336,33 @@ def _verify_checkpoint_matches_triage(
         return False
     if not isinstance(marker, dict):
         return False
-    # Missing markers are historical and therefore came from enforced-scope runs.
-    stored_scope = marker.get("submission_scope_enforced", True)
+    if (
+        marker.get("schema_version") != VERIFICATION_CHECKPOINT_SCHEMA_VERSION
+        or marker.get("verification_policy_version")
+        != VERIFICATION_POLICY_VERSION
+        or marker.get("status") != "complete"
+    ):
+        return False
+    stored_scope = marker.get("submission_scope_enforced")
     stored_ids = marker.get("accepted_hypothesis_ids", [])
     expected_ids = [hypothesis.id for hypothesis in triaged.accepted]
+    stored_digests = marker.get("accepted_hypothesis_digests", [])
+    expected_digests = [
+        canonical_hypothesis_digest(hypothesis) for hypothesis in triaged.accepted
+    ]
+    expected_by_id = {hypothesis.id: hypothesis for hypothesis in triaged.accepted}
     expected_manual_ids = [
         hypothesis.id
         for hypothesis in triaged.accepted
         if not hypothesis.bug_class.is_known
     ]
-    # Historical markers remain valid for registry-backed candidates. An open CWE
-    # requires an explicit manual-resolution record so a pre-policy automatic
-    # confirmation cannot be silently resumed.
     stored_manual_ids = marker.get("manual_review_hypothesis_ids", [])
+    stored_automatic_ids = marker.get("automatic_verification_hypothesis_ids", [])
+    expected_automatic_ids = [
+        hypothesis.id
+        for hypothesis in triaged.accepted
+        if hypothesis.bug_class.is_known
+    ]
     findings, corrupt_count = read_jsonl_models(
         run_dir / "findings.jsonl",
         Finding,
@@ -329,13 +370,19 @@ def _verify_checkpoint_matches_triage(
     if corrupt_count:
         return False
     finding_ids = [finding.id for finding in findings]
-    finding_hypothesis_ids = {finding.hypothesis.id for finding in findings}
     stored_finding_ids = marker.get("finding_ids", [])
     return (
-        stored_scope is triaged.submission_scope_enforced
+        type(stored_scope) is bool
+        and stored_scope is triaged.submission_scope_enforced
         and stored_ids == expected_ids
+        and stored_digests == expected_digests
         and stored_manual_ids == expected_manual_ids
-        and finding_hypothesis_ids <= set(expected_ids)
+        and stored_automatic_ids == expected_automatic_ids
+        and all(
+            (current := expected_by_id.get(finding.hypothesis.id)) is not None
+            and finding_verification_binding_matches(finding, current)
+            for finding in findings
+        )
         and all(finding.hypothesis.bug_class.is_known for finding in findings)
         and stored_finding_ids == finding_ids
     )

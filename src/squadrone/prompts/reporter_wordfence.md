@@ -49,8 +49,13 @@ Produce these sections in this exact order, with these exact level-2 headings:
   Remote File Inclusion, Path Traversal, Information Exposure, Authentication Bypass,
   Privilege Escalation, Insecure Direct Object Reference, Open Redirect, Remote Code Execution,
   Command Injection, Missing Authorization, Other.
-  Pick exactly one.
-- **vulnerabilityCwe:** the CWE id (e.g. CWE-79).
+  Pick exactly one from the finding's root-cause `vulnerability_type`, never from
+  a downstream outcome or `impact_labels`. For example, a CWE-434 arbitrary file
+  upload remains Arbitrary File Upload even when clean verification demonstrates
+  resulting code execution; describe that execution as impact, not as the root
+  vulnerability type.
+- **vulnerabilityCwe:** reproduce the finding's root-cause `root_cause_cwe`
+  exactly (e.g. CWE-79); never replace it with a downstream-impact CWE.
 - **vulnerabilityAuthLevel:** one of `Unauthenticated`, `Subscriber`, `Contributor`, `Author`, `Editor`, `Shop Manager`, `Administrator`, `Custom`. Use the lowest privilege the FINDING demonstrates exploitation from. If preconditions clearly require manage_options, use Administrator.
 - **pocType:** Python, PHP, JavaScript, HTML, URL, or Other. Match the language the PoC script is written in.
 
@@ -62,8 +67,14 @@ It MUST contain, in flowing prose:
 1. One opening sentence naming the plugin, version, vulnerability class, and the entry point.
 2. The exact file path and line number of the sink, the **actual sink expression as it appears in the VERIFIED_SOURCE_SLICE** (quote the function call literally), and why it is unsafe.
 3. The critic-approved taint flow, limited to steps supported by the supplied source and finding evidence.
+   When `injection_order` is `second`, explicitly separate the attacker write,
+   exact stored identity and `storage_boundary`, later trigger/read, and final
+   SQL query, and state that the same attacker identity performs both requests,
+   rather than describing it as direct-request SQLi.
 4. Preconditions for exploitation (auth level, user interaction, server configuration).
 5. Concrete impact in the WordPress admin context — describe only what the PoC actually demonstrated or what the source code provably permits. Do not extrapolate to "could lead to RCE / privilege escalation" unless the source slice shows the primitive needed for it.
+   Treat `impact_labels` as navigation metadata only; the clean confirmation
+   observation remains authoritative for any RCE claim.
 
 Do NOT restate metadata already captured by the form fields above (no "CWE: ..." line, no "Affected version: ..." line, no "Author level: ..." line).
 

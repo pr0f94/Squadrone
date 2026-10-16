@@ -261,21 +261,67 @@ Rules:
   written by the script—must find positive markers and prove negative markers
   absent from a complete response capture.
 - Never prove a vulnerability by directly seeding the malicious payload into the database, options table, post meta, user meta, filesystem, or other sink storage. You may use setup-created benign state, but the PoC itself must deliver the attacker-controlled value through a real plugin/WordPress entry point reachable by the claimed attacker role.
+- If `evidence_summary.verification_preflights` is present, issue those exact
+  source-reviewed GET/HEAD requests once, in list order, through the same actor
+  session after built-in authentication and before any control/attack proof
+  request. Do not add, duplicate, reorder, redirect, or substitute traffic. Use
+  a returned nonce or rendered hidden value only when source proves its exact
+  extraction and destination field; fail closed if acquisition fails. These
+  preflights are read-only transport prerequisites, never setup or proof.
 - For stored vulnerabilities, first identify the write path that stores attacker input, submit the malicious value through that path, then trigger the read/render/action path. If the normal write path sanitizes or rejects the payload, print FAILURE; do not work around it with direct DB writes.
 - For `admin_init` hypotheses, do not assume the vulnerable handler is only reachable through the plugin's own admin menu page. WordPress runs `admin_init` on ordinary `/wp-admin/` requests, including generic pages such as `/wp-admin/profile.php` or `/wp-admin/index.php` that lower-privilege users can often access. If a plugin settings page returns 403 for a subscriber, retry the actual POST/GET parameters against a generic accessible admin URL before declaring the guard effective.
 - For weak crypto / weak PRNG findings (`CWE-327`, `CWE-338`), emit a vulnerable
   result only after demonstrating token prediction, forgery, realistic bounded
   brute force, or a protected-state bypass. A legitimate generated token working
   is setup evidence, not proof of weak randomness.
-- SQLi: use a `timing` oracle with at least three attack and three control samples, or a unique `response_marker` absent from the control.
+- Direct SQLi may use a `timing` oracle with at least three attack and three
+  control samples, or a unique `response_marker` absent from the control.
+- For a CWE-89 hypothesis whose top-level `injection_order` is exactly
+  `second`, preserve the dedicated second-order scaffold's two-stage proof shape.
+  Read and bind both transports from source: (1) the legitimate attacker-reachable
+  writer, including its exact method, route, dispatch fields, stored-value field,
+  object/storage identity, nonce acquisition, and source-reviewed
+  `write_success_marker`; and (2) the
+  natural later trigger that reads that same stored tuple and reaches the cited SQL
+  sink. Never substitute `wp db query`, `$wpdb`, an option/meta CLI command, setup,
+  or any other direct storage mutation for the writer. Run separate comparable
+  attack and benign-control write-then-trigger sequences. Automatic second-order
+  proof is timing-only: measure only the natural trigger and collect at least
+  six complete samples for each arm, alternating control-then-attack and
+  attack-then-control so each ordering has at least three samples. The timing
+  differential must independently satisfy the full threshold in both orderings.
+  The parent-owned proxy makes the authoritative latency measurement. Do not
+  substitute a response marker,
+  database error, or response-normalization effect; response-marker-only leads
+  must remain in manual review. Keep the
+  scaffold's `_write_confirmed` response-body contract unchanged. Fail closed
+  when the exact 8–256 character specific writer-success marker is absent from
+  the response body of any control or attack write response, or when either
+  transport, the exact stored
+  tuple binding, writer acceptance, or control
+  isolation cannot be established from source and runtime observations.
 - Auth bypass: use `authorization` or `state_change` and record the actual privileged effect.
+- OS command injection (CWE-78): keep the route, dispatch fields, request-field
+  location, and request shape identical between control and attack, changing
+  only the parent-supplied opaque canary path inside the source-proven
+  command-bearing value. Send the benign control first. When
+  `TRUSTED_EXECUTION_CANARY` is supplied, make the command sink invoke PHP CLI on
+  the supplied control/attack paths; never read either path from the PoC process.
+  The fresh private marker is withheld from the model and absent as a complete
+  value from the canary source. Extract it dynamically only from the attack
+  response captured from the target and require its absence from the comparable
+  control response. Reflection, raw file contents, an error message, command text
+  in a response, or any request-supplied marker is not command execution.
 - PHP code injection (CWE-94): keep the route and request shape identical between
-  attack and control, changing only the code-bearing value. Prove an
-  execution-only effect, not reflection or a PHP error. For `response_marker`,
-  make evaluated code construct the complete marker at runtime so that exact
-  value is absent from every transmitted request byte, and require it to be
-  absent from the comparable non-executing control. Prefer a measured
-  `state_change` or `file_effect` when the natural vulnerable path provides one.
+  control and attack, changing only the parent-supplied opaque canary path inside
+  the code-bearing value, and send the benign control first. When
+  `TRUSTED_EXECUTION_CANARY` is supplied, make evaluated PHP include the supplied
+  control/attack path and accept the fresh private marker only from the named
+  response header. Never read a path from the PoC process or treat response-body
+  text as execution evidence. Prove an execution-only effect, not reflection or
+  a PHP error. The marker is withheld from the model: its exact value is absent
+  from every transmitted request byte and from the canary source; a raw file read,
+  reflection, or PHP error cannot satisfy this oracle.
 - File ops: use `file_effect` and snapshot the deterministic attack and control
   paths before sending either request, then snapshot each path again after its
   comparable request. A successful attack must prove either file creation

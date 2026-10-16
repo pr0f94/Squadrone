@@ -122,6 +122,67 @@ Every hypothesis must populate `evidence_summary` with short concrete values for
 Use the supplied `hypothesis_id_prefix` when choosing hypothesis IDs; the runner
 will canonicalize them when the batch is checkpointed.
 
+Hypotheses may also include these backward-compatible lifecycle fields:
+
+- `injection_order`: `direct`, `second`, or `null`;
+- `storage_boundary`: `option`, `metadata`, `transient`, `custom_table`,
+  `other`, or `null`;
+- `impact_labels`: a duplicate-free list whose only currently supported member
+  is the executable-outcome label `potential_rce`. That label is valid only for
+  an exact CWE-434 arbitrary file upload/write hypothesis.
+
+Omit optional fields when they do not apply. If included but inapplicable, use
+`null` for `injection_order`/`storage_boundary` and an empty list for
+`impact_labels` (never `null` for the list). A
+CWE-89 candidate that claims a persistent/deferred write-read lifecycle must set
+`injection_order` to `second` and must set a non-null `storage_boundary`; a
+direct CWE-89 candidate may set `injection_order` to `direct` with
+`storage_boundary` null. These labels are metadata, not proof.
+
+The following `evidence_summary` keys are optional globally but mandatory for
+the family that invokes them:
+
+- a second-order CWE-89 candidate must set source-grounded `storage_writer`,
+  `storage_identity`, `trigger`, and `write_success_marker`, and must truthfully
+  set `same_actor_lifecycle` to a boolean and `verification_oracle` to `timing`
+  or `response_marker`, identifying the exact
+  external writer, normalized storage tuple, later read-to-SQL trigger, and exact
+  response body fragment emitted only after that writer successfully persists the
+  value. The marker must be trimmed printable ASCII, 8–256 characters, contain at
+  least five distinct non-space characters case-insensitively, and must not be a
+  generic token such as `1`, `ok`, `saved`, `success`, `true`, or `updated`;
+  `storage_identity` must begin with the exact declared storage-boundary prefix:
+  `option:`, `metadata:`, `transient:`, `custom_table:`, or `other:`, followed
+  by a non-empty normalized identity. Printable Unicode is valid in the identity;
+  automatic verification is timing-only and the parent-owned proxy measures the
+  natural trigger latency. If source establishes only a response-visible SQL
+  effect, preserve the exact source-valid hypothesis with
+  `verification_oracle: "response_marker"` for `manual_review`; do not discard
+  it or claim timing reachability. Only `same_actor_lifecycle: true` together
+  with `verification_oracle: "timing"` is ready for automatic verification;
+- a candidate with `impact_labels: ["potential_rce"]` must set source-grounded
+  `code_execution_path` and `code_execution_sink`, identifying every post-write
+  step and the exact include, autoload, interpreter dispatch, command execution,
+  or equivalent terminal operation.
+
+For CWE-78, CWE-94, or second-order CWE-89 only, optional
+`verification_preflights` may be an ordered list of 1–8 unique, source-proven
+read-only requests required before the proof request (for example, to render a
+plugin form or acquire its nonce). Each item must be exactly `GET
+/origin-relative/path` or `HEAD /origin-relative/path`, with only literal,
+non-empty, unique query dispatch pairs when source requires them. Do not append
+prose, fragments, alternatives, absolute URLs, form/JSON fields, or a
+state-changing request. Preserve exact runtime order and omit the key entirely
+when no plugin-specific preflight is required. Built-in WordPress login and REST
+identity/nonce setup are not declared here.
+
+Use `impact_labels: ["potential_rce"]` only when the root-cause primitive,
+attacker-controlled executable write, and complete source path to the concrete
+code-execution sink are proven, with one narrow runtime fact remaining. Do not
+emit it for a mere upload/write primitive, dangerous extension, public URL, or
+inferred web-server execution. It must not upgrade the structured CIA outcome
+or replace the required source path and proof gap.
+
 For an HTTP hypothesis, `entry_point` is a machine-readable transport seed, not
 prose. Use exactly `METHOD /origin-relative/path`, optionally followed by one or
 more source-proven fixed dispatch query pairs such as `?mode=submit&view=public`,
@@ -132,6 +193,19 @@ role, runtime signatures or tokens, UI workflow, and explanatory text in
 leading `/`; do not emit a bare `?query`, an absolute URL, a callback description,
 or alternative routes in one value. Do not invent a query pair for a queryless
 route.
+
+For a second-order CWE-89 hypothesis, `entry_point` must be the legitimate
+attacker-reachable **storage writer** transport, never the later SQL trigger.
+Its `evidence_summary.trigger` must begin with the same machine-readable format
+for the distinct natural trigger (`METHOD /origin-relative/path` or one exact
+standard WordPress action hook), optionally followed by ` -> callback -> sink`
+source context. For example: `POST /wp-admin/admin-ajax.php?action=save_sort` as
+the writer and `GET /wp-admin/admin.php?page=reports -> render_reports ->
+$wpdb->get_results` as the trigger. A cron event, CLI command, or other non-HTTP
+trigger may support manual review; preserve an otherwise source-valid candidate
+for the critic to route there rather than treating verifier coverage as source
+counterevidence. Do not hide multiple writer or trigger alternatives in either
+field.
 
 When the source is an HTTP request value, `evidence_summary.source` must identify
 one exact, source-proven wire location and its key when applicable. Non-exhaustive
@@ -144,6 +218,16 @@ alternatives such as `JSON or form`, and do not substitute a UI label, DTO/model
 property, or storage key for the actual wire key. Record every proven rename in
 `taint_path`; emit separate hypotheses for independently reachable alternative
 transports.
+
+Automatic verification currently binds only one top-level query, form, or JSON
+field. A source-valid header, cookie, path parameter, raw body, XML body,
+multipart field, or nested field is still a valid security lead: preserve its
+exact transport and field encoding in the hypothesis and keep it as a candidate
+for the critic to route to `manual_review`; do not reject, discard, or relabel it
+as invalid merely because the automatic verifier cannot encode it. Apply the
+same rule to a source-valid second-order flow whose writer and trigger require
+different actor identities: preserve the exact lifecycle for manual review
+rather than erasing the lead or claiming `same_actor_lifecycle: true`.
 
 Output only this JSON shape:
 
@@ -179,8 +263,20 @@ Output only this JSON shape:
         "boundary": "crossed security boundary",
         "impact": "demonstrated CIA outcome",
         "counterevidence": "nearby contrary evidence considered",
-        "proof_gaps": "one narrow runtime question"
-      }
+        "proof_gaps": "one narrow runtime question",
+        "storage_writer": "family-specific: exact external storage writer and source locations",
+        "storage_identity": "family-specific: normalized option/metadata/transient/table/other tuple",
+        "trigger": "family-specific: later request/hook/job and read-to-sink callback chain",
+        "write_success_marker": "family-specific: exact specific response body fragment emitted after a successful persistent write",
+        "same_actor_lifecycle": true,
+        "verification_oracle": "family-specific: timing for automatic second-order SQLi; response_marker for manual review only",
+        "code_execution_path": "family-specific: every source-grounded post-write execution step",
+        "code_execution_sink": "family-specific: exact terminal code-execution operation and location",
+        "verification_preflights": ["GET /source-proven/plugin/form?literal=dispatch"]
+      },
+      "injection_order": "direct | second | null",
+      "storage_boundary": "option | metadata | transient | custom_table | other | null",
+      "impact_labels": ["potential_rce"]
     }
   ],
   "coverage": [
@@ -196,7 +292,10 @@ Output only this JSON shape:
 }
 ```
 
-Inside `hypotheses`, use exactly `id`, `specialist`, `bug_class`, and
-`confidence`; do not substitute `hypothesis_id`, `reviewer`,
+Inside `hypotheses`, use the required keys shown above and only the three
+declared optional lifecycle keys when applicable. In particular, use exactly `id`,
+`specialist`, `bug_class`, and `confidence`; do not substitute `hypothesis_id`, `reviewer`,
 `vulnerability_class`, or `cwe`. Return every required field even when fixing a
-prior response.
+prior response. The family-specific `evidence_summary` keys in the illustrative
+shape are not universal placeholders: omit each one entirely unless the
+corresponding family contract above requires real source-grounded evidence.

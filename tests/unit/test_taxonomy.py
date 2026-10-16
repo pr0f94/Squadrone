@@ -16,6 +16,7 @@ from squadrone.schemas.taxonomy import (
     OPEN_CWE_CRITIC_EVIDENCE_CONTRACT,
     OPEN_CWE_POC_TEMPLATE,
     PATCHSTACK_POLICIES,
+    SECOND_ORDER_SQLI_AUTOMATIC_ORACLES,
     WORDFENCE_POLICIES,
     critic_evidence_contract_for,
     get_known_cwe_profile,
@@ -49,17 +50,17 @@ def test_exact_profile_taxonomy_and_review_ownership() -> None:
         BugClass.SQLI: (
             "sql_injection",
             "injection_files",
-            ("sql_query", "sql_write"),
+            ("sql_query", "sql_write", "persistent_sql_operand"),
         ),
         BugClass.COMMAND_INJECTION: (
             "command_injection",
             "injection_files",
-            ("command_execution",),
+            ("command_execution", "command_wrapper"),
         ),
         BugClass.PHP_CODE_INJECTION: (
             "php_code_injection",
             "injection_files",
-            ("php_code_execution",),
+            ("php_code_execution", "dynamic_callable"),
         ),
         BugClass.PATH_TRAVERSAL: (
             "path_traversal_or_file_access",
@@ -69,7 +70,14 @@ def test_exact_profile_taxonomy_and_review_ownership() -> None:
         BugClass.ARBITRARY_FILE_WRITE: (
             "arbitrary_file_upload_or_write",
             "injection_files",
-            ("file_upload", "file_write", "file_delete", "file_read"),
+            (
+                "file_upload",
+                "file_write",
+                "file_delete",
+                "file_read",
+                "archive_extract",
+                "upload_policy",
+            ),
         ),
         BugClass.SSRF: (
             "server_side_request_forgery",
@@ -287,6 +295,11 @@ def test_policy_oracle_and_template_vocabularies_are_valid() -> None:
         assert profile.allowed_oracles <= valid_oracles, bug_class
         if profile.poc_template is not None:
             assert (template_root / profile.poc_template).is_file(), bug_class
+
+
+def test_second_order_sqli_taxonomy_is_timing_only() -> None:
+    assert SECOND_ORDER_SQLI_AUTOMATIC_ORACLES == frozenset({"timing"})
+    assert "response_marker" in KNOWN_CWE_REGISTRY[BugClass.SQLI].allowed_oracles
 
 
 def test_open_cwe_delivery_fallback_is_manual_template_only() -> None:

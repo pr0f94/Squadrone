@@ -18,6 +18,15 @@ unserialize()/maybe_unserialize() with non-literal args; and direct
 update_metadata() calls as implicit-deserialization review anchors. Do not add
 every get_*_meta()/update_*_meta() wrapper as a separate sink.
 
+Also inventory command execution via pcntl_exec(), expect_popen(), and bounded
+PHP backtick expressions. Treat Process/WP_CLI command wrappers and dynamic
+callable dispatch (call_user_func*, forward_static_call*, ReflectionFunction /
+ReflectionMethod) as review anchors, not as vulnerability proof. Include archive
+extraction (unzip_file, PclZip, Archive_Tar), stream_copy_to_stream and
+WP_Filesystem move/copy operations, plus upload MIME/prefilter/override policy
+hooks. Follow persistent getters into later dynamic SQL operands when the local
+dataflow is visible; do not list every unrelated persistent read.
+
 For each entry point, note presence of wp_verify_nonce/check_ajax_referer and
 current_user_can().
 
@@ -62,7 +71,7 @@ Output ONLY valid JSON matching the ReconArtifact schema:
   ],
   "sinks": [
     {
-      "type": "sql_query" | "file_upload" | "file_write" | "file_read" | "file_delete" | "external_http" | "deserialization" | "implicit_deserialization" | "php_code_execution" | "dynamic_include",
+      "type": "sql_query" | "file_upload" | "file_write" | "file_read" | "file_delete" | "external_http" | "deserialization" | "implicit_deserialization" | "php_code_execution" | "command_execution" | "command_wrapper" | "dynamic_callable" | "archive_extract" | "upload_policy" | "dynamic_include",
       "function": str,
       "file": str,
       "line": int,

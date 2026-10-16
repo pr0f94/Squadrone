@@ -58,9 +58,23 @@ _REVIEW_BATCH_WINDOW_LINES = 250
 # receives only the items that remain unresolved, so the last pass is isolated
 # when a batch has narrowed to a single difficult path.
 _REVIEW_BATCH_ATTEMPTS = 4
-_REVIEW_CHECKPOINT_VERSION = 5
-_REVIEW_BATCH_POLICY_VERSION = 2
+_REVIEW_CHECKPOINT_VERSION = 6
+_REVIEW_BATCH_POLICY_VERSION = 4
 _REVIEWABLE_SUPPORT = {"active", "partial", "review_only"}
+_FOCUSED_INJECTION_BATCH_MAX_ITEMS = 4
+_FOCUSED_INJECTION_TYPES = frozenset(
+    {
+        "command_execution",
+        "command_wrapper",
+        "dynamic_callable",
+        "php_code_execution",
+        "file_upload",
+        "file_write",
+        "archive_extract",
+        "upload_policy",
+        "persistent_sql_operand",
+    }
+)
 
 
 def _batch_input_fingerprint(
@@ -97,6 +111,13 @@ def _batch_input_fingerprint(
         )
     if reviewer == "authentication":
         execution_policy["authentication_state_batches"] = "isolated"
+    if reviewer == "injection_files":
+        execution_policy["focused_injection_types"] = sorted(
+            _FOCUSED_INJECTION_TYPES
+        )
+        execution_policy["focused_injection_batch_max_items"] = (
+            _FOCUSED_INJECTION_BATCH_MAX_ITEMS
+        )
     review_policy_parts = [
         load_prompt(f"specialists/{reviewer}"),
         load_prompt("specialists/_shared_rules"),
@@ -156,6 +177,23 @@ async def _verify_hypotheses(
 # Group only semantically identical source-to-boundary paths and keep the
 # highest-confidence representative. Distinct routes can reach the same sink
 # with the same CWE and must survive for the critic's path-aware review.
+def _raw_evidence_identity(
+    hypothesis: Hypothesis,
+    key: str,
+) -> tuple[bool, str]:
+    """Preserve presence, type, and value for verifier-contract evidence."""
+    evidence = hypothesis.evidence_summary
+    return (
+        key in evidence,
+        json.dumps(
+            evidence.get(key),
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ),
+    )
+
+
 def _pre_verifier_dedup(
     hypotheses: list[Hypothesis],
 ) -> tuple[list[Hypothesis], dict[str, str]]:
@@ -173,6 +211,23 @@ def _pre_verifier_dedup(
             str(h.evidence_summary.get("source", "")).strip(),
             str(h.evidence_summary.get("control", "")).strip(),
             str(h.evidence_summary.get("boundary", "")).strip(),
+            h.injection_order,
+            h.storage_boundary,
+            tuple(sorted(h.impact_labels)),
+            *(
+                _raw_evidence_identity(h, evidence_key)
+                for evidence_key in (
+                    "storage_writer",
+                    "storage_identity",
+                    "trigger",
+                    "write_success_marker",
+                    "same_actor_lifecycle",
+                    "verification_oracle",
+                    "code_execution_path",
+                    "code_execution_sink",
+                    "verification_preflights",
+                )
+            ),
         )
         existing = by_key.get(key)
         if existing is None:
@@ -293,11 +348,15 @@ def _build_review_batches(
         implicit_deserialization_targets = [
             target for target in targets if target.type == "implicit_deserialization"
         ]
+        high_risk_targets = [
+            target for target in targets if target.type in _FOCUSED_INJECTION_TYPES
+        ]
         focused_ids = {
             target.id
             for target in [
                 *variable_include_targets,
                 *implicit_deserialization_targets,
+                *high_risk_targets,
             ]
         }
         ordinary_batches = _build_bounded_review_batches(
@@ -306,18 +365,62 @@ def _build_review_batches(
             max_windows=_REVIEW_BATCH_MAX_WINDOWS,
             dense_same_file_max_items=_REVIEW_BATCH_MAX_ITEMS_DENSE,
         )
+        focused_targets = {
+            target.id: target
+            for target in [
+                *variable_include_targets,
+                *implicit_deserialization_targets,
+                *high_risk_targets,
+            ]
+        }
+        lifecycle_ids = {
+            target.id
+            for target in [
+                *variable_include_targets,
+                *implicit_deserialization_targets,
+            ]
+        } | {
+            target.id
+            for target in high_risk_targets
+            if target.type == "persistent_sql_operand"
+        }
         focused_batches = [
             [target]
-            for target in [
-                *sorted(variable_include_targets, key=_target_sort_key),
-                *sorted(implicit_deserialization_targets, key=_target_sort_key),
-            ]
+            for target in sorted(
+                (
+                    target
+                    for target in focused_targets.values()
+                    if target.id in lifecycle_ids
+                ),
+                key=_target_sort_key,
+            )
         ]
-        # Review high-risk include operands and implicit metadata
-        # deserialization operations as singleton traces. This gives each one
-        # a complete caller/storage trace and checkpoints useful candidates
-        # before broad fixed-include/query review.
-        return [*focused_batches, *ordinary_batches]
+        grouped_focus: dict[
+            tuple[str, tuple[str, int]], list[CoverageItem]
+        ] = {}
+        for target in sorted(focused_targets.values(), key=_target_sort_key):
+            if target.id in lifecycle_ids:
+                continue
+            grouped_focus.setdefault(
+                (target.type, _source_window_key(target)),
+                [],
+            ).append(target)
+        for group in grouped_focus.values():
+            focused_batches.extend(
+                _build_bounded_review_batches(
+                    group,
+                    max_items=_FOCUSED_INJECTION_BATCH_MAX_ITEMS,
+                    max_windows=1,
+                )
+            )
+        # Keep high-risk families in dedicated, source-local batches without
+        # multiplying one model call per routine operation. Storage lifecycles,
+        # variable includes, and implicit deserialization stay singleton. Sort
+        # all batches by source so a dense family cannot starve ordinary review.
+        return sorted(
+            [*focused_batches, *ordinary_batches],
+            key=lambda batch: _target_sort_key(batch[0]),
+        )
 
     if reviewer != "authorization_workflows":
         return _build_bounded_review_batches(

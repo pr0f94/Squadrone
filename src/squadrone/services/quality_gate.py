@@ -19,11 +19,12 @@ from ..schemas.hypothesis import (
 from ..schemas.observation import CIAImpact, PoCObservation
 from ..schemas.taxonomy import get_known_cwe_profile
 from .artifacts import atomic_write_json
+from .http_transport import canonical_http_transport_key, parse_http_transport
 from .php_object_gadget_oracle import (
     validate_persisted_php_object_gadget_confirmation,
 )
+from .request_fields import classify_request_field_source
 from .roles import UNKNOWN_ATTACKER_ROLE, normalize_attacker_role
-
 
 UNSAFE_CONFIGURATION_RE = re.compile(
     r"\b(misconfig(?:uration)?|modified source|premium[- ]gated|debug mode|"
@@ -44,6 +45,39 @@ COSMETIC_RE = re.compile(
 SOURCE_RE = re.compile(
     r"\$_(?:GET|POST|REQUEST|COOKIE|FILES|SERVER)|REST|AJAX|shortcode|form|upload|webhook",
     re.IGNORECASE,
+)
+VERIFICATION_PREFLIGHT_RE = re.compile(r"^(?:GET|HEAD) /\S+$")
+SECOND_ORDER_NON_HTTP_TRIGGER_RE = re.compile(
+    r"^(?:(?:scheduled|cron)(?:\s+(?:job|event|callback|task))?|"
+    r"(?:WP-)?CLI(?:\s+(?:command|callback))?)\s+"
+    r"[A-Za-z0-9_./:'() -]{1,384}\s+(?:->|→)\s+"
+    r"[A-Za-z0-9_.$>:'() -]{1,384}$",
+    re.IGNORECASE,
+)
+GENERIC_WRITE_SUCCESS_MARKERS = frozenset(
+    {"1", "ok", "saved", "success", "true", "updated"}
+)
+SECOND_ORDER_SQLI_EVIDENCE_KEYS = frozenset(
+    {
+        "storage_writer",
+        "storage_identity",
+        "trigger",
+        "write_success_marker",
+        "same_actor_lifecycle",
+        "verification_oracle",
+    }
+)
+POTENTIAL_RCE_EVIDENCE_KEYS = frozenset(
+    {"code_execution_path", "code_execution_sink"}
+)
+MANUAL_REVIEW_ONLY_QUALITY_RULES = frozenset(
+    {
+        "execution_source_field_unsupported",
+        "second_order_sqli_writer_field_unsupported",
+        "second_order_sqli_different_actor_manual",
+        "second_order_sqli_response_marker_manual",
+        "second_order_sqli_trigger_transport_unsupported",
+    }
 )
 BOUNDARY_PLACEHOLDER_RE = re.compile(
     r"^(?:n/?a|none(?: identified)?|unknown|unclear|unspecified|tbd|todo|"
@@ -86,6 +120,64 @@ PROTECTED_SELF_TARGET_RE = re.compile(
     r"server[- ]side execut(?:e|ion)|execut(?:e|ion))\b",
     re.IGNORECASE,
 )
+
+
+def _valid_write_success_marker(value: object) -> bool:
+    """Match the strict parent verifier's source-bound writer receipt contract."""
+    return bool(
+        isinstance(value, str)
+        and value == value.strip()
+        and 8 <= len(value) <= 256
+        and value.isascii()
+        and value.isprintable()
+        and value.casefold() not in GENERIC_WRITE_SUCCESS_MARKERS
+        and len(
+            {
+                character.casefold()
+                for character in value
+                if not character.isspace()
+            }
+        )
+        >= 5
+    )
+
+
+def _valid_storage_identity(value: object, boundary: object) -> bool:
+    """Bind the normalized stored tuple to its declared storage family."""
+    if (
+        not isinstance(value, str)
+        or not isinstance(boundary, str)
+        or value != value.strip()
+        or not 3 <= len(value) <= 512
+        or not value.isprintable()
+    ):
+        return False
+    prefix = f"{boundary}:"
+    return value.startswith(prefix) and bool(value.removeprefix(prefix).strip())
+
+
+def _append_source_field_contract_rule(
+    rules: list[str],
+    *,
+    prefix: str,
+    source: object,
+    dispatch: dict[str, str],
+) -> None:
+    """Separate unsupported-but-exact fields from invalid source evidence."""
+    classification = classify_request_field_source(source)
+    dispatch_name = classification.top_level_name
+    if (
+        dispatch_name
+        and classification.location in {"query", "form", "json"}
+        and f"{classification.location}:{dispatch_name}" in dispatch
+    ):
+        rules.append(f"{prefix}_dispatch_conflict")
+    elif classification.disposition == "unsupported":
+        rules.append(f"{prefix}_unsupported")
+    elif classification.disposition != "supported":
+        rules.append(f"{prefix}_invalid")
+
+
 FLOW_ONLY_BOUNDARY_RE = re.compile(
     r"^(?:the )?(?:(?:(?:attacker|caller|user|request)\s+)?"
     r"(?:request|input|data|value)|(?:attacker|caller|user))\s+"
@@ -225,6 +317,19 @@ def infer_evidence(hypothesis: Hypothesis) -> dict[str, Any]:
     # closed instead of falling back to keyword matching.
     if "usable_gadget" in supplied:
         evidence["usable_gadget"] = supplied["usable_gadget"]
+    for family_key in (
+        "storage_writer",
+        "storage_identity",
+        "trigger",
+        "write_success_marker",
+        "same_actor_lifecycle",
+        "verification_oracle",
+        "code_execution_path",
+        "code_execution_sink",
+        "verification_preflights",
+    ):
+        if family_key in supplied:
+            evidence[family_key] = supplied[family_key]
     return evidence
 
 
@@ -297,6 +402,120 @@ def grade_hypothesis(
         value == "high" for value in evidence["impact_dimensions"].values()
     ):
         rules.append("csrf_without_high_impact_outcome")
+    if hypothesis.bug_class in {
+        BugClass.COMMAND_INJECTION,
+        BugClass.PHP_CODE_INJECTION,
+    }:
+        execution_transport = parse_http_transport(hypothesis.entry_point)
+        if not execution_transport["route"]:
+            rules.append("execution_transport_invalid")
+        _append_source_field_contract_rule(
+            rules,
+            prefix="execution_source_field",
+            source=supplied_evidence.get("source"),
+            dispatch=execution_transport["dispatch"],
+        )
+    if hypothesis.injection_order == "second":
+        required_second_order_strings = SECOND_ORDER_SQLI_EVIDENCE_KEYS - {
+            "same_actor_lifecycle",
+            "verification_oracle",
+        }
+        if any(
+            not isinstance(supplied_evidence.get(key), str)
+            or not str(supplied_evidence[key]).strip()
+            for key in required_second_order_strings
+        ):
+            rules.append("second_order_sqli_storage_evidence_missing")
+        same_actor = supplied_evidence.get("same_actor_lifecycle")
+        if type(same_actor) is not bool:
+            rules.append("second_order_sqli_same_actor_invalid")
+        elif same_actor is False:
+            rules.append("second_order_sqli_different_actor_manual")
+        verification_oracle = supplied_evidence.get("verification_oracle")
+        if verification_oracle == "response_marker":
+            rules.append("second_order_sqli_response_marker_manual")
+        elif verification_oracle != "timing":
+            rules.append("second_order_sqli_oracle_invalid")
+        if not _valid_storage_identity(
+            supplied_evidence.get("storage_identity"),
+            hypothesis.storage_boundary,
+        ):
+            rules.append("second_order_sqli_storage_identity_invalid")
+        trigger = supplied_evidence.get("trigger")
+        if not isinstance(trigger, str) or not trigger.strip():
+            rules.append("second_order_sqli_trigger_transport_invalid")
+        elif not parse_http_transport(trigger)["route"]:
+            if (
+                trigger == trigger.strip()
+                and trigger.isascii()
+                and trigger.isprintable()
+                and SECOND_ORDER_NON_HTTP_TRIGGER_RE.fullmatch(trigger) is not None
+            ):
+                rules.append("second_order_sqli_trigger_transport_unsupported")
+            else:
+                rules.append("second_order_sqli_trigger_transport_invalid")
+        writer_transport = parse_http_transport(hypothesis.entry_point)
+        if not writer_transport["route"]:
+            rules.append("second_order_sqli_writer_transport_invalid")
+        _append_source_field_contract_rule(
+            rules,
+            prefix="second_order_sqli_writer_field",
+            source=supplied_evidence.get("source"),
+            dispatch=writer_transport["dispatch"],
+        )
+        if not _valid_write_success_marker(
+            supplied_evidence.get("write_success_marker")
+        ):
+            rules.append("second_order_sqli_write_success_marker_invalid")
+    elif SECOND_ORDER_SQLI_EVIDENCE_KEYS.intersection(supplied_evidence):
+        rules.append("second_order_sqli_evidence_inapplicable")
+    if "potential_rce" in hypothesis.impact_labels:
+        if hypothesis.bug_class != BugClass.ARBITRARY_FILE_WRITE:
+            rules.append("potential_rce_bug_class_inapplicable")
+        if any(
+            not isinstance(supplied_evidence.get(key), str)
+            or not str(supplied_evidence[key]).strip()
+            for key in POTENTIAL_RCE_EVIDENCE_KEYS
+        ):
+            rules.append("potential_rce_execution_evidence_missing")
+    elif POTENTIAL_RCE_EVIDENCE_KEYS.intersection(supplied_evidence):
+        rules.append("potential_rce_evidence_without_label")
+    if "verification_preflights" in supplied_evidence:
+        preflights = supplied_evidence.get("verification_preflights")
+        applicable = hypothesis.bug_class in {
+            BugClass.COMMAND_INJECTION,
+            BugClass.PHP_CODE_INJECTION,
+        } or (
+            hypothesis.bug_class == BugClass.SQLI
+            and hypothesis.injection_order == "second"
+        )
+        parsed_preflights = (
+            [parse_http_transport(item) for item in preflights]
+            if isinstance(preflights, list)
+            and all(isinstance(item, str) for item in preflights)
+            else []
+        )
+        valid_preflights = (
+            isinstance(preflights, list)
+            and 1 <= len(preflights) <= 8
+            and all(isinstance(item, str) for item in preflights)
+            and len(parsed_preflights)
+            == len({canonical_http_transport_key(item) for item in parsed_preflights})
+            and all(
+                VERIFICATION_PREFLIGHT_RE.fullmatch(item) is not None
+                and item.isascii()
+                and item.isprintable()
+                and parsed["method"] in {"GET", "HEAD"}
+                and bool(parsed["route"])
+                and all(
+                    key.startswith("query:")
+                    for key in parsed["dispatch"]
+                )
+                for item, parsed in zip(preflights, parsed_preflights)
+            )
+        )
+        if not applicable or not valid_preflights:
+            rules.append("verification_preflights_invalid")
     accepted = not rules
     reason = (
         "passes source and impact gate"
@@ -306,6 +525,45 @@ def grade_hypothesis(
     return Grade(
         accepted, reason, evidence, severity, warnings, list(dict.fromkeys(rules))
     )
+
+
+_AUTOMATIC_VERIFIER_CONTRACT_RULES = frozenset(
+    {
+        "execution_transport_invalid",
+        "execution_source_field_invalid",
+        "execution_source_field_dispatch_conflict",
+        "execution_source_field_unsupported",
+        "second_order_sqli_storage_evidence_missing",
+        "second_order_sqli_same_actor_invalid",
+        "second_order_sqli_different_actor_manual",
+        "second_order_sqli_oracle_invalid",
+        "second_order_sqli_response_marker_manual",
+        "second_order_sqli_storage_identity_invalid",
+        "second_order_sqli_trigger_transport_invalid",
+        "second_order_sqli_trigger_transport_unsupported",
+        "second_order_sqli_writer_transport_invalid",
+        "second_order_sqli_writer_field_invalid",
+        "second_order_sqli_writer_field_dispatch_conflict",
+        "second_order_sqli_writer_field_unsupported",
+        "second_order_sqli_write_success_marker_invalid",
+        "second_order_sqli_evidence_inapplicable",
+        "potential_rce_bug_class_inapplicable",
+        "potential_rce_execution_evidence_missing",
+        "potential_rce_evidence_without_label",
+        "verification_preflights_invalid",
+    }
+)
+
+
+def automatic_verifier_contract_violations(
+    hypothesis: Hypothesis,
+) -> list[str]:
+    """Revalidate verifier-critical metadata at fresh and resumed boundaries."""
+    return [
+        rule
+        for rule in grade_hypothesis(hypothesis).rules
+        if rule in _AUTOMATIC_VERIFIER_CONTRACT_RULES
+    ]
 
 
 def annotate_hypothesis(hypothesis: Hypothesis, grade: Grade) -> Hypothesis:
@@ -370,15 +628,26 @@ def apply_quality_gate(
 ) -> TriagedArtifact:
     accepted: list[Hypothesis] = []
     rejected = list(triaged.rejected)
+    manual_review = list(triaged.manual_review)
     decisions: list[dict[str, Any]] = []
     for hypothesis in triaged.accepted:
+        original_payload = hypothesis.model_dump(mode="json")
         grade = grade_hypothesis(hypothesis)
-        annotate_hypothesis(hypothesis, grade)
+        manual_review_only = bool(grade.rules) and set(grade.rules).issubset(
+            MANUAL_REVIEW_ONLY_QUALITY_RULES
+        )
+        disposition = (
+            "accepted"
+            if grade.accepted
+            else "manual_review"
+            if manual_review_only
+            else "rejected"
+        )
         decisions.append(
             {
                 "hypothesis_id": hypothesis.id,
                 "accepted": grade.accepted,
-                "disposition": "accepted" if grade.accepted else "rejected",
+                "disposition": disposition,
                 "reason": grade.reason,
                 "evidence": grade.evidence,
                 "severity": grade.severity,
@@ -387,8 +656,20 @@ def apply_quality_gate(
             }
         )
         if grade.accepted:
+            annotate_hypothesis(hypothesis, grade)
             accepted.append(hypothesis)
+        elif manual_review_only:
+            manual_review.append(
+                {
+                    "hypothesis_id": hypothesis.id,
+                    "reason": grade.reason,
+                    "source": "quality_gate",
+                    "rules": list(grade.rules),
+                    "hypothesis": original_payload,
+                }
+            )
         else:
+            annotate_hypothesis(hypothesis, grade)
             rejected.append(
                 {
                     "hypothesis_id": hypothesis.id,
@@ -399,6 +680,7 @@ def apply_quality_gate(
             )
     triaged.accepted = accepted
     triaged.rejected = rejected
+    triaged.manual_review = manual_review
     if artifact_path is not None:
         atomic_write_json(artifact_path, decisions)
     return triaged

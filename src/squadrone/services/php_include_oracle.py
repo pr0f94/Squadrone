@@ -271,8 +271,15 @@ class PhpIncludeOracle:
     container-view measurements through the attestation methods.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, execution_mode: bool = False) -> None:
+        if not isinstance(execution_mode, bool):
+            raise ValueError("execution_mode must be a boolean")
         self._issued_private_values: set[str] = set()
+        # The execution verifier deliberately reuses this mature, parent-owned
+        # filesystem lifecycle.  Its canary has an additional CLI response path,
+        # but the ordinary PHP-include oracle keeps its historical bytes and
+        # behavior unchanged.
+        self._execution_mode = execution_mode
         self._host_identity_hmac_key = secrets.token_bytes(32)
         self._verifier_owner_uid = _effective_owner_id("uid")
         self._verifier_owner_gid = _effective_owner_id("gid")
@@ -339,6 +346,11 @@ class PhpIncludeOracle:
         self._require_active_generation()
         return self._attack_content
 
+    @property
+    def execution_mode(self) -> bool:
+        """Whether this instance renders the private execution canary variant."""
+        return self._execution_mode
+
     def public_context(self) -> dict[str, str]:
         """Return the complete and only child-facing PHP include context."""
         self._validate_public_contract()
@@ -371,7 +383,10 @@ class PhpIncludeOracle:
             or _CAPABILITY_RE.fullmatch(generation_id) is None
         ):
             raise RuntimeError("failed to generate private PHP include values")
-        attack_content = _render_attack_canary(marker)
+        attack_content = _render_attack_canary(
+            marker,
+            execution_mode=self._execution_mode,
+        )
         self._marker = marker
         self._marker_sha256 = _sha256_ascii(marker)
         self._attack_content = attack_content
@@ -969,7 +984,11 @@ class PhpIncludeOracle:
             or type(self._attack_content) is not bytes
             or not self._attack_content
             or not hmac.compare_digest(
-                self._attack_content, _render_attack_canary(self._marker)
+                self._attack_content,
+                _render_attack_canary(
+                    self._marker,
+                    execution_mode=self._execution_mode,
+                ),
             )
             or not _is_sha256(self._attack_content_sha256)
             or not hmac.compare_digest(
@@ -1238,12 +1257,45 @@ class PhpIncludeOracle:
         )
 
 
-def _render_attack_canary(marker: str) -> bytes:
+def _render_attack_canary(
+    marker: str,
+    *,
+    execution_mode: bool = False,
+) -> bytes:
     if _MARKER_RE.fullmatch(marker) is None:
         raise RuntimeError("invalid private PHP include marker")
+    if not isinstance(execution_mode, bool):
+        raise RuntimeError("invalid PHP include canary mode")
+    if execution_mode:
+        # The complete private marker is intentionally absent from the canary
+        # bytes.  A raw file read therefore cannot satisfy either execution
+        # oracle.  Evaluated PHP emits a private response header; invoking the
+        # same file through an OS-command sink's PHP CLI emits the marker on
+        # stdout.  Both paths require server-side execution of the canary.
+        split_at = len(marker) // 2
+        left = marker[:split_at]
+        right = marker[split_at:]
+        rendered = (
+            "<?php\n"
+            f"$receipt = '{left}' . '{right}';\n"
+            "if (PHP_SAPI === 'cli') {\n"
+            "    fwrite(STDOUT, $receipt);\n"
+            "} else {\n"
+            f"    header('{PHP_INCLUDE_ORACLE_HEADER_NAME}: ' . $receipt);\n"
+            "}\n"
+            "return;\n"
+        ).encode("ascii")
+        if marker.encode("ascii") in rendered:
+            raise RuntimeError("private execution marker leaked into canary bytes")
+        return rendered
     return (
         f"<?php\nheader('{PHP_INCLUDE_ORACLE_HEADER_NAME}: {marker}');\nreturn;\n"
     ).encode("ascii")
+
+
+def render_execution_attack_canary(marker: str) -> bytes:
+    """Render the exact parent-private canary expected by execution validation."""
+    return _render_attack_canary(marker, execution_mode=True)
 
 
 def _sha256_ascii(value: str) -> str:

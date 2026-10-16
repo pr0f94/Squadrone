@@ -5,11 +5,9 @@ from __future__ import annotations
 import ast
 import json
 import logging
-import posixpath
 import re
 from importlib.resources import files
-from typing import TYPE_CHECKING, Awaitable, Callable, Optional, TypedDict
-from urllib.parse import parse_qsl, urlsplit
+from typing import TYPE_CHECKING, Awaitable, Callable, Optional
 
 from jinja2 import Template
 
@@ -25,6 +23,12 @@ from ..schemas.taxonomy import (
 )
 from ..services.roles import normalize_attacker_role
 from ..services.diagnostics import bound_diagnostic
+from ..services.http_transport import (
+    HTTPTransport,
+    canonical_http_transport_key,
+    parse_http_transport,
+)
+from ..services.request_fields import explicit_request_field
 from .plugin_tools import PluginToolHandlers
 from .prompts_io import load_prompt
 from .tools import (
@@ -46,26 +50,9 @@ _BUG_CLASS_TEMPLATE: dict[str, str] = {
     if profile.poc_template is not None
 }
 _OPEN_CWE_TEMPLATE = OPEN_CWE_POC_TEMPLATE
+_SECOND_ORDER_SQLI_TEMPLATE = "sqli_second_order.py.j2"
 
 _FENCE_BLOCK_RE = re.compile(r"```(?:python)?\s*\n(.*?)\n```", re.DOTALL)
-_HTTP_ENTRY_POINT_RE = re.compile(
-    r"^\s*(?P<method>GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+"
-    r"(?P<target>/\S*)(?:\s+(?:via\b|->).*)?\s*$",
-    re.IGNORECASE,
-)
-_WORDPRESS_HOOK_ENTRY_POINT_RE = re.compile(
-    r"^\s*(?P<prefix>wp_ajax_nopriv_|wp_ajax_|admin_post_nopriv_|admin_post_)"
-    r"(?P<action>[A-Za-z0-9_.:-]+)(?:\s+(?:via\b|->).*)?\s*$"
-)
-_PHP_REQUEST_PARAMETER_RE = re.compile(
-    r"\$_(?:GET|POST|REQUEST)\s*\[\s*(['\"])([A-Za-z_][A-Za-z0-9_.:-]{0,127})\1\s*\]",
-    re.IGNORECASE,
-)
-_DESCRIBED_REQUEST_PARAMETER_RE = re.compile(
-    r"\b([A-Za-z_][A-Za-z0-9_.:-]{0,127})\s+"
-    r"(?:query|string|form|body|json|request|url)\s+parameter\b",
-    re.IGNORECASE,
-)
 _PHP_OBJECT_ARM_TOKEN_RE = re.compile(r"sqpobjt1\.[0-9a-f]{64}\Z")
 PHP_OBJECT_INERT_IMPACT_DESCRIPTION = (
     "The exact request path instantiated the verifier-owned inert canary and "
@@ -82,18 +69,27 @@ _OLDER_ATTEMPT_LEDGER_HEADER = (
 )
 
 
-class _EntryPointTransport(TypedDict):
-    method: str
-    route: str
-    dispatch: dict[str, str]
+def _select_template(
+    bug_class: str,
+    injection_order: str | None = None,
+) -> str | None:
+    """Select an exact known template or the fail-closed open-CWE scaffold.
 
-
-def _select_template(bug_class: str) -> str | None:
-    """Select an exact known template or the fail-closed open-CWE scaffold."""
+    Second-order SQL injection has a materially different proof shape from a
+    direct request-to-query injection.  Route to that scaffold only when source
+    review supplied the exact machine-readable lifecycle classification; fuzzy
+    labels must not silently turn a direct SQLi hypothesis into a stored-flow
+    exploit attempt.
+    """
     try:
         parsed = BugClass(bug_class)
     except (TypeError, ValueError):
         return None
+    if (
+        parsed is BugClass.SQLI
+        and injection_order == "second"
+    ):
+        return _SECOND_ORDER_SQLI_TEMPLATE
     profile = get_known_cwe_profile(parsed)
     if profile is not None:
         return profile.poc_template
@@ -105,107 +101,63 @@ def _render_template(name: str, **vars) -> str:
     return Template(raw).render(**vars)
 
 
-def _parse_entry_point_transport(entry_point: str) -> _EntryPointTransport:
+def _parse_entry_point_transport(entry_point: str) -> HTTPTransport:
     """Derive a conservative HTTP seed from a structured entry-point label.
 
     Only an explicit origin-relative HTTP entry or a standard WordPress action
     hook is recognized. Ambiguous prose deliberately produces empty values so
     the fail-closed PoC skeleton cannot turn a callback label into a live route.
     """
-    fallback: _EntryPointTransport = {
-        "method": "",
-        "route": "",
-        "dispatch": {},
-    }
-    if not isinstance(entry_point, str):
-        return fallback
+    return parse_http_transport(entry_point)
 
-    http_match = _HTTP_ENTRY_POINT_RE.fullmatch(entry_point)
-    if http_match:
-        raw_target = http_match.group("target")
-        if re.search(r"%(?![0-9A-Fa-f]{2})", raw_target):
-            return fallback
-        parsed = urlsplit(raw_target)
-        route = parsed.path
-        if (
-            not route.startswith("/")
-            or route.startswith("//")
-            or "//" in route
-            or route != posixpath.normpath(route)
-            or "%" in route
-            or "\\" in route
-            or parsed.scheme
-            or parsed.netloc
-            or parsed.fragment
-        ):
-            return fallback
 
-        try:
-            query_pairs = parse_qsl(
-                parsed.query,
-                keep_blank_values=True,
-                strict_parsing=True,
-                max_num_fields=64,
-            )
-        except ValueError:
-            return fallback
-
-        query_keys = [key for key, _value in query_pairs]
-        if len(query_keys) != len(set(query_keys)) or any(
-            not key.strip()
-            or key != key.strip()
-            or not value.strip()
-            or value != value.strip()
-            or not key.isascii()
-            or not key.isprintable()
-            or not value.isascii()
-            or not value.isprintable()
-            for key, value in query_pairs
-        ):
-            return fallback
-        dispatch = {
-            f"query:{key}": value
-            for key, value in sorted(query_pairs, key=lambda item: item[0])
-        }
-
-        return {
-            "method": http_match.group("method").upper(),
-            "route": route,
-            "dispatch": dispatch,
-        }
-
-    hook_match = _WORDPRESS_HOOK_ENTRY_POINT_RE.fullmatch(entry_point)
-    if not hook_match:
-        return fallback
-    prefix = hook_match.group("prefix")
-    route = (
-        "/wp-admin/admin-ajax.php"
-        if prefix.startswith("wp_ajax_")
-        else "/wp-admin/admin-post.php"
-    )
-    return {
-        "method": "POST",
-        "route": route,
-        "dispatch": {"form:action": hook_match.group("action")},
-    }
+def _verification_preflight_transports(
+    hypothesis: Hypothesis,
+) -> list[HTTPTransport]:
+    """Render only canonical, read-only preflights from reviewed evidence."""
+    raw = (hypothesis.evidence_summary or {}).get("verification_preflights")
+    if raw is None:
+        return []
+    if (
+        not isinstance(raw, list)
+        or not 1 <= len(raw) <= 8
+        or not all(isinstance(item, str) for item in raw)
+        or not all(re.fullmatch(r"(?:GET|HEAD) /\S+", item) for item in raw)
+        or not all(item.isascii() and item.isprintable() for item in raw)
+        or len(raw) != len(set(raw))
+    ):
+        return []
+    parsed = [parse_http_transport(item) for item in raw]
+    if any(
+        item["method"] not in {"GET", "HEAD"}
+        or not item["route"]
+        or any(not key.startswith("query:") for key in item["dispatch"])
+        for item in parsed
+    ) or len(parsed) != len(
+        {canonical_http_transport_key(item) for item in parsed}
+    ):
+        return []
+    return parsed
 
 
 def _infer_injectable_parameter(hypothesis: Hypothesis) -> str:
     """Conservatively seed a named request parameter from structured evidence."""
+    return _explicit_request_parameter(hypothesis) or "id"
+
+
+def _explicit_request_parameter(hypothesis: Hypothesis) -> str:
+    """Return only a source-cited request parameter, without a guessed fallback."""
+    return _explicit_request_field(hypothesis)[0]
+
+
+def _explicit_request_field(hypothesis: Hypothesis) -> tuple[str, str]:
+    """Return one source-cited request name/location pair, failing closed on ambiguity."""
     evidence = hypothesis.evidence_summary or {}
-    values = [
+    return explicit_request_field(
         str(evidence.get("source") or ""),
-        *[str(item) for item in hypothesis.taint_path],
+        hypothesis.taint_path,
         hypothesis.sink_code,
-    ]
-    for value in values:
-        php_match = _PHP_REQUEST_PARAMETER_RE.search(value)
-        if php_match:
-            return php_match.group(2)
-        described_match = _DESCRIBED_REQUEST_PARAMETER_RE.search(value)
-        if described_match:
-            return described_match.group(1)
-    return "id"
+    )
 
 
 def _strip_to_script(text: str) -> str:
@@ -473,7 +425,10 @@ class PoCAuthorAgent:
     ) -> str:
         # A completed prior write must never leak tool feedback into a new attempt.
         self._pending_setup_feedback.clear()
-        template_name = _select_template(hypothesis.bug_class.value)
+        template_name = _select_template(
+            hypothesis.bug_class.value,
+            hypothesis.injection_order,
+        )
         if template_name is None:
             raise ValueError(
                 f"no automatic PoC template is declared for {hypothesis.bug_class.value}"
@@ -482,6 +437,7 @@ class PoCAuthorAgent:
         ssrf_oracle = (extra_context or {}).get("ssrf_oracle") or {}
         ssrf_oracle_mode = str(ssrf_oracle.get("mode") or "http")
         php_include_oracle = (extra_context or {}).get("php_include_oracle") or {}
+        execution_oracle = (extra_context or {}).get("execution_oracle") or {}
         php_object_oracle = (extra_context or {}).get("php_object_oracle") or {}
         attacker_role = (
             (extra_context or {}).get("attacker_role")
@@ -495,6 +451,7 @@ class PoCAuthorAgent:
             (extra_context or {}).get("php_object_http_transport")
             or (extra_context or {}).get("php_include_http_transport")
             or (extra_context or {}).get("ssrf_http_transport")
+            or (extra_context or {}).get("execution_http_transport")
         )
         source_destination_parameter = ""
         source_destination_location = ""
@@ -540,6 +497,18 @@ class PoCAuthorAgent:
         ):
             php_object_attack_token = ""
             php_object_control_token = ""
+        explicit_parameter, explicit_parameter_location = _explicit_request_field(
+            hypothesis
+        )
+        verification_preflights = _verification_preflight_transports(hypothesis)
+        raw_write_success_marker = (hypothesis.evidence_summary or {}).get(
+            "write_success_marker"
+        )
+        second_order_write_success_marker = (
+            raw_write_success_marker
+            if isinstance(raw_write_success_marker, str)
+            else ""
+        )
         skeleton = _render_template(
             template_name,
             bug_class=hypothesis.bug_class.value,
@@ -550,6 +519,13 @@ class PoCAuthorAgent:
             injectable_param=(extra_context or {}).get("injectable_param")
             or source_destination_parameter
             or _infer_injectable_parameter(hypothesis),
+            execution_parameter=source_destination_parameter or explicit_parameter,
+            execution_parameter_location=(
+                source_destination_location or explicit_parameter_location
+            ),
+            second_order_write_parameter=explicit_parameter,
+            second_order_write_location=explicit_parameter_location,
+            second_order_write_success_marker=second_order_write_success_marker,
             test_username=(extra_context or {}).get("test_username", ""),
             test_password=(extra_context or {}).get("test_password", ""),
             extra_params=(extra_context or {}).get("extra_params", ""),
@@ -557,6 +533,7 @@ class PoCAuthorAgent:
             request_method=entry_transport["method"],
             request_route=entry_transport["route"],
             request_dispatch=entry_transport["dispatch"],
+            verification_preflights=verification_preflights,
             ssrf_attack_url=str(ssrf_oracle.get("attack_url") or ""),
             ssrf_control_url=str(ssrf_oracle.get("control_url") or ""),
             ssrf_oracle_mode=ssrf_oracle_mode,
@@ -566,6 +543,9 @@ class PoCAuthorAgent:
             php_include_header_name=str(php_include_oracle.get("header_name") or ""),
             php_include_destination_location=source_destination_location,
             php_include_unauthenticated=php_include_unauthenticated,
+            execution_attack_path=str(execution_oracle.get("attack_path") or ""),
+            execution_control_path=str(execution_oracle.get("control_path") or ""),
+            execution_header_name=str(execution_oracle.get("header_name") or ""),
             php_object_attack_token=php_object_attack_token,
             php_object_control_token=php_object_control_token,
             php_object_field=source_object_field,
@@ -697,6 +677,46 @@ class PoCAuthorAgent:
                     "from the attack response and never place a SQUADRONE_ value in "
                     "any request. The parent independently validates the response and "
                     "oracle ledger. " + mode_guidance
+                )
+        if execution_oracle:
+            execution_public = {
+                key: str(execution_oracle.get(key) or "")
+                for key in ("attack_path", "control_path", "header_name")
+            }
+            if all(execution_public.values()):
+                family_guidance = (
+                    "Construct CONTROL_VALUE and ATTACK_VALUE so the reviewed shell "
+                    "sink invokes the PHP CLI on the corresponding control or attack "
+                    "path. Extract the unique marker only from the attack response "
+                    "body."
+                    if hypothesis.bug_class == BugClass.COMMAND_INJECTION
+                    else "Construct CONTROL_VALUE and ATTACK_VALUE so the reviewed "
+                    "PHP evaluation sink includes the corresponding control or attack "
+                    "path. Extract the unique marker only from the named response "
+                    "header; response-body text is never execution proof."
+                )
+                user_parts.append(
+                    "TRUSTED_EXECUTION_CANARY (verifier-owned; marker withheld):\n"
+                    + json.dumps(
+                        {"schema_version": 1, **execution_public},
+                        sort_keys=True,
+                    )
+                    + "\nUse each opaque path only as part of the value submitted "
+                    "through the exact source-derived vulnerable request field. "
+                    "Never open or read either path from Python, send either path in "
+                    "any other field, or add exploratory target requests. The two "
+                    "destination values must be byte-identical after replacing the "
+                    "single control/attack path with one placeholder. Send exactly "
+                    "one control request followed by exactly one attack request after "
+                    "any declared read-only preflights. "
+                    + family_guidance
+                    + " The private marker has the form "
+                    "SQUADRONE_PHP_INCLUDE_<64 lowercase hex>, is fresh on every "
+                    "clean-state replay, and must never be guessed, hard-coded, "
+                    "constructed, logged, or transmitted. Emit execution_path and "
+                    "destination_value for each arm. The parent independently binds "
+                    "the exact wire field, response effect, immutable canary, absent "
+                    "control, and fresh replay."
                 )
         if php_include_oracle:
             public_keys = {

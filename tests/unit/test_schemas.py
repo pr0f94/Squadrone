@@ -28,6 +28,7 @@ from squadrone.schemas import (
     StaticCallback,
     TriagedArtifact,
 )
+from squadrone.schemas.taxonomy import KNOWN_CWE_REGISTRY
 
 
 def _hypothesis() -> Hypothesis:
@@ -264,6 +265,22 @@ def test_xss_taxonomy_keeps_stored_and_reflected_distinct():
     assert stored.vulnerability_type != reflected.vulnerability_type
 
 
+def test_high_risk_discovery_surfaces_have_canonical_taxonomy_owners() -> None:
+    assert "persistent_sql_operand" in KNOWN_CWE_REGISTRY[
+        BugClass.SQLI
+    ].deterministic_surfaces
+    assert "command_wrapper" in KNOWN_CWE_REGISTRY[
+        BugClass.COMMAND_INJECTION
+    ].deterministic_surfaces
+    assert "dynamic_callable" in KNOWN_CWE_REGISTRY[
+        BugClass.PHP_CODE_INJECTION
+    ].deterministic_surfaces
+    file_surfaces = KNOWN_CWE_REGISTRY[
+        BugClass.ARBITRARY_FILE_WRITE
+    ].deterministic_surfaces
+    assert {"archive_extract", "upload_policy"} <= set(file_surfaces)
+
+
 def test_authenticated_cwe306_history_is_preserved_on_deserialization():
     data = _hypothesis().model_dump(mode="json")
     data.update(
@@ -391,6 +408,121 @@ def test_valid_bug_class_wins_over_conflicting_auxiliary_cwe():
     )
 
     assert parsed.bug_class == BugClass.SQLI
+
+
+def test_second_order_sqli_characteristics_round_trip() -> None:
+    parsed = Hypothesis.model_validate(
+        {
+            **_hypothesis().model_dump(mode="json"),
+            "bug_class": "CWE-89",
+            "injection_order": "second",
+            "storage_boundary": "metadata",
+            "impact_labels": [],
+        }
+    )
+
+    reparsed = Hypothesis.model_validate_json(parsed.model_dump_json())
+
+    assert reparsed.injection_order == "second"
+    assert reparsed.storage_boundary == "metadata"
+
+
+def test_second_order_sqli_requires_exact_storage_boundary() -> None:
+    with pytest.raises(ValidationError, match="storage_boundary"):
+        Hypothesis.model_validate(
+            {
+                **_hypothesis().model_dump(mode="json"),
+                "bug_class": "CWE-89",
+                "injection_order": "second",
+            }
+        )
+
+
+def test_injection_order_is_rejected_for_non_sqli() -> None:
+    with pytest.raises(
+        ValidationError,
+        match="injection_order and storage_boundary.*both to null",
+    ):
+        Hypothesis.model_validate(
+            {
+                **_hypothesis().model_dump(mode="json"),
+                "injection_order": "direct",
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("injection_order", "storage_boundary"),
+    [
+        ("second", "metadata"),
+        (None, "metadata"),
+    ],
+)
+def test_non_sqli_lifecycle_error_names_both_fields(
+    injection_order: str | None,
+    storage_boundary: str,
+) -> None:
+    with pytest.raises(
+        ValidationError,
+        match="injection_order and storage_boundary.*both to null",
+    ):
+        Hypothesis.model_validate(
+            {
+                **_hypothesis().model_dump(mode="json"),
+                "bug_class": "CWE-79:stored",
+                "injection_order": injection_order,
+                "storage_boundary": storage_boundary,
+            }
+        )
+
+
+def test_direct_sqli_rejects_storage_boundary() -> None:
+    with pytest.raises(
+        ValidationError,
+        match="storage_boundary requires injection_order='second'",
+    ):
+        Hypothesis.model_validate(
+            {
+                **_hypothesis().model_dump(mode="json"),
+                "bug_class": "CWE-89",
+                "injection_order": "direct",
+                "storage_boundary": "metadata",
+            }
+        )
+
+
+def test_potential_rce_impact_label_is_visible_without_changing_root_cause() -> None:
+    parsed = Hypothesis.model_validate(
+        {
+            **_hypothesis().model_dump(mode="json"),
+            "bug_class": "CWE-434",
+            "impact_labels": ["potential_rce"],
+        }
+    )
+
+    assert parsed.root_cause_cwe == "CWE-434"
+    assert parsed.impact_labels == ["potential_rce"]
+
+
+def test_impact_labels_reject_duplicates() -> None:
+    with pytest.raises(ValidationError, match="duplicates"):
+        Hypothesis.model_validate(
+            {
+                **_hypothesis().model_dump(mode="json"),
+                "impact_labels": ["potential_rce", "potential_rce"],
+            }
+        )
+
+
+def test_potential_rce_impact_label_requires_exact_cwe_434() -> None:
+    with pytest.raises(ValidationError, match="exact CWE-434"):
+        Hypothesis.model_validate(
+            {
+                **_hypothesis().model_dump(mode="json"),
+                "bug_class": "CWE-78",
+                "impact_labels": ["potential_rce"],
+            }
+        )
 
 
 def test_unmapped_cwe_label_is_preserved_and_round_trips() -> None:

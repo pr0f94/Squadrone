@@ -1779,29 +1779,38 @@ async def test_verify_records_primitive_but_does_not_promote_full_finding(
     assert {
         attempt["proof_kind"] for attempt in attempts["attempts"]
     } == {"php_object_primitive"}
-    assert verify_stage._attempt_checkpoint_state(verification_dir) == (
+    assert verify_stage._attempt_checkpoint_state(verification_dir, hypothesis) == (
         "primitive_confirmed"
     )
 
     incomplete_attempts = json.loads(json.dumps(attempts))
     incomplete_attempts["attempts"] = incomplete_attempts["attempts"][1:]
     (verification_dir / "attempts.json").write_text(json.dumps(incomplete_attempts))
-    assert verify_stage._attempt_checkpoint_state(verification_dir) == "incomplete"
+    assert (
+        verify_stage._attempt_checkpoint_state(verification_dir, hypothesis)
+        == "incomplete"
+    )
     (verification_dir / "attempts.json").write_text(json.dumps(attempts))
 
     incomplete_primitive = json.loads(json.dumps(primitive))
     incomplete_primitive["clean_state_executions"] = 1
     primitive_path.write_text(json.dumps(incomplete_primitive))
-    assert verify_stage._attempt_checkpoint_state(verification_dir) == "incomplete"
+    assert (
+        verify_stage._attempt_checkpoint_state(verification_dir, hypothesis)
+        == "incomplete"
+    )
     primitive_path.write_text(json.dumps(primitive))
 
     natural_path = (
         verification_dir / verify_stage.PHP_OBJECT_NATURAL_CONFIRMATION_FILENAME
     )
     natural_path.write_text("{}")
-    assert verify_stage._attempt_checkpoint_state(verification_dir) == "incomplete"
+    assert (
+        verify_stage._attempt_checkpoint_state(verification_dir, hypothesis)
+        == "incomplete"
+    )
     natural_path.unlink()
-    assert verify_stage._attempt_checkpoint_state(verification_dir) == (
+    assert verify_stage._attempt_checkpoint_state(verification_dir, hypothesis) == (
         "primitive_confirmed"
     )
 

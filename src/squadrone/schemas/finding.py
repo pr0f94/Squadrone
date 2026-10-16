@@ -117,6 +117,10 @@ class PoCAttempt(JSONFileMixin):
 class Finding(JSONFileMixin):
     id: str
     hypothesis: Hypothesis
+    # Runner-owned resume binding.  Optional fields keep historical artifacts
+    # readable, but the verify stage deliberately treats their absence as stale.
+    verification_policy_version: Optional[int] = None
+    hypothesis_digest: Optional[str] = None
     poc_status: PoCStatus
     poc_script_path: str
     poc_attempts: list[PoCAttempt]

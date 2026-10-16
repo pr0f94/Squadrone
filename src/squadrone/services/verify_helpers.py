@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 from datetime import datetime, timezone
@@ -14,6 +15,28 @@ from .artifacts import atomic_write_text
 logger = logging.getLogger(__name__)
 
 MANUAL_REVIEW_QUEUE = Path("cache/findings_for_manual_review.jsonl")
+MANUAL_REVIEW_QUEUE_POLICY_VERSION = 2
+
+
+def manual_review_queue_fingerprint(
+    hyp: Hypothesis,
+    reason: str,
+    source: str,
+) -> str:
+    """Bind queue deduplication to the current claim, reason, and policy."""
+    payload = {
+        "policy_version": MANUAL_REVIEW_QUEUE_POLICY_VERSION,
+        "hypothesis": hyp.model_dump(mode="json"),
+        "reason": str(reason),
+        "source": str(source),
+    }
+    canonical = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 async def screenshot_url(url: str, output_path: Path, timeout_s: int = 15,
@@ -100,8 +123,9 @@ def emit_to_manual_review_queue(
     new queue row is appended.
     """
     source = str((verifier_notes or {}).get("source") or "verify")
-    dedupe_key = f"{run_dir}:{hyp.id}:{source}"
-    existing_keys: set[str] = set()
+    fingerprint = manual_review_queue_fingerprint(hyp, reason, source)
+    dedupe_key = (str(run_dir), hyp.id, source, fingerprint)
+    existing_keys: set[tuple[str, str, str, str]] = set()
     if MANUAL_REVIEW_QUEUE.exists():
         for line in MANUAL_REVIEW_QUEUE.read_text().splitlines():
             if not line.strip():
@@ -110,14 +134,34 @@ def emit_to_manual_review_queue(
                 prior = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            prior_source = str((prior.get("verifier_notes") or {}).get("source") or "verify")
-            existing_keys.add(f"{prior.get('run_dir')}:{prior.get('hypothesis_id')}:{prior_source}")
+            prior_source = str(
+                (prior.get("verifier_notes") or {}).get("source") or "verify"
+            )
+            prior_fingerprint = prior.get("fingerprint")
+            if (
+                prior.get("policy_version")
+                != MANUAL_REVIEW_QUEUE_POLICY_VERSION
+                or not isinstance(prior_fingerprint, str)
+            ):
+                # ID-only rows from earlier policies are not authoritative for
+                # a resumed run whose canonical ID may now name a new claim.
+                continue
+            existing_keys.add(
+                (
+                    str(prior.get("run_dir")),
+                    str(prior.get("hypothesis_id")),
+                    prior_source,
+                    prior_fingerprint,
+                )
+            )
     if dedupe_key in existing_keys:
         logger.info("verify: hypothesis %s already exists in manual review queue (%s)", hyp.id, source)
         return False
 
     MANUAL_REVIEW_QUEUE.parent.mkdir(parents=True, exist_ok=True)
     entry = {
+        "policy_version": MANUAL_REVIEW_QUEUE_POLICY_VERSION,
+        "fingerprint": fingerprint,
         "queued_at": datetime.now(timezone.utc).isoformat(),
         "hypothesis_id": hyp.id,
         "bug_class": hyp.bug_class.value,

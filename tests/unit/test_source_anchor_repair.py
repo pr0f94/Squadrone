@@ -162,6 +162,94 @@ def test_source_anchor_repair_cannot_launder_a_changed_claim(tmp_path, mutation)
         _validate_critic_accounting(inputs, output, plugin_path=str(tmp_path))
 
 
+def _lifecycle_hypothesis(family: str) -> Hypothesis:
+    payload = _original_hypothesis().model_dump(mode="python")
+    if family == "second_order_sqli":
+        payload.update(
+            bug_class=BugClass.SQLI,
+            injection_order="second",
+            storage_boundary="option",
+        )
+        payload["evidence_summary"].update(
+            storage_writer="POST /writer stores form parameter filter",
+            storage_identity="option:demo_filter:site",
+            trigger="GET /reader?mode=run",
+            write_success_marker="Filter stored successfully",
+            same_actor_lifecycle=True,
+            verification_oracle="timing",
+        )
+    elif family == "execution":
+        payload.update(
+            bug_class=BugClass.ARBITRARY_FILE_WRITE,
+            impact_labels=["potential_rce"],
+        )
+        payload["evidence_summary"].update(
+            code_execution_path="upload -> executable destination -> HTTP request",
+            code_execution_sink="server executes uploads/proof.php",
+        )
+    elif family == "execution_preflight":
+        payload.update(bug_class=BugClass.COMMAND_INJECTION)
+        payload["evidence_summary"].update(
+            verification_preflights=["GET /plugin/form?view=command"],
+        )
+    else:  # pragma: no cover - test helper misuse
+        raise AssertionError(f"unknown lifecycle family: {family}")
+    return Hypothesis.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("family", "mutation"),
+    [
+        ("second_order_sqli", "injection_order"),
+        ("second_order_sqli", "storage_boundary"),
+        ("second_order_sqli", "storage_writer"),
+        ("second_order_sqli", "storage_identity"),
+        ("second_order_sqli", "trigger"),
+        ("second_order_sqli", "write_success_marker"),
+        ("second_order_sqli", "same_actor_lifecycle"),
+        ("second_order_sqli", "verification_oracle"),
+        ("execution", "impact_labels"),
+        ("execution", "code_execution_path"),
+        ("execution", "code_execution_sink"),
+        ("execution_preflight", "verification_preflights"),
+    ],
+)
+def test_source_anchor_repair_preserves_lifecycle_and_execution_metadata(
+    tmp_path,
+    family,
+    mutation,
+):
+    _write_source(tmp_path)
+    original = _lifecycle_hypothesis(family)
+    corrected = _corrected_hypothesis(original)
+    if mutation == "injection_order":
+        corrected.injection_order = "direct"
+        corrected.storage_boundary = None
+    elif mutation == "storage_boundary":
+        corrected.storage_boundary = "metadata"
+    elif mutation == "impact_labels":
+        corrected.impact_labels = []
+    elif mutation == "verification_preflights":
+        corrected.evidence_summary[mutation] = ["GET /plugin/other?view=command"]
+    else:
+        corrected.evidence_summary[mutation] = "A materially different lifecycle."
+    inputs, output = _artifacts(original, corrected)
+
+    with pytest.raises(ValueError, match="changed claim fields"):
+        _validate_critic_accounting(inputs, output, plugin_path=str(tmp_path))
+
+
+def test_source_anchor_repair_preserves_family_evidence_key_presence(tmp_path):
+    _write_source(tmp_path)
+    original = _lifecycle_hypothesis("execution_preflight")
+    corrected = _corrected_hypothesis(original)
+    corrected.evidence_summary.pop("verification_preflights")
+    inputs, output = _artifacts(original, corrected)
+
+    with pytest.raises(ValueError, match="verification_preflights"):
+        _validate_critic_accounting(inputs, output, plugin_path=str(tmp_path))
+
+
 @pytest.mark.parametrize("change", ["cross_file", "too_far"])
 def test_source_anchor_repair_must_remain_same_file_and_local(tmp_path, change):
     _write_source(tmp_path)
@@ -223,6 +311,81 @@ def test_unchanged_accurate_hypothesis_needs_no_repair_metadata(tmp_path):
     _validate_critic_accounting(inputs, output, plugin_path=str(tmp_path))
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "injection_order",
+        "storage_boundary",
+        "storage_identity",
+        "write_success_marker",
+        "verification_oracle",
+        "verification_preflights",
+    ],
+)
+def test_unchanged_anchor_cannot_change_verifier_contract(mutation):
+    original = _lifecycle_hypothesis("second_order_sqli")
+    changed = original.model_copy(deep=True)
+    if mutation == "injection_order":
+        changed.injection_order = "direct"
+        changed.storage_boundary = None
+    elif mutation == "storage_boundary":
+        changed.storage_boundary = "metadata"
+    elif mutation == "verification_preflights":
+        changed.evidence_summary[mutation] = ["GET /plugin/form?view=other"]
+    else:
+        changed.evidence_summary[mutation] = "A different verifier contract."
+    inputs, output = _artifacts(original, changed, include_repair=False)
+
+    with pytest.raises(ValueError, match="changed verifier contract fields"):
+        _validate_critic_accounting(inputs, output)
+
+
+def test_unchanged_anchor_cannot_add_potential_rce_contract():
+    original = _original_hypothesis()
+    changed = original.model_copy(deep=True)
+    changed.impact_labels = ["potential_rce"]
+    changed.evidence_summary.update(
+        code_execution_path="upload -> executable destination -> HTTP request",
+        code_execution_sink="server executes uploads/proof.php",
+    )
+    inputs, output = _artifacts(original, changed, include_repair=False)
+
+    with pytest.raises(ValueError, match="impact_labels"):
+        _validate_critic_accounting(inputs, output)
+
+
+def test_critic_can_atomically_remove_unproven_potential_rce_amplification():
+    original = _original_hypothesis().model_copy(deep=True)
+    original.impact_labels = ["potential_rce"]
+    original.evidence_summary.update(
+        code_execution_path="upload -> executable destination -> HTTP request",
+        code_execution_sink="server executes uploads/proof.php",
+    )
+    downgraded = original.model_copy(deep=True)
+    downgraded.impact_labels = []
+    downgraded.evidence_summary.pop("code_execution_path")
+    downgraded.evidence_summary.pop("code_execution_sink")
+    inputs, output = _artifacts(original, downgraded, include_repair=False)
+
+    _validate_critic_accounting(inputs, output)
+
+
+def test_potential_rce_downgrade_must_remove_both_execution_evidence_fields():
+    original = _original_hypothesis().model_copy(deep=True)
+    original.impact_labels = ["potential_rce"]
+    original.evidence_summary.update(
+        code_execution_path="upload -> executable destination -> HTTP request",
+        code_execution_sink="server executes uploads/proof.php",
+    )
+    partial = original.model_copy(deep=True)
+    partial.impact_labels = []
+    partial.evidence_summary.pop("code_execution_path")
+    inputs, output = _artifacts(original, partial, include_repair=False)
+
+    with pytest.raises(ValueError, match="potential_rce_evidence"):
+        _validate_critic_accounting(inputs, output)
+
+
 def test_source_anchor_repair_schema_is_backward_compatible_and_round_trips():
     legacy = TriagedArtifact.model_validate(
         {"plugin_slug": "demo", "accepted": [], "rejected": [], "merged": []}
@@ -234,6 +397,29 @@ def test_source_anchor_repair_schema_is_backward_compatible_and_round_trips():
     artifact = _artifacts(original, corrected)[1]
     restored = TriagedArtifact.model_validate_json(artifact.model_dump_json())
     assert restored.source_anchor_repairs == artifact.source_anchor_repairs
+
+
+def test_manual_review_cannot_change_lifecycle_metadata() -> None:
+    original = _lifecycle_hypothesis("second_order_sqli")
+    changed = original.model_copy(deep=True)
+    changed.evidence_summary["write_success_marker"] = "Different stored receipt"
+    inputs = HypothesesArtifact(plugin_slug="demo", hypotheses=[original])
+    output = TriagedArtifact(
+        plugin_slug="demo",
+        accepted=[],
+        rejected=[],
+        merged=[],
+        manual_review=[
+            {
+                "hypothesis_id": original.id,
+                "reason": "runtime confirmation needed",
+                "hypothesis": changed.model_dump(mode="json"),
+            }
+        ],
+    )
+
+    with pytest.raises(ValueError, match="changed its hypothesis payload"):
+        _validate_critic_accounting(inputs, output)
 
 
 def test_exact_anchor_validator_cannot_read_outside_plugin_root(tmp_path):
@@ -263,3 +449,5 @@ def test_specialist_and_critic_prompts_require_bounded_branch_repair():
     assert (
         "`evidence_summary.attacker_role`, `.source`, `.control`, `.boundary`" in critic
     )
+    assert "`injection_order`, `storage_boundary`, `impact_labels`" in critic
+    assert "`.verification_preflights` are also immutable" in critic
