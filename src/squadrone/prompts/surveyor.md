@@ -30,6 +30,21 @@ dataflow is visible; do not list every unrelated persistent read.
 For each entry point, note presence of wp_verify_nonce/check_ajax_referer and
 current_user_can().
 
+Grounding rules for the downstream review map:
+
+- A hook callback is not itself a public HTTP route. Distinguish registration
+  from its upstream caller; do not invent an AJAX/REST URL for an internal hook.
+- `has_nonce_check` and `has_capability_check` inventory check presence, not proof
+  that the check protects every mutation. Note writes before a check, alternate
+  callers, early returns, and conditional guards in `security_profile.notes`.
+- Record only enforced capabilities/role tests as restrictions. A settings label
+  describing intended users is not an allowlist and does not exclude other roles.
+- Connect stored writers/readers only for the same exact option/meta key, scope,
+  and object identity. Similar names or neighboring settings do not prove an edge.
+- Obtain exact cited lines from source tools. Keep uncertain core routing,
+  sanitization, actor control and configuration assumptions explicitly uncertain;
+  do not convert an unverified downstream prerequisite into a recon fact.
+
 Also produce a plugin-level `security_profile`. This is not vulnerability
 finding; it is a review map for downstream specialists. Infer:
 

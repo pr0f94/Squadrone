@@ -80,6 +80,20 @@ because vulnerable-looking code exists in `vendor`.
 
 ## Candidate bar
 
+Keep one actor/configuration contract across `preconditions`,
+`evidence_summary.attacker_role`, source control, and impact. Name privileged
+victims and trusted setup actors separately. Do not lower the attacker role
+because that role is mentioned in counterevidence or would be more interesting.
+Missing plugin-level authorization does not remove upstream WordPress checks.
+Prove the concrete external write/trigger path, including core content filtering
+and callback prerequisites, or explicitly retain the missing fact as a proof gap.
+An unavailable developer consultation is not agreement or supporting evidence.
+
+Set `affected_versions` to the exact supplied `plugin_version` inspected in this
+run. One source tree does not establish "and earlier", "all versions", a range,
+or a version boundary inferred from plugin history. If the inspected version is
+unavailable, state that uncertainty rather than inventing a version scope.
+
 Emit only when all of these are concrete:
 
 - lowest realistic attacker role and exact shipped configuration
@@ -163,7 +177,11 @@ the family that invokes them:
 - a candidate with `impact_labels: ["potential_rce"]` must set source-grounded
   `code_execution_path` and `code_execution_sink`, identifying every post-write
   step and the exact include, autoload, interpreter dispatch, command execution,
-  or equivalent terminal operation.
+  or equivalent terminal operation. A web-server SAPI dispatch of a written
+  path counts as interpreter dispatch only when the exact served path,
+  deterministic filename/extension, and direct request route are source-proven;
+  the deployed server actually executing that path remains the one narrow
+  runtime fact recorded in `proof_gaps`.
 
 For CWE-78, CWE-94, or second-order CWE-89 only, optional
 `verification_preflights` may be an ordered list of 1–8 unique, source-proven
@@ -180,8 +198,9 @@ Use `impact_labels: ["potential_rce"]` only when the root-cause primitive,
 attacker-controlled executable write, and complete source path to the concrete
 code-execution sink are proven, with one narrow runtime fact remaining. Do not
 emit it for a mere upload/write primitive, dangerous extension, public URL, or
-inferred web-server execution. It must not upgrade the structured CIA outcome
-or replace the required source path and proof gap.
+inferred web-server execution without a source-grounded execution sink. It must
+not upgrade the structured CIA outcome or replace the required source path and
+proof gap.
 
 For an HTTP hypothesis, `entry_point` is a machine-readable transport seed, not
 prose. Use exactly `METHOD /origin-relative/path`, optionally followed by one or

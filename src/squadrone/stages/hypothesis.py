@@ -28,6 +28,7 @@ from ..agents._specialist_base import (
 from ..agents.prompts_io import load_prompt
 from ..agents.runtime import AgentRuntime
 from ..schemas.config import DEFAULT_HYPOTHESIS_REVIEW_AREAS, PipelineConfig
+from ..schemas.intake import IntakeArtifact
 from ..schemas.hypothesis import (
     canonicalize_new_candidate_taxonomy,
     HypothesesArtifact,
@@ -40,6 +41,7 @@ from ..services.artifacts import atomic_write_json, atomic_write_jsonl
 from ..services.budget import BudgetTracker
 from ..services.console_format import format_verifier_decision
 from ..services.decision_ledger import append_decision
+from ..services.model_provenance import stage_model_identities
 
 
 _VERIFIER_BATCH_SIZE = 3
@@ -58,7 +60,7 @@ _REVIEW_BATCH_WINDOW_LINES = 250
 # receives only the items that remain unresolved, so the last pass is isolated
 # when a batch has narrowed to a single difficult path.
 _REVIEW_BATCH_ATTEMPTS = 4
-_REVIEW_CHECKPOINT_VERSION = 6
+_REVIEW_CHECKPOINT_VERSION = 8
 _REVIEW_BATCH_POLICY_VERSION = 4
 _REVIEWABLE_SUPPORT = {"active", "partial", "review_only"}
 _FOCUSED_INJECTION_BATCH_MAX_ITEMS = 4
@@ -81,6 +83,9 @@ def _batch_input_fingerprint(
     recon: ReconArtifact,
     targets: list[CoverageItem],
     reviewer: ReviewArea,
+    *,
+    model_identity: dict | None = None,
+    plugin_version: str | None = None,
 ) -> str:
     """Digest every semantic input used to decide whether a batch is reusable."""
     max_iterations, force_finalise_after = _specialist_iteration_limits(
@@ -152,6 +157,8 @@ def _batch_input_fingerprint(
         ).hexdigest(),
         "targets": [target.model_dump(mode="json") for target in targets],
         "related_recon": _compact_recon(recon, targets),
+        "model_identity": model_identity,
+        "plugin_version": plugin_version,
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -722,6 +729,7 @@ async def run(
     run_id: str = "",
 ) -> HypothesesArtifact:
     model = config.models.specialists
+    model_identity = stage_model_identities(config)["hypothesis"]
     specialists = _build_specialists(
         runtime,
         model,
@@ -733,6 +741,13 @@ async def run(
     # every completed batch is checkpointed independently for resume.
     spec_dir = Path(runs_root) / run_id
     spec_dir.mkdir(parents=True, exist_ok=True)
+    plugin_version = None
+    intake_path = spec_dir / "intake.json"
+    if intake_path.exists():
+        intake = IntakeArtifact.from_json_file(str(intake_path))
+        if intake.plugin_slug != recon.plugin_slug:
+            raise ValueError("hypothesis intake plugin_slug does not match recon")
+        plugin_version = intake.plugin_version.strip() or None
     batch_root = spec_dir / "review_batches"
     merged: list[Hypothesis] = []
     coverage_dispositions: list[CoverageDisposition] = []
@@ -770,6 +785,8 @@ async def run(
                 recon,
                 batch_targets,
                 spec.NAME,
+                model_identity=model_identity,
+                plugin_version=plugin_version,
             )
             if checkpoint.exists():
                 cached = SpecialistReviewArtifact.model_validate_json(
@@ -832,6 +849,8 @@ async def run(
                     }
                     if retry_progress:
                         analyze_kwargs["prior_incomplete_review"] = retry_progress
+                    if plugin_version is not None:
+                        analyze_kwargs["plugin_version"] = plugin_version
                     result = await spec.analyze(
                         recon,
                         **analyze_kwargs,

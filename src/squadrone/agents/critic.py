@@ -208,12 +208,17 @@ class CriticAgent:
         hypotheses: HypothesesArtifact,
         code_slices: dict[str, str],
         plugin_path: str | None = None,
+        scanned_version: str | None = None,
     ) -> TriagedArtifact:
         system = self._build_system_prompt(hypotheses)
         user_payload: dict = {
             "plugin_slug": hypotheses.plugin_slug,
             "hypotheses": hypotheses.model_dump()["hypotheses"],
             "code_slices": code_slices,
+            "review_scope": {
+                "inspected_version": scanned_version or None,
+                "historical_versions_inspected": False,
+            },
         }
         user_parts = [json.dumps(user_payload, default=str)]
         # Disclosure eligibility is deterministic and runs after this technical

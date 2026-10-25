@@ -68,6 +68,7 @@ def _patch_pipeline(
         llm=SimpleNamespace(model_dump=lambda **_kwargs: {}),
         reasoning=SimpleNamespace(model_dump=lambda **_kwargs: {}),
         llm_options_for_role=lambda _role: {},
+        gateway_options=lambda: {},
     )
 
     monkeypatch.setattr(orchestrator, "PLUGINS_ROOT", str(tmp_path / "plugins"))

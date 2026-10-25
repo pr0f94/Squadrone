@@ -33,6 +33,28 @@ calls. The list below is a defensive reference, not exhaustive.
 - `sanitize_file_name` aggressively strips `<>"|?*\:` — filenames cannot carry
   HTML-attribute breakout payloads through this filter.
 
+## Actor capabilities and content filtering
+
+Verified core contracts (not proof of any plugin-specific path):
+
+- Default single-site Editor and Administrator roles have `unfiltered_html`;
+  Author and Contributor do not. Source:
+  https://developer.wordpress.org/reference/functions/populate_roles_160/
+- `map_meta_cap()` denies `unfiltered_html` for non-super-admins on multisite,
+  and for everyone when `DISALLOW_UNFILTERED_HTML` is true. Effective roles and
+  capability filters may differ from defaults; keep the installation explicit.
+  Source: https://developer.wordpress.org/reference/functions/map_meta_cap/
+- `kses_init()` installs content filters for users without `unfiltered_html`.
+  This alone does not establish whether specific bytes in a shortcode/block
+  survive the complete write/render pipeline. Trace the exact input, storage,
+  transforms, renderer and trigger; retain unknowns rather than declaring them
+  passed. Source: https://developer.wordpress.org/reference/functions/kses_init/
+- These are distinct capabilities: permission to edit a post, permission to
+  publish it, permission to save unfiltered content, and any plugin-specific
+  privilege. Do not substitute one for another or call an internal hook a public
+  endpoint. A missing check inside a plugin callback does not erase core route
+  authentication, ownership or capability checks before that callback.
+
 ## Nonces
 
 - `wp_create_nonce($action)` derives the nonce from `$action`, `wp_nonce_tick()`,

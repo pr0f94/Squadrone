@@ -358,8 +358,9 @@ async def test_triage_completes_only_post_quality_scope_and_cap_candidates(
             artifact: object,
             _code_slices: object,
             plugin_path: str | None = None,
+            scanned_version: str | None = None,
         ) -> TriagedArtifact:
-            del artifact, plugin_path
+            del artifact, plugin_path, scanned_version
             return TriagedArtifact(
                 plugin_slug="generic-plugin",
                 accepted=hypotheses,
@@ -381,7 +382,7 @@ async def test_triage_completes_only_post_quality_scope_and_cap_candidates(
     monkeypatch.setattr(
         triage_stage,
         "apply_quality_gate",
-        lambda artifact, *, artifact_path: artifact,
+        lambda artifact, *, artifact_path, scanned_version: artifact,
     )
     monkeypatch.setattr(
         triage_stage,

@@ -19,27 +19,29 @@ Squadrone does not auto-submit reports, test remote production systems, or
 claim that a pattern, HTTP status, reflection, or blind callback is itself a
 vulnerability.
 
+## Architecture Overview
+
+![Squadrone architecture](docs/diagrams/architecture.svg)
+
+The component diagram separates orchestration, agent execution, the shared LLM
+gateway, persistence, external services, and the local verification boundary.
+It shows the selected Go model assignments alongside the unchanged Daybreak
+alternative. The sandbox detail depicts the trace-bound HTTP proof path, not
+universal host-process isolation.
+
 ## Pipeline
 
-```text
-plugin slug
-  -> intake
-  -> deterministic coverage + threat mapping
-  -> configured accountable source reviews (four by default)
-  -> citation verifier
-  -> full-source critic
-  -> technical quality gate
-  -> disclosure routing + ranking
-  -> clean sandbox proof + confirmation
-  -> confirmed CVSS
-  -> known-vulnerability dedup
-  -> private report drafts
-```
+![Squadrone process flow](docs/diagrams/process-flow.svg)
 
-This is the default disclosure scan. `--triage-only` stops after source-valid
-technical triage, before runtime verification. `--verify-only` disables
-disclosure-program scope filtering, verifies source-valid candidates, and skips
-known-vulnerability deduplication and report generation.
+The flow diagram shows execution order, mode-specific stops, triage outcomes,
+bounded retries, and the clean-state confirmation required before a finding.
+
+This is the default disclosure scan. `--triage-only` disables disclosure-program
+scope filtering and stops after technical triage, before runtime verification.
+`--verify-only` also disables that filtering, verifies candidates, and skips
+known-vulnerability deduplication and report generation. An accepted triage
+candidate is not a reproduced vulnerability; a completed triage-only run may
+also retain manual-review items and unresolved source-coverage gaps.
 
 ### 1. Intake
 
@@ -79,6 +81,12 @@ The Surveyor validates and enriches this minimum inventory, resolves dynamic
 registrations, follows handlers/helpers, and produces the plugin threat map:
 sensitive objects, roles, capabilities, workflows, and persistent write/read
 lifecycles.
+
+Deterministic inventory survives the merge; Surveyor discoveries can add review
+targets. Neither the inventory nor a model-generated call edge proves external
+reachability. Internal lifecycle hooks are not additional public HTTP routes,
+and a nonce/capability presence flag does not prove that the check dominates
+every branch. UI role labels must be distinguished from enforced controls.
 
 Outputs: `recon.json` and initial `coverage.json`.
 
@@ -120,6 +128,13 @@ A hypothesis must include the exact sink expression and location, lowest
 attacker role, source-to-outcome path, closest control, security boundary,
 counterevidence, narrow runtime proof gap, and plain CIA consequence.
 
+The inspected version comes from `intake.json`, not the model's recollection of
+release history. Source review must distinguish known plugin facts, qualified
+WordPress core contracts, and unverified save/filter/render prerequisites.
+Source tools are plugin-scoped; an ordinary one-shot Developer consultation has
+no independent WordPress-core reader or running WordPress instance. A completed
+consultation is advice, not a verified source citation or runtime observation.
+
 Outputs: `review_batches/<area>/`, `hypotheses_<area>.jsonl`,
 `coverage_<area>.json`, updated `coverage.json`, and `hypotheses.jsonl`.
 
@@ -128,6 +143,9 @@ Outputs: `review_batches/<area>/`, `hypotheses_<area>.jsonl`,
 The narrowly scoped hypothesis verifier has one job: reject a fabricated
 citation or a contradiction visible in the cited source window. It does not
 attempt a second, partial vulnerability methodology.
+It first checks the source quote, tolerating whitespace and a uniquely matching
+nearby citation within its bounded line window. Keeping a hypothesis means its
+local citation survived this check, not that every prerequisite was proved.
 
 The Critic can read any plugin file. It re-derives complete callbacks and
 helpers, attempts to disprove every claim, checks default configuration and the
@@ -139,10 +157,32 @@ The deterministic quality gate then requires:
 - an explicit attacker source and reachable path
 - a real security boundary
 - at least one concrete CIA dimension
-- no cosmetic-only, unsafe-configuration-only, or primitive-only claim
+- no cosmetic-only or unsafe-configuration-only claim
+
+A dangerous primitive alone is insufficient: its family contract determines the
+protected effect and evidence required for an automatic finding.
+
+Triage also checks explicit attacker-role prerequisites against the structured
+role and limits affected-version claims to the inspected version. When no other
+disqualifying rule applies, unknown/conflicting role metadata and unsupported
+historical version claims are retained unchanged in `manual_review`, rather than
+silently assigned a lower role or narrowed to another version. Other invalid
+evidence can still cause rejection.
+The role parser is a conservative text-consistency check, not a capability or
+plugin-intent oracle. The Critic may not rewrite the raw attacker role,
+preconditions, or affected-version claim to make an acceptance pass.
+
+Family-specific evidence contracts additionally separate source-valid paths
+that the automatic verifier can represent from those needing manual review.
+The Critic can make a same-file, bounded source-anchor correction only with
+explicit repair metadata and preserved claim invariants. Merge decisions must
+retain genuine source/actor/outcome equivalence; a shared dangerous sink alone
+is not enough.
 
 No CVSS number is guessed before runtime proof. Pre-verification severity is
-only an unscored priority used for ranking.
+only an unscored priority used for ranking. Source reads, valid JSON, a complete
+coverage ledger, and model agreement do not establish exploitability or prove
+that intended PHP/HTML authoring crosses a security boundary.
 
 ### 5. Scope And Ranking
 
@@ -219,6 +259,16 @@ success word:
 | `browser_execution` | JavaScript execution for attack and not control |
 | `file_effect` | Observed path plus SHA-256 marker, absent for control |
 
+This table is not a universal acceptance matrix. The
+[taxonomy registry](src/squadrone/schemas/taxonomy.py) selects family-specific
+contracts and supported oracles; unreviewed CWE families remain manual-only.
+Selected execution, PHP-include, object-injection and executable-upload paths
+require additional parent-owned request/effect attestations. A child-generated
+observation cannot substitute for those receipts. Stored SQL injection has a
+narrower automatic timing-only contract with a bound writer, storage identity
+and later trigger; an inert object-instantiation receipt alone does not prove a
+usable deserialization gadget or full compromise.
+
 The cross-object HTTP proof path is supervised by a parent-owned, exact-origin proxy.
 The child receives only the proxy address; request nonces, trace salts, and the
 sandbox receipt secret remain in the parent. For cross-object claims, every
@@ -273,12 +323,13 @@ Output: `verifications/<hypothesis_id>/` and `findings.jsonl`.
 
 ### 7. Scoring, Deduplication, And Reports
 
-CVSS v3.1 base metrics are calculated after confirmation from the observed
-attacker role, vulnerability interaction/scope semantics, and CIA dimensions.
-The exact vector and score are stored in the finding.
-
 Deduplication checks Wordfence Intelligence and, when `WPSCAN_API_KEY` is set,
 WPScan, and distinguishes exact known paths from potentially related issues.
+The report stage then calculates CVSS v3.1 base metrics from confirmed attacker
+role, interaction/scope semantics, and CIA dimensions, storing the vector and
+score in the finding. This happens before its report-evidence, known-duplicate,
+and current-program eligibility checks. `--verify-only` skips deduplication and
+reporting, so a confirmed finding can remain unscored in that mode.
 Reports are generated only for a confirmed, evidence-complete, non-duplicate
 finding that still meets the target program's current rules.
 
@@ -290,6 +341,8 @@ Outputs: updated `findings.jsonl` and
 Pipeline YAML contains operational controls:
 
 - role models, global generation controls, and per-role reasoning overrides
+- optional named model profiles with explicit route, protocol, credential-variable
+  name, generation/history limits, and token-price estimates
 - cost ceiling and candidate cap
 - verification iterations and timeouts
 - developer consultation cap
@@ -302,16 +355,86 @@ negative controls, clean confirmation, scope routing, and report grading are
 fixed behavior. Wordfence and WPScan credentials are supplied through the
 environment rather than pipeline YAML.
 
-`llm.reasoning_effort` is the default for every role. A non-null
-`reasoning.<role>` value overrides it for that role, with all four focused review
-areas mapping to `specialists`.
+For legacy LiteLLM model strings, `llm.reasoning_effort` is the global default.
+For `profile/<name>` routes, profile generation defaults are overlaid by global
+controls and then non-null `reasoning.<role>` overrides. Unsupported efforts or
+protocol-specific settings fail validation/resolution instead of being silently
+dropped. All four focused review areas map to the single `specialists` slot;
+the configuration does not choose a different model for each specialist.
+
+### Model Routing And Conversation State
+
+Two operational pipelines are shipped. [pipelines/chatgpt.yaml](pipelines/chatgpt.yaml)
+uses provisioned ChatGPT-subscription access and
+`chatgpt/gpt-daybreak-blue-latest` for every role with `medium` reasoning.
+[pipelines/opencode-go.yaml](pipelines/opencode-go.yaml) explicitly selects:
+
+| Roles | Model | Profile API / generation |
+|---|---|---|
+| Surveyor | `glm-5.3` | OpenAI-compatible Chat; `max` reasoning; 32,768 output-token cap |
+| Four specialists, citation verifier, Critic, Developer, Developer follow-up, PoC author | `deepseek-v4.1-flash` | OpenAI-compatible Chat; `high` reasoning; 16,384 allowance floor, 32,768 cap |
+| Reporter | `qwen3.8-max` | Anthropic-compatible Messages; 16,384 output-token cap |
+
+These are configured choices, not a measured claim that each is optimal for its
+role. Squadrone does not automatically change models, reduce reasoning effort,
+or switch protocols when a provider refuses a request.
+
+`AgentRuntime` owns tool dispatch and trace records; `LiteLLMTransport` owns the
+bounded conversation loop; `services/llm.py` is the shared cache, connection,
+retry and budget gateway. `services/model_profiles.py` resolves either a legacy
+LiteLLM model string or a validated named profile before dispatch. Profiles use
+explicit HTTPS endpoints and name an environment variable instead of embedding
+a key. Credential values and connection headers are injected after cache lookup,
+not into the semantic model identity or request cache key. Profile Chat routes
+reject ambiguous ambient OpenAI custom/organization/project headers rather than
+inherit them. Legacy provider/OAuth routing remains with LiteLLM.
+
+Each agent invocation gets a conversation ID. The same ID spans ordinary tool
+turns, forced finalization, schema repair and bounded one-shot retries; nested
+Developer invocations get a separate ID with parent context. Caller-side
+`developer_call` records do not expose every helper's separate request ID.
+OpenCode profile requests send `User-Agent: squadrone/0.1.0` and that stable
+`x-opencode-session` value. Resume starts new invocations rather than continuing
+an interrupted provider-side conversation.
+
+Assistant history retains reasoning, signatures, tool-call IDs and provider
+fields. The shipped Go profiles use `history_policy: preserve`; profiles can
+explicitly opt into `trim`, and legacy routes retain bounded whole-tool-cycle
+trimming. An optional estimated input-token limit rejects oversized preserved
+requests without silently dropping evidence; otherwise provider context limits
+still apply. For the selected DeepSeek route, a tool-calling assistant turn with
+missing/null `reasoning_content` receives an explicit empty string. Existing
+reasoning is preserved; no reasoning text is invented. This wire-compatibility
+choice is traced separately from semantic model identity.
+
+### Output Validation And Failure Handling
+
+Output-token allowances include provider reasoning as well as the visible
+answer. The DeepSeek profile's floor applies even to short Developer helpers;
+it is a request allowance, not a minimum answer length or an accuracy guarantee.
+A one-shot request with an incomplete answer may retry once at its profile cap
+when that is larger than the initial allowance. Refusals and filtering do not
+trigger this larger-allowance retry; legacy routes without a profile cap have
+no allowance expansion. A setup helper can separately request one JSON-shape
+repair, so those two one-shot calls can consume up to four budgeted generations
+when expansion is available. Empty/reasoning-only final answers and
+length-limited output are not treated as completed advice, setup or schema
+results. Complete tool-only turns remain valid inside the agent loop; an
+incomplete loop turn fails instead of automatically restarting that agent.
+
+The shared gateway makes bounded retries for classified transient transport,
+rate-limit and service failures. Authentication, unsupported-request and other
+non-retryable errors propagate. Agent loops have their own iteration and tool
+budgets, forced-finalization policy and schema-repair handling. Source-coverage
+retries are separate: completed work is checkpointed, while missing or invalid
+candidate links remain unresolved rather than counted as reviewed.
+
+An incomplete Developer consultation returns an explicit unavailable,
+non-authoritative tool result; it is not expert agreement or evidence against a
+hypothesis. Consultations can still be factually wrong when complete, so callers
+must retain source checks and precise unresolved prerequisites.
 
 ### Runtime And Distribution
-
-The sole shipped operational profile is `pipelines/chatgpt.yaml`. It uses
-provisioned ChatGPT-subscription access and
-`chatgpt/gpt-daybreak-blue-latest` for every role with `medium` reasoning.
-LiteLLM is the only model transport.
 
 A bounded in-process compatibility layer registers explicit newer ChatGPT
 aliases when LiteLLM does not yet know them, maps them to GPT-5 generation
@@ -320,23 +443,38 @@ allowlist is `chatgpt/gpt-5.5`, `chatgpt/gpt-5.6-sol`, and
 `chatgpt/gpt-daybreak-blue-latest`; unrelated future aliases are not patched
 implicitly. Native LiteLLM support remains authoritative when present.
 
-The supported runtime is CPython 3.12, with 3.12.14 recorded for the reference
-environment and Python 3.13 excluded. Direct, development, and build
-dependencies are exactly pinned. `requirements/constraints.txt` pins the full
-resolved graph, and LiteLLM stays on the adapter-compatible release until the
+The supported runtime is CPython 3.12; Python 3.13 is excluded. Direct,
+development, and build dependencies are exactly pinned.
+`requirements/constraints.txt` pins the full resolved graph, and LiteLLM stays
+on the adapter-compatible release until the
 compatibility layer is no longer required.
 
 Compose, WordPress initialization, and actor-receipt templates are installed as
 `squadrone.docker` package resources so wheel installations do not depend on the
 repository working directory. The root `docker/` files are compatibility
 mirrors and must remain byte-identical to the packaged copies. The shipped
-pipeline also pins the WordPress and MariaDB images by digest.
+pipelines also pin the WordPress and MariaDB images by digest.
+
+### Response Cache And Estimated Budgets
+
+The SQLite response cache hashes the resolved route/model, prepared messages,
+tool definitions, effective non-secret settings and output allowance. Session
+IDs, credential-variable names, credential values and prices are not semantic
+cache identity. A cache hit avoids a provider request and new budget charge;
+it does not establish correctness or replace final-response validation. This
+cache is not an account or tenant isolation boundary. Traces and cached model
+responses can contain source, tool results and provider reasoning, so they are
+sensitive research artifacts even when connection credentials are excluded.
 
 The LLM budget is reserved conservatively before uncached calls. Completed
 responses are accounted for and returned before another call can be rejected,
-so a ceiling does not discard an already-completed batch result. Dollar values
-are internal token-price estimates; under subscription OAuth they are
-pre-dispatch scheduling guardrails rather than API charges.
+so a ceiling does not discard an already-completed batch result. Profile pricing
+separates uncached input, cache reads, cache writes and output; normalized
+provider counts are reconciled without counting cached input twice. Legacy
+routes without explicit prices retain fallback estimates. Dollar values are
+internal scheduling estimates, not subscription charges, Go quota balances or
+proof that a provider will permit the next request. Provider usage windows,
+rate limits and access rules are enforced independently.
 
 On resume, prior `cost_calls.tsv` rows are restored before new calls. Earlier
 and resumed work share one cumulative ceiling, including stages repeated with
@@ -372,10 +510,31 @@ findings, disclosures, and cache data for lookup. A run status is `running`,
 `complete`, `failed`, `budget_exceeded`, or `interrupted`.
 
 Resume loads compatible stage artifacts unless `--from` forces that stage and
-all later stages to run again. Specialist checkpoints are fingerprinted and
-may be complete or explicitly exhausted. Triage reuse is bound to submission
-scope, while verification reuse is additionally bound to the accepted and
-manual candidate sets and finding IDs. Incompatible checkpoints are rerun.
+all later stages to run again. It uses the configuration and mode flags supplied
+to the new command; `--resume` alone does not restore the prior `--config`,
+`--triage-only` or `--verify-only` choice.
+
+`model_provenance.json` records stage model identities, selected prompt-content
+hashes and explicit methodology-policy revisions before stage work begins.
+Identities cover resolved endpoints/models, generation controls, history policy
+and input/output limits, not credentials, pricing or every source-code change.
+A changed tracked identity invalidates the earliest affected stage and all
+downstream stages; existing artifacts are moved into a recoverable
+`model_archive/<id>/` envelope rather than rewritten or relabeled. Missing or
+unreadable provenance fails closed for profile-based reuse; historical untracked
+legacy runs keep their legacy resume behavior. This is compatibility tracking,
+not a guarantee that arbitrary implementation changes are automatically detected.
+
+Specialist checkpoints additionally fingerprint the inspected version, assigned
+targets, compact recon, reviewer prompts/methodology, effective model identity
+and batch execution policy, and may be complete or explicitly exhausted. Triage
+reuse is bound to submission scope, while verification reuse is additionally
+bound to the accepted and manual candidate sets and finding IDs. Incompatible
+checkpoints are rerun. When invalidation retires verification artifacts, the
+run's active undisclosed SQLite finding index is reconciled without deleting
+disclosure history. Prior cost is validated/restored before artifact moves and
+is not erased by invalidation.
+
 `decision_ledger.jsonl` records every consequential decision, JSON/JSONL writes
 are atomic where possible, and malformed finding rows are quarantined.
 
@@ -398,11 +557,22 @@ checked before local cleanup state is discarded. Cleanup is best effort.
 
 - Static registration and call-graph extraction is conservative and cannot
   resolve every dynamic PHP pattern. The Surveyor must validate and augment it.
+  Zero `unreviewed` ledger entries means the enumerated assignments received
+  dispositions, not that every attack surface or prerequisite was discovered.
+- Source citations, role/version consistency, schema validation and complete
+  model answers do not prove effective WordPress capabilities, plugin intent,
+  payload survival, core filter behavior or runtime exploitability. Generic
+  consultations lack independent access to missing core source; qualified
+  reference facts and model confidence must not be promoted into observations.
+- Preserved history and larger reasoning/output allowances can still exceed
+  provider limits or produce incomplete/incorrect answers. No quota scheduler,
+  automatic model fallback or universal reasoning adapter is implemented.
 - Generated PoCs remain test programs, not mathematical proof. Their source and
   measured output must still be reviewed before disclosure.
 - Strict host-side PoC isolation currently requires macOS Seatbelt and covers
-  the requests-based cross-object and SSRF proof capabilities. Other PoCs use
-  the compatibility runner without a strict socket policy; browser and
+  selected parent-proxied HTTP proof paths, including cross-object and SSRF
+  capabilities and the bounded execution/include/object/upload paths. Other
+  PoCs use the compatibility runner without a strict socket policy; browser and
   inbound-callback oracles need separate OS-isolated brokers before they can use
   that profile. This limit is separate from the Docker target's sealed network.
 - Program rules and asset thresholds change. Scope references include their

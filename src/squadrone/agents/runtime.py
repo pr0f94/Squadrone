@@ -15,6 +15,8 @@ from typing import Optional, TYPE_CHECKING
 
 from pydantic import BaseModel
 
+from ..services.llm import IncompleteLLMResponse
+from ..services.llm_context import current_conversation
 from .transport.base import AgentResult, AgentOutputError
 from .transport.litellm_transport import LiteLLMTransport, _strip_fences
 
@@ -80,6 +82,11 @@ class AgentRuntime:
 
     def _trace(self, agent_name: str, kind: str, payload: dict) -> None:
         record = {"ts": time.time(), "agent": agent_name, "kind": kind, **payload}
+        conversation = current_conversation()
+        if conversation is not None:
+            record["conversation_id"] = conversation.conversation_id
+            if conversation.parent_conversation_id is not None:
+                record["parent_conversation_id"] = conversation.parent_conversation_id
         with self.trace_path.open("a") as f:
             f.write(json.dumps(record, default=str) + "\n")
 
@@ -141,19 +148,46 @@ class AgentRuntime:
                 )
                 return msg
         if tool_name == "consult_developer":
-            if dev_calls[0] >= self.developer_calls_per_agent:
-                return (
-                    "Developer consultation limit reached for this turn. "
-                    "Make your best assessment from the code you have."
+            def unavailable(reason: str) -> str:
+                self._trace(
+                    agent_name,
+                    "developer_call",
+                    {
+                        "n": dev_calls[0],
+                        "question": arguments.get("question", ""),
+                        "code_snippet": arguments.get("code_snippet", ""),
+                        "context": arguments.get("context") or "",
+                        "status": "unavailable",
+                        "authoritative": False,
+                        "error": reason,
+                    },
                 )
+                result = (
+                    f"[runtime] Developer consultation failed: {reason}. "
+                    "No authoritative developer answer is available. This failure is not "
+                    "evidence for or against the hypothesis, and must not be treated as "
+                    "expert agreement. Continue from source evidence or record the unresolved "
+                    "proof gap."
+                )
+                if dedup_key is not None and call_history is not None:
+                    call_history[dedup_key] = result
+                return result
+
+            if dev_calls[0] >= self.developer_calls_per_agent:
+                return unavailable("consultation limit reached")
             if self.developer is None:
-                return "Developer agent unavailable."
+                return unavailable("developer agent unavailable")
             dev_calls[0] += 1
-            answer = await self.developer.consult(
-                question=arguments.get("question", ""),
-                code_snippet=arguments.get("code_snippet", ""),
-                context=arguments.get("context"),
-            )
+            try:
+                answer = await self.developer.consult(
+                    question=arguments.get("question", ""),
+                    code_snippet=arguments.get("code_snippet", ""),
+                    context=arguments.get("context"),
+                )
+                if not answer.strip():
+                    raise IncompleteLLMResponse("consultation returned empty content")
+            except IncompleteLLMResponse as exc:
+                return unavailable(str(exc))
             self._trace(
                 agent_name,
                 "developer_call",

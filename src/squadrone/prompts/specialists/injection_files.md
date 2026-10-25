@@ -412,7 +412,11 @@ confirmation. It must populate `evidence_summary.code_execution_path` with
 every source-grounded step after the write and
 `evidence_summary.code_execution_sink` with the exact include, autoload,
 interpreter dispatch, command execution, or equivalent code-execution operation
-and source location. Describe the remaining runtime fact in `proof_gaps` and do
+and source location. When source proves the written bytes land at a
+deterministic path inside a web-served directory and names the direct request
+route, that web-server SAPI dispatch is a source-grounded sink; keep only the
+deployed server's execution of that exact path as the narrow runtime fact.
+Describe the remaining runtime fact in `proof_gaps` and do
 not inflate confidentiality, integrity, or availability beyond the source-proven
 write. Do not add that label for a mere upload/write primitive, a `.php` or URL
 alone, inferred web-server behavior without a source-grounded execution sink, a

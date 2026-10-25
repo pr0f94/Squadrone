@@ -132,6 +132,8 @@ async def test_persist_findings_empty_list_clears_only_undisclosed_findings(
         "plugin",
         [_finding("f-stale"), _finding("f-disclosed")],
     )
+    await orchestrator._record_run_start("run-other", "plugin")
+    await orchestrator._persist_findings("run-other", "plugin", [_finding("f-other")])
     with sqlite3.connect(db_path) as db:
         db.execute(
             "INSERT INTO disclosures(finding_id, submitted_to, status) "
@@ -147,5 +149,10 @@ async def test_persist_findings_empty_list_clears_only_undisclosed_findings(
             "SELECT finding_id FROM findings WHERE run_id=? ORDER BY finding_id",
             ("run-empty",),
         ).fetchall()
+        other = db.execute(
+            "SELECT finding_id FROM findings WHERE run_id=?",
+            ("run-other",),
+        ).fetchall()
 
     assert remaining == [("f-disclosed",)]
+    assert other == [("f-other",)]

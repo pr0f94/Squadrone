@@ -16,6 +16,7 @@ from ..agents.critic import (
 from ..agents.hypothesis_verifier import validate_exact_sink_anchor
 from ..agents.runtime import AgentRuntime
 from ..schemas.config import PipelineConfig
+from ..schemas.intake import IntakeArtifact
 from ..schemas.hypothesis import (
     HypothesesArtifact,
     Hypothesis,
@@ -1498,7 +1499,15 @@ def _validate_critic_accounting(
             "potential_rce" in original_labels
             and "potential_rce" not in accepted_labels
         )
-        verifier_contract_pairs = {
+        verifier_contract_pairs: dict[str, tuple[object, object]] = {
+            "preconditions": (
+                original.preconditions,
+                accepted_hypothesis.preconditions,
+            ),
+            "affected_versions": (
+                original.affected_versions,
+                accepted_hypothesis.affected_versions,
+            ),
             "injection_order": (
                 original.injection_order,
                 accepted_hypothesis.injection_order,
@@ -1511,6 +1520,7 @@ def _validate_critic_accounting(
         original_evidence = original.evidence_summary or {}
         accepted_evidence = accepted_hypothesis.evidence_summary or {}
         for evidence_key in (
+            "attacker_role",
             "storage_writer",
             "storage_identity",
             "trigger",
@@ -1597,7 +1607,7 @@ def _validate_critic_accounting(
                     "is not a same-file local correction"
                 )
 
-            invariant_pairs = {
+            invariant_pairs: dict[str, tuple[object, object]] = {
                 "specialist": (original.specialist, accepted_hypothesis.specialist),
                 "bug_class": (original.bug_class, accepted_hypothesis.bug_class),
                 "entry_point": (original.entry_point, accepted_hypothesis.entry_point),
@@ -1882,6 +1892,17 @@ def _record_php_object_gadget_recipe_completions(
         )
 
 
+def _scanned_version(run_dir: Path, plugin_slug: str) -> str:
+    """Use intake provenance, never a model's affected-version assertion."""
+    intake_path = run_dir / "intake.json"
+    if not intake_path.exists():
+        return ""
+    intake = IntakeArtifact.from_json_file(str(intake_path))
+    if intake.plugin_slug != plugin_slug:
+        raise ValueError("triage intake plugin_slug does not match hypotheses")
+    return intake.plugin_version.strip()
+
+
 async def run(
     hypotheses: HypothesesArtifact,
     plugin_path: str,
@@ -1892,6 +1913,8 @@ async def run(
     run_id: str = "",
     enforce_submission_scope: bool = True,
 ) -> TriagedArtifact:
+    run_dir = Path(runs_root) / run_id
+    scanned_version = _scanned_version(run_dir, hypotheses.plugin_slug)
     code_slices = _build_code_slices(hypotheses.hypotheses, Path(plugin_path))
 
     critic = CriticAgent(runtime, model=config.models.critic)
@@ -1899,9 +1922,9 @@ async def run(
         hypotheses,
         code_slices,
         plugin_path=plugin_path,
+        scanned_version=scanned_version,
     )
     _validate_critic_accounting(hypotheses, triaged, plugin_path=plugin_path)
-    run_dir = Path(runs_root) / run_id
     for h in triaged.accepted:
         logger.debug(format_triage_accept(h))
     for rejection in triaged.rejected:
@@ -1968,7 +1991,9 @@ async def run(
 
     before = len(triaged.accepted)
     quality_path = run_dir / "quality_gate_triage.json"
-    triaged = apply_quality_gate(triaged, artifact_path=quality_path)
+    triaged = apply_quality_gate(
+        triaged, artifact_path=quality_path, scanned_version=scanned_version
+    )
     if quality_path.exists():
         try:
             for decision in json.loads(quality_path.read_text()):

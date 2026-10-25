@@ -1,0 +1,82 @@
+# OpenCode Go / Go Plus multi-model research pipeline.
+# Model IDs, endpoints and prices checked 2026-10-21 against:
+# https://opencode.ai/v2/docs/console/go/
+# Export OPENCODE_GO_API_KEY; no OpenAI/Anthropic API key is required.
+cost_ceiling_usd: 10.00
+max_hypotheses_to_verify: 10
+sandbox_timeout_seconds: 120
+verify_max_iterations: 7
+developer_calls_per_agent: 7
+
+models:
+  surveyor: profile/go-glm
+  specialists: profile/go-deepseek
+  hypothesis_verifier: profile/go-deepseek
+  critic: profile/go-deepseek
+  developer: profile/go-deepseek
+  developer_followup: profile/go-deepseek
+  poc_author: profile/go-deepseek
+  reporter: profile/go-qwen
+
+model_profiles:
+  go-glm:
+    model: glm-5.3
+    api_format: openai_chat
+    api_base: https://opencode.ai/inference/go/openai/v1
+    api_key_env: OPENCODE_GO_API_KEY
+    generation:
+      reasoning_effort: max
+    reasoning_efforts: [low, high, max]
+    thinking: enabled
+    history_policy: preserve
+    max_output_tokens: 32768
+    pricing:
+      input_per_million: 1.40
+      output_per_million: 4.40
+      cache_read_per_million: 0.26
+      cache_write_per_million: 1.40
+  go-deepseek:
+    model: deepseek-v4.1-flash
+    api_format: openai_chat
+    api_base: https://opencode.ai/inference/go/openai/v1
+    api_key_env: OPENCODE_GO_API_KEY
+    generation:
+      reasoning_effort: high
+    reasoning_efforts: [low, high, max]
+    thinking: enabled
+    # Upstreams may omit reasoning on a non-thinking tool turn, but later
+    # thinking continuations require the field. Send "", never invented text.
+    empty_tool_reasoning: true
+    history_policy: preserve
+    # Reasoning consumes the same allowance as the final answer. Short helper
+    # calls must not inherit the legacy 4K budget; this is not a minimum length.
+    output_budget_floor: 32768
+    max_output_tokens: 32768
+    # Conservative peak prices; actual off-peak usage may be lower.
+    pricing:
+      input_per_million: 0.30
+      output_per_million: 1.20
+      cache_read_per_million: 0.006
+      cache_write_per_million: 0.30
+  go-qwen:
+    model: qwen3.8-max
+    api_format: anthropic_messages
+    api_base: https://opencode.ai/inference/go/anthropic
+    api_key_env: OPENCODE_GO_API_KEY
+    history_policy: preserve
+    max_output_tokens: 16384
+    pricing:
+      input_per_million: 2.00
+      output_per_million: 6.00
+      cache_read_per_million: 0.25
+      cache_write_per_million: 2.50
+
+sandbox:
+  wordpress_image: wordpress@sha256:5a93c470ae8220fddf71f6ebe3bc94e615ddc2ae4d9810f795b830fb11c41a17
+  db_image: mariadb@sha256:07c0aaff7396b74cb7975cba78257178d188e30f531a5db2b617c48beef13c41
+  wp_admin_user: admin
+  wp_admin_pass: password
+  wp_admin_email: admin@test.local
+
+verify:
+  state_introspection_on_failure: true
