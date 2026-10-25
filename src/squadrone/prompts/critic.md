@@ -380,6 +380,9 @@ Every input hypothesis must appear in exactly one primary disposition:
 Never omit an input and never invent an ID. Every `kept_id` in `merged` must be
 present in `accepted`. A manual-review item must contain the complete original
 Hypothesis object under `hypothesis` so the sandbox handoff remains usable.
+Completeness takes priority over elaboration: keep each disposition concise and
+account for every input ID even when the remaining uncertainty is unresolved
+(use `manual_review` for that fact).
 
 Output only a `TriagedArtifact` JSON object:
 
