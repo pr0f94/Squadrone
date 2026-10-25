@@ -21,6 +21,42 @@ it before accepting:
 6. Require a concrete confidentiality, integrity, or availability consequence.
 7. Reject contradictions between the quoted source, taint path, role, and impact.
 
+Keep attacker attribution consistent across `evidence_summary.attacker_role`,
+`preconditions`, the reachable path, and the required capabilities. A role named
+as a victim, setup administrator, excluded alternative, or negated possibility
+is not an attacker prerequisite. Never pick the lowest role merely mentioned
+in the prose. An Editor-only prerequisite does not prove a Contributor path.
+Distinguish core route permissions from a missing plugin-specific check: absence
+of a capability check in a callback does not mean its upstream REST/editor/widget
+route has no authorization. Internal lifecycle hooks are not public endpoints.
+Nonce/capability presence flags mean a check exists, not that it dominates all
+branches; independently trace the exact branch used by the candidate.
+
+Use these qualified WordPress core facts when checking capability claims:
+`populate_roles_160()` grants `unfiltered_html` to Editor and Administrator,
+not Author or Contributor. On a normal single-site installation an Editor
+therefore has it; do not assume all non-administrators undergo the same KSES
+filtering. `map_meta_cap()` denies it to non-super-admins on multisite and
+when `DISALLOW_UNFILTERED_HTML` is true. Actual filters, role changes and the
+claimed installation can alter effective capabilities. Source references:
+https://developer.wordpress.org/reference/functions/populate_roles_160/ and
+https://developer.wordpress.org/reference/functions/map_meta_cap/ . These facts
+do not prove a particular payload survives: trace its exact save/encode/decode
+and render chain. A blank or incomplete developer consultation is not evidence.
+
+The trusted `review_scope.inspected_version` identifies the one inspected tree;
+it does not prove earlier, later, or all versions with similar code. Accept an
+affected-version statement only for that exact version (for example `2.0.3`),
+not `<=2.0.3`, "and earlier", or "all versions shipping this code". If version
+provenance is absent or a historical range remains unproven, retain the complete
+unchanged hypothesis in `manual_review` with that precise provenance gap.
+For every acceptance, copy `preconditions`, `affected_versions`, and the raw
+`evidence_summary.attacker_role` unchanged. Never repair a role or version
+contradiction by rewriting these immutable claims. Reject a source-disproved
+claim; retain an otherwise viable lead in `manual_review` when one precise
+attacker prerequisite remains unresolved, naming the missing proof rather than
+asserting a stronger role or capability as fact.
+
 Before rejecting a hypothesis because an upstream authentication or
 authorization guard exists, prove that the guard dominates every realistic
 external-source-to-sink path. Enumerate action/mode branches, early returns,

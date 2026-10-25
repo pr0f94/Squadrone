@@ -4,9 +4,10 @@ Anthropic prompt-cache pricing (per Anthropic docs):
   - Cache write: 1.25× the base input rate
   - Cache read: 0.10× the base input rate (90% off)
 
-We track prompt_tokens (uncached input), cache_creation_input_tokens, and
-cache_read_input_tokens separately so cost reflects actual cache behaviour and
-we can see the cache hit rate on each scan.
+We track uncached input, cache creation, and cache reads separately. LiteLLM's
+normalized ``prompt_tokens`` includes cached input, whereas a direct Anthropic
+``input_tokens`` count excludes cache creation and reads. Per-call pricing may
+override the legacy model rates without changing prices for other routes.
 """
 
 from __future__ import annotations
@@ -52,6 +53,27 @@ def _get(usage: Any, key: str) -> int:
     if val is None and isinstance(usage, dict):
         val = usage.get(key, 0)
     return int(val or 0)
+
+
+def _rates_for_call(model: str, pricing: dict | None) -> dict[str, float]:
+    """Resolve one route's rates without mutating the legacy model table."""
+    legacy = COST_PER_1M.get(model, {"input": 3.0, "output": 15.0})
+    overrides = pricing or {}
+
+    def rate(key: str, default: float) -> float:
+        value = overrides.get(key)
+        resolved = default if value is None else float(value)
+        if not math.isfinite(resolved) or resolved < 0:
+            raise ValueError(f"invalid per-million token price: {key}")
+        return resolved
+
+    input_rate = rate("input_per_million", legacy["input"])
+    return {
+        "input": input_rate,
+        "output": rate("output_per_million", legacy["output"]),
+        "cache_read": rate("cache_read_per_million", input_rate * CACHE_READ_MULT),
+        "cache_write": rate("cache_write_per_million", input_rate * CACHE_WRITE_MULT),
+    }
 
 
 class BudgetTracker:
@@ -186,11 +208,18 @@ class BudgetTracker:
         model: str,
         input_tokens: int,
         max_output_tokens: int,
+        *,
+        pricing: dict | None = None,
     ) -> float:
-        """Conservatively estimate an uncached call before it is dispatched."""
-        rates = COST_PER_1M.get(model, {"input": 3.0, "output": 15.0})
+        """Estimate a call, allowing for a route's higher cache-write price."""
+        rates = _rates_for_call(model, pricing)
+        input_rate = (
+            max(rates["input"], rates["cache_write"])
+            if pricing is not None
+            else rates["input"]
+        )
         return (
-            max(input_tokens, 0) * rates["input"]
+            max(input_tokens, 0) * input_rate
             + max(max_output_tokens, 0) * rates["output"]
         ) / 1_000_000
 
@@ -199,9 +228,13 @@ class BudgetTracker:
         model: str,
         input_tokens: int,
         max_output_tokens: int,
+        *,
+        pricing: dict | None = None,
     ) -> float:
         """Reserve the worst-case estimated cost or reject the call up front."""
-        estimate = self.estimate_call_cost(model, input_tokens, max_output_tokens)
+        estimate = self.estimate_call_cost(
+            model, input_tokens, max_output_tokens, pricing=pricing,
+        )
         async with self._lock:
             projected = self.spent + self._reserved_usd + estimate
             if projected > self.ceiling:
@@ -224,29 +257,50 @@ class BudgetTracker:
         model: str,
         agent: str = "unknown",
         reservation_usd: float = 0.0,
+        *,
+        pricing: dict | None = None,
     ) -> None:
-        rates = COST_PER_1M.get(model, {"input": 3.0, "output": 15.0})
-        # Standard fields
-        prompt_tokens = _get(usage, "prompt_tokens")
-        completion_tokens = _get(usage, "completion_tokens")
-        # Anthropic-specific cache fields (passed through by litellm)
-        cache_write = _get(usage, "cache_creation_input_tokens")
-        cache_read = _get(usage, "cache_read_input_tokens")
-        # litellm sometimes nests cache info under prompt_tokens_details
-        if cache_write == 0 and cache_read == 0:
-            details = getattr(usage, "prompt_tokens_details", None) or (
-                usage.get("prompt_tokens_details") if isinstance(usage, dict) else None
-            )
-            if details:
-                cache_read = _get(details, "cached_tokens")
-        # The "uncached input" is what's billed at base rate. cache_write_tokens are
-        # billed at 1.25x; cache_read_tokens at 0.10x. prompt_tokens from the API
-        # already EXCLUDES the cached input on Anthropic, so we add them separately.
-        uncached_input = max(prompt_tokens - cache_read - cache_write, 0)
+        rates = _rates_for_call(model, pricing)
+        # Top-level provider counts and normalized details may both describe the
+        # same cache tokens. Resolve each field once rather than adding both.
+        details = getattr(usage, "prompt_tokens_details", None) or (
+            usage.get("prompt_tokens_details") if isinstance(usage, dict) else None
+        )
+        cache_write = max(
+            _get(usage, "cache_creation_input_tokens")
+            or _get(details, "cache_creation_tokens"),
+            0,
+        )
+        cache_read = max(
+            _get(usage, "cache_read_input_tokens") or _get(details, "cached_tokens"),
+            0,
+        )
+        prompt_value = (
+            usage.get("prompt_tokens")
+            if isinstance(usage, dict)
+            else getattr(usage, "prompt_tokens", None)
+        )
+        if prompt_value is not None:
+            # LiteLLM/OpenAI-compatible usage includes both cached categories.
+            uncached_input = max(int(prompt_value) - cache_read - cache_write, 0)
+        else:
+            # Native Anthropic usage reports only uncached input here.
+            uncached_input = max(_get(usage, "input_tokens"), 0)
+        completion_value = (
+            usage.get("completion_tokens")
+            if isinstance(usage, dict)
+            else getattr(usage, "completion_tokens", None)
+        )
+        completion_tokens = max(
+            int(completion_value)
+            if completion_value is not None
+            else _get(usage, "output_tokens"),
+            0,
+        )
         cost = (
             uncached_input * rates["input"]
-            + cache_write * rates["input"] * CACHE_WRITE_MULT
-            + cache_read * rates["input"] * CACHE_READ_MULT
+            + cache_write * rates["cache_write"]
+            + cache_read * rates["cache_read"]
             + completion_tokens * rates["output"]
         ) / 1_000_000
         async with self._lock:

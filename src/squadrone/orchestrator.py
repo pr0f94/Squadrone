@@ -29,6 +29,7 @@ from .services.artifacts import (
 from .services.budget import BudgetExceededError, BudgetTracker
 from .services.decision_ledger import append_decision
 from .services.llm import init_cache
+from .services.model_provenance import prepare_model_resume, record_stage_model_identity
 from .services.sqlite import connect_sqlite
 from .services.verification_checkpoint import (
     VERIFICATION_CHECKPOINT_SCHEMA_VERSION,
@@ -421,10 +422,27 @@ async def run_scan(
         run_dir.mkdir(parents=True, exist_ok=True)
     started = time.time()
 
+    budget = BudgetTracker(ceiling_usd=ceiling)
+    if resume_run_id:
+        # Restore/validate the cumulative ceiling before moving any artifacts.
+        budget.restore_cost_report(run_dir)
+    model_resume = prepare_model_resume(run_dir, config, resuming=bool(resume_run_id))
+
     # Determine which stages to skip (load from disk) vs run.
     # Auto-resume picks up at the first missing artifact.
     # --from forces re-run from that stage onwards (later artifacts ignored).
     force_idx = STAGE_ORDER.index(resume_from) if resume_from else None
+    if model_resume.invalidated_from is not None:
+        model_force_idx = STAGE_ORDER.index(model_resume.invalidated_from)
+        force_idx = model_force_idx if force_idx is None else min(force_idx, model_force_idx)
+        append_decision(
+            run_dir,
+            stage=model_resume.invalidated_from,
+            action="archive",
+            result="model_identity_changed",
+            reason="Effective model or provider settings changed; rerunning affected downstream stages.",
+            artifact=model_resume.archive_path,
+        )
 
     def _should_load(stage: str) -> bool:
         """True if stage should be loaded from disk rather than re-run."""
@@ -433,10 +451,6 @@ async def run_scan(
         if _stage_is_forced(stage, force_idx):
             return False
         return True
-
-    budget = BudgetTracker(ceiling_usd=ceiling)
-    if resume_run_id:
-        budget.restore_cost_report(run_dir)
 
     status = "running"
     findings: list[Finding] = []
@@ -511,6 +525,13 @@ async def run_scan(
     try:
         await init_cache()
         await _init_db()
+        if (
+            model_resume.invalidated_from is not None
+            and STAGE_ORDER.index(model_resume.invalidated_from) <= STAGE_ORDER.index("verify")
+        ):
+            # The old files are safely archived. Reconcile only this run's
+            # undisclosed index rows; disclosed history remains preserved.
+            await _persist_findings(run_id, plugin_slug, [])
 
         if not resume_run_id:
             await _record_run_start(run_id, plugin_slug)
@@ -535,7 +556,7 @@ async def run_scan(
             developer=developer,
             developer_calls_per_agent=config.developer_calls_per_agent,
             budget_tracker=budget,
-            llm_options=config.llm.model_dump(exclude_none=True),
+            llm_options=config.gateway_options(),
             role_reasoning=config.reasoning.model_dump(exclude_none=True),
         )
 
@@ -601,6 +622,7 @@ async def run_scan(
                 },
             )
         else:
+            record_stage_model_identity(run_dir, model_resume, "recon")
             await _emit(on_event, "recon", "start", {})
             recon = await recon_stage.run(
                 intake, config, runtime, runs_root=_runs_root(plugin_slug)
@@ -629,6 +651,7 @@ async def run_scan(
             )
             await _emit(on_event, "hypothesis", "skipped", {"count": len(hypotheses)})
         else:
+            record_stage_model_identity(run_dir, model_resume, "hypothesis")
             await _emit(on_event, "hypothesis", "start", {})
             hyps = await hypothesis_stage.run(
                 recon,
@@ -690,6 +713,7 @@ async def run_scan(
                     },
                 )
         if not loaded_triage:
+            record_stage_model_identity(run_dir, model_resume, "triage")
             await _emit(on_event, "triage", "start", {})
             triaged = await triage_stage.run(
                 hyps,
@@ -761,6 +785,7 @@ async def run_scan(
                     )
                 await _emit(on_event, "verify", "skipped", {"findings": len(findings)})
             else:
+                record_stage_model_identity(run_dir, model_resume, "verify")
                 await _emit(
                     on_event, "verify", "start", {"to_verify": len(triaged.accepted)}
                 )
@@ -834,6 +859,7 @@ async def run_scan(
                 # ---- report ----
                 # Per-finding skip: existing report files are preserved.
                 budget.set_stage("report")
+                record_stage_model_identity(run_dir, model_resume, "report")
                 await _emit(on_event, "report", "start", {})
                 report_paths = await report_stage.run(
                     findings,

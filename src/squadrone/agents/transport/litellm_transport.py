@@ -14,6 +14,7 @@ environment variables (e.g. ANTHROPIC_API_KEY, OPENAI_API_KEY).
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import re
@@ -23,7 +24,13 @@ from typing import Optional, TYPE_CHECKING
 from pydantic import BaseModel, ValidationError
 
 from ...services.artifacts import atomic_write_json
-from ...services.llm import call_llm
+from ...services.llm import (
+    IncompleteLLMResponse,
+    call_llm,
+    require_complete_response,
+)
+from ...services.llm_context import current_conversation, new_conversation
+from ...services.model_profiles import resolve_model
 from .base import AgentOutputError, AgentResult
 
 if TYPE_CHECKING:
@@ -34,6 +41,16 @@ logger = logging.getLogger(__name__)
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```\s*$", re.DOTALL)
 _EMBED_FENCE_RE = re.compile(r"```(?:json)?\s*\n(.*?)\n```", re.DOTALL)
+
+
+def _assistant_message(message: dict) -> dict:
+    """Retain reasoning, signatures and provider fields for the next model turn."""
+    preserved = copy.deepcopy(message)
+    if not preserved.get("role"):
+        preserved["role"] = "assistant"
+    if "content" not in preserved and not preserved.get("tool_calls"):
+        preserved["content"] = ""
+    return preserved
 
 
 def _apply_cache_control(msgs: list[dict], model: str) -> list[dict]:
@@ -287,6 +304,8 @@ def _trim_history_for_budget(
     msgs: list[dict],
     max_keep_tool_cycles: int = _TRIM_KEEP_TOOL_CYCLES,
     trim_threshold_bytes: int = _TRIM_THRESHOLD_BYTES,
+    *,
+    history_policy: str = "trim",
 ) -> tuple[list[dict], int]:
     """Drop older tool-call cycles when the conversation gets too big.
 
@@ -300,6 +319,12 @@ def _trim_history_for_budget(
     drop complete cycles, never half a cycle (OpenAI rejects orphan tool_calls
     or orphan tool responses).
     """
+    if history_policy == "preserve":
+        # Preserved-thinking models need their complete conversation. The
+        # gateway/provider enforces their context limit without losing evidence.
+        return msgs, 0
+    if history_policy != "trim":
+        raise ValueError(f"Unknown history policy: {history_policy}")
     try:
         size = sum(len(json.dumps(m, default=str)) for m in msgs)
     except (TypeError, ValueError):
@@ -362,6 +387,7 @@ def _trim_history_for_budget(
 
 
 class LiteLLMTransport:
+    @new_conversation
     async def run_agent(
         self,
         *,
@@ -380,6 +406,10 @@ class LiteLLMTransport:
     ) -> AgentResult:
         if force_finalise_allowed_tool_calls < 1:
             raise ValueError("force_finalise_allowed_tool_calls must be positive")
+        conversation = current_conversation()
+        assert conversation is not None
+        llm_options = runtime.llm_options_for_agent(agent_name)
+        resolved_model = resolve_model(model, llm_options)
         msgs = [dict(m) for m in messages]
         usage_acc: dict = {}
         dev_calls = [0]
@@ -390,6 +420,26 @@ class LiteLLMTransport:
             else None
         )
         finalisation_tool_calls = 0
+
+        def _require_complete(
+            response: dict, *, where: str, require_content: bool
+        ) -> None:
+            try:
+                require_complete_response(response, require_content=require_content)
+            except IncompleteLLMResponse as exc:
+                choice = (response.get("choices") or [{}])[0]
+                runtime._trace(
+                    agent_name,
+                    "incomplete_response",
+                    {
+                        "where": where,
+                        "finish_reason": choice.get("finish_reason"),
+                        "error": str(exc),
+                    },
+                )
+                raise AgentOutputError(
+                    f"{agent_name}: incomplete {where} response: {exc}"
+                ) from exc
 
         def _tool_name(tool: dict) -> str:
             function = tool.get("function") or {}
@@ -439,9 +489,12 @@ class LiteLLMTransport:
             )
 
         async def _one_call(
-            call_msgs: list[dict], call_tools: Optional[list[dict]]
+            call_msgs: list[dict], call_tools: Optional[list[dict]],
+            *, require_content: bool = False,
         ) -> dict:
-            trimmed_msgs, dropped = _trim_history_for_budget(call_msgs)
+            trimmed_msgs, dropped = _trim_history_for_budget(
+                call_msgs, history_policy=resolved_model.history_policy
+            )
             if dropped:
                 runtime._trace(
                     agent_name,
@@ -453,7 +506,6 @@ class LiteLLMTransport:
                     },
                 )
             cached_msgs = _apply_cache_control(trimmed_msgs, model)
-            llm_options = runtime.llm_options_for_agent(agent_name)
             runtime._trace(
                 agent_name,
                 "request",
@@ -461,7 +513,14 @@ class LiteLLMTransport:
                     "model": model,
                     "messages": trimmed_msgs,
                     "tools": call_tools,
-                    "llm_options": llm_options,
+                    "llm_options": resolved_model.options,
+                    "model_identity": resolved_model.identity,
+                    "transport_compatibility": {
+                        "empty_tool_reasoning": bool(
+                            resolved_model.profile
+                            and resolved_model.profile.empty_tool_reasoning
+                        ),
+                    },
                 },
             )
             resp = await call_llm(
@@ -472,6 +531,7 @@ class LiteLLMTransport:
                 budget_tracker=runtime.budget_tracker,
                 agent_name=agent_name,
                 llm_options=llm_options,
+                conversation_id=conversation.conversation_id,
             )
             usage = resp.get("usage") if isinstance(resp, dict) else None
             _accumulate_usage(usage_acc, usage if isinstance(usage, dict) else None)
@@ -483,27 +543,28 @@ class LiteLLMTransport:
                     "usage": usage,
                 },
             )
+            _require_complete(
+                resp,
+                where="schema_repair" if require_content else "agent_turn",
+                require_content=require_content,
+            )
             return resp
 
         iteration = 0
         final_content: str = ""
+        last_assistant_message: dict = {}
         total_tool_calls = 0
         forced = False
         for iteration in range(1, max_iterations + 1):
             resp = await _one_call(msgs, _tools_for_next_call(forced))
             choice = (resp.get("choices") or [{}])[0]
             message = choice.get("message") or {}
+            last_assistant_message = _assistant_message(message)
             content = message.get("content") or ""
             tool_calls = message.get("tool_calls") or []
 
             if tool_calls:
-                msgs.append(
-                    {
-                        "role": "assistant",
-                        "content": content or None,
-                        "tool_calls": tool_calls,
-                    }
-                )
+                msgs.append(last_assistant_message)
                 blocked_during_finalisation = False
                 dispatched_finalisation_tool = False
                 for tc in tool_calls:
@@ -654,6 +715,7 @@ class LiteLLMTransport:
                         )
                 continue
 
+            _require_complete(resp, where="final", require_content=True)
             final_content = content
             break
         else:
@@ -674,7 +736,9 @@ class LiteLLMTransport:
                     ),
                 }
             )
-            trimmed_msgs, dropped = _trim_history_for_budget(msgs)
+            trimmed_msgs, dropped = _trim_history_for_budget(
+                msgs, history_policy=resolved_model.history_policy
+            )
             if dropped:
                 runtime._trace(
                     agent_name,
@@ -687,14 +751,20 @@ class LiteLLMTransport:
                     },
                 )
             cached_msgs = _apply_cache_control(trimmed_msgs, model)
-            llm_options = runtime.llm_options_for_agent(agent_name)
             runtime._trace(
                 agent_name,
                 "forced_request",
                 {
                     "model": model,
                     "messages": trimmed_msgs,
-                    "llm_options": llm_options,
+                    "llm_options": resolved_model.options,
+                    "model_identity": resolved_model.identity,
+                    "transport_compatibility": {
+                        "empty_tool_reasoning": bool(
+                            resolved_model.profile
+                            and resolved_model.profile.empty_tool_reasoning
+                        ),
+                    },
                 },
             )
             try:
@@ -706,6 +776,7 @@ class LiteLLMTransport:
                     budget_tracker=runtime.budget_tracker,
                     agent_name=agent_name,
                     llm_options=llm_options,
+                    conversation_id=conversation.conversation_id,
                 )
             except Exception as e:
                 raise AgentOutputError(
@@ -719,14 +790,13 @@ class LiteLLMTransport:
                 "forced_response",
                 {"choices": resp.get("choices", []), "usage": usage},
             )
+            _require_complete(
+                resp, where="forced_finalisation", require_content=True
+            )
             choice = (resp.get("choices") or [{}])[0]
             message = choice.get("message") or {}
+            last_assistant_message = _assistant_message(message)
             final_content = message.get("content") or ""
-            if not final_content.strip():
-                raise AgentOutputError(
-                    f"{agent_name}: exceeded {max_iterations} iterations and forced "
-                    f"finalisation returned empty content"
-                )
             iteration = max_iterations + 1
 
         if output_schema is None:
@@ -822,12 +892,16 @@ class LiteLLMTransport:
                     f"{agent_name}: schema validation failed after retry — {err}"
                 )
 
-            msgs.append({"role": "assistant", "content": final_content})
+            msgs.append(last_assistant_message)
             msgs.append({"role": "user", "content": err})
             runtime._trace(agent_name, "retry", {"reason": err[:500]})
-            resp = await _one_call(msgs, _tools_for_next_call(forced))
+            resp = await _one_call(
+                msgs, _tools_for_next_call(forced), require_content=True
+            )
             choice = (resp.get("choices") or [{}])[0]
-            final_content = (choice.get("message") or {}).get("content") or ""
+            message = choice.get("message") or {}
+            last_assistant_message = _assistant_message(message)
+            final_content = message.get("content") or ""
 
         raise AgentOutputError(
             f"{agent_name}: schema validation loop exited unexpectedly"

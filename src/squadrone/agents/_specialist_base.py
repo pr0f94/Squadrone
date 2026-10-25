@@ -923,6 +923,7 @@ async def run_specialist(
     priority_files: list[str],
     coverage_targets: list[CoverageItem],
     batch_id: str,
+    plugin_version: str | None = None,
     prior_incomplete_review: list[dict[str, object]] | None = None,
 ) -> SpecialistReviewArtifact:
     parts = [
@@ -955,6 +956,7 @@ async def run_specialist(
     }
     user_payload: dict = {
         "plugin_slug": recon.plugin_slug,
+        "plugin_version": plugin_version,
         "review_area": name,
         "batch_id": batch_id,
         "hypothesis_id_prefix": batch_id,
@@ -1124,6 +1126,7 @@ class FocusedSpecialist:
         priority_files: list[str],
         coverage_targets: list[CoverageItem],
         batch_id: str,
+        plugin_version: str | None = None,
         prior_incomplete_review: list[dict[str, object]] | None = None,
     ) -> SpecialistReviewArtifact:
         return await run_specialist(
@@ -1136,5 +1139,6 @@ class FocusedSpecialist:
             priority_files=priority_files,
             coverage_targets=coverage_targets,
             batch_id=batch_id,
+            plugin_version=plugin_version,
             prior_incomplete_review=prior_incomplete_review,
         )

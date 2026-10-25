@@ -30,11 +30,10 @@ python3.12 -m venv .venv
 .venv/bin/playwright install chromium
 cp .env.example .env
 $EDITOR .env
-set -a; . ./.env; set +a
 .venv/bin/squadrone scan hello-dolly
 ```
 
-The sole shipped pipeline routes every LLM role to
+The default pipeline routes every LLM role to
 `chatgpt/gpt-daybreak-blue-latest` through ChatGPT subscription OAuth in
 LiteLLM. It uses `medium` reasoning by default. The authenticated ChatGPT
 account must be provisioned for that model; no OpenAI API key is needed:
@@ -44,13 +43,33 @@ account must be provisioned for that model; no OpenAI API key is needed:
 ```
 
 The first `chatgpt/` request may start an OAuth device-code flow. This route does
-not need `OPENAI_API_KEY`.
+not need `OPENAI_API_KEY` or any other model API key. The `.env` step is optional
+for this default route; credential loading is explained under
+[Configuration](#configuration). Do not source `.env` as a shell script.
 
-The shipped pipeline has a `$10` estimated ceiling for each plugin run. Before
+Alternatively, use the OpenCode Go / Go Plus pipeline:
+
+```sh
+export OPENCODE_GO_API_KEY='your-go-key'
+.venv/bin/squadrone scan hello-dolly --config pipelines/opencode-go.yaml
+```
+
+This pipeline uses GLM-5.3 (`max` reasoning) for the surveyor, DeepSeek V4.1
+Flash (`high` reasoning) for all four specialists, hypothesis verifier, critic,
+developer/setup, developer follow-up and PoC author, and Qwen3.8 Max for reports.
+It does not need `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`. The existing Daybreak
+pipeline and the default CLI configuration are unchanged.
+
+If Go rejects a model with “requires Global regions,” review the workspace's
+Privacy settings in OpenCode Console. Region selection is an account/privacy
+decision; Squadrone does not change it automatically. This can block DeepSeek
+even when other Go models work with the same key.
+
+Both shipped pipelines have a `$10` estimated ceiling for each plugin run. Before
 dispatch, Squadrone blocks a call whose conservative reservation would cross
 that ceiling. A response that has already completed is retained and accounted
-for. With ChatGPT subscription OAuth, these dollar values are internal
-token-price estimates, not API charges or an account invoice.
+for. With ChatGPT or Go subscription access, these dollar values are internal
+token-price estimates, not the remaining subscription allowance or an invoice.
 
 ## Research Process
 
@@ -65,9 +84,11 @@ token-price estimates, not API charges or an account invoice.
    review disposition requires cited source. Incomplete work receives up to
    four progressively narrowed attempts; any remaining gap is stored explicitly
    as `unreviewed` rather than silently treated as covered.
-4. **Source validation** checks each candidate's citations, reachability,
-   controls, attacker role, security boundary, and concrete confidentiality,
-   integrity, or availability impact.
+4. **Source validation** checks exact sink quotes against source. The verifier
+   and critic assess source contradictions, reachability, controls, attacker
+   role, security boundary, and concrete confidentiality, integrity, or
+   availability impact; deterministic gates check required evidence and
+   role/version consistency.
 5. **Triage** ranks source-valid candidates and selects the configured number
    for sandbox verification. Default scans also apply configured finding-level
    Wordfence and Patchstack class, role, and impact rules. Asset eligibility,
@@ -78,14 +99,25 @@ token-price estimates, not API charges or an account invoice.
    attack/control oracle, restores the database and complete WordPress
    filesystem, and repeats the exact PoC from clean state. Both executions must
    pass before Squadrone creates a finding.
-7. **Scoring, deduplication, and reporting** calculate CVSS v3.1 from confirmed
-   evidence, query Wordfence Intelligence and, when `WPSCAN_API_KEY` is set,
-   WPScan, and create private report drafts for non-duplicate findings that pass
-   finding-level routing.
+7. **Deduplication and reporting** query Wordfence Intelligence and, when
+   `WPSCAN_API_KEY` is set, WPScan. The report stage then calculates CVSS v3.1
+   from confirmed evidence and creates private drafts for non-duplicate findings
+   that pass report-evidence and program-scope checks. Verification-only runs
+   skip these stages and may retain findings without assigned CVSS scores.
+
+See the [process flow diagram](docs/diagrams/process-flow.svg) for mode-specific
+stops, review outcomes, retries, and clean-state confirmation.
 
 Evidence checks, negative controls, and clean-state confirmation are enforced by
 the pipeline. Pipeline YAML configures operational choices such as models,
 budget, candidate limits, and sandbox settings.
+
+An **accepted triage candidate is not a confirmed vulnerability**. Matching
+source anchors and consistent metadata do not prove WordPress save/filter/render
+behavior, runtime reachability, or that a feature exceeds its intended authority.
+Developer consultations are model advice, not independently inspected core source.
+Unresolved or conflicting prerequisites can require manual review; runtime proof
+and operator review are still needed before disclosure.
 
 Verification begins only after Squadrone removes WordPress from its temporary
 bootstrap network. At runtime WordPress and MariaDB have only an internal Docker
@@ -144,15 +176,27 @@ supported installs so transitive packages cannot drift independently.
 
 ```sh
 cp .env.example .env
+$EDITOR .env
 ```
+
+The CLI reads process environment variables. The pinned LiteLLM dependency can
+also load a discovered `.env` as data in its default `LITELLM_MODE=DEV`; existing
+exported values normally take precedence. With `LITELLM_MODE=PRODUCTION`, that
+implicit loader is disabled, so export/inject the required variables before
+starting Squadrone. Squadrone does not provide a separate dotenv loader. Never use
+`source .env` or `. ./.env`: those execute file contents as shell code. Keep real
+keys out of shell history and shared logs; the export examples use placeholders.
 
 | Variable | Used for | Required |
 |---|---|---|
 | `ANTHROPIC_API_KEY` | Custom pipeline configurations using Anthropic models | Only for those custom configurations |
 | `OPENAI_API_KEY` | OpenAI API models | Not for `chatgpt/` OAuth models |
+| `OPENCODE_GO_API_KEY` | OpenCode Go / Go Plus models | For `pipelines/opencode-go.yaml` |
 | `WORDFENCE_API_KEY` | Optional authenticated dedup feed access | No |
 | `WPSCAN_API_KEY` | WPScan dedup lookup | No |
 | `LITELLM_LOG` | LiteLLM logging level | No |
+| `LITELLM_MODE` | LiteLLM development/production environment behavior | No; defaults to `DEV` |
+| `LITELLM_LOCAL_MODEL_COST_MAP` | Use LiteLLM's bundled cost map without its metadata download | No; set `True` for offline tests |
 
 Pipeline YAML controls model routing, reasoning effort, cost ceiling, candidate
 cap, PoC iterations, sandbox images/timeouts, persistent sandbox reuse, failure
@@ -164,6 +208,84 @@ budget.
 all use the `specialists` role. Supported override names are `critic`,
 `developer`, `developer_followup`, `surveyor`, `poc_author`, `specialists`,
 `reporter`, and `hypothesis_verifier`.
+
+### OpenCode Go model profiles
+
+`pipelines/opencode-go.yaml` defines named `model_profiles`, referenced as
+`profile/<name>` in the role mapping. Each profile specifies the upstream model,
+HTTPS API base, API format, environment-variable name (never a literal key),
+generation defaults, supported reasoning efforts, history policy, output limit
+and per-million-token price estimates. Legacy LiteLLM model strings still work.
+Role/global generation settings override profile defaults; unsupported controls
+fail explicitly rather than being silently discarded. Do not copy Daybreak's
+global `medium` reasoning into GLM: GLM supports `low`, `high` and `max`.
+Qwen's Messages route is not given Claude-specific thinking controls.
+
+| Profile | Roles | API format | Reasoning | Output allowance |
+|---|---|---|---|---|
+| `go-glm` / GLM-5.3 | Surveyor | OpenAI-compatible Chat | `max` | Cap 32,768 |
+| `go-deepseek` / DeepSeek V4.1 Flash | Specialists, hypothesis verifier, critic, developer/setup, developer follow-up, PoC author | OpenAI-compatible Chat | `high` | Floor 16,384; cap 32,768 |
+| `go-qwen` / Qwen3.8 Max | Reporter | Anthropic-compatible Messages | No Claude-specific controls | Cap 16,384 |
+
+DeepSeek's `output_budget_floor: 16384` raises short helper calls' initial shared
+reasoning/answer allowance to at least 16,384 tokens; it does not require a long
+answer or guarantee one.
+DeepSeek requests remain capped at `max_output_tokens: 32768`. An incomplete
+one-shot generation gets at most one regeneration at that ceiling when a larger
+allowance is available, with both attempts accounted against the run budget.
+Refusals and filtered responses do not trigger expansion. Setup JSON may also
+need its existing one-time shape repair, so one setup operation can use up to
+four separately budgeted generations. Tool-loop output is not automatically
+expanded: an incomplete response fails the loop explicitly. Empty or truncated
+output is never accepted as advice or executable setup, even if its partial JSON
+parses; legitimate tool-only turns are allowed. An exhausted consultation is
+reported to its caller as unavailable and non-authoritative, not as an empty
+successful answer or expert agreement. Legacy model strings do not gain output
+allowance expansion.
+
+The gateway uses the [documented Go endpoints and client headers](https://opencode.ai/v2/docs/console/go/)
+with Bearer authentication, Squadrone's own user agent and a stable conversation
+ID. Concurrent reviews and developer consultations receive distinct IDs;
+continuations, retries and JSON repair retain their conversation ID. Keys are
+resolved only at dispatch and are not included in traces, response-cache keys or
+model provenance. For Chat-compatible profiles, nonempty `OPENAI_CUSTOM_HEADERS`,
+`OPENAI_ORG_ID`, `OPENAI_PROJECT_ID` or `OPENAI_ORGANIZATION` cause a clear error:
+unset them for the Go process to prevent unrelated SDK headers leaking to Go.
+`OPENAI_API_KEY` and `ANTHROPIC_API_KEY` may remain set; they are not used by Go.
+The shipped Go profiles preserve complete reasoning/tool history rather than
+silently dropping earlier turns; context overflow fails explicitly at a configured
+input estimate limit or at the provider's actual token limit.
+Custom profiles may explicitly select the legacy `history_policy: trim` instead.
+DeepSeek also enables `empty_tool_reasoning`: omitted/null reasoning slots on
+assistant tool turns are serialized as an explicit empty string when required
+by the upstream API. Actual reasoning is preserved unchanged. This wire-only
+compatibility option does not invalidate completed model-stage checkpoints;
+effective normalized messages still determine response-cache keys, and request
+traces record the option separately.
+
+The `$10` run ceiling is an internal usage estimate, **not** your remaining Go
+allowance, a subscription charge or an invoice. Profile prices were checked on
+2026-10-21; DeepSeek uses peak rates conservatively, so off-peak spend can be
+overestimated. The gateway does not switch providers/models when quota runs out.
+Go Console's optional Extra usage setting can independently allow paid overflow;
+check that setting and actual allowances in your account.
+
+Resumes record effective model routes/settings, prompt hashes and methodology
+revisions. A change archives the first affected stage and its downstream outputs
+under `model_archive/<id>/` before recomputing them; compatible earlier stages and
+batch checkpoints remain reusable. A legacy run
+without model provenance cannot be migrated to a profile pipeline in place: start
+a new run. The old artifacts remain available.
+
+Specialists receive the inspected version from intake. Triage can retain
+unresolved attacker roles, conflicting role prerequisites, and unsupported
+historical-version claims for manual review without rewriting the original
+claim; other disqualifying quality failures can still require rejection. These
+checks do not prove core routing, payload survival or runtime exploitability.
+
+Offline adapter tests do not prove your account's entitlement or live service
+availability. Complete a small live tool-call/structured-output check for each
+model before relying on this pipeline for research.
 
 Focused discovery can limit source review to one or more areas; omit this field
 to retain all four reviewers in their fixed order:
@@ -211,8 +333,12 @@ and `authentication`. The optional item-type list matches deterministic
 .venv/bin/squadrone scan-batch plugins.txt --budget 100 \
   --config pipelines/chatgpt.yaml --verbose
 
-# Resume after the latest completed stage
+# Resume after the latest completed stage; reuse the original pipeline and mode
 .venv/bin/squadrone scan contact-form-7 --resume <run_id>
+
+# Resume an interrupted Go triage-only run, retaining compatible completed batches
+.venv/bin/squadrone scan contact-form-7 --resume <run_id> \
+  --config pipelines/opencode-go.yaml --triage-only --budget 2
 
 # Resume and force a specific stage onward
 .venv/bin/squadrone scan contact-form-7 --resume <run_id> --from verify
@@ -228,14 +354,27 @@ Use `.venv/bin/squadrone scan --help` or
 `.venv/bin/squadrone scan-batch --help` for the complete option reference.
 `--triage-only` and `--verify-only` are mutually exclusive:
 
-- `--triage-only` writes artifacts through `triaged.json` and stops before
-  Docker verification.
+- `--triage-only` disables disclosure-program scope filtering and stops after
+  technical triage and manual-queue handoff, before Docker verification,
+  vulnerability-database lookup, or reporting. Manual scaffolds may appear under
+  `verifications/`; they are not evidence that a sandbox or PoC ran.
 - `--verify-only` includes out-of-program-scope candidates in technical triage,
   runs verification, and skips vulnerability-database lookup and reporting.
 
 A triage-only run can be resumed with either mode. Verify-only resume reuses its
 technical-triage artifact; a normal resume reruns triage with disclosure scope
 enabled before continuing through verification, deduplication, and reporting.
+
+`--resume` does not restore the original pipeline path, mode flags, or budget
+override. Pass the same `--config` and `--triage-only`/`--verify-only` mode when
+continuing the same workflow. Omitting `--config` selects the Daybreak default
+and can invalidate a Go run's outputs. Omitting a mode flag requests the full
+disclosure workflow. Within an unfinished hypothesis stage, compatible completed
+review batches are reused and only unfinished/incompatible batches are repeated.
+There is no durable checkpoint inside an individual tool loop, although matching
+LLM responses can be reused from the semantic cache. `--from` forces stage
+re-entry; it does not bypass that cache or automatically discard valid batch
+checkpoints.
 
 Resume restores the prior `cost_calls.tsv` before making another model call.
 Earlier and resumed calls, including work repeated with `--from`, share one
@@ -262,7 +401,11 @@ Each run is stored under `plugins/<slug>/runs/<run_id>/`. Important files are:
 - `hypotheses.jsonl`: source-verifier survivors
 - `triaged.json`: accepted, rejected, merged, deferred, and manual dispositions
 - `quality_gate_triage.json`: deterministic source/impact decisions
-- `verifications/<hypothesis_id>/`: generated PoCs and optional diagnostics
+- `model_provenance.json`: stage model/route identities, prompt hashes, and methodology revisions
+- `model_archive/<id>/`: recoverable incompatible stage outputs preserved on resume
+- `verifications/<hypothesis_id>/`: generated PoCs, manual handoff scaffolds, and optional diagnostics
+- `verify_complete.json`: verification completion marker used for compatible resume
+- `manual_review_queued.json`: manual-queue handoff fingerprints used to prevent duplicate enqueueing
 - `findings.jsonl`: clean-state confirmed findings and structured observations
 - `decision_ledger.jsonl`: every keep, reject, defer, verify, dedup, and report decision
 - `trace.jsonl`: agent and tool activity
@@ -284,9 +427,13 @@ Persistent sandbox reuse remains confined to one verification run.
 
 ## Manual Review
 
-Triage or verification may use the manual queue for a source-proven candidate
-with one narrow runtime fact automation cannot establish. Quality-gate failures
-and lower-ranked candidates are rejected or deferred explicitly.
+Triage or verification may use the manual queue for a source-grounded candidate
+whose actor, prerequisites, transport, or other required evidence automation
+cannot establish. Unresolved/mixed attacker roles, role/prerequisite conflicts,
+and version claims beyond the inspected release can be retained unchanged for
+manual review rather than silently repaired. Other quality failures may be
+rejected; scope-ineligible or lower-ranked candidates may be deferred. Neither
+manual status nor acceptance establishes exploitability or intended authority.
 
 ```sh
 .venv/bin/squadrone manual list
@@ -305,6 +452,8 @@ and lower-ranked candidates are rejected or deferred explicitly.
 
 Generated reports remain drafts. Reproduce the final request and impact before
 submitting through the selected program.
+`disclose` only records a submission you made separately; it does not send a
+report or contact a program.
 
 ## Benchmark
 
@@ -356,7 +505,7 @@ env -u WORDFENCE_API_KEY -u WPSCAN_API_KEY \
 ## Tests
 
 ```sh
-.venv/bin/pytest -q
+LITELLM_LOCAL_MODEL_COST_MAP=True .venv/bin/pytest -q
 .venv/bin/ruff check --select E9,F63,F7,F82 src tests benchmarks
 ```
 
@@ -364,18 +513,41 @@ The Ruff command checks critical syntax and name failures across the current
 tree. Use broader Ruff checks on the files changed by a patch rather than
 assuming every optional rule is part of the current baseline.
 
+Adapter tests exercise real serialization against mocked HTTP responses; they
+do not prove live account entitlement, model accuracy, or full sandbox/report
+behavior. The real Docker network regression is opt-in:
+
+```sh
+SQUADRONE_RUN_DOCKER_ENGINE_TESTS=1 \
+  LITELLM_LOCAL_MODEL_COST_MAP=True \
+  .venv/bin/pytest tests/test_docker_network_restart_integration.py -q
+```
+
+That test requires a running compatible Docker Engine and a locally available
+probe image (`wordpress:latest` by default, or `SQUADRONE_DOCKER_ENGINE_TEST_IMAGE`);
+the test never pulls images. Some offline tests also require local loopback
+sockets or macOS sandbox permissions.
+
 ## Architecture
+
+![Squadrone architecture](docs/diagrams/architecture.svg)
 
 - `src/squadrone/stages/`: intake through report pipeline
 - `src/squadrone/agents/`: source reviewers and LLM runtime
+- `src/squadrone/agents/transport/litellm_transport.py`: tool loops, full assistant history, structured-output repair, and completeness guards
 - `src/squadrone/services/`: coverage, scope, quality, LLM, Docker, and dedup services
+- `src/squadrone/services/llm.py`: shared LiteLLM gateway, semantic response cache, bounded one-shot recovery, and budget accounting
+- `src/squadrone/services/model_profiles.py`: explicit API routes, validated generation controls, credential lookup, and request-envelope normalization
+- `src/squadrone/services/llm_context.py`: independent conversation scopes and parent/child context
+- `src/squadrone/services/model_provenance.py`: stage identities, prompt/policy tracking, and recoverable resume invalidation
 - `src/squadrone/docker/`: packaged Compose and WordPress runtime assets
 - `src/squadrone/schemas/`: Pydantic artifact contracts
 - `src/squadrone/prompts/`: agent and current program instructions
 - `src/squadrone/poc_templates/`: PoC skeletons and evidence helpers
 - `benchmarks/`: paired benchmark corpus and seeded historical-CVE regressions
 
-See `DESIGN.md` for the design-level walkthrough.
+See [DESIGN.md](DESIGN.md) for the architecture, design-level walkthrough, and
+known limits.
 
 ## Responsible Disclosure
 

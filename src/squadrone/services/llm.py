@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import ssl
+from uuid import uuid4
 from pathlib import Path
 from typing import Any, Optional
 
@@ -32,12 +33,12 @@ from tenacity import (
     before_sleep_log,
     retry,
     retry_if_exception,
-    retry_if_exception_type,
     stop_after_attempt,
     wait_exponential,
 )
 
 from .budget import BudgetTracker
+from .model_profiles import resolve_model
 from .sqlite import connect_sqlite
 
 DEFAULT_CACHE_DB = os.getenv("SQUADRONE_LLM_CACHE_DB", "cache/llm.sqlite")
@@ -249,21 +250,43 @@ async def init_cache(cache_db: str = DEFAULT_CACHE_DB) -> None:
         await db.commit()
 
 
-def _cache_key(model: str, messages: list, tools: list | None, llm_options: dict | None = None) -> str:
+def _cache_key(
+    model: str, messages: list, tools: list | None,
+    llm_options: dict | None = None, max_tokens: int = 4096,
+) -> str:
     payload = json.dumps(
-        {"model": model, "messages": messages, "tools": tools, "llm_options": llm_options or {}},
+        {"version": 2, "model": model, "messages": messages, "tools": tools,
+         "llm_options": llm_options or {}, "max_tokens": max_tokens},
         sort_keys=True,
         default=str,
     )
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(min=2, max=30),
-    retry=retry_if_exception_type(RateLimitError),
-    reraise=True,
-)
+class IncompleteLLMResponse(RuntimeError):
+    """A provider response cannot be treated as a complete authoritative answer."""
+
+
+def require_complete_response(response: dict, *, require_content: bool = True) -> None:
+    """Reject interrupted output before parsing or executing even valid-looking JSON.
+
+    Reasoning-only and empty final turns are not successful answers. Tool-only
+    assistant turns are legitimate when the caller explicitly allows them.
+    Never put model text or reasoning in the exception.
+    """
+    choice = (response.get("choices") or [{}])[0]
+    finish_reason = choice.get("finish_reason")
+    message = choice.get("message") or {}
+    if finish_reason in {"length", "max_tokens", "content_filter"}:
+        raise IncompleteLLMResponse(f"Incomplete model response (finish_reason={finish_reason})")
+    if message.get("refusal"):
+        raise IncompleteLLMResponse("Model refused the requested answer")
+    content = message.get("content")
+    has_content = isinstance(content, str) and bool(content.strip())
+    if not has_content and (require_content or not message.get("tool_calls")):
+        raise IncompleteLLMResponse("Model returned no final answer")
+
+
 async def call_llm_oneshot(
     *,
     model: str,
@@ -272,20 +295,53 @@ async def call_llm_oneshot(
     budget_tracker: Optional[BudgetTracker] = None,
     agent_name: str = "unknown",
     llm_options: dict | None = None,
-) -> str:
+    conversation_id: str | None = None,
+    return_response: bool = False,
+) -> str | dict:
     """Single-turn LLM call (no tools, no agent loop).
 
     Returns the assistant's text content. Used by agents that don't
     participate in the tool-use loop (e.g. `DeveloperAgent`), where the full
     `AgentRuntime.run` agent loop would be overkill.
     """
-    resp = await call_llm(
-        model=model, messages=messages, max_tokens=max_tokens,
-        budget_tracker=budget_tracker, agent_name=agent_name,
-        llm_options=llm_options,
-    )
-    choice = (resp.get("choices") or [{}])[0]
-    return ((choice.get("message") or {}).get("content") or "").strip()
+    resolved = resolve_model(model, llm_options)
+    allowance = resolved.output_limit(max_tokens)
+    ceiling = resolved.profile.max_output_tokens if resolved.profile else None
+    # Retry a failed generation, not a continuation of its incomplete answer.
+    # Preserve one session across both attempts even outside an agent context.
+    if conversation_id is None:
+        from .llm_context import current_conversation
+
+        context = current_conversation()
+        conversation_id = context.conversation_id if context else str(uuid4())
+    for attempt in range(2):
+        resp = await call_llm(
+            model=model, messages=messages, max_tokens=allowance,
+            budget_tracker=budget_tracker, agent_name=agent_name,
+            llm_options=llm_options,
+            conversation_id=conversation_id,
+        )
+        try:
+            require_complete_response(resp)
+        except IncompleteLLMResponse:
+            choice = (resp.get("choices") or [{}])[0]
+            # Refusals/filtering are not exhaustion and must not trigger retries.
+            blocked = choice.get("finish_reason") == "content_filter" or (
+                choice.get("message") or {}
+            ).get("refusal")
+            if attempt or blocked or ceiling is None or allowance >= ceiling:
+                raise
+            logger.warning(
+                "%s: incomplete answer with %d-token allowance; retrying once at %d",
+                agent_name, allowance, ceiling,
+            )
+            allowance = ceiling
+            continue
+        if return_response:
+            return resp
+        choice = resp["choices"][0]
+        return choice["message"]["content"].strip()
+    raise AssertionError("unreachable")
 
 
 def _install_chatgpt_aggregator_patch() -> None:
@@ -416,6 +472,7 @@ async def call_llm(
     cache_db: str = DEFAULT_CACHE_DB,
     agent_name: str = "unknown",
     llm_options: dict | None = None,
+    conversation_id: str | None = None,
 ) -> dict:
     """Direct LiteLLM completion with on-disk response cache.
 
@@ -424,8 +481,19 @@ async def call_llm(
     output items into the final response's `output` field.
     """
     _ensure_parent(cache_db)
-    options = dict(llm_options or {})
-    key = _cache_key(model, messages, tools, options)
+    resolved = resolve_model(model, llm_options)
+    messages = resolved.prepare_messages(messages)
+    max_tokens = resolved.output_limit(max_tokens)
+    if max_tokens <= 0:
+        raise ValueError("max_tokens must be positive")
+    if resolved.profile and resolved.profile.max_input_tokens is not None:
+        estimated = _estimate_request_tokens(messages, tools)
+        if estimated > resolved.profile.max_input_tokens:
+            raise ValueError(
+                f"{model}: estimated input {estimated} tokens exceeds configured "
+                f"limit {resolved.profile.max_input_tokens}; history was not silently truncated"
+            )
+    key = _cache_key(resolved.request_model, messages, tools, resolved.identity, max_tokens)
 
     async with connect_sqlite(cache_db) as db:
         async with db.execute(
@@ -439,18 +507,27 @@ async def call_llm(
     logger.debug("llm cache MISS model=%s key=%s", model, key[:12])
 
     request_kwargs = {
-        "model": model,
+        "model": resolved.request_model,
         "messages": messages,
         "tools": tools,
         "max_tokens": max_tokens,
     }
-    request_kwargs.update(options)
+    request_kwargs.update(resolved.options)
+    # A single logical request keeps its ID through every transport retry.
+    if conversation_id is None:
+        from .llm_context import current_conversation
+
+        context = current_conversation()
+        conversation_id = context.conversation_id if context else str(uuid4())
+    request_kwargs.update(resolved.connection_kwargs(conversation_id))
     reservation = 0.0
     if budget_tracker is not None:
+        pricing_kwargs = {"pricing": resolved.pricing} if resolved.pricing else {}
         reservation = await budget_tracker.reserve(
             model,
             _estimate_request_tokens(messages, tools),
             max_tokens,
+            **pricing_kwargs,
         )
     try:
         response = await _acompletion_with_retries(request_kwargs)
@@ -465,6 +542,7 @@ async def call_llm(
             model,
             agent=agent_name,
             reservation_usd=reservation,
+            **({"pricing": resolved.pricing} if resolved.pricing else {}),
         )
 
     _coerce_response_api_usage(response)

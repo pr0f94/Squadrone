@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ..schemas.finding import Finding, PoCStatus
+from ..schemas.finding import Finding, PoCAttempt, PoCStatus
 from ..schemas.hypothesis import (
     BugClass,
     Confidence,
@@ -24,7 +24,11 @@ from .php_object_gadget_oracle import (
     validate_persisted_php_object_gadget_confirmation,
 )
 from .request_fields import classify_request_field_source
-from .roles import UNKNOWN_ATTACKER_ROLE, normalize_attacker_role
+from .roles import (
+    UNKNOWN_ATTACKER_ROLE,
+    extract_attacker_roles,
+    normalize_attacker_role,
+)
 
 UNSAFE_CONFIGURATION_RE = re.compile(
     r"\b(misconfig(?:uration)?|modified source|premium[- ]gated|debug mode|"
@@ -77,6 +81,13 @@ MANUAL_REVIEW_ONLY_QUALITY_RULES = frozenset(
         "second_order_sqli_different_actor_manual",
         "second_order_sqli_response_marker_manual",
         "second_order_sqli_trigger_transport_unsupported",
+        "attacker_role_unresolved",
+        "attacker_role_preconditions_mismatch",
+        "affected_versions_not_inspected",
+        # Execution evidence without the matching label is a metadata
+        # inconsistency, not a source-invalid claim. Preserve the candidate
+        # for human review instead of discarding it.
+        "potential_rce_evidence_without_label",
     }
 )
 BOUNDARY_PLACEHOLDER_RE = re.compile(
@@ -231,12 +242,31 @@ def infer_attacker_role(hypothesis: Hypothesis) -> str:
     supplied = str((hypothesis.evidence_summary or {}).get("attacker_role") or "")
     if supplied:
         return normalize_attacker_role(supplied)
-    inferred = normalize_attacker_role(_text(hypothesis))
-    if inferred != UNKNOWN_ATTACKER_ROLE:
-        return inferred
-    if "nopriv" in hypothesis.entry_point.lower():
+    # Impact, sink text and reasoning also describe victims, rejected attacker
+    # alternatives and setup administrators. None can establish the caller.
+    prerequisite_roles = extract_attacker_roles(hypothesis.preconditions)
+    if len(prerequisite_roles) == 1:
+        return next(iter(prerequisite_roles))
+    if re.fullmatch(r"wp_ajax_nopriv_[A-Za-z0-9_]+", hypothesis.entry_point.strip()):
         return "unauthenticated"
     return UNKNOWN_ATTACKER_ROLE
+
+
+def _inspected_version_only(claim: str, scanned_version: str) -> bool:
+    """A single source tree proves its own version, not a historical range.
+
+    Deliberately require a bounded version statement rather than accepting a
+    model-authored ``version_evidence`` assertion. Historical research needs a
+    separate trusted provenance contract before it can broaden this scope.
+    """
+    version = scanned_version.strip()
+    if not version:
+        return False
+    return re.fullmatch(
+        r"(?:version\s+|v)?" + re.escape(version) + r"(?:\s+only)?",
+        claim.strip(),
+        re.IGNORECASE,
+    ) is not None
 
 
 def _impact_dimensions(hypothesis: Hypothesis, description: str) -> dict[str, str]:
@@ -363,6 +393,8 @@ def recompute_severity(
 
 def grade_hypothesis(
     hypothesis: Hypothesis,
+    *,
+    scanned_version: str | None = None,
 ) -> Grade:
     evidence = infer_evidence(hypothesis)
     severity = recompute_severity(hypothesis, evidence)
@@ -386,6 +418,15 @@ def grade_hypothesis(
     if not evidence["has_impact_statement"]:
         rules.append("missing_concrete_cia_impact")
     supplied_evidence = hypothesis.evidence_summary or {}
+    prerequisite_roles = extract_attacker_roles(hypothesis.preconditions)
+    if evidence["attacker_role"] == UNKNOWN_ATTACKER_ROLE:
+        rules.append("attacker_role_unresolved")
+    elif prerequisite_roles and evidence["attacker_role"] not in prerequisite_roles:
+        rules.append("attacker_role_preconditions_mismatch")
+    if scanned_version is not None and not _inspected_version_only(
+        hypothesis.affected_versions, scanned_version
+    ):
+        rules.append("affected_versions_not_inspected")
     if not hypothesis.preconditions.strip() and not (
         str(supplied_evidence.get("attacker_role") or "").strip()
         and str(supplied_evidence.get("proof_gaps") or "").strip()
@@ -529,6 +570,8 @@ def grade_hypothesis(
 
 _AUTOMATIC_VERIFIER_CONTRACT_RULES = frozenset(
     {
+        "attacker_role_unresolved",
+        "attacker_role_preconditions_mismatch",
         "execution_transport_invalid",
         "execution_source_field_invalid",
         "execution_source_field_dispatch_conflict",
@@ -625,6 +668,7 @@ def apply_quality_gate(
     triaged: TriagedArtifact,
     *,
     artifact_path: Path | None = None,
+    scanned_version: str | None = None,
 ) -> TriagedArtifact:
     accepted: list[Hypothesis] = []
     rejected = list(triaged.rejected)
@@ -632,7 +676,7 @@ def apply_quality_gate(
     decisions: list[dict[str, Any]] = []
     for hypothesis in triaged.accepted:
         original_payload = hypothesis.model_dump(mode="json")
-        grade = grade_hypothesis(hypothesis)
+        grade = grade_hypothesis(hypothesis, scanned_version=scanned_version)
         manual_review_only = bool(grade.rules) and set(grade.rules).issubset(
             MANUAL_REVIEW_ONLY_QUALITY_RULES
         )
@@ -920,7 +964,9 @@ def validate_php_object_natural_finding_confirmation(
     ]
     if len(successful_natural) != 2:
         return False, "CWE-502 full promotion requires two natural PoC attempts"
-    attempts_by_phase = {attempt.phase: attempt for attempt in successful_natural}
+    attempts_by_phase: dict[str, PoCAttempt] = {
+        attempt.phase: attempt for attempt in successful_natural
+    }
     if set(attempts_by_phase) != {"attack", "confirmation"}:
         return False, "CWE-502 natural PoC attempts must include attack and confirmation"
     script_paths = {attempt.script_path for attempt in successful_natural}

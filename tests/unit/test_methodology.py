@@ -922,9 +922,11 @@ async def test_hypothesis_review_item_types_filter_targets_and_dispositions(
 
         def __init__(self) -> None:
             self.seen: list[CoverageItem] = []
+            self.versions: list[str | None] = []
 
         async def analyze(self, *_args, coverage_targets, **_kwargs):
             self.seen.extend(coverage_targets)
+            self.versions.append(_kwargs.get("plugin_version"))
             return SpecialistReviewArtifact(
                 hypotheses=[],
                 coverage=[
@@ -951,6 +953,13 @@ async def test_hypothesis_review_item_types_filter_targets_and_dispositions(
     config = PipelineConfig.from_yaml("tests/fixtures/pipeline.yaml")
     config.hypothesis_review_item_types = ["deserialization"]
     runs_root = tmp_path / "runs"
+    run_dir = runs_root / "focused-items"
+    run_dir.mkdir(parents=True)
+    (run_dir / "intake.json").write_text(json.dumps({
+        "run_id": "focused-items", "plugin_slug": "demo", "plugin_version": "1.2.3",
+        "source_path": str(tmp_path), "file_count": 1, "total_lines": 2,
+        "source_url": "https://example.test/demo.zip", "scanned_at": "2026-10-21T12:00:00Z",
+    }))
 
     artifact = await hypothesis_stage.run(
         recon,
@@ -964,6 +973,7 @@ async def test_hypothesis_review_item_types_filter_targets_and_dispositions(
 
     assert artifact.hypotheses == []
     assert [target.id for target in specialist.seen] == [selected.id]
+    assert specialist.versions == ["1.2.3"]
     assert recon.coverage is not None
     assert [item.item_id for item in recon.coverage.dispositions] == [selected.id]
     persisted = CoverageArtifact.model_validate_json(
@@ -1866,8 +1876,10 @@ async def test_dynamic_write_runtime_limits_are_authorization_specific(
         priority_files=["demo.php"],
         coverage_targets=[target],
         batch_id="b001",
+        plugin_version="1.2.3",
     )
 
+    assert json.loads(captured["messages"][-1]["content"])["plugin_version"] == "1.2.3"
     assert (
         captured["max_iterations"],
         captured["force_finalise_after"],

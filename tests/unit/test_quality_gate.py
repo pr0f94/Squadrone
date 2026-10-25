@@ -537,6 +537,7 @@ def test_quality_gate_accepts_protected_attribute_boundary_on_own_object():
 def test_quality_gate_recognizes_public_upload_execution_impact():
     hypothesis = _hypothesis(
         bug_class=BugClass.ARBITRARY_FILE_WRITE,
+        preconditions="Subscriber attacker uploads a file through the REST route.",
         security_outcome=SecurityOutcome(
             description=(
                 "The attacker can place arbitrary files, including PHP-named payloads, "
@@ -957,6 +958,33 @@ def test_execution_evidence_requires_potential_rce_label() -> None:
 
     assert grade.accepted is False
     assert "potential_rce_evidence_without_label" in grade.rules
+
+
+def test_execution_evidence_without_label_routes_to_manual_review(tmp_path) -> None:
+    evidence = {
+        **_hypothesis().evidence_summary,
+        "code_execution_path": "upload -> executable destination -> HTTP request",
+        "code_execution_sink": "server executes uploads/proof.php",
+    }
+    hypothesis = _hypothesis(
+        bug_class=BugClass.ARBITRARY_FILE_WRITE,
+        specialist="injection_files",
+        evidence_summary=evidence,
+    )
+
+    assert grade_hypothesis(hypothesis).rules == [
+        "potential_rce_evidence_without_label"
+    ]
+
+    decision_path = tmp_path / "quality.json"
+    gated = _apply_one(hypothesis, artifact_path=decision_path)
+
+    assert gated.accepted == []
+    assert gated.rejected == []
+    assert gated.manual_review[0]["rules"] == [
+        "potential_rce_evidence_without_label"
+    ]
+    assert json.loads(decision_path.read_text())[0]["disposition"] == "manual_review"
 
 
 def test_quality_gate_preserves_canonical_ordered_verification_preflights() -> None:

@@ -14,17 +14,19 @@ import hashlib
 import json
 import logging
 from pathlib import Path
-from typing import Literal, Optional, TYPE_CHECKING
+from typing import Literal, Optional, TYPE_CHECKING, cast
 
 from pydantic import BaseModel
 
 from ..schemas.hypothesis import Hypothesis
 from ..schemas.taxonomy import get_known_cwe_profile
 from ..services.llm import call_llm_oneshot
+from ..services.llm_context import current_conversation, new_conversation
 from ..services.setup_http import SetupHttpContext
 from .plugin_tools import PluginToolHandlers
 from .prompts_io import load_prompt
 from .runtime import _strip_fences
+from .transport.litellm_transport import _assistant_message
 
 if TYPE_CHECKING:
     from .runtime import AgentRuntime
@@ -95,6 +97,15 @@ def _bound_setup_execution_feedback(value: str, *, limit: int = 6000) -> str:
     head = value[:head_limit].rsplit("\n", 1)[0] or value[:head_limit]
     tail = value[-tail_limit:].split("\n", 1)[-1] or value[-tail_limit:]
     return head + omission + tail
+
+
+def _oneshot_message(response: dict | str) -> dict:
+    """Keep the original assistant turn when setup output needs JSON repair."""
+    if isinstance(response, str):
+        # Also retain compatibility with callers that replace the text helper.
+        return {"role": "assistant", "content": response}
+    message = (response.get("choices") or [{}])[0].get("message") or {}
+    return _assistant_message(message)
 
 
 class SetupPlan(BaseModel):
@@ -252,6 +263,7 @@ class DeveloperAgent:
             return self.followup_llm_options
         return self.llm_options
 
+    @new_conversation
     async def _call_setup_json(
         self,
         *,
@@ -261,14 +273,20 @@ class DeveloperAgent:
         retry_shape: str | None = None,
     ) -> dict | None:
         """Call a setup-oriented prompt and retry once if no JSON object is recoverable."""
-        content = await call_llm_oneshot(
+        conversation = current_conversation()
+        assert conversation is not None
+        response = await call_llm_oneshot(
             model=model,
             messages=messages,
             budget_tracker=self.budget_tracker,
             max_tokens=4096,
             agent_name=agent_name,
             llm_options=self._llm_options_for_agent(agent_name),
+            conversation_id=conversation.conversation_id,
+            return_response=True,
         )
+        message = _oneshot_message(response)
+        content = (message.get("content") or "").strip()
         parsed = _parse_json_resilient(content)
         if parsed is not None:
             return parsed
@@ -280,10 +298,7 @@ class DeveloperAgent:
         )
         retry_messages = [
             *messages,
-            {
-                "role": "assistant",
-                "content": content or "",
-            },
+            message,
             {
                 "role": "user",
                 "content": (
@@ -298,14 +313,17 @@ class DeveloperAgent:
                 ),
             },
         ]
-        retry_content = await call_llm_oneshot(
+        retry_response = await call_llm_oneshot(
             model=model,
             messages=retry_messages,
             budget_tracker=self.budget_tracker,
             max_tokens=4096,
             agent_name=f"{agent_name}.retry",
             llm_options=self._llm_options_for_agent(agent_name),
+            conversation_id=conversation.conversation_id,
+            return_response=True,
         )
+        retry_content = (_oneshot_message(retry_response).get("content") or "").strip()
         parsed = _parse_json_resilient(retry_content)
         if parsed is None:
             logger.warning(
@@ -315,6 +333,7 @@ class DeveloperAgent:
             )
         return parsed
 
+    @new_conversation
     async def consult(
         self,
         question: str,
@@ -328,12 +347,18 @@ class DeveloperAgent:
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": "\n\n".join(user_parts)},
         ]
-        return await call_llm_oneshot(
-            model=self.model,
-            messages=messages,
-            budget_tracker=self.budget_tracker,
-            agent_name="developer.consult",
-            llm_options=self.llm_options,
+        conversation = current_conversation()
+        assert conversation is not None
+        return cast(
+            str,
+            await call_llm_oneshot(
+                model=self.model,
+                messages=messages,
+                budget_tracker=self.budget_tracker,
+                agent_name="developer.consult",
+                llm_options=self.llm_options,
+                conversation_id=conversation.conversation_id,
+            ),
         )
 
     async def propose_setup(
